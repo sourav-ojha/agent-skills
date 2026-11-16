@@ -46,19 +46,34 @@ export function takeSnapshot(dir) {
 export function snapshotPath(dir, tag = 'default') {
   if (!/^[A-Za-z0-9_-]{1,40}$/.test(String(tag))) throw new Error(`invalid snapshot tag "${tag}" (use letters, digits, - and _)`);
   const id = createHash('sha1').update(path.resolve(dir)).digest('hex').slice(0, 12);
-  return path.join(os.tmpdir(), 'product-intelligence-snapshots', `${id}-${tag}.json`);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'u';
+  return path.join(os.tmpdir(), `product-intelligence-snapshots-${uid}`, `${id}-${tag}.json`);
+}
+
+// Snapshot dir must be a real directory we own, not group/world accessible (guards against pre-planted dirs/symlinks in shared tmp).
+function ensureSafeDir(d) {
+  fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(d);
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`snapshot dir ${d} is not a plain directory; refusing to use it`);
+  if (typeof process.getuid === 'function' && (st.uid !== process.getuid() || (st.mode & 0o077) !== 0)) {
+    throw new Error(`snapshot dir ${d} is not private to this user; remove it and retry`);
+  }
 }
 
 export function saveSnapshot(dir, tag) {
   const p = snapshotPath(dir, tag);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
+  ensureSafeDir(path.dirname(p));
   const snap = takeSnapshot(dir);
-  fs.writeFileSync(p, JSON.stringify({ taken: new Date().toISOString(), files: snap }));
+  fs.rmSync(p, { force: true });
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0);
+  const fd = fs.openSync(p, flags, 0o600);
+  try { fs.writeSync(fd, JSON.stringify({ taken: new Date().toISOString(), files: snap })); } finally { fs.closeSync(fd); }
   return { path: p, count: Object.keys(snap).length };
 }
 
 export function diffSnapshot(dir, tag) {
   const p = snapshotPath(dir, tag);
+  ensureSafeDir(path.dirname(p));
   if (!fs.existsSync(p)) throw new Error(`No snapshot at ${p}. Run "snapshot" before research starts.`);
   const before = JSON.parse(fs.readFileSync(p, 'utf8')).files;
   const after = takeSnapshot(dir);
