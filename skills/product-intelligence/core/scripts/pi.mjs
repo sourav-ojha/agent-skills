@@ -55,6 +55,7 @@ function requireBy() {
 function optNote(required) {
   if (flags.note === true) die('--note needs a value.');
   const note = flags.note ? String(flags.note).trim() : '';
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(note)) die('--note must not contain control characters (including newlines and escape sequences).');
   if (required && !note) die('--note "<the user\'s words / reason>" is required: it records what the human actually said.');
   return note;
 }
@@ -62,12 +63,15 @@ function optNote(required) {
 // Optional stricter mode (config gates.human_confirmation = "tty"): a human must type "yes" in an interactive
 // terminal. An agent's shell has no TTY, so it cannot satisfy this; the user runs the command themselves.
 function confirmHuman(summary) {
-  const mode = loadConfig(dir).config.gates?.human_confirmation || 'chat';
+  const loaded = loadConfig(dir);
+  if (loaded.errors.length) die(`cannot read the gate configuration, refusing to continue:\n  ${loaded.errors.join('\n  ')}`);
+  const mode = loaded.config.gates?.human_confirmation || 'chat';
   if (mode !== 'tty') return;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    die(`gates.human_confirmation is "tty": this needs a person at an interactive terminal. Ask the user to run this exact command themselves:\n  ${process.argv.slice(1).map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
+    const sh = (a) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`); // POSIX single-quoting
+    die(`gates.human_confirmation is "tty": this needs a person at an interactive terminal. Ask the user to run this exact command themselves:\n  ${['node', ...process.argv.slice(1)].map(sh).join(' ')}`);
   }
-  process.stdout.write(`${summary}\nType "yes" to confirm: `);
+  process.stdout.write(`${summary}\nType "yes" to confirm: `); // summary values are JSON-quoted by callers: no raw control characters
   const buf = Buffer.alloc(64);
   let n = 0;
   try { n = fs.readSync(0, buf, 0, 64, null); } catch { n = 0; }
@@ -150,7 +154,7 @@ function cmdApproveProduct() {
   if (ph.length) die(`PRODUCT.md still contains placeholder-like text on body lines ${ph.slice(0, 5).join(', ')} (counted from the first line after the frontmatter). Flagged: {{...}}, <<...>>, TODO, TBD, FIXME, lorem ipsum, even inside prose: rephrase (e.g. "open to-do comments") or remove.`);
   const pre = validateProject(dir, { today }).errors.filter((e) => e.startsWith('PRODUCT.md'));
   if (pre.length) die(`PRODUCT.md is not valid, refusing to approve:\n  ${pre.join('\n  ')}`);
-  confirmHuman(`Approve PRODUCT.md as revision ${Number(data.revision || 0) + 1}, recorded for ${by}?`);
+  confirmHuman(`Approve PRODUCT.md as revision ${Number(data.revision || 0) + 1}, recorded for ${JSON.stringify(by)}?`);
   const revision = Number(data.revision || 0) + 1;
   t = appendHistory(t, { revision, date: today, by, action: data.approved_at ? 're-approved' : 'approved', note: optNote(false) });
   t = setFrontmatter(t, { status: 'approved', revision, approved_by: by, approved_at: today, last_reviewed: today, content_hash: productHash(t) });
@@ -166,7 +170,7 @@ function cmdReopenProduct() {
   let t = need(p, 'PRODUCT.md');
   const { data } = splitFrontmatter(t);
   if (data.status !== 'approved') die('PRODUCT.md is not approved; it is already editable.');
-  confirmHuman(`Reopen the approved PRODUCT.md for editing, recorded for ${by}?`);
+  confirmHuman(`Reopen the approved PRODUCT.md for editing, recorded for ${JSON.stringify(by)}?`);
   t = appendHistory(t, { revision: data.revision, date: today, by, action: 'reopened', note: optNote(false) || 'edit requested' });
   t = setFrontmatter(t, { status: 'draft' });
   fs.writeFileSync(p, t);
@@ -180,7 +184,7 @@ function cmdConfirmProduct() {
   const { data } = splitFrontmatter(t);
   if (data.status !== 'approved') die('PRODUCT.md is not approved; use approve-product.');
   if (data.content_hash !== productHash(t)) die('PRODUCT.md was modified after approval; reopen and re-approve instead of confirming.');
-  confirmHuman(`Confirm PRODUCT.md revision ${data.revision} is still accurate, recorded for ${by}?`);
+  confirmHuman(`Confirm PRODUCT.md revision ${data.revision} is still accurate, recorded for ${JSON.stringify(by)}?`);
   t = appendHistory(t, { revision: data.revision, date: today, by, action: 'reviewed', note: optNote(false) || 'confirmed unchanged' });
   t = setFrontmatter(t, { last_reviewed: today });
   fs.writeFileSync(p, t);
@@ -206,7 +210,7 @@ function cmdDecide() {
   if (!allowed.includes(target)) die(`${id} is "${row.status}"; a user decision cannot move it to "${target}". Allowed: ${allowed.join(', ') || 'none'}.`);
   const note = optNote(true);
   requireApprovedProduct();
-  confirmHuman(`Record decision "${decision}" for ${id} (${row.title}), by ${by}? Note: ${note}`);
+  confirmHuman(`Record decision ${JSON.stringify(decision)} for ${JSON.stringify(id)} (title ${JSON.stringify(row.title)}), by ${JSON.stringify(by)}. Note: ${JSON.stringify(note)}`);
   let next = updateRow(t, id, { status: target, updated: today });
   next = appendLog(next, { date: today, id, decision, by, note });
   const log = parseLog(next);

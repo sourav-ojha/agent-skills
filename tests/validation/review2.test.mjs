@@ -261,3 +261,20 @@ test('low: names with quotes or backslashes are refused for --by', () => {
   const dir = projectFrom('b');
   assert.match(pi(dir, ['decide', 'OPP-002', 'approve', '--by', 'A"B', '--note', 'x']).err, /--by must be/);
 });
+
+// ---- confirmHuman hardening (security review of the tty gate) ----------------------------------------------------------------
+test('tty gate: suggested command is shell-quoted, control characters in --note are refused, bad config fails closed', () => {
+  const dir = projectFrom('b');
+  fs.writeFileSync(path.join(dir, '.product/config.json'), JSON.stringify({ gates: { human_confirmation: 'tty' } }));
+  const r = pi(dir, ['decide', 'OPP-002', 'approve', '--by', 'Ann', '--note', "it's $(touch pwned); ok"]);
+  assert.notEqual(r.code, 0);
+  assert.ok(r.err.includes("'it'\\''s $(touch pwned); ok'"), r.err);
+
+  const esc = pi(dir, ['decide', 'OPP-002', 'approve', '--by', 'Ann', '--note', 'x\u001b[2Jy']);
+  assert.match(esc.err, /control characters/);
+
+  fs.writeFileSync(path.join(dir, '.product/config.json'), '{ not json');
+  const bad = pi(dir, ['decide', 'OPP-002', 'approve', '--by', 'Ann', '--note', 'user: yes']);
+  assert.notEqual(bad.code, 0);
+  assert.match(read(dir, OPPS), /\| OPP-002 \| Per-organization rate limits \| Proposed/);
+});

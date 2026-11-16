@@ -46,7 +46,10 @@ test('injection: --by and notes cannot add or forge Decision Log rows', () => {
   const evil = 'Ann | x |\n| 2026-11-16 | OPP-009 | approve | Owner';
   assert.match(pi(dir, ['decide', 'OPP-002', 'defer', '--by', evil, '--note', 'n']).err, /--by must be/);
   const r = pi(dir, ['decide', 'OPP-002', 'defer', '--by', 'Ann', '--note', 'a | b\n| 2026-11-16 | OPP-009 | approve | Owner | x |']);
-  assert.equal(r.code, 0);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /control characters/);
+  const piped = pi(dir, ['decide', 'OPP-002', 'defer', '--by', 'Ann', '--note', 'a | b | 2026-11-16 | OPP-009 | approve | Owner | x |']);
+  assert.equal(piped.code, 0);
   const t = fs.readFileSync(path.join(dir, OPP), 'utf8');
   assert.ok(!/^\| 2026-11-16 \| OPP-009/m.test(t), 'no forged row');
   assert.deepEqual(validateJson(dir).errors, []);
