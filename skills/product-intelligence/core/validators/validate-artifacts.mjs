@@ -6,8 +6,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { splitFrontmatter, sectionText, strayTableRows } from '../scripts/lib/fm.mjs';
 import { productHash, historyHasProse, parseHistory, HISTORY_ACTIONS } from '../scripts/lib/product.mjs';
-import { parseRegistry, parseLog, parseDetails, verifyChain } from '../scripts/lib/registry.mjs';
-import { lintEvidence, findPlaceholders, daysBetween, isValidDate, repoSourcePath, repoSourceExists } from '../scripts/lib/evidence.mjs';
+import { parseRegistry, parseLog, parseDetails, logIntegrityErrors, contentDigest } from '../scripts/lib/registry.mjs';
+import { lintEvidence, findPlaceholders, daysBetween, isValidDate, sourceKey } from '../scripts/lib/evidence.mjs';
 import { computeScore, computeTier, parseRatings } from '../scripts/lib/score.mjs';
 import { loadConfig, readJson, CORE_DIR } from '../scripts/lib/config.mjs';
 
@@ -96,6 +96,8 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       if (ph.length) errors.push(`PRODUCT.md: unresolved placeholders on lines ${ph.slice(0, 5).join(', ')} (approved product context must be complete)`);
     }
     // Revision History must be well-formed and agree with the approval metadata in the frontmatter.
+    const strayHist = strayTableRows(text, 'Revision History');
+    if (strayHist) errors.push(`PRODUCT.md: ${strayHist} Revision History table row(s) appear after a gap or other text; they are neither hashed nor validated`);
     const hist = parseHistory(text);
     hist.forEach((h, i) => {
       if (h.n !== 5 || !/^\d+$/.test(h.revision) || !isValidDate(h.date) || !h.by || !HISTORY_ACTIONS.includes(h.action)) {
@@ -110,6 +112,7 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       if (h.revision !== String(data.revision) || h.by !== data.approved_by || h.date !== data.approved_at) {
         errors.push(`PRODUCT.md: the last approval row in Revision History (rev ${h.revision}, ${h.by}, ${h.date}) does not match the frontmatter (rev ${data.revision}, ${data.approved_by}, ${data.approved_at}); approval metadata was edited by hand`);
       }
+      if (hist.length && data.last_reviewed && hist[hist.length - 1].date !== data.last_reviewed) errors.push(`PRODUCT.md: last_reviewed (${data.last_reviewed}) does not match the newest Revision History row (${hist[hist.length - 1].date}); the review date is set by approve-product/confirm-product`);
       if (hist.slice(lastApproval + 1).some((r) => r.action === 'reopened')) errors.push('PRODUCT.md: status is approved but the history shows it was reopened after the last approval');
     }
     product = data;
@@ -131,8 +134,8 @@ export function validateProject(dir, { today = todayStr() } = {}) {
     for (const k of artifacts.registry.frontmatter_required) if (!(k in reg.fm)) errors.push(`opportunities.md: missing frontmatter "${k}"`);
     if (reg.fm.review_mode && !artifacts.registry.review_modes.includes(reg.fm.review_mode)) errors.push(`opportunities.md: invalid review_mode "${reg.fm.review_mode}"`);
     if (reg.fm.review_mode === 'self-review' && !reg.fm.review_note) errors.push('opportunities.md: review_mode is self-review but review_note does not explain why no independent reviewer ran');
-    if (reg.fm.last_research && !isValidDate(reg.fm.last_research)) errors.push(`opportunities.md: last_research "${reg.fm.last_research}" is not YYYY-MM-DD`);
-    else if (reg.fm.last_research && daysBetween(reg.fm.last_research, today) > config.freshness.market_refresh_days) {
+    if (reg.fm.last_research && reg.fm.last_research !== 'never' && !isValidDate(reg.fm.last_research)) errors.push(`opportunities.md: last_research "${reg.fm.last_research}" is not YYYY-MM-DD`);
+    else if (reg.fm.last_research && reg.fm.last_research !== 'never' && daysBetween(reg.fm.last_research, today) > config.freshness.market_refresh_days) {
       warnings.push(`opportunities.md: market research is ${daysBetween(reg.fm.last_research, today)} days old; consider "refresh"`);
     }
 
@@ -171,15 +174,8 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       const stray = strayTableRows(text, h);
       if (stray) errors.push(`${h}: ${stray} table row(s) appear after a gap or other text and are not part of the table; rows hidden this way are ignored by every check`);
     }
-    if (log.length) {
-      if (!log.every((e) => 'seal' in e)) errors.push('Decision Log: missing "Seal" column (rows must be written by pi.mjs decide)');
-      else errors.push(...verifyChain(log));
-    }
-    // Chain head: the count and last seal live in the frontmatter, so removing rows from the END of the log is detected too.
-    const head = log.length ? log[log.length - 1].seal || '' : '';
-    if (log.length) {
-      if (reg.fm.decision_count !== String(log.length) || reg.fm.decision_head !== head) errors.push(`Decision Log: ${log.length} row(s) with head seal "${head}" do not match frontmatter decision_count="${reg.fm.decision_count ?? ''}" / decision_head="${reg.fm.decision_head ?? ''}" (rows were removed or edited by hand; "pi.mjs decide" maintains these fields)`);
-    } else if (Number(reg.fm.decision_count || 0) > 0) errors.push(`Decision Log is empty but frontmatter decision_count is ${reg.fm.decision_count}: logged decisions were deleted`);
+    // Chain, count and head seal (so removing rows from the END of the log is detected too).
+    errors.push(...logIntegrityErrors(text));
     const seen = new Set();
     const lastDecision = {};
     for (const e of log) lastDecision[e.id] = (e.decision || '').toLowerCase();
@@ -226,7 +222,7 @@ export function validateProject(dir, { today = todayStr() } = {}) {
           // Confidence cannot exceed what the cited evidence supports: High needs 2+ distinct facts at medium+ confidence, Medium needs 1.
           // Only primary sources count: https URLs and existing repo files (line numbers of one file are one source).
           // search: logs and ref: reasoning never support confidence.
-          const key = (s) => (/^https?:/i.test(s) ? s.replace(/#.*$/, '') : /^repo:/.test(s) && repoSourceExists(dir, s) ? `repo:${repoSourcePath(s)}` : null);
+          const key = (s) => sourceKey(dir, s);
           const strong = new Set(lintEvidence(d.text, { file: id, today }).tags.filter((t) => t.cls === 'fact' && t.conf !== 'low').map((t) => key(t.src)).filter(Boolean));
           const maxConf = strong.size >= 2 ? 'High' : strong.size === 1 ? 'Medium' : 'Low';
           if (RANK[r.confidence] > RANK[maxConf]) errors.push(`${id}: confidence ${r.confidence} exceeds what the cited evidence supports (${maxConf}: ${strong.size} distinct primary source(s) [https or existing repo file] cited as medium+ facts)`);
@@ -242,6 +238,12 @@ export function validateProject(dir, { today = todayStr() } = {}) {
         if (!log.some((e) => e.id === id && (e.decision || '').toLowerCase() === want)) errors.push(`${id}: status ${r.status} has no "${want}" entry in the Decision Log (decisions come from the user)`);
       }
       if (ALLOWED_AFTER[last] && !ALLOWED_AFTER[last].includes(r.status)) errors.push(`${id}: status "${r.status}" contradicts the latest logged decision "${last}" (allowed: ${ALLOWED_AFTER[last].join(', ')}); decided items change only through "pi decide"`);
+
+      // What was approved must still be what is written: the approval seals a digest of the row and detail block.
+      if (['Approved', 'Ready for Implementation', 'Implemented', 'Validated'].includes(r.status)) {
+        const lastApprove = [...log].reverse().find((e) => e.id === id && (e.decision || '').toLowerCase() === 'approve');
+        if (lastApprove && lastApprove.content !== contentDigest(text, id)) errors.push(`${id}: its title, scores or detail block changed after the user approved it, so the approval no longer matches what is written. Restore the approved text, or reopen the idea ("pi.mjs decide ${id} research"), re-propose and get a new decision`);
+      }
 
       // Feature linkage.
       const feat = r.feature && r.feature !== '-' ? r.feature : null;
@@ -298,6 +300,7 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       }
       if (!product || product.status !== 'approved') warnings.push(`${label}: PRODUCT.md is not currently approved`);
       else if (data.product_revision && Number(data.product_revision) < Number(product.revision)) warnings.push(`${label}: written against product revision ${data.product_revision}; baseline is now ${product.revision}`);
+      if (data.status === 'superseded') continue; // retired by a reversed approval: frontmatter and linkage only
       checkSections(body, artifacts.feature.sections, label, errors);
       const ac = sectionBody(body, 'Acceptance criteria');
       if (!/\bGiven\b/.test(ac) || !/\bWhen\b/.test(ac) || !/\bThen\b/.test(ac)) errors.push(`${label}: Acceptance criteria must be testable Given/When/Then statements`);

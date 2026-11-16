@@ -4,7 +4,7 @@ last_research: 2026-11-16
 review_mode: self-review
 review_note: Host had no second agent available in this run; a separate self-review pass used the reviewer checklist.
 decision_count: 3
-decision_head: 85a4593fa89b
+decision_head: fec44732cab3
 ---
 # Opportunities
 
@@ -62,11 +62,11 @@ Self-review (no second agent available). Challenged: OPP-001 evidence upgraded t
 
 ## Decision Log
 
-| Date | ID | Decision | By | Note | Seal |
-|---|---|---|---|---|---|
-| 2026-11-16 | OPP-001 | approve | Fixture Owner | user: approved | 3d7e79a2bd78 |
-| 2026-11-16 | OPP-003 | reject | Fixture Owner | user: no demand, skip | 7516cb178b0d |
-| 2026-11-16 | OPP-004 | defer | Fixture Owner | user: revisit after retention policy | 85a4593fa89b |
+| Date | ID | Decision | By | Note | Content | Seal |
+|---|---|---|---|---|---|---|
+| 2026-11-16 | OPP-001 | approve | Fixture Owner | user: approved | 9128eedb7b26 | 459280208442 |
+| 2026-11-16 | OPP-003 | reject | Fixture Owner | user: no demand, skip | 916679fd478f | f42934db55e4 |
+| 2026-11-16 | OPP-004 | defer | Fixture Owner | user: revisit after retention policy | bb79f89dc62f | fec44732cab3 |
 
 ## Opportunity Details
 

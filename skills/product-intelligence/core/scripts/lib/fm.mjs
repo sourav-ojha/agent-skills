@@ -31,7 +31,7 @@ function unquote(v) {
 
 function fmtValue(v) {
   const s = String(v);
-  return /[:#]|^\s|\s$|^$/.test(s) ? JSON.stringify(s) : s;
+  return /[:#]|^\s|\s$|^$|^['"]/.test(s) ? JSON.stringify(s) : s;
 }
 
 // Update top-level scalar keys, preserving order and everything else.

@@ -19,7 +19,7 @@
     ]
   },
   "registry": {
-    "frontmatter_required": ["type", "last_research", "review_mode"],
+    "frontmatter_required": ["type", "last_research", "review_mode", "decision_count"],
     "review_modes": ["pending", "independent", "self-review"],
     "landscape_categories": [
       "Direct competitors",
