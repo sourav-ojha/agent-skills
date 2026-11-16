@@ -278,3 +278,11 @@ test('tty gate: suggested command is shell-quoted, control characters in --note 
   assert.notEqual(bad.code, 0);
   assert.match(read(dir, OPPS), /\| OPP-002 \| Per-organization rate limits \| Proposed/);
 });
+
+test('tty gate: C1 controls and bidi characters are rejected in --by and --note', () => {
+  const dir = projectFrom('b');
+  for (const bad of ['a\u009bb', 'a‮b', 'a⁦b']) {
+    assert.match(pi(dir, ['decide', 'OPP-002', 'approve', '--by', bad, '--note', 'x']).err, /--by must be/);
+    assert.match(pi(dir, ['decide', 'OPP-002', 'approve', '--by', 'Ann', '--note', bad]).err, /control characters/);
+  }
+});

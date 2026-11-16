@@ -45,17 +45,21 @@ const out = (o) => console.log(typeof o === 'string' ? o : JSON.stringify(o, nul
 
 function read(p) { return fs.readFileSync(p, 'utf8'); }
 function need(p, what) { if (!fs.existsSync(p)) die(`${what} not found at ${path.relative(dir, p) || p}`); return read(p); }
+// C0/C1 controls and bidi/format characters can move the cursor or reorder text in a terminal.
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const escapeUnsafe = (s) => String(s).replace(new RegExp(UNSAFE_CHARS.source, 'g'), (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+
 function requireBy() {
   if (!flags.by || flags.by === true) die('--by "<name>" is required: record who made this decision (the human user).');
   const by = String(flags.by).trim();
-  if (!/^[^\u0000-\u001f\u007f|"\\]{1,80}$/.test(by)) die('--by must be 1-80 characters without "|", quotes, backslashes or control characters.');
+  if (UNSAFE_CHARS.test(by) || !/^[^|"\\]{1,80}$/.test(by)) die('--by must be 1-80 characters without "|", quotes, backslashes or control characters.');
   return by;
 }
 
 function optNote(required) {
   if (flags.note === true) die('--note needs a value.');
   const note = flags.note ? String(flags.note).trim() : '';
-  if (/[\u0000-\u001f\u007f-\u009f]/.test(note)) die('--note must not contain control characters (including newlines and escape sequences).');
+  if (UNSAFE_CHARS.test(note)) die('--note must not contain control characters (including newlines and escape sequences).');
   if (required && !note) die('--note "<the user\'s words / reason>" is required: it records what the human actually said.');
   return note;
 }
@@ -71,7 +75,7 @@ function confirmHuman(summary) {
     const sh = (a) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`); // POSIX single-quoting
     die(`gates.human_confirmation is "tty": this needs a person at an interactive terminal. Ask the user to run this exact command themselves:\n  ${['node', ...process.argv.slice(1)].map(sh).join(' ')}`);
   }
-  process.stdout.write(`${summary}\nType "yes" to confirm: `); // summary values are JSON-quoted by callers: no raw control characters
+  process.stdout.write(`${escapeUnsafe(summary)}\nType "yes" to confirm: `); // summary values are JSON-quoted by callers: no raw control characters
   const buf = Buffer.alloc(64);
   let n = 0;
   try { n = fs.readSync(0, buf, 0, 64, null); } catch { n = 0; }
