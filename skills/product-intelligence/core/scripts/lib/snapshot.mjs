@@ -11,7 +11,7 @@ const BULK = /(^|\/)(node_modules|\.git|\.product|\.venv|__pycache__|dist|build|
 
 function listFiles(dir) {
   try {
-    const run = (args) => execFileSync('git', ['ls-files', '-z', ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }).toString('utf8').split('\0').filter(Boolean);
+    const run = (args) => execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'ls-files', '-z', ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }).toString('utf8').split('\0').filter(Boolean);
     // tracked + untracked-not-ignored, plus ignored files (local secrets/config are application state too),
     // minus bulk build/dependency directories.
     const all = new Set([...run(['-c', '-o', '--exclude-standard']), ...run(['-o', '-i', '--exclude-standard'])]);
