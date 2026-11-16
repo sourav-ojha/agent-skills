@@ -1,0 +1,73 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.product', '.remember', '.DS_Store']);
+const MAX_HASH_BYTES = 8 * 1024 * 1024;
+
+const BULK = /(^|\/)(node_modules|\.git|\.product|\.venv|__pycache__|dist|build|target|\.next|\.cache)(\/|$)/;
+
+function listFiles(dir) {
+  try {
+    const run = (args) => execFileSync('git', ['ls-files', '-z', ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }).toString('utf8').split('\0').filter(Boolean);
+    // tracked + untracked-not-ignored, plus ignored files (local secrets/config are application state too),
+    // minus bulk build/dependency directories.
+    const all = new Set([...run(['-c', '-o', '--exclude-standard']), ...run(['-o', '-i', '--exclude-standard'])]);
+    return [...all].filter((f) => !BULK.test(f));
+  } catch {
+    const acc = [];
+    (function walk(d, rel) {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        if (SKIP_DIRS.has(e.name)) continue;
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(path.join(d, e.name), r);
+        else if (e.isFile()) acc.push(r);
+      }
+    })(dir, '');
+    return acc;
+  }
+}
+
+export function takeSnapshot(dir) {
+  const map = {};
+  for (const f of listFiles(dir)) {
+    const p = path.join(dir, f);
+    try {
+      const st = fs.statSync(p);
+      if (!st.isFile()) continue;
+      map[f] = st.size > MAX_HASH_BYTES ? `size:${st.size}:${st.mtimeMs}` : createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    } catch { /* deleted between list and read */ }
+  }
+  return map;
+}
+
+export function snapshotPath(dir, tag = 'default') {
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(String(tag))) throw new Error(`invalid snapshot tag "${tag}" (use letters, digits, - and _)`);
+  const id = createHash('sha1').update(path.resolve(dir)).digest('hex').slice(0, 12);
+  return path.join(os.tmpdir(), 'product-intelligence-snapshots', `${id}-${tag}.json`);
+}
+
+export function saveSnapshot(dir, tag) {
+  const p = snapshotPath(dir, tag);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const snap = takeSnapshot(dir);
+  fs.writeFileSync(p, JSON.stringify({ taken: new Date().toISOString(), files: snap }));
+  return { path: p, count: Object.keys(snap).length };
+}
+
+export function diffSnapshot(dir, tag) {
+  const p = snapshotPath(dir, tag);
+  if (!fs.existsSync(p)) throw new Error(`No snapshot at ${p}. Run "snapshot" before research starts.`);
+  const before = JSON.parse(fs.readFileSync(p, 'utf8')).files;
+  const after = takeSnapshot(dir);
+  const added = Object.keys(after).filter((f) => !(f in before));
+  const removed = Object.keys(before).filter((f) => !(f in after));
+  const modified = Object.keys(after).filter((f) => f in before && before[f] !== after[f]);
+  return { clean: !added.length && !removed.length && !modified.length, added, removed, modified };
+}
+
+export function clearSnapshot(dir, tag) {
+  fs.rmSync(snapshotPath(dir, tag), { force: true });
+}
