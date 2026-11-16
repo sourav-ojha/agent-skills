@@ -3,7 +3,7 @@ const CONF_RANK = { Low: 0, Medium: 1, High: 2 };
 // Parse "user_value=5, strategic_alignment=4" (also accepts ":" and whitespace separators).
 export function parseRatings(line) {
   const out = {};
-  for (const m of line.matchAll(/([a-z_]+)\s*[=:]\s*(\d+(?:\.\d+)?)/g)) out[m[1]] = Number(m[2]);
+  for (const m of line.matchAll(/([a-z][a-z0-9_]*)\s*[=:]\s*(\d+(?:\.\d+)?)/g)) out[m[1]] = Number(m[2]);
   return out;
 }
 

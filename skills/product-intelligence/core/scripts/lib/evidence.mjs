@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 // Evidence tag grammar:
 //   [E: <class>; <confidence>; <source>; <YYYY-MM-DD>]
 //   class:      fact | inference | hypothesis | assumption | unknown
@@ -19,7 +22,7 @@ export function daysBetween(a, b) {
   return Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000);
 }
 
-export function lintEvidence(text, { file = '', today, maxAgeDays = 180 } = {}) {
+export function lintEvidence(text, { file = '', today, maxAgeDays = 180, repoRoot = null } = {}) {
   const errors = [];
   const warnings = [];
   const tags = [];
@@ -58,12 +61,26 @@ export function lintEvidence(text, { file = '', today, maxAgeDays = 180 } = {}) 
       }
     } else if (/^repo:\S+/.test(src) || /^search:.+/.test(src) || /^user:.+/.test(src) || /^ref:.+/.test(src)) {
       if (date && !isValidDate(date)) errors.push(`${loc}: invalid date "${date}"`);
+      if (cls === 'fact' && conf !== 'low' && /^(search|ref):/.test(src)) errors.push(`${loc}: a ${src.split(':')[0]}: source cannot back a medium/high-confidence fact (search logs record absence, ref: records reasoning); use inference/unknown, or low confidence`);
+      if (repoRoot && /^repo:\S+/.test(src) && !repoSourceExists(repoRoot, src, { dirOk: true })) warnings.push(`${loc}: ${src} does not point to an existing file or folder in the project`);
     } else if (cls === 'fact') {
       errors.push(`${loc}: fact source must be an https URL, repo:<path>, search:<queries>, or user:<note> (got "${src}")`);
     }
   }
   for (const idx of opens) if (!good.has(idx)) errors.push(`${where(idx)}: malformed evidence tag`);
   return { errors, warnings, tags };
+}
+
+// repo:<path>[:line|:start-end] -> the file path part.
+export function repoSourcePath(src) {
+  return src.replace(/^repo:/, '').replace(/:\d+(?:-\d+)?$/, '');
+}
+
+export function repoSourceExists(root, src, { dirOk = false } = {}) {
+  const abs = path.resolve(root, repoSourcePath(src));
+  const rel = path.relative(path.resolve(root), abs);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  try { const st = fs.statSync(abs); return st.isFile() || (dirOk && st.isDirectory()); } catch { return false; }
 }
 
 export function findPlaceholders(text) {
@@ -78,10 +95,11 @@ export function findPlaceholders(text) {
 export function isPrivateHost(h) {
   const host = h.toLowerCase().replace(/^\[|\]$/g, '');
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || host === '::1' || host === '0.0.0.0') return true;
+  if (!host.includes('.') && !host.includes(':')) return true; // single-label intranet names
   const m = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (m) {
     const [a, b] = [Number(m[1]), Number(m[2])];
-    return a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+    return a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
   }
   return /^(fc|fd|fe80)/.test(host) && host.includes(':');
 }

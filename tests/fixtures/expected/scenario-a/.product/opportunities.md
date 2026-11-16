@@ -2,6 +2,8 @@
 type: opportunity-registry
 last_research: 2026-11-16
 review_mode: independent
+decision_count: 2
+decision_head: 91298e3c4737
 ---
 # Opportunities
 

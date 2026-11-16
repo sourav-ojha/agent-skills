@@ -51,7 +51,7 @@ test('failure: silently editing an approved product baseline is detected', () =>
 
 test('failure: revision history edits do not break the hash', () => {
   const dir = projectFrom('a');
-  edit(dir, '.product/PRODUCT.md', (t) => t + '| 1 | 2026-11-17 | someone | note | extra row |\n');
+  edit(dir, '.product/PRODUCT.md', (t) => t + '| 1 | 2026-11-17 | Fixture Owner | reviewed | extra row |\n');
   assert.deepEqual(validateJson(dir).errors, []);
 });
 
@@ -108,7 +108,7 @@ test('no worthwhile opportunities: valid with an evidenced conclusion', () => {
   edit(dir, '.product/opportunities.md', (t) => {
     const reg = t.replace(/^\| OPP-\d+ .*\n/gm, '').replace(/^\| 2026-11-16 \| OPP-.*\n/gm, '');
     const noDetails = reg.slice(0, reg.indexOf('## Opportunity Details'));
-    return noDetails.replace('review_mode: independent', 'review_mode: independent\nconclusion: no-actionable-opportunities')
+    return noDetails.replace('review_mode: independent', 'review_mode: independent\nconclusion: no-actionable-opportunities').replace(/^decision_(count|head):.*\n/gm, '')
       + '## Opportunity Details\n\n## Conclusion\n\nNo opportunity cleared the bar: the product already covers the evidenced job and competitor gaps are parity-only [E: inference; medium; ref:Market Landscape; 2026-11-16]. New evidence of batch demand would change this.\n';
   });
   const res = validateJson(dir);

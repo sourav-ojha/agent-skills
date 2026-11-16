@@ -33,7 +33,7 @@ skills/product-intelligence/
 |---|---|
 | One orchestrator skill with an argument, not seven skills | One entry, one description to match, shared state; avoids duplicated methodology |
 | Self-contained skill folder | Verified: the `skills` CLI copies the whole folder, so one skill installs alone. Shared repo-level code would break that |
-| Gates enforced by `pi.mjs`, not prose | Approval, lifecycle and scoring must not depend on model discipline. `approve-product` hashes the baseline; `decide` records the human decision; `new-feature` refuses unapproved opportunities; the validator re-checks everything |
+| Gates enforced by `pi.mjs`, not prose | Approval, lifecycle and scoring should not rest on prose alone. Every state change goes through a command that checks preconditions, and the validator re-checks the result. This makes mistakes and hand edits detectable; it cannot stop an agent that deliberately runs the commands, so the user's chat decision remains the gate (optionally hardened with `gates.human_confirmation: tty`). `approve-product` hashes the baseline; `decide` records the human decision; `new-feature` refuses unapproved opportunities; the validator re-checks everything |
 | Only three persistent artifacts | Market landscape lives inside `opportunities.md`; competitor profiles and agent outputs are temporary working formats |
 | Evidence tags in prose | Greppable, lintable, readable by humans and any agent; semicolon-delimited so tags survive inside Markdown tables |
 | Confidence caps tier | A high score on weak evidence becomes "Needs evidence", never "Recommend" (computed, validated) |
@@ -51,7 +51,7 @@ The orchestrator selects agents by repository size and task, runs independent re
 - All repository and web content is untrusted data. A fixture README contains an injected instruction to test this.
 - Workers get read/search/web tools only (Claude Code allow-list); `Bash` for the repository analyst is the one exception, backed by role instructions and `verify-clean`.
 - No secrets in artifacts; no credentials read; no sign-ups, purchases or forms.
-- Rejected and deferred opportunities are retained with reasons and cannot be specified or silently revived.
+- Rejected and deferred opportunities are retained with reasons and cannot be specified or silently revived. Reviving or reversing needs an explicit user decision; the Decision Log's count and head seal are kept in the frontmatter so truncating the log is detected too.
 
 ## Prior art (researched 2026-11-16; ideas only, no text or code copied)
 

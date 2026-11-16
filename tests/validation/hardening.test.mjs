@@ -166,7 +166,8 @@ test('evidence: private and link-local hosts are not public sources; semicolons 
 
 test('evidence: search: is a valid source for negative results', () => {
   assert.deepEqual(lintEvidence('x [E: unknown; low; search:site, github releases]', { today: '2026-11-16' }).errors, []);
-  assert.deepEqual(lintEvidence('x [E: fact; medium; search:pricing page checked 2026-11-16]', { today: '2026-11-16' }).errors, []);
+  assert.deepEqual(lintEvidence('x [E: fact; low; search:pricing page checked 2026-11-16]', { today: '2026-11-16' }).errors, []);
+  assert.match(lintEvidence('x [E: fact; medium; search:pricing page checked 2026-11-16]', { today: '2026-11-16' }).errors[0], /cannot back a medium\/high-confidence fact/);
 });
 
 test('lifecycle: Deferred can only return through a user decision to Under Evaluation', () => {

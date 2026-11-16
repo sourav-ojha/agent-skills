@@ -7,15 +7,20 @@ import { execFileSync } from 'node:child_process';
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.product', '.remember', '.DS_Store']);
 const MAX_HASH_BYTES = 8 * 1024 * 1024;
 
-const BULK = /(^|\/)(node_modules|\.git|\.product|\.venv|__pycache__|dist|build|target|\.next|\.cache)(\/|$)/;
+// Never application state: git internals and our own artifacts.
+const ALWAYS_SKIP = /(^|\/)(\.git|\.product)(\/|$)/;
+// Bulk build/dependency/cache folders. Skipped only for UNTRACKED files: anything git tracks is application
+// source, even when it lives in a folder that happens to be called build/ or dist/.
+const BULK = /(^|\/)(node_modules|\.venv|venv|__pycache__|dist|build|out|target|coverage|vendor|\.next|\.nuxt|\.cache|\.turbo|\.parcel-cache|\.gradle|\.terraform|\.tox|\.mypy_cache|\.pytest_cache|\.idea|\.vscode)(\/|$)/;
 
 function listFiles(dir) {
   try {
     const run = (args) => execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'ls-files', '-z', ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }).toString('utf8').split('\0').filter(Boolean);
-    // tracked + untracked-not-ignored, plus ignored files (local secrets/config are application state too),
-    // minus bulk build/dependency directories.
-    const all = new Set([...run(['-c', '-o', '--exclude-standard']), ...run(['-o', '-i', '--exclude-standard'])]);
-    return [...all].filter((f) => !BULK.test(f));
+    // tracked files always count; untracked and ignored files (local secrets/config are application state too)
+    // count unless they sit in bulk build/dependency directories.
+    const tracked = run(['-c']).filter((f) => !ALWAYS_SKIP.test(f));
+    const others = [...run(['-o', '--exclude-standard']), ...run(['-o', '-i', '--exclude-standard'])].filter((f) => !ALWAYS_SKIP.test(f) && !BULK.test(f));
+    return [...new Set([...tracked, ...others])];
   } catch {
     const acc = [];
     (function walk(d, rel) {
@@ -37,7 +42,8 @@ export function takeSnapshot(dir) {
     try {
       const st = fs.statSync(p);
       if (!st.isFile()) continue;
-      map[f] = st.size > MAX_HASH_BYTES ? `size:${st.size}:${st.mtimeMs}` : createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+      const mode = (st.mode & 0o777).toString(8); // permission changes (e.g. chmod +x) are changes too
+      map[f] = `${st.size > MAX_HASH_BYTES ? `size:${st.size}:${st.mtimeMs}` : createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:${mode}`;
     } catch { /* deleted between list and read */ }
   }
   return map;

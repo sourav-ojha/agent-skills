@@ -34,7 +34,7 @@
   },
   "feature": {
     "frontmatter_required": ["type", "id", "opportunity", "status", "product_revision"],
-    "status_values": ["draft", "ready", "implemented", "validated"],
+    "status_values": ["draft", "ready", "implemented", "validated", "superseded"],
     "sections": [
       "Feature overview",
       "Problem statement",

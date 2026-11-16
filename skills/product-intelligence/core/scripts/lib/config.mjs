@@ -63,6 +63,7 @@ export function loadConfig(projectDir) {
   const config = mergeConfig(defaults, user);
   // A custom criteria set replaces the defaults entirely (it defines the rubric); other sections merge.
   if (isObj(user.scoring?.criteria)) config.scoring.criteria = { ...user.scoring.criteria };
+  for (const k of Object.keys(config.scoring.criteria)) if (!/^[a-z][a-z0-9_]*$/.test(k)) errors.push(`scoring.criteria key '${k}' must match [a-z][a-z0-9_]*`);
   const w = Object.values(config.scoring.criteria);
   if (!(w.reduce((a, b) => a + b, 0) > 0)) errors.push('scoring.criteria weights must sum to more than 0');
   if (config.scoring.tiers.consider_min > config.scoring.tiers.recommend_min) errors.push('scoring.tiers.consider_min must be <= recommend_min');

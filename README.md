@@ -21,7 +21,7 @@ Reusable, independently installable skills for AI coding agents. They follow the
 
 It never edits application code, implements features, opens application PRs or deploys.
 
-**Architecture** — agent-neutral core (method, schemas, validators, role definitions, helper CLI) + thin adapters (Claude Code, Codex). Approval gates, lifecycle, scoring and source protection are enforced by a zero-dependency Node helper, not just by instructions. Details: [docs/architecture.md](docs/architecture.md).
+**Architecture** — agent-neutral core (method, schemas, validators, role definitions, helper CLI) + thin adapters (Claude Code, Codex). Approval gates, lifecycle, scoring and source protection are checked by a zero-dependency Node helper and validator, not just by instructions. The gates are tamper-evident rather than tamper-proof: an agent with a shell can still run the commands, so the real gate is you (see [usage](docs/usage.md#helper-cli)) Details: [docs/architecture.md](docs/architecture.md).
 
 ## Install (only this skill)
 

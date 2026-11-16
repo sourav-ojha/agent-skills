@@ -49,7 +49,7 @@ A "Needs evidence" opportunity is not presented as a recommendation. Either gath
 ## Confidence is bounded by the cited evidence (enforced by the validator)
 
 The registry confidence of a Proposed-or-later opportunity may not exceed what its detail block's evidence tags support:
-**High** needs at least 2 distinct `fact` sources at medium+ confidence; **Medium** needs at least 1; otherwise **Low**. Absence claims, hypotheses and unknowns do not count toward this.
+**High** needs at least 2 distinct primary sources (an `https` URL or an existing `repo:` file; line numbers of one file are one source) cited as `fact` at medium+ confidence; **Medium** needs at least 1; otherwise **Low**. `search:` and `ref:` sources, absence claims, hypotheses and unknowns do not count toward this.
 
 ## Also capture
 

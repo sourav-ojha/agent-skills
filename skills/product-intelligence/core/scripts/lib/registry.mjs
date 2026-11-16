@@ -53,7 +53,7 @@ export function updateRow(text, id, patch) {
   for (const [k, v] of Object.entries(patch)) {
     const i = t.header.indexOf(k);
     if (i === -1) throw new Error(`Registry has no "${k}" column`);
-    cells[i] = cell(v);
+    cells[i] = String(v); // cells are already unescaped by splitRow; escaping happens once when the row is written
   }
   lines[row.lineIndex] = `| ${cells.map(cell).join(' | ')} |`;
   return lines.join('\n');

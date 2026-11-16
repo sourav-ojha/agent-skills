@@ -64,7 +64,7 @@ Claude Code: `/product-intelligence research`. Codex: `$product-intelligence res
 ### init → [references/research-methodology.md](references/research-methodology.md), [references/product-discovery.md](references/product-discovery.md)
 
 `pi init` (creates the draft) → `pi snapshot` (stores a hash of the application files in the OS temp directory, outside the project) → investigate (adapt agents to repository size; read-only) → consolidate with facts/inferences/assumptions/unknowns and recorded conflicts → write `.product/PRODUCT.md` from [templates/product-understanding.md](templates/product-understanding.md) → `pi verify-clean` and `pi validate` →
-present a summary with your specific questions → **STOP: Gate 1.** Apply the user's corrections and show the changes; if the user's one message both answers your questions and approves, fold the answers in, summarize what changed in your reply, then approve. Only after explicit confirmation run `pi approve-product --by "<user>"`. If PRODUCT.md is already approved, do the material-change check instead of re-onboarding.
+present a summary with your specific questions → **STOP: Gate 1.** Apply the user's corrections and show the changes, then wait: the user must confirm the text they have seen. Never approve in the same step as applying their answers. Only after that explicit confirmation run `pi approve-product --by "<user>"`. If PRODUCT.md is already approved, do the material-change check instead of re-onboarding.
 
 ### research → [references/research-methodology.md](references/research-methodology.md), [references/competitor-analysis.md](references/competitor-analysis.md)
 

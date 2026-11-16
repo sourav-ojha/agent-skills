@@ -91,6 +91,16 @@ export function cell(s) {
   return String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\|/g, '\\|').trim();
 }
 
+// Pipe-lines that appear in a section after its first table ended (e.g. after a blank line). The table
+// parser stops at the gap and would silently ignore them, so the validator reports them.
+export function strayTableRows(text, heading, level = 2) {
+  const t = parseTableInSection(text, heading, level);
+  if (!t || t.headerIndex === -1) return 0;
+  let n = 0;
+  for (let j = t.lastIndex + 1; j < t.section.end; j++) if (t.section.lines[j].trim().startsWith('|')) n++;
+  return n;
+}
+
 export function isSeparator(line) {
   return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
 }

@@ -3,6 +3,8 @@ type: opportunity-registry
 last_research: 2026-11-16
 review_mode: self-review
 review_note: Host had no second agent available in this run; a separate self-review pass used the reviewer checklist.
+decision_count: 3
+decision_head: 85a4593fa89b
 ---
 # Opportunities
 

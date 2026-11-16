@@ -21,7 +21,7 @@ Every significant finding in a `.product` artifact carries an evidence tag. The 
 
 - `https://…` public URL **with accessed date** (the date you read it, from the orchestrator's "today").
 - `repo:<path>[:line]` or `repo:<path>:<start>-<end>` for facts about the repository being analysed (date optional). A directory path is acceptable only for absence claims ("no tests under `repo:src/`").
-- `search:<queries or places checked>` for negative results and search logs (what you looked for and where). Use this, not `user:`, for your own searches.
+- `search:<queries or places checked>` for negative results and search logs (what you looked for and where). Use this, not `user:`, for your own searches. A `search:` or `ref:` source can only carry a **low**-confidence fact; absence claims are `inference` or `unknown`.
 - `user:<note>` only for what the user actually told you in this session.
 - `ref:<id>` pointing to another tagged claim in the same artifact (for inferences).
 

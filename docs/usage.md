@@ -48,11 +48,16 @@ Evidence tags look like `[E: fact; high; https://…; 2026-11-16]` ([evidence st
 
 `node <skill-dir>/core/scripts/pi.mjs <command> [--dir <project>]` — the agent runs these for you, but you can too.
 
-`status` · `validate` · `config` · `score --ratings … --confidence …` · `approve-product --by NAME` · `reopen-product --by NAME` · `decide OPP-001 approve|reject|defer|research|modify --by NAME --note …` · `transition` · `new-feature OPP-001` · `snapshot` / `verify-clean`.
+`status` · `validate` · `config` · `score --ratings … --confidence …` · `approve-product --by NAME` · `reopen-product --by NAME` · `confirm-product --by NAME` (re-check an unchanged baseline without a new revision) · `decide OPP-001 approve|reject|defer|research|modify --by NAME --note …` · `transition` · `new-feature OPP-001` · `snapshot` / `verify-clean`.
 
 Approvals and decisions are recorded with your name and date, and only after you state them in chat. The Decision Log is hash-chained (each row's seal covers the previous one), the approved `PRODUCT.md` is hashed, and `pi validate` fails when a decided status disagrees with the log, a log row was edited, or the approved baseline changed.
 
-**What this does and does not guarantee.** It is *tamper-evident*, not *tamper-proof*. An agent with file-write access and a shell can still run `pi decide --by "<your name>"` or recompute seals by hand, because nothing in a text file or a CLI can prove who typed a command. The real gate is you: the skill is instructed to run these commands only after you decide in chat, and you can check the Decision Log and `git diff .product/` at any time. If you want a stronger barrier, run `pi decide` / `pi approve-product` yourself in your own terminal and tell the agent the result, and use a permission mode that prompts before shell commands.
+**What this does and does not guarantee.** It is *tamper-evident*, not *tamper-proof*. An agent with file-write access and a shell can still run `pi decide --by "<your name>"` or recompute seals by hand, because nothing in a text file or a CLI can prove who typed a command. The real gate is you: the skill is instructed to run these commands only after you decide in chat, and you can check the Decision Log and `git diff .product/` at any time. If you want a stronger barrier, run `pi decide` / `pi approve-product` yourself in your own terminal and tell the agent the result, and use a permission mode that prompts before shell commands. Two built-in hardenings:
+
+- **`gates.human_confirmation: "tty"`** in `.product/config.json`: `decide`, `approve-product`, `reopen-product` and `confirm-product` then refuse unless a person types `yes` in an interactive terminal. An agent's shell has no terminal, so you run those commands yourself.
+- **Permission rules**: have your agent ask before running them. Claude Code example (`.claude/settings.json`): `{"permissions": {"ask": ["Bash(node *pi.mjs decide*)", "Bash(node *pi.mjs approve-product*)", "Bash(node *pi.mjs reopen-product*)", "Bash(node *pi.mjs confirm-product*)"]}}`. In Codex use an approval policy that prompts for these commands.
+
+Also enforced: decisions and proposals need an approved, unmodified PRODUCT.md; approval metadata must agree with the Revision History; and the Decision Log's row count and head seal are kept in the frontmatter, so deleting rows from the end is detected. Reversing an approval is a user decision (`decide OPP-001 reject|defer|research`): the linked spec is marked `superseded` and revived as a draft if the item is approved again.
 
 ## Configuration
 
@@ -84,5 +89,5 @@ Create `.product/config.json` only for what you change; omitted keys use `core/c
 - Research quality depends on web access, the model, and the sources reachable without sign-in. Paywalled data, private communities and internal metrics are out of reach; the skill records them as unknown.
 - The automated tests verify contracts (gates, evidence rules, validators), not the LLM's judgement. Live-run rubrics are in `tests/scenarios/`.
 - Independent review needs a second agent. Without one the skill says `self-review` and why.
-- Read-only behaviour for sub-agents is enforced by tool allow-lists on Claude Code and by instructions plus the post-run `verify-clean` check elsewhere. Run research in a clean working tree for the clearest signal.
+- Read-only behaviour for sub-agents: Claude Code agents get read/search/web tool allow-lists, except the repository analyst, which keeps `Bash` for inventory and is read-only by instruction only; elsewhere it is instructions. The post-run `verify-clean` check is the backstop everywhere. Run research in a clean working tree for the clearest signal.
 - The validator checks structure, not truth: a well-formed tag can still cite a weak source. Review the evidence for decisions that matter.

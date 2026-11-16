@@ -45,3 +45,16 @@ Remove with `--remove`.
 ## Limitations
 
 Sub-agent nesting and concurrency are governed by Claude Code settings; if parallel launch is unavailable the skill runs roles sequentially. Plugin-packaged agents ignore `hooks`/`mcpServers`/`permissionMode`, which these files do not use.
+
+## Recommended permission rules (gates)
+
+The skill runs `pi decide` / `pi approve-product` only after you decide in chat, but nothing in a shell can prove who typed a command. Make Claude Code ask you first, in `.claude/settings.json`:
+
+```json
+{ "permissions": { "ask": [
+  "Bash(node *pi.mjs decide*)", "Bash(node *pi.mjs approve-product*)",
+  "Bash(node *pi.mjs reopen-product*)", "Bash(node *pi.mjs confirm-product*)"
+] } }
+```
+
+For a stricter barrier set `gates.human_confirmation` to `"tty"` in `.product/config.json` and run those four commands yourself in a terminal.

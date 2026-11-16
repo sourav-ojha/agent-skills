@@ -22,6 +22,9 @@
     "max_competitors_per_category": 5,
     "max_parallel_agents": 4
   },
+  "gates": {
+    "human_confirmation": "chat"
+  },
   "models": {
     "claude-code": { "reasoning": "opus", "standard": "sonnet", "fast": "haiku" },
     "codex": { "reasoning": null, "standard": null, "fast": null },

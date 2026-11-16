@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { splitFrontmatter, findSection } from './fm.mjs';
+import { splitFrontmatter, findSection, parseTableInSection } from './fm.mjs';
 
 // The hash covers the whole PRODUCT.md body except the table rows of the "Revision History" section
 // (so recording history does not invalidate the baseline). Any other text, including prose smuggled
@@ -40,4 +40,13 @@ export function historyHasProse(text) {
   const s = findSection(text, 'Revision History');
   if (!s) return false;
   return s.lines.slice(s.start + 1, s.end).some((l) => l.trim() && !l.trim().startsWith('|'));
+}
+
+export const HISTORY_ACTIONS = ['approved', 're-approved', 'reopened', 'reviewed'];
+
+// Rows of the Revision History table: {revision, date, by, action, note, n}.
+export function parseHistory(text) {
+  const t = parseTableInSection(text, 'Revision History');
+  if (!t || !t.header.length) return [];
+  return t.rows.map((r) => ({ revision: r.cells[0], date: r.cells[1], by: r.cells[2], action: (r.cells[3] || '').toLowerCase(), note: r.cells[4] ?? '', n: r.cells.length }));
 }

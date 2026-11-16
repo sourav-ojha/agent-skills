@@ -46,3 +46,7 @@ To pin models, set `models.codex.reasoning|standard|fast` in `.product/config.js
 
 The Codex docs summary used for this adapter (2026-11-16) listed `.agents/skills` for repo skills and `~/.agents/skills` for user skills, `agents/openai.yaml` with `allow_implicit_invocation`, and `.codex/agents/*.toml` for custom agents.
 Codex changes quickly; if a path or key is not picked up, check `https://developers.openai.com/codex/skills` and `https://developers.openai.com/codex/subagents`.
+
+## Recommended approval settings (gates)
+
+Use an approval policy that prompts before running shell commands, and decline `pi.mjs decide`, `approve-product`, `reopen-product` and `confirm-product` unless you just made that decision in chat. For a stricter barrier set `gates.human_confirmation` to `"tty"` in `.product/config.json`: those commands then refuse to run unless a person types `yes` in an interactive terminal, so you run them yourself.

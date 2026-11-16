@@ -2,7 +2,7 @@
 
 Product Intelligence is a single self-contained folder (`skills/product-intelligence/`). You can install just that folder; nothing else in this repository is required.
 
-Requirements: Claude Code or Codex (or any Agent Skills host), Node.js 20+ for the bundled helper (`core/scripts/pi.mjs`); the `skills` CLI itself needs Node 22.20+ per its docs. Web search/fetch access is needed for the research phases.
+Requirements: Claude Code or Codex (or any Agent Skills host), Node.js 20+ for the bundled helper (`core/scripts/pi.mjs`); the `skills` CLI itself needs Node 22.20+ per its docs, and this repository's own tests and tooling need Node 22+. Web search/fetch access is needed for the research phases.
 
 > Replace `sourav-ojha/agent-skills` below with the repository you publish. Paths below were checked against the official docs and a local install test on 2026-11-16 (see "Verified paths").
 
@@ -70,7 +70,7 @@ node ~/.agents/skills/product-intelligence/core/scripts/install-agents.mjs --age
 node .agents/skills/product-intelligence/core/scripts/install-agents.mjs --agent all --scope project --project-dir .
 ```
 
-Files land in `~/.claude/agents/`, `~/.codex/agents/`, `<project>/.claude/agents/` or `<project>/.codex/agents/` (`pi-*.md` / `pi-*.toml`). Add `--dry-run` to preview. Model mapping comes from `.product/config.json` (see [usage](usage.md#configuration)); re-run after changing it.
+Files land in `~/.claude/agents/`, `~/.codex/agents/`, `<project>/.claude/agents/` or `<project>/.codex/agents/` (`pi-*.md` / `pi-*.toml`). Add `--dry-run` to preview. Project-scope installs take the model mapping from `.product/config.json` (see [usage](usage.md#configuration)); user-scope installs ignore the current project's config on purpose and use the defaults. Re-run after changing it.
 
 ## Verify the install
 

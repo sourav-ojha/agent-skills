@@ -4,10 +4,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { splitFrontmatter, sectionText } from '../scripts/lib/fm.mjs';
-import { productHash, historyHasProse } from '../scripts/lib/product.mjs';
+import { splitFrontmatter, sectionText, strayTableRows } from '../scripts/lib/fm.mjs';
+import { productHash, historyHasProse, parseHistory, HISTORY_ACTIONS } from '../scripts/lib/product.mjs';
 import { parseRegistry, parseLog, parseDetails, verifyChain } from '../scripts/lib/registry.mjs';
-import { lintEvidence, findPlaceholders, daysBetween, isValidDate } from '../scripts/lib/evidence.mjs';
+import { lintEvidence, findPlaceholders, daysBetween, isValidDate, repoSourcePath, repoSourceExists } from '../scripts/lib/evidence.mjs';
 import { computeScore, computeTier, parseRatings } from '../scripts/lib/score.mjs';
 import { loadConfig, readJson, CORE_DIR } from '../scripts/lib/config.mjs';
 
@@ -56,6 +56,10 @@ export function validateProject(dir, { today = todayStr() } = {}) {
   const RANK = { Low: 0, Medium: 1, High: 2 };
   if (RANK[config.scoring.min_confidence_for_recommend] < RANK[defaults.scoring.min_confidence_for_recommend]) warnings.push('.product/config.json relaxes the evidence cap (min_confidence_for_recommend is lower than the default); confirm the user chose this');
   if (config.scoring.tiers.recommend_min < defaults.scoring.tiers.recommend_min) warnings.push('.product/config.json lowers scoring.tiers.recommend_min below the default; confirm the user chose this');
+  const sameCriteria = JSON.stringify(Object.entries(config.scoring.criteria).sort()) === JSON.stringify(Object.entries(defaults.scoring.criteria).sort());
+  if (!sameCriteria) warnings.push('.product/config.json replaces the default scoring criteria/weights; confirm the user chose this rubric');
+  if (config.scoring.scale_max !== defaults.scoring.scale_max) warnings.push('.product/config.json changes scoring.scale_max; confirm the user chose this');
+  if (config.scoring.tiers.consider_min < defaults.scoring.tiers.consider_min) warnings.push('.product/config.json lowers scoring.tiers.consider_min below the default; confirm the user chose this');
   const maxAge = config.freshness.source_max_age_days;
 
   // ---- PRODUCT.md -----------------------------------------------------------
@@ -72,7 +76,7 @@ export function validateProject(dir, { today = todayStr() } = {}) {
     else if (data.last_reviewed && daysBetween(data.last_reviewed, today) > config.freshness.product_review_days) {
       warnings.push(`PRODUCT.md: last reviewed ${data.last_reviewed}; re-check it against the repository (run "init": it performs the material-change check) and ask the user to confirm`);
     }
-    const ev = lintEvidence(text, { file: 'PRODUCT.md', today, maxAgeDays: maxAge });
+    const ev = lintEvidence(text, { file: 'PRODUCT.md', today, maxAgeDays: maxAge, repoRoot: dir });
     errors.push(...ev.errors);
     warnings.push(...ev.warnings);
     if (!ev.tags.some((t) => t.cls === 'fact')) warnings.push('PRODUCT.md: no observed facts are tagged [E: fact; ...]; findings are not traceable');
@@ -91,6 +95,23 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       if (historyHasProse(text)) errors.push('PRODUCT.md: "Revision History" may contain only its table (other text there is part of the approved content)');
       if (ph.length) errors.push(`PRODUCT.md: unresolved placeholders on lines ${ph.slice(0, 5).join(', ')} (approved product context must be complete)`);
     }
+    // Revision History must be well-formed and agree with the approval metadata in the frontmatter.
+    const hist = parseHistory(text);
+    hist.forEach((h, i) => {
+      if (h.n !== 5 || !/^\d+$/.test(h.revision) || !isValidDate(h.date) || !h.by || !HISTORY_ACTIONS.includes(h.action)) {
+        errors.push(`PRODUCT.md: Revision History row ${i + 1} is malformed (need: revision | YYYY-MM-DD | by | ${HISTORY_ACTIONS.join('/')} | note)`);
+      }
+    });
+    const lastApproval = hist.map((h) => h.action).lastIndexOf('re-approved') > hist.map((h) => h.action).lastIndexOf('approved') ? hist.map((h) => h.action).lastIndexOf('re-approved') : hist.map((h) => h.action).lastIndexOf('approved');
+    data._approvalRecorded = lastApproval !== -1;
+    if (data.approved_at && lastApproval === -1) errors.push('PRODUCT.md: approved_at is set but Revision History has no approval row (approvals are recorded by "pi.mjs approve-product")');
+    if (data.status === 'approved' && lastApproval !== -1) {
+      const h = hist[lastApproval];
+      if (h.revision !== String(data.revision) || h.by !== data.approved_by || h.date !== data.approved_at) {
+        errors.push(`PRODUCT.md: the last approval row in Revision History (rev ${h.revision}, ${h.by}, ${h.date}) does not match the frontmatter (rev ${data.revision}, ${data.approved_by}, ${data.approved_at}); approval metadata was edited by hand`);
+      }
+      if (hist.slice(lastApproval + 1).some((r) => r.action === 'reopened')) errors.push('PRODUCT.md: status is approved but the history shows it was reopened after the last approval');
+    }
     product = data;
     info.product = { status: data.status, revision: data.revision };
   }
@@ -104,7 +125,7 @@ export function validateProject(dir, { today = todayStr() } = {}) {
     const { body } = splitFrontmatter(text);
 
     if (!product) errors.push('opportunities.md exists but PRODUCT.md is missing (product context must be established first)');
-    else if (!product.approved_at) errors.push('opportunities.md exists but PRODUCT.md was never approved by the user');
+    else if (!product.approved_at || !product._approvalRecorded) errors.push('opportunities.md exists but PRODUCT.md was never approved by the user (no approval recorded in its Revision History)');
     else if (product.status !== 'approved') warnings.push('PRODUCT.md is reopened (draft); opportunity work should wait for re-approval');
 
     for (const k of artifacts.registry.frontmatter_required) if (!(k in reg.fm)) errors.push(`opportunities.md: missing frontmatter "${k}"`);
@@ -146,10 +167,19 @@ export function validateProject(dir, { today = todayStr() } = {}) {
     info.opportunities = rows.length;
     const details = parseDetails(text);
     const log = parseLog(text);
+    for (const h of ['Registry', 'Decision Log']) {
+      const stray = strayTableRows(text, h);
+      if (stray) errors.push(`${h}: ${stray} table row(s) appear after a gap or other text and are not part of the table; rows hidden this way are ignored by every check`);
+    }
     if (log.length) {
       if (!log.every((e) => 'seal' in e)) errors.push('Decision Log: missing "Seal" column (rows must be written by pi.mjs decide)');
       else errors.push(...verifyChain(log));
     }
+    // Chain head: the count and last seal live in the frontmatter, so removing rows from the END of the log is detected too.
+    const head = log.length ? log[log.length - 1].seal || '' : '';
+    if (log.length) {
+      if (reg.fm.decision_count !== String(log.length) || reg.fm.decision_head !== head) errors.push(`Decision Log: ${log.length} row(s) with head seal "${head}" do not match frontmatter decision_count="${reg.fm.decision_count ?? ''}" / decision_head="${reg.fm.decision_head ?? ''}" (rows were removed or edited by hand; "pi.mjs decide" maintains these fields)`);
+    } else if (Number(reg.fm.decision_count || 0) > 0) errors.push(`Decision Log is empty but frontmatter decision_count is ${reg.fm.decision_count}: logged decisions were deleted`);
     const seen = new Set();
     const lastDecision = {};
     for (const e of log) lastDecision[e.id] = (e.decision || '').toLowerCase();
@@ -194,9 +224,12 @@ export function validateProject(dir, { today = todayStr() } = {}) {
         if (!/\[E:/.test(d.text)) errors.push(`${id}: no evidence tags in detail (an opportunity without evidence cannot be proposed)`);
         else {
           // Confidence cannot exceed what the cited evidence supports: High needs 2+ distinct facts at medium+ confidence, Medium needs 1.
-          const strong = new Set(lintEvidence(d.text, { file: id, today }).tags.filter((t) => t.cls === 'fact' && t.conf !== 'low').map((t) => t.src));
+          // Only primary sources count: https URLs and existing repo files (line numbers of one file are one source).
+          // search: logs and ref: reasoning never support confidence.
+          const key = (s) => (/^https?:/i.test(s) ? s.replace(/#.*$/, '') : /^repo:/.test(s) && repoSourceExists(dir, s) ? `repo:${repoSourcePath(s)}` : null);
+          const strong = new Set(lintEvidence(d.text, { file: id, today }).tags.filter((t) => t.cls === 'fact' && t.conf !== 'low').map((t) => key(t.src)).filter(Boolean));
           const maxConf = strong.size >= 2 ? 'High' : strong.size === 1 ? 'Medium' : 'Low';
-          if (RANK[r.confidence] > RANK[maxConf]) errors.push(`${id}: confidence ${r.confidence} exceeds what the cited evidence supports (${maxConf}: ${strong.size} distinct fact source(s) at medium+ confidence)`);
+          if (RANK[r.confidence] > RANK[maxConf]) errors.push(`${id}: confidence ${r.confidence} exceeds what the cited evidence supports (${maxConf}: ${strong.size} distinct primary source(s) [https or existing repo file] cited as medium+ facts)`);
         }
         if (r.confidence === 'Low' && r.status === 'Proposed' && r.tier === 'Recommend') errors.push(`${id}: low-confidence opportunity presented as Recommend`);
         if (reg.fm.review_mode === 'pending') errors.push(`${id}: status ${r.status} but review_mode is still "pending" (review before proposing)`);
@@ -212,14 +245,16 @@ export function validateProject(dir, { today = todayStr() } = {}) {
 
       // Feature linkage.
       const feat = r.feature && r.feature !== '-' ? r.feature : null;
-      if (feat && !lifecycle.feature_allowed_statuses.includes(r.status)) errors.push(`${id}: has feature ${feat} but status is ${r.status} (specs only for approved opportunities)`);
+      const featPath = feat ? path.join(pdir, 'features', `${feat}.md`) : null;
+      const featStatus = featPath && fs.existsSync(featPath) ? splitFrontmatter(fs.readFileSync(featPath, 'utf8')).data.status : null;
+      if (feat && !lifecycle.feature_allowed_statuses.includes(r.status) && featStatus !== 'superseded') errors.push(`${id}: has feature ${feat} but status is ${r.status} and the spec is not marked superseded (specs only for approved opportunities; reversing an approval retires the spec)`);
       if (feat && !fs.existsSync(path.join(pdir, 'features', `${feat}.md`))) errors.push(`${id}: feature ${feat} not found in .product/features/`);
       if (['Ready for Implementation', 'Implemented', 'Validated'].includes(r.status) && !feat) errors.push(`${id}: status ${r.status} but no feature spec linked`);
     }
     for (const id of Object.keys(details)) if (!seen.has(id)) warnings.push(`Detail block ${id} has no registry row`);
     for (const id of new Set(log.map((e) => e.id))) if (!seen.has(id)) errors.push(`Decision Log mentions ${id} but the registry has no such row (decided opportunities must not be deleted)`);
 
-    const ev = lintEvidence(text, { file: 'opportunities.md', today, maxAgeDays: maxAge });
+    const ev = lintEvidence(text, { file: 'opportunities.md', today, maxAgeDays: maxAge, repoRoot: dir });
     errors.push(...ev.errors);
     warnings.push(...ev.warnings);
 
@@ -239,7 +274,11 @@ export function validateProject(dir, { today = todayStr() } = {}) {
   // ---- features ---------------------------------------------------------------
   const fdir = path.join(pdir, 'features');
   if (fs.existsSync(fdir)) {
-    for (const f of fs.readdirSync(fdir).filter((n) => n.endsWith('.md')).sort()) {
+    for (const ent of fs.readdirSync(fdir, { withFileTypes: true })) {
+      if (ent.name === '.gitkeep') continue;
+      if (ent.isDirectory() || !/^FEATURE-\d{3,}\.md$/.test(ent.name)) errors.push(`features/${ent.name}: unexpected entry (only FEATURE-NNN.md specs belong in .product/features/; anything else is never validated)`);
+    }
+    for (const f of fs.readdirSync(fdir).filter((n) => /^FEATURE-\d{3,}\.md$/.test(n)).sort()) {
       info.features++;
       const label = `features/${f}`;
       const text = fs.readFileSync(path.join(fdir, f), 'utf8');
@@ -252,7 +291,9 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       const row = rows.find((r) => r.id === data.opportunity);
       if (!row) errors.push(`${label}: opportunity "${data.opportunity}" not in registry`);
       else {
-        if (!lifecycle.feature_allowed_statuses.includes(row.status)) errors.push(`${label}: opportunity ${row.id} is "${row.status}" — specs may only exist for approved opportunities`);
+        const live = lifecycle.feature_allowed_statuses.includes(row.status);
+        if (!live && data.status !== 'superseded') errors.push(`${label}: opportunity ${row.id} is "${row.status}" — specs may only exist for approved opportunities (reversed approvals mark the spec superseded)`);
+        if (live && data.status === 'superseded') errors.push(`${label}: spec is superseded but opportunity ${row.id} is "${row.status}" again; re-approval through "pi.mjs decide" revives it as a draft`);
         if (row.feature !== data.id) errors.push(`${label}: registry feature column for ${row.id} is "${row.feature}", expected ${data.id}`);
       }
       if (!product || product.status !== 'approved') warnings.push(`${label}: PRODUCT.md is not currently approved`);
@@ -266,7 +307,7 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       if (rowReady && data.status === 'draft') errors.push(`${label}: opportunity ${row.id} is "${row.status}" but the spec is still status: draft`);
       const ph = findPlaceholders(body);
       if (ph.length) errors.push(`${label}: placeholder text on lines ${ph.slice(0, 5).join(', ')}`);
-      const ev = lintEvidence(text, { file: label, today, maxAgeDays: maxAge });
+      const ev = lintEvidence(text, { file: label, today, maxAgeDays: maxAge, repoRoot: dir });
       errors.push(...ev.errors);
       warnings.push(...ev.warnings);
       if (!/\[E:|ref:|OPP-\d+/.test(sectionBody(body, 'Research references'))) errors.push(`${label}: Research references must cite evidence tags or the originating OPP id`);

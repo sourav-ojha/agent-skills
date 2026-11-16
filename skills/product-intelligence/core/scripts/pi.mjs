@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { splitFrontmatter, setFrontmatter } from './lib/fm.mjs';
 import { productHash, appendHistory } from './lib/product.mjs';
-import { parseRegistry, updateRow, appendLog, nextId, parseDetails } from './lib/registry.mjs';
+import { parseRegistry, parseLog, updateRow, appendLog, nextId, parseDetails } from './lib/registry.mjs';
 import { computeScore, computeTier, parseRatings } from './lib/score.mjs';
 import { loadConfig, readJson, CORE_DIR } from './lib/config.mjs';
 import { saveSnapshot, diffSnapshot, clearSnapshot } from './lib/snapshot.mjs';
@@ -48,7 +48,7 @@ function need(p, what) { if (!fs.existsSync(p)) die(`${what} not found at ${path
 function requireBy() {
   if (!flags.by || flags.by === true) die('--by "<name>" is required: record who made this decision (the human user).');
   const by = String(flags.by).trim();
-  if (!/^[^\u0000-\u001f\u007f|]{1,80}$/.test(by)) die('--by must be 1-80 characters without "|" or control characters.');
+  if (!/^[^\u0000-\u001f\u007f|"\\]{1,80}$/.test(by)) die('--by must be 1-80 characters without "|", quotes, backslashes or control characters.');
   return by;
 }
 
@@ -57,6 +57,29 @@ function optNote(required) {
   const note = flags.note ? String(flags.note).trim() : '';
   if (required && !note) die('--note "<the user\'s words / reason>" is required: it records what the human actually said.');
   return note;
+}
+
+// Optional stricter mode (config gates.human_confirmation = "tty"): a human must type "yes" in an interactive
+// terminal. An agent's shell has no TTY, so it cannot satisfy this; the user runs the command themselves.
+function confirmHuman(summary) {
+  const mode = loadConfig(dir).config.gates?.human_confirmation || 'chat';
+  if (mode !== 'tty') return;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    die(`gates.human_confirmation is "tty": this needs a person at an interactive terminal. Ask the user to run this exact command themselves:\n  ${process.argv.slice(1).map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')}`);
+  }
+  process.stdout.write(`${summary}\nType "yes" to confirm: `);
+  const buf = Buffer.alloc(64);
+  let n = 0;
+  try { n = fs.readSync(0, buf, 0, 64, null); } catch { n = 0; }
+  if (buf.toString('utf8', 0, n).trim().toLowerCase() !== 'yes') die('not confirmed.');
+}
+
+// Decisions and proposals are only meaningful against an approved, unmodified product baseline.
+function requireApprovedProduct() {
+  const t = need(path.join(pdir, 'PRODUCT.md'), 'PRODUCT.md');
+  const { data } = splitFrontmatter(t);
+  if (data.status !== 'approved') die('PRODUCT.md is not approved (draft or reopened). Get the baseline approved again before deciding or proposing opportunities.');
+  if (data.content_hash !== productHash(t)) die('PRODUCT.md was modified after approval (hash mismatch). Reopen and re-approve it first.');
 }
 
 function cmdInit() {
@@ -127,6 +150,7 @@ function cmdApproveProduct() {
   if (ph.length) die(`PRODUCT.md still contains placeholder-like text on body lines ${ph.slice(0, 5).join(', ')} (counted from the first line after the frontmatter). Flagged: {{...}}, <<...>>, TODO, TBD, FIXME, lorem ipsum, even inside prose: rephrase (e.g. "open to-do comments") or remove.`);
   const pre = validateProject(dir, { today }).errors.filter((e) => e.startsWith('PRODUCT.md'));
   if (pre.length) die(`PRODUCT.md is not valid, refusing to approve:\n  ${pre.join('\n  ')}`);
+  confirmHuman(`Approve PRODUCT.md as revision ${Number(data.revision || 0) + 1}, recorded for ${by}?`);
   const revision = Number(data.revision || 0) + 1;
   t = appendHistory(t, { revision, date: today, by, action: data.approved_at ? 're-approved' : 'approved', note: optNote(false) });
   t = setFrontmatter(t, { status: 'approved', revision, approved_by: by, approved_at: today, last_reviewed: today, content_hash: productHash(t) });
@@ -142,10 +166,25 @@ function cmdReopenProduct() {
   let t = need(p, 'PRODUCT.md');
   const { data } = splitFrontmatter(t);
   if (data.status !== 'approved') die('PRODUCT.md is not approved; it is already editable.');
+  confirmHuman(`Reopen the approved PRODUCT.md for editing, recorded for ${by}?`);
   t = appendHistory(t, { revision: data.revision, date: today, by, action: 'reopened', note: optNote(false) || 'edit requested' });
   t = setFrontmatter(t, { status: 'draft' });
   fs.writeFileSync(p, t);
   out({ reopened: true, note: 'Edit PRODUCT.md, show the diff to the user, then run approve-product after they confirm.' });
+}
+
+function cmdConfirmProduct() {
+  const by = requireBy();
+  const p = path.join(pdir, 'PRODUCT.md');
+  let t = need(p, 'PRODUCT.md');
+  const { data } = splitFrontmatter(t);
+  if (data.status !== 'approved') die('PRODUCT.md is not approved; use approve-product.');
+  if (data.content_hash !== productHash(t)) die('PRODUCT.md was modified after approval; reopen and re-approve instead of confirming.');
+  confirmHuman(`Confirm PRODUCT.md revision ${data.revision} is still accurate, recorded for ${by}?`);
+  t = appendHistory(t, { revision: data.revision, date: today, by, action: 'reviewed', note: optNote(false) || 'confirmed unchanged' });
+  t = setFrontmatter(t, { last_reviewed: today });
+  fs.writeFileSync(p, t);
+  out({ confirmed: true, revision: Number(data.revision), last_reviewed: today });
 }
 
 function loadOpps() {
@@ -166,9 +205,23 @@ function cmdDecide() {
   const allowed = lifecycle.user[row.status] || [];
   if (!allowed.includes(target)) die(`${id} is "${row.status}"; a user decision cannot move it to "${target}". Allowed: ${allowed.join(', ') || 'none'}.`);
   const note = optNote(true);
+  requireApprovedProduct();
+  confirmHuman(`Record decision "${decision}" for ${id} (${row.title}), by ${by}? Note: ${note}`);
   let next = updateRow(t, id, { status: target, updated: today });
   next = appendLog(next, { date: today, id, decision, by, note });
+  const log = parseLog(next);
+  next = setFrontmatter(next, { decision_count: log.length, decision_head: log[log.length - 1].seal });
   fs.writeFileSync(p, next);
+  // Reversing an approval retires the linked spec; re-approving revives it as a draft to re-check.
+  if (row.feature && row.feature !== '-') {
+    const sp = path.join(pdir, 'features', `${row.feature}.md`);
+    if (fs.existsSync(sp)) {
+      const st = splitFrontmatter(read(sp)).data.status;
+      const live = lifecycle.feature_allowed_statuses;
+      if (!live.includes(target) && st !== 'superseded') fs.writeFileSync(sp, setFrontmatter(read(sp), { status: 'superseded' }));
+      else if (live.includes(target) && st === 'superseded') fs.writeFileSync(sp, setFrontmatter(read(sp), { status: 'draft' }));
+    }
+  }
   out({ id, from: row.status, to: target, by });
 }
 
@@ -183,6 +236,7 @@ function cmdTransition() {
     const viaUser = (lifecycle.user[row.status] || []).includes(to);
     die(`${row.status} -> ${to} is not an agent transition.${viaUser ? ' It needs an explicit user decision: use "decide".' : ''}`);
   }
+  if (to === 'Proposed') requireApprovedProduct();
   if (to === 'Proposed' && reg.fm.review_mode === 'pending') die('review_mode is "pending": run the independent review (or record self-review with a reason) before proposing.');
   if (to === 'Ready for Implementation') {
     if (!row.feature || row.feature === '-') die(`${id} has no feature spec; run new-feature first.`);
@@ -253,6 +307,7 @@ const commands = {
   status: cmdStatus,
   'approve-product': cmdApproveProduct,
   'reopen-product': cmdReopenProduct,
+  'confirm-product': cmdConfirmProduct,
   decide: cmdDecide,
   transition: cmdTransition,
   'new-feature': cmdNewFeature,
@@ -286,6 +341,7 @@ usage: node pi.mjs <command> [--dir <project>] [flags]
   init [--registry]               create .product/ from templates (draft)
   approve-product --by NAME       record user approval + content hash (only after the user confirmed in chat)
   reopen-product  --by NAME       make approved PRODUCT.md editable again (logged)
+  confirm-product --by NAME       record that an approved, unchanged PRODUCT.md was re-checked (resets the review age)
   decide OPP-ID approve|reject|defer|research|modify --by NAME [--note ...]
                                   record the USER's decision on a proposed opportunity
   transition OPP-ID "<Status>"    agent-allowed lifecycle moves only

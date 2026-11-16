@@ -20,6 +20,8 @@
   },
   "user": {
     "Proposed": ["Approved", "Rejected", "Deferred", "Under Evaluation"],
+    "Approved": ["Rejected", "Deferred", "Under Evaluation"],
+    "Ready for Implementation": ["Rejected", "Deferred", "Under Evaluation"],
     "Rejected": ["Under Evaluation"],
     "Deferred": ["Under Evaluation"]
   },

@@ -20,7 +20,9 @@ model discipline. Run `pi validate` before presenting anything to the user and f
   after seeing it), run `pi approve-product --by "<user name>"`. Corrections from the user are applied to the draft, shown again, and approved separately.
 - The hash covers the body (not Revision History). Editing an approved file makes `pi validate` fail. To change an approved baseline: get the user's
   agreement on the change first, `pi reopen-product --by …`, edit, show the diff, wait for confirmation, `pi approve-product`.
-- Revision history is append-only in the file and in git.
+- Revision history is append-only in the file and in git. Its last approval row must match `revision`, `approved_by` and `approved_at`, or validation fails.
+- If the baseline is merely stale and unchanged, run `pi confirm-product --by … ` after the user re-confirms it: it resets the review age without a new revision. Decisions and `Proposed` transitions are refused while the baseline is draft, reopened or modified.
+- Optional hardening: `gates.human_confirmation: "tty"` in config makes the user-only commands require a person at an interactive terminal.
 - Phases 2–7 refuse to start without an approved PRODUCT.md.
 
 ## Gate 2 — opportunity decisions
@@ -32,6 +34,7 @@ Lifecycle: `Discovered → Under Evaluation → Proposed → Approved | Rejected
 | Discovered ↔ Under Evaluation, → Proposed | agent | `pi transition OPP-001 "Under Evaluation"` |
 | Proposed → Approved / Rejected / Deferred / back to Under Evaluation | **user only** | `pi decide OPP-001 approve\|reject\|defer\|research\|modify --by "<user>" --note "<reason>"` |
 | Rejected/Deferred reconsidered | **user only** | `pi decide OPP-001 research --by … --note "<new evidence>"` |
+| Approved / Ready reversed | **user only** | `pi decide OPP-001 reject\|defer\|research …` (the linked spec becomes `superseded`; re-approval revives it as a draft) |
 | Approved → Ready for Implementation | agent, after spec validates | `pi transition OPP-001 "Ready for Implementation"` |
 | Implemented → Validated | implementation/QA skill or user | `pi transition …` |
 
