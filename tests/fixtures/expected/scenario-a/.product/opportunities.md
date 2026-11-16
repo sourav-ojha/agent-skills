@@ -3,7 +3,7 @@ type: opportunity-registry
 last_research: 2026-11-16
 review_mode: independent
 decision_count: 2
-decision_head: 91298e3c4737
+decision_head: a906a90f5fd5
 ---
 # Opportunities
 
@@ -56,10 +56,10 @@ Independent reviewer challenged OPP-001 differentiation (lowered 4 to 3: ShrinkR
 
 ## Decision Log
 
-| Date | ID | Decision | By | Note | Seal |
-|---|---|---|---|---|---|
-| 2026-11-16 | OPP-001 | approve | Fixture Owner | user: yes, build batch | 84ab2677b7db |
-| 2026-11-16 | OPP-002 | defer | Fixture Owner | user: wait for more evidence | 91298e3c4737 |
+| Date | ID | Decision | By | Note | Content | Seal |
+|---|---|---|---|---|---|---|
+| 2026-11-16 | OPP-001 | approve | Fixture Owner | user: yes, build batch | ca7efbd8e757 | d56d0331a0ee |
+| 2026-11-16 | OPP-002 | defer | Fixture Owner | user: wait for more evidence | c73a39ae4657 | a906a90f5fd5 |
 
 ## Opportunity Details
 

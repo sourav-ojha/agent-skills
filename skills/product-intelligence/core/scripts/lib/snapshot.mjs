@@ -40,9 +40,10 @@ export function takeSnapshot(dir) {
   for (const f of listFiles(dir)) {
     const p = path.join(dir, f);
     try {
-      const st = fs.statSync(p);
-      if (!st.isFile()) continue;
+      const st = fs.lstatSync(p);
       const mode = (st.mode & 0o777).toString(8); // permission changes (e.g. chmod +x) are changes too
+      if (st.isSymbolicLink()) { map[f] = `link:${fs.readlinkSync(p)}:${mode}`; continue; } // never follow: retargeting a link is a change
+      if (!st.isFile()) continue;
       map[f] = `${st.size > MAX_HASH_BYTES ? `size:${st.size}:${st.mtimeMs}` : createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:${mode}`;
     } catch { /* deleted between list and read */ }
   }

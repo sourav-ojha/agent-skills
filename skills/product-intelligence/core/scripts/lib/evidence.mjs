@@ -83,6 +83,22 @@ export function repoSourceExists(root, src, { dirOk = false } = {}) {
   try { const st = fs.statSync(abs); return st.isFile() || (dirOk && st.isDirectory()); } catch { return false; }
 }
 
+// Canonical identity of a primary source for counting distinct evidence; null when it is not a primary source
+// (not https, a repo path that is missing, or one of our own artifacts / git internals).
+export function sourceKey(root, src) {
+  if (/^https?:\/\//i.test(src)) {
+    try {
+      const u = new URL(src);
+      return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, '')}${u.search}`;
+    } catch { return null; }
+  }
+  if (/^repo:\S+/.test(src) && repoSourceExists(root, src)) {
+    const rel = path.relative(path.resolve(root), path.resolve(root, repoSourcePath(src))).split(path.sep).join('/');
+    return /^(\.product|\.git)(\/|$)/.test(rel) ? null : `repo:${rel}`;
+  }
+  return null;
+}
+
 export function findPlaceholders(text) {
   const hits = [];
   const lines = text.split('\n');

@@ -64,7 +64,7 @@ export function updateRow(text, id, patch) {
 // every later seal. This detects accidents and careless edits; it is NOT a defence against an actor
 // who deliberately recomputes seals. The human reading the log (and git history) is the real gate.
 export function sealOf(prev, e) {
-  const body = [e.date, e.id, e.decision, e.by, e.note].map((x) => String(x ?? '')).join('\u241f');
+  const body = [e.date, e.id, e.decision, e.by, e.note, e.content].map((x) => String(x ?? '')).join('\u241f');
   return createHash('sha256').update(`${prev}\u241e${body}`).digest('hex').slice(0, 12);
 }
 
@@ -79,16 +79,50 @@ export function verifyChain(log) {
   return errs;
 }
 
+// Fingerprint of what the user is deciding on: the registry row (minus status/dates/links) and the detail block.
+// It is sealed into the Decision Log, so an approved idea cannot be quietly rewritten into a different one.
+export function contentDigest(text, id) {
+  const r = parseRegistry(text).rows.find((x) => x.id === id);
+  if (!r) return '';
+  const d = parseDetails(text)[id];
+  const body = (d ? d.lines : []).map((l) => l.replace(/\s+$/, '')).join('\n').trim();
+  const head = [r.title, r.score, r.confidence, r.tier, r.effort].join('\u241f');
+  return createHash('sha256').update(`${head}\u241e${body}`).digest('hex').slice(0, 12);
+}
+
+// The log's row count and last seal are mirrored in the frontmatter so removing rows from the end is detected.
+export function checkLogHead(fm, log) {
+  const errs = [];
+  if (log.length) {
+    const head = log[log.length - 1].seal || '';
+    if (fm.decision_count !== String(log.length) || fm.decision_head !== head) errs.push(`Decision Log: ${log.length} row(s) with head seal "${head}" do not match frontmatter decision_count="${fm.decision_count ?? ''}" / decision_head="${fm.decision_head ?? ''}" (rows were removed or edited by hand; "pi.mjs decide" maintains these fields)`);
+  } else if (fm.decision_count !== undefined && fm.decision_count !== '0') {
+    errs.push(`Decision Log is empty but frontmatter decision_count is ${fm.decision_count}: logged decisions were deleted`);
+  }
+  return errs;
+}
+
+// Everything that must hold before the log may be appended to or trusted.
+export function logIntegrityErrors(text) {
+  const { data: fm } = splitFrontmatter(text);
+  const log = parseLog(text);
+  const errs = [];
+  if (log.length && !log.every((e) => 'seal' in e && 'content' in e)) errs.push('Decision Log: missing "Content"/"Seal" column (rows must be written by pi.mjs decide)');
+  else errs.push(...verifyChain(log));
+  errs.push(...checkLogHead(fm, log));
+  return errs;
+}
+
 export function appendLog(text, entry) {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
-  const clean = { date: cell(entry.date), id: cell(entry.id), decision: cell(entry.decision), by: cell(entry.by), note: cell(entry.note || '') };
+  const clean = { date: cell(entry.date), id: cell(entry.id), decision: cell(entry.decision), by: cell(entry.by), note: cell(entry.note || ''), content: cell(entry.content || '') };
   const existing = parseLog(text);
   const prev = existing.length ? existing[existing.length - 1].seal || '' : '';
   const unesc = Object.fromEntries(Object.entries(clean).map(([k, v]) => [k, parseLogCell(v)]));
-  const row = `| ${clean.date} | ${clean.id} | ${clean.decision} | ${clean.by} | ${clean.note} | ${sealOf(prev, unesc)} |`;
+  const row = `| ${clean.date} | ${clean.id} | ${clean.decision} | ${clean.by} | ${clean.note} | ${clean.content} | ${sealOf(prev, unesc)} |`;
   const t = parseTableInSection(text, 'Decision Log');
   if (!t) {
-    const add = ['', '## Decision Log', '', '| Date | ID | Decision | By | Note | Seal |', '|---|---|---|---|---|---|', row, ''];
+    const add = ['', '## Decision Log', '', '| Date | ID | Decision | By | Note | Content | Seal |', '|---|---|---|---|---|---|---|', row, ''];
     return lines.join('\n').replace(/\s*$/, '\n') + add.join('\n');
   }
   lines.splice(t.lastIndex + 1, 0, row);

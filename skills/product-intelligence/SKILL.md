@@ -51,6 +51,7 @@ Claude Code: `/product-intelligence research`. Codex: `$product-intelligence res
 2. Check preconditions below; if unmet, say what is missing and offer the prerequisite command. Do not skip ahead.
 3. Respect existing project conventions (docs, folders, templates). If equivalent product docs exist, treat them as evidence and ask whether to link or import them. Do not create duplicates.
 4. Read `.product/config.json` if present (`pi config` shows effective settings: weights, freshness, model tiers).
+5. For any command that reads the repository, run `pi snapshot` now (a fresh baseline each run, so the user's own commits since the last run are not blamed on research); `pi verify-clean` closes the run. `init` takes its snapshot in its own procedure.
 
 | Command | Precondition |
 |---|---|

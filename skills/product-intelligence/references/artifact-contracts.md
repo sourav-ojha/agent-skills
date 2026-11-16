@@ -23,7 +23,7 @@ model discipline. Run `pi validate` before presenting anything to the user and f
 - Revision history is append-only in the file and in git. Its last approval row must match `revision`, `approved_by` and `approved_at`, or validation fails.
 - If the baseline is merely stale and unchanged, run `pi confirm-product --by … ` after the user re-confirms it: it resets the review age without a new revision. Decisions and `Proposed` transitions are refused while the baseline is draft, reopened or modified.
 - Optional hardening: `gates.human_confirmation: "tty"` in config makes the user-only commands require a person at an interactive terminal.
-- Phases 2–7 refuse to start without an approved PRODUCT.md.
+- Phases 2–7 must not start without an approved, unmodified PRODUCT.md. The helper enforces this for `decide`, `transition … Proposed`, `transition … "Ready for Implementation"` and `new-feature`; for the other commands the validator reports it and you must check `pi status` yourself.
 
 ## Gate 2 — opportunity decisions
 
@@ -38,7 +38,7 @@ Lifecycle: `Discovered → Under Evaluation → Proposed → Approved | Rejected
 | Approved → Ready for Implementation | agent, after spec validates | `pi transition OPP-001 "Ready for Implementation"` |
 | Implemented → Validated | implementation/QA skill or user | `pi transition …` |
 
-- Only run `decide` after the user states the decision in chat. `--by` is their name; `--note` is required and quotes their words. The Decision Log is hash-chained and the validator requires every status to agree with the latest logged decision: hand edits are detectable, so never make them (and note they are detectable, not impossible: you are trusted to follow this rule). Never infer approval from silence, from "ok" to a
+- Only run `decide` after the user states the decision in chat. `--by` is their name; `--note` is required and quotes their words. Each log row also seals a digest of the opportunity's title, scores and detail block (the `Content` column): if that text changes after the user approved it, validation fails, so re-propose and get a new decision. `decide` refuses to append to a log that already fails its integrity check. The Decision Log is hash-chained and the validator requires every status to agree with the latest logged decision: hand edits are detectable, so never make them (and note they are detectable, not impossible: you are trusted to follow this rule). Never infer approval from silence, from "ok" to a
   different question, or from a background notification.
 - "Modify" and "research" send the opportunity back to Under Evaluation; revise, re-review, re-propose.
 - `pi transition … Proposed` is refused while `review_mode` is `pending`.

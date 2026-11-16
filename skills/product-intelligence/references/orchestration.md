@@ -46,7 +46,7 @@ without evidence. You review sub-agent output; do not paste it into artifacts un
 
 ## Source protection
 
-Before any phase that reads the repository, run `pi snapshot`. After the phase (and again before finishing), run `pi verify-clean`. If it reports changed application
+At the start of every run that reads the repository (and so for every phase), run `pi snapshot`: it replaces any older baseline, so changes the user made between runs are never blamed on research. After the phase (and again before finishing), run `pi verify-clean`. If it reports changed application
 files, stop, tell the user exactly which, and do not continue. Only `.product/` is ever written. Sub-agents get read-only tools where the host allows it;
 the check above is the backstop where it does not.
 

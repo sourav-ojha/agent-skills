@@ -2,6 +2,7 @@
 type: opportunity-registry
 last_research: never
 review_mode: pending
+decision_count: 0
 ---
 # Opportunities
 
@@ -51,8 +52,8 @@ None found — searched: {{queries}} {{[E: …]}}
 
 ## Decision Log
 
-| Date | ID | Decision | By | Note | Seal |
-|---|---|---|---|---|---|
+| Date | ID | Decision | By | Note | Content | Seal |
+|---|---|---|---|---|---|---|
 
 ## Opportunity Details
 

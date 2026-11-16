@@ -18,7 +18,7 @@ test('forgery: hand-editing a status to Approved is detected (no log entry)', ()
 test('forgery: a hand-written Decision Log row without a valid seal is detected', () => {
   const dir = projectFrom('b');
   edit(dir, OPP, (t) => t.replace('| OPP-002 | Per-organization rate limits | Proposed |', '| OPP-002 | Per-organization rate limits | Approved |')
-    .replace(/(\| 2026-11-16 \| OPP-004 \| defer .*\|\n)/, '$1| 2026-11-16 | OPP-002 | approve | Ann | user: yes | 000000000000 |\n'));
+    .replace(/(\| 2026-11-16 \| OPP-004 \| defer .*\|\n)/, '$1| 2026-11-16 | OPP-002 | approve | Ann | user: yes | aaaaaaaaaaaa | 000000000000 |\n'));
   assert.ok(hasError(validateJson(dir), 'seal "000000000000" does not match'));
 });
 
