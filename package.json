@@ -1,0 +1,16 @@
+{
+  "name": "agent-skills",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reusable agent skills for Claude Code, Codex and other Agent Skills hosts.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "validate": "node scripts/validate-skills.mjs",
+    "test": "node --test \"tests/validation/*.test.mjs\"",
+    "check": "npm run validate && npm test",
+    "agents:generate": "node skills/product-intelligence/core/scripts/install-agents.mjs --generate-defaults",
+    "package": "node scripts/package-skill.mjs product-intelligence"
+  }
+}
