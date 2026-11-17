@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { REPO, tmpDir } from './helpers.mjs';
-import { validatePlan, nextBatch, startTask, finishTask, passTask } from '../../skills/implementer/core/scripts/lib/ledger.mjs';
+import { validatePlan, nextBatch, startTask, finishTask, passTask, blockTask, reopenTask, unblockTask, mapCriterion, ownsOverlap } from '../../skills/implementer/core/scripts/lib/ledger.mjs';
 
 const IMPL = path.join(REPO, 'skills/implementer/core/scripts/impl.mjs');
 const task = (id, o = {}) => ({
@@ -74,4 +74,47 @@ test('AC5 CLI end to end: persist, ruling log, replan guard, corrupt ledger, uns
   assert.notEqual(run('init', '--name', '../evil').code, 0);
   fs.writeFileSync(path.join(dir, '.implementation/x/tasks.json'), '{nope');
   assert.match(run('status', '--name', 'x').out, /invalid|corrupt|parse/i);
+});
+
+test('AC3 files stay held while QA rework is pending; reopen and block/unblock recover', () => {
+  const p = plan(task('A', { files: ['src/'] }), task('B', { files: ['src/b.js'] }));
+  startTask(p, 'A'); finishTask(p, 'A');
+  assert.deepEqual(nextBatch(p), []); // A is done but not passed: its files are still held
+  reopenTask(p, 'A');
+  assert.equal(p.tasks[0].status, 'in_progress');
+  blockTask(p, 'A', 'stuck');
+  assert.equal(p.tasks[0].status, 'blocked');
+  unblockTask(p, 'A');
+  assert.equal(p.tasks[0].status, 'pending');
+  startTask(p, 'A'); finishTask(p, 'A');
+  passTask(p, 'A', { cmd: 'npm test', exit: 0 });
+  assert.throws(() => blockTask(p, 'A', 'x'), /passed/i); // a passed task cannot be blocked
+});
+
+test('AC4 map records criteria->tests so pass can succeed; overlap needs no trailing slash', () => {
+  const p = plan(task('A', { criteria: [{ id: 'c1', text: 't', tests: [] }, { id: 'c2', text: 't', tests: [] }] }));
+  startTask(p, 'A'); finishTask(p, 'A');
+  assert.throws(() => passTask(p, 'A', { cmd: 'x', exit: 0 }), /criteri/i);
+  mapCriterion(p, 'A', 'c1', { tests: ['t1'] });
+  mapCriterion(p, 'A', 'c2', { noTest: 'docs' });
+  passTask(p, 'A', { cmd: 'x', exit: 0 });
+  assert.equal(p.tasks[0].passes, true);
+  assert.equal(ownsOverlap(['src'], ['src/b.js']), true);
+  assert.equal(ownsOverlap(['src'], ['src-old/b.js']), false);
+});
+
+test('AC1 CLI: plan file cannot preset status or passes; non-object ledger and empty --exit are refused', () => {
+  const dir = tmpDir('impl-');
+  const run = (...a) => { const r = spawnSync('node', [IMPL, ...a, '--dir', dir], { encoding: 'utf8' }); return { code: r.status, out: r.stdout + r.stderr }; };
+  run('init', '--name', 'x', '--tier', 'T2');
+  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify({ tasks: [task('A', { status: 'done', passes: true, evidence: { cmd: 'fake' } })] }));
+  run('plan', '--name', 'x', '--file', path.join(dir, 'plan.json'));
+  assert.match(run('status', '--name', 'x').out, /0\/1 passed/);
+  run('start', 'A', '--name', 'x'); run('finish', 'A', '--name', 'x');
+  assert.notEqual(run('pass', 'A', '--name', 'x', '--cmd', 'c', '--exit', '').code, 0);
+  assert.equal(run('map', 'A', '--name', 'x', '--criterion', 'A-c1', '--tests', 'a,b').code, 0);
+  fs.writeFileSync(path.join(dir, '.implementation/x/tasks.json'), 'null');
+  const r = run('status', '--name', 'x');
+  assert.notEqual(r.code, 0);
+  assert.doesNotMatch(r.out, /TypeError|at /);
 });

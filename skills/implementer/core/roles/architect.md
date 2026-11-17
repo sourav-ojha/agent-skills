@@ -14,7 +14,7 @@ The spec or mini-spec with acceptance criteria, the tier, and pointers to the re
    acceptance criteria copied from the spec, and one verify command. Every task has at least one criterion.
 
 ## Output (under 500 words)
-Design note (decisions + risks) then the task list as JSON for `impl.mjs plan`.
+Design note (decisions + risks) then the task list as JSON for `impl.mjs plan` (shape: templates/plan.json; directories end with `/`).
 
 ## Rules
 - Do not write product code. Do not invent requirements; flag spec gaps as questions.

@@ -1,13 +1,13 @@
 // Pure task-ledger logic for the implementer skill. No I/O. Mutators throw Error on violation.
 export const TIERS = ['T0', 'T1', 'T2', 'T3'];
 
-const norm = (p) => String(p).replace(/^\.\//, '');
+const norm = (p) => String(p).replace(/^\.\//, '').replace(/\/+/g, '/').replace(/\/$/, '');
 
 // Two ownership lists conflict when any entry is equal or one is a directory prefix of the other.
 export function ownsOverlap(a, b) {
   return a.some((x) => b.some((y) => {
     const p = norm(x), q = norm(y);
-    return p === q || (p.endsWith('/') && q.startsWith(p)) || (q.endsWith('/') && p.startsWith(q));
+    return p === q || q.startsWith(`${p}/`) || p.startsWith(`${q}/`);
   }));
 }
 
@@ -52,7 +52,8 @@ const get = (plan, id) => {
   return t;
 };
 const depsPassed = (plan, t) => (t.deps || []).every((d) => get(plan, d).passes);
-const heldFiles = (plan) => plan.tasks.filter((t) => t.status === 'in_progress').flatMap((t) => t.files);
+// Files stay owned from start until the task passes (a done-but-unpassed task may still be reworked after QA).
+const heldFiles = (plan) => plan.tasks.filter((t) => t.status === 'in_progress' || (t.status === 'done' && !t.passes)).flatMap((t) => t.files);
 
 export function nextBatch(plan, max = 4) {
   const taken = [...heldFiles(plan)];
@@ -80,10 +81,35 @@ export function finishTask(plan, id) {
   t.status = 'done'; // finishing never sets passes; only passTask (QA, with evidence) does
 }
 
+export function reopenTask(plan, id) {
+  const t = get(plan, id);
+  if (t.status !== 'done' || t.passes) throw new Error(`${id} can only be reopened when done and not yet passed`);
+  t.status = 'in_progress'; // QA failed: back to the engineer, files stay owned
+}
+
 export function blockTask(plan, id, reason) {
   const t = get(plan, id);
+  if (t.passes) throw new Error(`${id} has already passed and cannot be blocked`);
+  if (t.status === 'blocked') throw new Error(`${id} is already blocked`);
   t.status = 'blocked';
   t.note = String(reason || '');
+}
+
+export function unblockTask(plan, id) {
+  const t = get(plan, id);
+  if (t.status !== 'blocked') throw new Error(`${id} is ${t.status}, not blocked`);
+  t.status = 'pending';
+  t.note = '';
+}
+
+// QA records which tests prove a criterion (or why none is possible).
+export function mapCriterion(plan, id, criterionId, { tests, noTest } = {}) {
+  const t = get(plan, id);
+  const c = t.criteria.find((x) => x.id === criterionId);
+  if (!c) throw new Error(`${id} has no criterion ${criterionId}`);
+  if (tests?.length) c.tests = tests;
+  else if (noTest) c.noTest = noTest;
+  else throw new Error('map needs --tests a,b or --no-test <reason>');
 }
 
 export function passTask(plan, id, { cmd, exit, at } = {}) {

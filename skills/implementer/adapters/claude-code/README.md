@@ -21,7 +21,7 @@ Read-only roles (architect, reviewer, security, database) get no edit or shell t
 `/implementer docs/spec.md` or `/implementer add rate limiting to the upload API`. Add `--no-tdd` to waive TDD, `--pr` to allow a PR.
 
 ## Tips
-- Add `.implementation/` to `.gitignore` unless you want the ledger committed.
+- Add `.implementation/` to `.gitignore` (the lead never commits it).
 - Parallel writers use git worktrees; the lead integrates and commits.
 - Optional: if gstack is installed, the lead may use its `/review` or `/ship`; otherwise it does both inline. Nothing here depends on gstack.
 - Ledger integrity is tamper-evident, not tamper-proof: the real gate is the user reading the plan, diff and rulings.

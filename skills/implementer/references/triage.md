@@ -23,7 +23,7 @@ Decide in one pass, from the spec and a quick look at the code. Write the tier a
 ## Cost rules
 
 - Default to the cheapest arrangement that still gives independent review for risky work.
-- Cap parallel tasks (config `limits.max_parallel_tasks`, default 4). More agents never fix an unclear spec.
+- Cap parallel tasks (`impl batch --max N`, default 4). More agents never fix an unclear spec.
 - Strong models for architect and reviewer, standard for engineer and QA, fast for pure inventory. Pass the model by tier.
 - Hand agents file paths, not pasted text; they return short summaries and write artifacts to disk.
 - Do not re-plan or re-review unchanged work.

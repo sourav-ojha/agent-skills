@@ -15,7 +15,8 @@ You are the **lead**: you triage, plan, delegate only what pays for itself, veri
 parallelism are added only when the work needs them (multi-agent runs cost many times the tokens of one agent).
 
 `<skill-dir>` is the directory containing this file. `impl` means `node <skill-dir>/core/scripts/impl.mjs` (always with `--name <slug>`).
-The target project is the current working directory. State lives in `.implementation/<slug>/` (`tasks.json` ledger, `log.md` rulings).
+The target project is the current working directory. State lives in `.implementation/<slug>/` (`tasks.json` ledger, `log.md` rulings);
+only the lead runs `impl` (no locking) and never commits `.implementation/`.
 
 ## Hard rules
 
@@ -53,7 +54,7 @@ Never run a role whose output the task does not need.
 ## Plan (T2, T3)
 
 Architect (or you for a clear spec) produces the task graph: id, deps, owned files, criteria, verify command. Run
-`impl init --tier T2 --spec <path>`, then `impl plan --file plan.json`. **Show the plan and wait for the user's approval** (T2/T3).
+`impl init --tier <T1|T2|T3> --spec <path>`, then `impl plan --file plan.json` (shape: [templates/plan.json](templates/plan.json); list directories with a trailing `/`; state fields are set by the helper, not the file). **Show the plan and wait for the user's approval** (T2/T3).
 T0/T1: no ledger needed beyond a note; no approval gate.
 
 ## Run
@@ -62,8 +63,9 @@ T0/T1: no ledger needed beyond a note; no approval gate.
 2. For each: `impl start <id>`; delegate to a software-engineer (one task, its owned files only, TDD). Parallel writers each use their own
    git worktree; you integrate. Tasks that share files run sequentially.
 3. Engineer reports; `impl finish <id>`.
-4. QA maps criteria to tests, fills gaps, prunes low-value tests, runs the verify command; if exit 0, `impl pass <id> --cmd "<cmd>" --exit 0`.
-   Failure: back to the engineer, at most 3 fix rounds, then `impl block <id> --reason ...` and tell the user.
+4. QA maps criteria to tests (`impl map <id> --criterion AC1 --tests a,b` or `--no-test "<reason>"`), fills gaps, prunes low-value tests,
+   runs the verify command; if exit 0, `impl pass <id> --cmd "<cmd>" --exit 0`. Failure: `impl reopen <id>`, back to the engineer
+   (files stay owned), at most 3 fix rounds, then `impl block <id> --reason ...` and tell the user (`impl unblock <id>` after a decision).
 5. Commit per task on the feature branch. Repeat until `impl status` shows all passed.
 
 Delegation message: absolute path of the role file ([core/roles/](core/roles/roles.json)), today's date, the task, its criteria and owned
