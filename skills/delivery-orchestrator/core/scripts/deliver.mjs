@@ -180,7 +180,12 @@ C.built = () => {
   save(q);
   emit({ id: f.id, state: f.state, tier: f.tier, commits: ahead, sha: f.built_sha, ci_files_touched: f.ci_files });
 };
-const ciFiles = (q, rev) => touchesCi(git('diff', '--name-only', '--no-renames', `origin/${q.base}...${rev}`).out.split('\n').filter(Boolean));
+// -z: NUL-separated, never quoted or escaped, so a path with unusual characters cannot hide from the pattern list. A failing diff holds the merge.
+const ciFiles = (q, rev) => {
+  const r = spawnSync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', `origin/${q.base}...${rev}`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) return ['(could not list the changed files)'];
+  return touchesCi(r.stdout.split('\0').filter(Boolean));
+};
 
 C.pr = () => {
   const q = load(); const f = item(q);
@@ -327,6 +332,11 @@ C.merge = () => {
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
   if (v.headRefOid !== f.ci_sha) { transition(f, 'pr_open'); save(q); return outcome({ id: f.id, result: 'stale', reason: 'the PR head changed after CI passed: wait for CI again', next: 'ci' }); }
+  // Do not trust the state file for "CI passed": ask GitHub again about this exact commit.
+  const needed = q.checks.length ? q.checks : requiredOf(f.pr.number);
+  const now = new Map(checksOf(f.pr.number).map((c) => [lc(c.name), c.bucket]));
+  const bad = [...now.values()].some((b) => ['fail', 'cancel', 'pending'].includes(b)) || needed.some((n) => now.get(lc(n)) !== 'pass');
+  if (f.ci === 'verified' && (!needed.length || bad)) return hold('GitHub no longer shows the required checks passing on this commit: a person decides');
   if (v.autoMergeRequest) return hold('auto-merge or a merge queue is already enabled on this PR: a person decides');
   for (let i = 0; v.mergeStateStatus === 'UNKNOWN' && i < 5; i++) { sleep(Number(opt.settle ?? 2) * 1000); v = view(); } // GitHub computes this lazily
   if (v.mergeStateStatus === 'BEHIND') {

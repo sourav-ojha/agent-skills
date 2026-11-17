@@ -128,7 +128,7 @@ export function runStop(q) {
 }
 
 // Paths whose change must be looked at by a person: a feature agent must not be able to edit the checks that gate it.
-export const CI_PATHS = [/^\.github\//, /^\.circleci\//, /^\.gitlab-ci\.ya?ml$/, /^Jenkinsfile$/, /^azure-pipelines\.ya?ml$/, /^\.buildkite\//, /^CODEOWNERS$/, /^\.github\/CODEOWNERS$/];
+export const CI_PATHS = [/^\.github\//i, /^\.circleci\//i, /^\.gitlab-ci\.ya?ml$/i, /^Jenkinsfile$/i, /^azure-pipelines\.ya?ml$/i, /^\.buildkite\//i, /(^|\/)CODEOWNERS$/i];
 export const touchesCi = (files) => files.filter((f) => CI_PATHS.some((re) => re.test(f)));
 
 export function summarize(q) {

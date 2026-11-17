@@ -94,7 +94,7 @@ test('queue: states cannot jump (queued -> merged is refused)', () => {
 });
 
 test('queue: CI and ownership files are flagged', () => {
-  assert.deepEqual(q.touchesCi(['src/a.js', '.github/workflows/ci.yml', 'CODEOWNERS', 'docs/.github-note.md']), ['.github/workflows/ci.yml', 'CODEOWNERS']);
+  assert.deepEqual(q.touchesCi(['src/a.js', '.github/workflows/ci.yml', 'CODEOWNERS', 'docs/CODEOWNERS', 'docs/.github-note.md']), ['.github/workflows/ci.yml', 'CODEOWNERS', 'docs/CODEOWNERS']);
 });
 
 // ---- init ----------------------------------------------------------------------------------------------------------
@@ -616,4 +616,26 @@ test('L9 a feature held three times for BEHIND is handed to a person, not looped
     if (i < 2) { assert.equal(last.json.result, 'updated'); e.d('ci', 'FEATURE-001', ...FAST); }
   }
   assert.match(last.json.reason, /base keeps moving/);
+});
+
+test('SEC a workflow file with an unusual name is still caught (git does not quote paths here)', () => {
+  const e = setup();
+  e.d('init'); e.d('next');
+  build(e, 'FEATURE-001', { file: '.github/workflows/caf\u00e9 \u201cci\u201d.yml' });
+  assert.deepEqual(e.d('built', 'FEATURE-001', '--tier', 'T2').json.ci_files_touched, ['.github/workflows/caf\u00e9 \u201cci\u201d.yml']);
+});
+
+test('SEC merge asks GitHub again: a forged "CI passed" in the state file does not merge a commit whose checks fail', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok');
+  ship(e, 'FEATURE-001');
+  e.setGh((s) => { s.checkQueue = [[{ name: 'ci', bucket: 'fail', link: 'x' }]]; });
+  const r = e.d('merge', 'FEATURE-001');
+  assert.match(r.json.reason, /no longer shows the required checks passing/);
+  assert.equal(e.gh().prs[0].state, 'OPEN');
+  const forged = setup();
+  forged.d('init', '--merge', '--note', 'ok');
+  ship(forged, 'FEATURE-001');
+  forged.setGh((s) => { s.required = []; });
+  assert.match(forged.d('merge', 'FEATURE-001').json.reason, /no longer shows/, 'a verified entry with no required or named checks is refused');
 });
