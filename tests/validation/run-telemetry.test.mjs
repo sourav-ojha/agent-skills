@@ -106,3 +106,70 @@ test('AC3 run-log writes never count as application changes for verify-clean', (
   const v = pi(dir, ['verify-clean']);
   assert.equal(v.code, 0, v.out + v.err);
 });
+
+test('SEC runlog refuses symlinked .skill-runs dir and symlinked log files (no write through links)', () => {
+  const target = tmpDir('victim-');
+  const a = tmpDir('rl-');
+  fs.symlinkSync(target, path.join(a, '.skill-runs'));
+  logEvent(a, 'implementer', 'r', { event: 'x' });
+  assert.deepEqual(fs.readdirSync(target), []);
+  const b = tmpDir('rl-');
+  fs.mkdirSync(path.join(b, '.skill-runs'));
+  const victim = path.join(target, 'victim.txt');
+  fs.writeFileSync(victim, 'ORIGINAL');
+  fs.symlinkSync(victim, path.join(b, '.skill-runs', 'implementer.jsonl'));
+  logEvent(b, 'implementer', 'r', { event: 'x' });
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'ORIGINAL');
+});
+
+test('SEC verify-clean ignores only our own root run-log files: other files under .skill-runs, or a nested .skill-runs, still count', () => {
+  const run = (rel, body = 'x') => {
+    const dir = projectFrom('a');
+    assert.equal(pi(dir, ['snapshot']).code, 0);
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), body);
+    return pi(dir, ['verify-clean']).code;
+  };
+  assert.equal(run('.skill-runs/implementer.jsonl', '{}\n'), 0);
+  assert.equal(run('.skill-runs/evil.sh'), 2);
+  assert.equal(run('src/.skill-runs/implementer.jsonl'), 2);
+});
+
+test('SEC export allowlists structural fields and redacts secrets/URLs in a forged or hand-edited log; --no-notes drops notes', () => {
+  const dir = tmpDir('rl-');
+  fs.mkdirSync(path.join(dir, '.skill-runs'));
+  const rec = (o) => JSON.stringify({ ts: '2026-11-17T10:00:00.000Z', skill: 'implementer', run: 'impl:x', ...o });
+  fs.writeFileSync(path.join(dir, '.skill-runs', 'implementer.jsonl'), [
+    rec({ event: 'init', ok: true, tier: 'T2 AKIAABCDEFGHIJKLMNOP', spec: 'https://evil.example/x?token=abc' }),
+    rec({ event: 'pass`|SECRET-EVENT', ok: false }),
+    rec({ event: 'retro', unclear: 'password=hunter2 and AKIAABCDEFGHIJKLMNOP at https://internal.corp/api sk-abcdefghijklmnop12345 `x` <img src=x>' }),
+  ].join('\n') + '\n');
+  const out = (...a) => spawnSync('node', [SI, 'export', '--dir', dir, '--projects-dir', path.join(dir, 'none'), ...a], { encoding: 'utf8' }).stdout;
+  const full = out();
+  for (const bad of ['hunter2', 'AKIA', 'internal.corp', 'sk-abcdefghijklmnop12345', 'evil.example', 'SECRET-EVENT', '<img']) assert.ok(!full.includes(bad), `leaked ${bad}`);
+  assert.match(full, /unclear/);
+  assert.ok(!/unclear/.test(out('--no-notes')));
+});
+
+test('SEC verify-clean still counts a TRACKED file under .skill-runs', () => {
+  const dir = projectFrom('a');
+  fs.mkdirSync(path.join(dir, '.skill-runs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.skill-runs', 'x.jsonl'), 'a\n');
+  const g = (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+  g('init'); g('add', '-f', '-A'); g('commit', '-m', 'track');
+  assert.equal(pi(dir, ['snapshot']).code, 0);
+  fs.writeFileSync(path.join(dir, '.skill-runs', 'x.jsonl'), 'changed\n');
+  assert.equal(pi(dir, ['verify-clean']).code, 2);
+});
+
+test('export --out writes the bundle to a file (not through a symlink) and prints nothing sensitive', () => {
+  const dir = exportFixture();
+  const out = path.join(dir, 'bundle.md');
+  const r = spawnSync('node', [SI, 'export', '--dir', dir, '--projects-dir', path.join(dir, 'none'), '--out', out], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(fs.readFileSync(out, 'utf8'), /Skill run bundle/);
+  const link = path.join(dir, 'link.md');
+  fs.symlinkSync(path.join(dir, 'elsewhere.md'), link);
+  assert.notEqual(spawnSync('node', [SI, 'export', '--dir', dir, '--projects-dir', path.join(dir, 'none'), '--out', link], { encoding: 'utf8' }).status, 0);
+  assert.ok(!fs.existsSync(path.join(dir, 'elsewhere.md')));
+});

@@ -4,11 +4,13 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', '.product', '.skill-runs', '.remember', '.DS_Store']);
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.product', '.remember', '.DS_Store']);
 const MAX_HASH_BYTES = 8 * 1024 * 1024;
 
 // Never application state: git internals and our own artifacts.
-const ALWAYS_SKIP = /(^|\/)(\.git|\.product|\.skill-runs)(\/|$)/;
+const ALWAYS_SKIP = /(^|\/)(\.git|\.product)(\/|$)/;
+// Our own run-log files, root only and exactly these shapes (a nested .skill-runs or any other file in it is application state).
+const RUNLOG = /^\.skill-runs\/(\.gitignore|[\w.-]+\.jsonl)$/;
 // Bulk build/dependency/cache folders. Skipped only for UNTRACKED files: anything git tracks is application
 // source, even when it lives in a folder that happens to be called build/ or dist/.
 const BULK = /(^|\/)(node_modules|\.venv|venv|__pycache__|dist|build|out|target|coverage|vendor|\.next|\.nuxt|\.cache|\.turbo|\.parcel-cache|\.gradle|\.terraform|\.tox|\.mypy_cache|\.pytest_cache|\.idea|\.vscode)(\/|$)/;
@@ -18,8 +20,8 @@ function listFiles(dir) {
     const run = (args) => execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'ls-files', '-z', ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }).toString('utf8').split('\0').filter(Boolean);
     // tracked files always count; untracked and ignored files (local secrets/config are application state too)
     // count unless they sit in bulk build/dependency directories.
-    const tracked = run(['-c']).filter((f) => !ALWAYS_SKIP.test(f));
-    const others = [...run(['-o', '--exclude-standard']), ...run(['-o', '-i', '--exclude-standard'])].filter((f) => !ALWAYS_SKIP.test(f) && !BULK.test(f));
+    const tracked = run(['-c']).filter((f) => !ALWAYS_SKIP.test(f)); // a tracked file is application source, even under .skill-runs
+    const others = [...run(['-o', '--exclude-standard']), ...run(['-o', '-i', '--exclude-standard'])].filter((f) => !ALWAYS_SKIP.test(f) && !RUNLOG.test(f) && !BULK.test(f));
     return [...new Set([...tracked, ...others])];
   } catch {
     const acc = [];
@@ -31,7 +33,7 @@ function listFiles(dir) {
         else if (e.isFile()) acc.push(r);
       }
     })(dir, '');
-    return acc;
+    return acc.filter((f) => !RUNLOG.test(f));
   }
 }
 

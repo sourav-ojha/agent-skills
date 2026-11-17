@@ -15,11 +15,12 @@ const opt = { skillsDir: [] };
 for (let i = 1; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--json') opt.json = true;
+  else if (a === '--no-notes') opt.noNotes = true;
   else if (a === '--skills-dir') opt.skillsDir.push(argv[++i]);
   else if (a.startsWith('--')) opt[a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = argv[++i];
 }
 const die = (m) => { console.error(`si: ${m}`); process.exit(1); };
-if (!['inventory', 'runs', 'report', 'export'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--json]');
+if (!['inventory', 'runs', 'report', 'export'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--no-notes] [--json]');
 const home = os.homedir();
 const projectsDir = path.resolve(opt.projectsDir || path.join(home, '.claude', 'projects'));
 const skillDirs = (opt.skillsDir.length ? opt.skillsDir : [path.join(home, '.claude', 'skills')]).map((d) => path.resolve(d));
@@ -68,20 +69,29 @@ function runRows(sessions) {
   return rows;
 }
 
+// Print, or write to --out (never through a symlink, owner-only).
+function emit(text) {
+  if (!opt.out) { console.log(text); return; }
+  const f = path.resolve(opt.out);
+  try { if (fs.lstatSync(f).isSymbolicLink()) die('--out is a symlink; refusing to write through it'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  fs.writeFileSync(f, text + '\n', { mode: 0o600 });
+  console.log(`wrote ${path.basename(f)}`);
+}
+
 function exportBundle() {
   const dir = path.resolve(opt.dir || '.');
   const rl = path.join(dir, '.skill-runs');
   const files = fs.existsSync(rl) ? fs.readdirSync(rl).filter((f) => f.endsWith('.jsonl')) : [];
   if (!files.length) { console.log('no run logs found in this project (.skill-runs is empty). Run a skill first, then export.'); return; }
   const events = files.flatMap((f) => parseRunLog(fs.readFileSync(path.join(rl, f), 'utf8')).events);
-  const runs = summarizeRuns(events);
+  const runs = summarizeRuns(events, { notes: !opt.noNotes });
   // Transcript cost for this project only: transcript folders are the project path with non-alphanumerics replaced by "-".
   const mine = dir.replace(/[^A-Za-z0-9]/g, '-');
   const cost = fs.existsSync(path.join(projectsDir, mine))
     ? loadSessions(mine).flatMap((s) => windows(s).filter((w) => w.skill !== '(none)').map((w) => ({ skill: w.skill, date: s.date, tokens: w.tokens, wallMin: Number(min(w.wallMs)), toolErrors: w.toolErrors, repeatedReads: w.repeatedReads })))
     : [];
-  if (opt.json) { console.log(JSON.stringify({ runs, cost }, null, 2)); return; }
-  const L = ['# Skill run bundle (redacted)', '', 'Metadata-only run logs plus agent self-report. No prompts, code, paths or emails. Bring this file to the skill author.', '', '## Runs', ''];
+  if (opt.json) { emit(JSON.stringify({ runs, cost }, null, 2)); return; }
+  const L = ['# Skill run bundle (redacted)', '', 'Metadata-only run logs plus agent self-report. No prompts, code, paths or emails. Review it, then bring it to the skill author (use --no-notes to leave out the agent self-report).', '', '## Runs', ''];
   for (const r of runs) {
     L.push(`### ${r.skill} (${r.run})`, `- window: ${r.start} .. ${r.end}; commands: ${r.commands}; failed commands: ${r.failedCommands.join(', ') || 'none'}`);
     if (r.skill === 'implementer') L.push(`- tier: ${r.tier || '?'}; input spec: ${r.spec || 'idea'}; tasks passed: ${r.passed}; fix rounds: ${r.fixRounds}; blocked: ${r.blocked}; rulings: ${r.rulings}; delivery: ${r.delivery || 'not reported'}`);
@@ -93,7 +103,7 @@ function exportBundle() {
     L.push('## Transcript cost for these skills', '', '| Skill | Date | In | Out | Cache-read | Min | Tool errors | Repeated reads |', '|---|---|---|---|---|---|---|---|');
     for (const c of cost) L.push(`| ${c.skill} | ${c.date} | ${k(c.tokens.in)} | ${k(c.tokens.out)} | ${k(c.tokens.cacheRead)} | ${c.wallMin} | ${c.toolErrors} | ${c.repeatedReads} |`);
   }
-  console.log(L.join('\n'));
+  emit(L.join('\n'));
 }
 
 if (cmd === 'export') { exportBundle(); process.exit(0); }
