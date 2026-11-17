@@ -2,7 +2,7 @@
 name: skill-insights
 description: Analyze how agent skills actually performed from Claude Code session transcripts, then propose improvements to the skills themselves. Reports per-skill token cost, wall time, tool errors, repeated reads and large outputs, which skills are really used (to prune bloated global skills), and standalone vs combined use. Use when the user wants to improve, audit, compare or clean up skills, asks what skills they use, or brings a run report to review.
 license: MIT
-compatibility: Needs shell and Node.js 20+. Read-only: reads the host's session transcripts; writes nothing unless asked.
+compatibility: "Needs shell and Node.js 20+. Read-only: reads the host's session transcripts; writes nothing unless asked."
 argument-hint: "[inventory | report | runs --skill <name> | review <report file>]"
 metadata:
   version: "0.2.0"
