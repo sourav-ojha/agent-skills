@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+// Fake `gh` for delivery-orchestrator tests. State lives in $FAKE_GH_STATE (JSON); real git does the merging.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+const sp = process.env.FAKE_GH_STATE;
+const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+const args = process.argv.slice(2);
+st.calls.push(args);
+const save = () => fs.writeFileSync(sp, JSON.stringify(st, null, 2));
+const out = (o) => { save(); console.log(typeof o === 'string' ? o : JSON.stringify(o)); process.exit(0); };
+const fail = (m, code = 1) => { save(); console.error(m); process.exit(code); };
+const git = (cwd, ...a) => spawnSync('git', a, { cwd, encoding: 'utf8' });
+const flag = (n) => { const i = args.indexOf(n); return i === -1 ? undefined : args[i + 1]; };
+const find = (x) => st.prs.find((p) => String(p.number) === String(x) || p.head === x);
+const headSha = (p) => git(st.origin, 'rev-parse', `refs/heads/${p.head}`).stdout.trim();
+
+const pushCommit = (branch, msg) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fakepush-'));
+  git(os.tmpdir(), 'clone', '-q', st.origin, tmp);
+  git(tmp, 'config', 'user.email', 'b@x'); git(tmp, 'config', 'user.name', 'bot');
+  git(tmp, 'checkout', '-q', branch);
+  git(tmp, 'commit', '-q', '--allow-empty', '-m', msg);
+  git(tmp, 'push', '-q', 'origin', branch);
+};
+
+const [a, b] = args;
+if (a === 'repo' && b === 'view') out({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'main' } });
+if (a === 'pr' && b === 'list') { const h = flag('--head'); out([...(st.cross || []).filter((p) => p.head === h), ...st.prs.filter((p) => p.head === h && p.state === 'OPEN').map((p) => ({ number: p.number, url: p.url, isCrossRepository: false }))]); }
+if (a === 'pr' && b === 'create') {
+  const p = { number: st.prs.length + 1, head: flag('--head'), base: flag('--base'), title: flag('--title'), state: 'OPEN', draft: false, mergeState: 'CLEAN' };
+  p.url = `https://github.com/o/r/pull/${p.number}`;
+  st.prs.push(p); out(p.url);
+}
+if (a === 'pr' && b === 'view') {
+  const p = find(args[2]); if (!p) fail('no pull request found');
+  if (p.mergeStates?.length) p.mergeState = p.mergeStates.length > 1 ? p.mergeStates.shift() : p.mergeStates[0];
+  out({ number: p.number, url: p.url, state: p.state, isDraft: p.draft, isCrossRepository: false, autoMergeRequest: p.autoMerge ? { enabledBy: 'x' } : null, mergeStateStatus: p.mergeState, headRefOid: p.state === 'OPEN' ? headSha(p) : p.headSha, headRefName: p.head, baseRefName: p.base, mergeCommit: p.mergeSha ? { oid: p.mergeSha } : null });
+}
+if (a === 'pr' && b === 'checks') {
+  const p = find(args[2]);
+  if (args.includes('--required')) out(st.required || []);
+  if (st.noChecks) fail(`no checks reported on the '${p.head}' branch`);
+  if (st.bump > 0) { st.bump--; pushCommit(p.head, 'bump'); }
+  const q = st.checkQueue || [];
+  const cur = q.length > 1 ? q.shift() : q[0] || [];
+  out(cur);
+}
+if (a === 'pr' && b === 'update-branch') { const p = find(args[2]); p.mergeState = 'CLEAN'; pushCommit(p.head, 'Merge branch main into branch'); out(''); }
+if (a === 'pr' && b === 'merge' && args.includes('--disable-auto')) { find(args[2]).autoMerge = false; out(''); }
+if (a === 'pr' && b === 'merge') {
+  const p = find(args[2]);
+  if (st.mergeRefuse) fail(st.mergeRefuse);
+  if (st.mergeQueue) { p.autoMerge = true; out(''); }
+  const want = flag('--match-head-commit');
+  if (want && want !== headSha(p)) fail('head commit does not match');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fakemerge-'));
+  git(os.tmpdir(), 'clone', '-q', st.origin, tmp);
+  git(tmp, 'config', 'user.email', 'b@x'); git(tmp, 'config', 'user.name', 'bot');
+  git(tmp, 'checkout', '-q', p.base);
+  const m = git(tmp, 'merge', '--squash', `origin/${p.head}`);
+  if (m.status !== 0) fail('merge conflict');
+  git(tmp, 'commit', '-q', '-m', `${p.title} (#${p.number})`);
+  git(tmp, 'push', '-q', 'origin', p.base);
+  p.mergeSha = git(tmp, 'rev-parse', 'HEAD').stdout.trim();
+  p.headSha = headSha(p);
+  p.state = 'MERGED';
+  if (args.includes('--delete-branch')) git(st.origin, 'branch', '-D', p.head);
+  if (st.mergeNonzeroAfter) fail('failed to delete local branch');
+  out('');
+}
+fail(`fake gh: unhandled ${args.join(' ')}`);

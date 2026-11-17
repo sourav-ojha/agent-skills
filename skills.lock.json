@@ -35,6 +35,11 @@
       "origin": "imported",
       "path": "commands/pr-review.md"
     },
+    "delivery-orchestrator": {
+      "kind": "skill",
+      "origin": "authored",
+      "path": "skills/delivery-orchestrator"
+    },
     "executing-plans": {
       "kind": "skill",
       "origin": "vendored",

@@ -3,7 +3,7 @@ name: implementer
 description: Implement an approved feature spec or a raw idea with expert roles (architect, software engineer, QA, reviewer) chosen by size and risk, using test-driven, acceptance-criteria-driven development, a tracked task ledger and parallel work where files do not overlap. Use when asked to build, implement or deliver a feature, fix, or spec (including product-intelligence feature specs). Commits on a feature branch; never pushes unless asked.
 license: MIT
 compatibility: Needs file read/write, shell, git. Node.js 20+ for the ledger helper (core/scripts/impl.mjs). Sub-agents optional with graceful fallback.
-argument-hint: "[<spec path> | <idea>] [--no-tdd] [--pr]"
+argument-hint: "[<spec path> | <idea>] [--no-tdd] [--pr] [--unattended] [--name <slug>]"
 metadata:
   version: "0.1.0"
   category: engineering
@@ -30,6 +30,13 @@ only the lead runs `impl` (no locking) and never commits `.implementation/`.
 6. **Work on a feature branch.** Commit small and often. Never push, merge or open a PR unless the user asked in this run (`--pr`).
 7. **Never expose secrets**; never install dependencies, deploy or change infra unless the spec requires it and the user agreed.
 8. **Do not claim what did not happen**: no independent review without a separate reviewer; no sub-agent results you did not receive.
+
+## Unattended mode (`--unattended`, set by an orchestrator such as delivery-orchestrator)
+
+No person is available to answer, so nothing may wait for one, and nothing that needs a person may be guessed:
+- Plan approval (T2/T3) is not awaited: record the plan as a ruling (`impl ruling`) and proceed. The spec was already approved upstream.
+- Every "stop and ask" case under Decisions and stops (destructive or security-sensitive action, side effect outside the worktree, user-challenge decision, spec conflict, task blocked after 3 fix rounds) ends the run instead: leave the work committed, report `BLOCKED` with the exact question, and do not continue on a guess.
+- Use `--name <slug>` as the ledger name when given. Never push, merge or open a PR, whatever else is asked (the orchestrator owns that). Still do the full close-out in the spec.
 
 ## Input
 
