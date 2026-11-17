@@ -50,3 +50,5 @@ Codex changes quickly; if a path or key is not picked up, check `https://develop
 ## Recommended approval settings (gates)
 
 Use an approval policy that prompts before running shell commands, and decline `pi.mjs decide`, `approve-product`, `reopen-product` and `confirm-product` unless you just made that decision in chat. For a stricter barrier set `gates.human_confirmation` to `"tty"` in `.product/config.json`: those commands then refuse to run unless a person types `yes` in an interactive terminal, so you run them yourself.
+
+For `full auto` (unattended), the `approve-product` ask rule above will pause the run at Gate 1. Either answer that one prompt, or keep the rule only for `decide` and rely on the recorded delegation (`--delegated`, shown in `pi status`). Never allow-list `decide`: opportunity decisions must stay yours.

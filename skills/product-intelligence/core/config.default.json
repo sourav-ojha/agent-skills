@@ -20,10 +20,13 @@
   },
   "research": {
     "max_competitors_per_category": 5,
-    "max_parallel_agents": 4
+    "max_parallel_agents": 4,
+    "widen_competitor_multiplier": 2,
+    "widen_target_candidates": 10
   },
   "gates": {
-    "human_confirmation": "chat"
+    "human_confirmation": "chat",
+    "allow_delegated_approval": true
   },
   "models": {
     "claude-code": { "reasoning": "opus", "standard": "sonnet", "fast": "haiku" },

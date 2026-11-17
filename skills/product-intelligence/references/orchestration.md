@@ -58,4 +58,4 @@ except through the research queries needed for the task, which must not include 
 
 ## Model and cost hygiene
 
-Prefer `fast`/`standard` tiers for collection. Do not re-run research whose evidence is still fresh. Cap competitors at `research.max_competitors_per_category`.
+Prefer `fast`/`standard` tiers for collection. Do not re-run research whose evidence is still fresh, unless the user said `override` or `widen` (see [run-modes.md](run-modes.md)). Cap competitors at `research.max_competitors_per_category`.
