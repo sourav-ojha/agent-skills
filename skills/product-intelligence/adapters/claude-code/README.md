@@ -58,3 +58,5 @@ The skill runs `pi decide` / `pi approve-product` only after you decide in chat,
 ```
 
 For a stricter barrier set `gates.human_confirmation` to `"tty"` in `.product/config.json` and run those four commands yourself in a terminal.
+
+For `full auto` (unattended), the `approve-product` ask rule above will pause the run at Gate 1. Either answer that one prompt, or keep the rule only for `decide` and rely on the recorded delegation (`--delegated`, shown in `pi status`). Never allow-list `decide`: opportunity decisions must stay yours.

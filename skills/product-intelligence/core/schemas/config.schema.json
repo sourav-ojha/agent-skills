@@ -37,14 +37,17 @@
       "additionalProperties": false,
       "properties": {
         "max_competitors_per_category": { "type": "integer", "minimum": 1 },
-        "max_parallel_agents": { "type": "integer", "minimum": 1 }
+        "max_parallel_agents": { "type": "integer", "minimum": 1 },
+        "widen_competitor_multiplier": { "type": "integer", "minimum": 1 },
+        "widen_target_candidates": { "type": "integer", "minimum": 1 }
       }
     },
     "gates": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "human_confirmation": { "type": "string", "enum": ["chat", "tty"] }
+        "human_confirmation": { "type": "string", "enum": ["chat", "tty"] },
+        "allow_delegated_approval": { "type": "boolean" }
       }
     },
     "models": {

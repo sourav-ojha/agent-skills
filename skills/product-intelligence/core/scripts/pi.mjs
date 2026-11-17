@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import tty from 'node:tty';
 import { splitFrontmatter, setFrontmatter } from './lib/fm.mjs';
-import { productHash, appendHistory } from './lib/product.mjs';
+import { productHash, appendHistory, parseHistory } from './lib/product.mjs';
 import { parseRegistry, parseLog, updateRow, appendLog, nextId, parseDetails, contentDigest, logIntegrityErrors } from './lib/registry.mjs';
 import { computeScore, computeTier, parseRatings } from './lib/score.mjs';
 import { loadConfig, readJson, CORE_DIR } from './lib/config.mjs';
@@ -118,6 +118,8 @@ function cmdStatus() {
       status: data.status,
       revision: Number(data.revision || 0),
       approved_at: data.approved_at || null,
+      approved_by: data.approved_by || null,
+      approved_by_delegation: data.status === 'approved' ? /^delegated \(auto run\)/.test(parseHistory(t).filter((h) => h.action === 'approved' || h.action === 're-approved').pop()?.note || '') : null,
       last_reviewed: data.last_reviewed || null,
       modified_since_approval: data.status === 'approved' ? data.content_hash !== productHash(t) : null,
       review_age_days: data.last_reviewed ? daysBetween(data.last_reviewed, today) : null,
@@ -147,7 +149,7 @@ function cmdStatus() {
   else if (o.awaiting_decision.length) info.next = 'await user decision on proposed opportunities';
   else if (o.approved_without_spec.length) info.next = 'handoff';
   else if (o.research_age_days !== null && o.research_age_days > config.freshness.market_refresh_days) info.next = 'refresh';
-  else info.next = 'opportunities | feature <idea> | refresh';
+  else info.next = 'opportunities | feature <idea> | refresh | research widen | full auto';
   out(info);
 }
 
@@ -161,14 +163,20 @@ function cmdApproveProduct() {
   if (ph.length) die(`PRODUCT.md still contains placeholder-like text on body lines ${ph.slice(0, 5).join(', ')} (counted from the first line after the frontmatter). Flagged: {{...}}, <<...>>, TODO, TBD, FIXME, lorem ipsum, even inside prose: rephrase (e.g. "open to-do comments") or remove.`);
   const pre = validateProject(dir, { today }).errors.filter((e) => e.startsWith('PRODUCT.md'));
   if (pre.length) die(`PRODUCT.md is not valid, refusing to approve:\n  ${pre.join('\n  ')}`);
-  const note = optNote(false);
+  let note = optNote(false);
+  if (flags.delegated) {
+    // Autonomous ("full auto") runs only: the user's own command delegated Gate 1. Recorded as such, never as a personal approval.
+    if (loadConfig(dir).config.gates?.allow_delegated_approval === false) die('gates.allow_delegated_approval is false: the user must approve PRODUCT.md themselves.');
+    if (!note) die('--delegated needs --note "<the confidence review: why this was safe to approve without the user>"');
+    note = `delegated (auto run): ${note}`.slice(0, 400);
+  }
   confirmHuman(`Approve PRODUCT.md as revision ${Number(data.revision || 0) + 1}, recorded for ${JSON.stringify(by)}?`);
   const revision = Number(data.revision || 0) + 1;
   t = appendHistory(t, { revision, date: today, by, action: data.approved_at ? 're-approved' : 'approved', note });
   t = setFrontmatter(t, { status: 'approved', revision, approved_by: by, approved_at: today, last_reviewed: today, content_hash: productHash(t) });
   fs.writeFileSync(p, t);
   const v = validateProject(dir, { today });
-  out({ approved: true, revision, validation_errors: v.errors });
+  out({ approved: true, delegated: !!flags.delegated, revision, validation_errors: v.errors });
   if (v.errors.length) process.exitCode = 1;
 }
 
@@ -356,6 +364,8 @@ usage: node pi.mjs <command> [--dir <project>] [flags]
   status                          state, approvals, freshness, suggested next step
   init [--registry]               create .product/ from templates (draft)
   approve-product --by NAME       record user approval + content hash (only after the user confirmed in chat)
+  approve-product --by NAME --delegated --note "<confidence review>"
+                                  "full auto" runs only: records Gate 1 as delegated by the user's command (never used for opportunity decisions)
   reopen-product  --by NAME       make approved PRODUCT.md editable again (logged)
   confirm-product --by NAME       record that an approved, unchanged PRODUCT.md was re-checked (resets the review age)
   decide OPP-ID approve|reject|defer|research|modify --by NAME [--note ...]
@@ -370,4 +380,5 @@ usage: node pi.mjs <command> [--dir <project>] [flags]
   config                          show effective configuration`);
   process.exit(cmd && cmd !== 'help' ? 1 : 0);
 }
+if (flags.delegated && cmd !== 'approve-product') die('--delegated applies only to approve-product in an autonomous run; opportunity decisions and every other gate always come from the user\'s own message.');
 try { commands[cmd](); } catch (e) { die(e.message); }

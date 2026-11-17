@@ -4,6 +4,11 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (run modes)
+- `widen` modifier: broader competitor reach (`research.widen_competitor_multiplier`), new source types, a second discovery pass targeting `research.widen_target_candidates` candidates examined. Admission test and confidence caps unchanged.
+- `override` modifier: rerun regardless of freshness; approvals are not reset. (Freshness was never enforced in code; the agent could mistake fresh research for "nothing to do".)
+- `full auto`: unattended run with a confidence review per phase, `.product/attention.md` queue, one final report and decision sheet. Gate 1 can be approved by recorded delegation (`approve-product --delegated --note`, shown in `pi status` as `approved_by_delegation`); opportunity decisions are never delegated and the helper refuses `--delegated` anywhere else. Controlled by `gates.allow_delegated_approval` (default true); `human_confirmation: tty` still requires a person.
+
 ### Fixed (third independent review)
 - `gates.human_confirmation: "tty"` now works from a real terminal (the earlier build never accepted "yes"); it is documented as a deterrent, not a boundary.
 - `decide` refuses to append to a Decision Log that already fails its integrity check, so a damaged log cannot be made to look legitimate.

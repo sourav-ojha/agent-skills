@@ -41,7 +41,7 @@ Codex:        $product-intelligence init
 Plain text:   "Understand this product and tell me who our competitors are"
 ```
 
-Commands: `init` · `research` · `opportunities` · `feature <idea>` · `refresh` · `handoff` · `full`. Walkthrough, artifacts, configuration and limitations: [docs/usage.md](docs/usage.md).
+Commands: `init` · `research` · `opportunities` · `feature <idea>` · `refresh` · `handoff` · `full`. Modifiers: `widen` (more candidate ideas), `override` (rerun even if fresh), `auto` (unattended `full` that stops once for your decisions). Walkthrough, artifacts, configuration and limitations: [docs/usage.md](docs/usage.md).
 
 Output in your project:
 

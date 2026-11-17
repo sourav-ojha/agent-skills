@@ -23,6 +23,17 @@ State lives in `.product/` in your project. Every run starts with `pi status`, s
 | handoff | `/product-intelligence handoff` | `$product-intelligence handoff` | "write specs for the approved features" |
 | full | `/product-intelligence full` | `$product-intelligence full` | "run the full product intelligence workflow" |
 
+### Modifiers: widen, override, auto
+
+| Say | Effect |
+|---|---|
+| `research widen` / `opportunities widen` | Deeper and broader: up to 2× competitors per category, new source types and queries, a second discovery pass over all six directions aiming to examine 10+ candidates. The admission test and confidence caps are unchanged, so you get more *candidates examined*, not padded weak ones. |
+| `full override` (or `<command> override`) | Run again even if the work already ran recently. Freshness is advisory; approvals and past decisions are not reset. |
+| `full auto` | Unattended `full`. A confidence review runs after every phase; routine calls are resolved for you; PRODUCT.md is approved **by recorded delegation**; whatever needs you goes to `.product/attention.md`. It stops once at the end with a report and a decision sheet. You approve, reject or defer each opportunity in one reply; opportunity decisions are never delegated. |
+| `full auto widen override` | All three combined: the "go find me more ideas and don't bother me" run. |
+
+To get more ideas than a normal run produced: `research widen`, then `opportunities widen` (or `full auto widen override`). Details: [run-modes.md](../skills/product-intelligence/references/run-modes.md).
+
 Codex does not substitute arguments into skills; the text after the skill name is part of your prompt and the skill routes on its first word.
 
 ## A typical session
@@ -71,6 +82,8 @@ Create `.product/config.json` only for what you change; omitted keys use `core/c
     "tiers": { "recommend_min": 75, "consider_min": 55 }
   },
   "freshness": { "source_max_age_days": 120, "market_refresh_days": 14 },
+  "research": { "max_competitors_per_category": 6, "widen_competitor_multiplier": 2, "widen_target_candidates": 12 },
+  "gates": { "allow_delegated_approval": true },
   "models": {
     "claude-code": { "reasoning": "opus", "standard": "sonnet", "fast": "haiku" },
     "codex": { "reasoning": null, "standard": null, "fast": null },
