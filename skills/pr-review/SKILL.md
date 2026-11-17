@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Quick single-pass pull request review against the target project's own conventions, done inline without sub-agents. Fetches the PR with gh CLI (or a GitHub MCP), infers project rules from CLAUDE.md/AGENTS.md/lint config/neighbouring code, then reports correctness, security, convention, over-engineering, and test-quality findings as bullet points with a summary and an explicit verdict. Use only when the user explicitly asks for a quick, light, shallow, or fast review, or invokes /pr-review. For any other PR review request — "review PR #N", a pasted PR URL, "is this ready to merge" — use the `pr-review-orchestrator` skill instead, which establishes PR intent and verifies its findings.
+description: "Quick single-pass pull request review against the target project's own conventions, done inline without sub-agents. Fetches the PR with gh CLI (or a GitHub MCP), infers project rules from CLAUDE.md/AGENTS.md/lint config/neighbouring code, then reports correctness, security, convention, over-engineering, and test-quality findings as bullet points with a summary and an explicit verdict. Use only when the user explicitly asks for a quick, light, shallow, or fast review, or invokes /pr-review. For any other PR review request — \"review PR #N\", a pasted PR URL, \"is this ready to merge\" — use the `pr-review-orchestrator` skill instead, which establishes PR intent and verifies its findings."
 user-invocable: true
 ---
 

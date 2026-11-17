@@ -1,6 +1,6 @@
 ---
 name: phased-review
-description: Orchestrate phase-by-phase implementation with code review loops. Usage: /phased-review <plan-path>
+description: "Orchestrate phase-by-phase implementation with code review loops. Usage: /phased-review <plan-path>"
 ---
 
 # Phased Implementation Review Workflow
