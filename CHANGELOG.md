@@ -4,6 +4,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (skill-insights 0.1.0)
+- New skill `skill-insights`: read-only analyzer over Claude Code transcripts. `si inventory` (real usage per skill, installed-but-unused), `si runs`, `si report` (tokens, wall time, tool errors, repeated reads, large outputs per skill). Detects both model-invoked and slash-command skill runs. Output is redacted: no paths, project names or message text.
+
 ### Fixed (implementer skill)
 - Delivery status is now written back. Close-out records a `## Delivery log` row and `delivery: none|partial|complete` in the spec, sets `status: implemented` plus `pi transition ... Implemented` only when every criterion is delivered, and lists non-code pending items. New `impl report` derives delivered vs pending criteria from the ledger. The skill also says where the helper lives and to stop (T2/T3) if it is missing.
 
