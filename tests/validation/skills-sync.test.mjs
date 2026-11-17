@@ -127,3 +127,34 @@ test('AC7 unsafe lock paths and unsupported repo URLs are rejected', () => {
   const r = skills(emptyRoot(), 'vendor', 'x', '--repo', 'ftp://example.com/x.git', '--ref', 'v1', '--path', 'skills/x', '--license', 'MIT');
   assert.notEqual(r.code, 0); assert.match(r.out, /url|scheme/i);
 });
+
+test('SEC vendor refuses upstream symlinks: path component, source root and LICENSE (no local file read into the repo)', () => {
+  const victim = tmpDir('victim-'); w(victim, 'secret.txt', 'TOPSECRET');
+  const mk = (fn) => { const up = tmpDir('up-'); git(up, 'init', '-q', '-b', 'main'); w(up, 'LICENSE', 'MIT\n'); w(up, 'skills/ok/SKILL.md', 'x'); fn(up); git(up, 'add', '-A'); git(up, 'commit', '-q', '-m', 'c'); git(up, 'tag', 'v1'); return up; };
+  const cases = {
+    root: mk((up) => fs.symlinkSync(victim, path.join(up, 'skills/evil'))),
+    component: mk((up) => { fs.symlinkSync(victim, path.join(up, 'linked')); }),
+    license: mk((up) => { fs.rmSync(path.join(up, 'LICENSE')); fs.symlinkSync(path.join(victim, 'secret.txt'), path.join(up, 'LICENSE')); }),
+  };
+  const run = (up, p) => { const root = emptyRoot(); const r = skills(root, 'vendor', 'x', '--repo', `file://${up}`, '--ref', 'v1', '--path', p, '--license', 'MIT'); return { r, root }; };
+  for (const [k, up, p] of [['root', cases.root, 'skills/evil'], ['component', cases.component, 'linked'], ['license', cases.license, 'skills/ok']]) {
+    const { r, root } = run(up, p);
+    assert.notEqual(r.code, 0, `${k}: ${r.out}`);
+    const all = spawnSync('grep', ['-r', 'TOPSECRET', root], { encoding: 'utf8' }).stdout;
+    assert.equal(all, '', `${k} leaked`);
+    assert.deepEqual(Object.keys(lock(root).skills), [], `${k} wrote a lock entry`);
+  }
+});
+
+test('SEC project bootstrap refuses a symlinked .claude, skills dir or manifest (user files untouched)', () => {
+  const root = bootRoot(); const victim = tmpDir('victim-'); w(victim, 'keep.txt', 'KEEP');
+  const p1 = tmpDir('proj-'); fs.symlinkSync(victim, path.join(p1, '.claude'));
+  assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p1).code, 0);
+  assert.deepEqual(fs.readdirSync(victim), ['keep.txt']);
+  const p2 = tmpDir('proj-'); fs.mkdirSync(path.join(p2, '.claude'), { recursive: true }); fs.symlinkSync(victim, path.join(p2, '.claude/skills'));
+  assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p2).code, 0);
+  assert.deepEqual(fs.readdirSync(victim), ['keep.txt']);
+  const p3 = tmpDir('proj-'); fs.mkdirSync(path.join(p3, '.claude'), { recursive: true }); fs.symlinkSync(path.join(victim, 'keep.txt'), path.join(p3, '.claude/.agent-skills-manifest.json'));
+  assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p3).code, 0);
+  assert.equal(fs.readFileSync(path.join(victim, 'keep.txt'), 'utf8'), 'KEEP');
+});

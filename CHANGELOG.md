@@ -7,6 +7,7 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 ### Added (arsenal: vendoring and bootstrap)
 - `skills.lock.json` plus `scripts/skills.mjs` (`status`, `check`, `vendor`, `update`, `accept`, `bootstrap`): pinned, license-tracked vendoring with a dry-run-first `update` and a safe `bootstrap` that never overwrites unmanaged items or follows symlinks.
 - Ported from the global skills, chosen by real usage: autonomous, pr-review, pr-review-orchestrator, phased-review, retro, and the deep-pr-review and pr-review commands (imported as-is). Vendored a Superpowers subset (MIT, v7.0.2, namespace rewritten): writing-plans, executing-plans, subagent-driven-development, brainstorming, finishing-a-development-branch, systematic-debugging, test-driven-development, requesting/receiving-code-review, using-git-worktrees, using-superpowers, verification-before-completion. graphify and security-audit are pin-only (external).
+- Hardened against hostile upstreams and projects: `vendor`/`update` refuse symlinks anywhere on the source path and a non-regular LICENSE (validated before anything is written); project-scope `bootstrap` refuses a symlinked `.claude`, `skills`, `commands` or manifest, and writes the manifest by temp file + rename.
 - Repo validator reads the lock: imported and vendored skills get spec-level checks only, and lock consistency (entries, hashes, licenses) is enforced.
 
 ### Added (run telemetry)
