@@ -5,6 +5,7 @@ Reusable, independently installable skills for AI coding agents. They follow the
 | Skill | What it does | Version |
 |---|---|---|
 | [`product-intelligence`](skills/product-intelligence/SKILL.md) | Understands your product, researches the market with cited evidence, finds and prioritizes opportunities, and writes implementation-ready feature specs, with human approval at every decision | 0.1.0 |
+| [`implementer`](skills/implementer/SKILL.md) | Implements an approved spec or a raw idea with architect, engineer, QA and reviewer roles chosen by size and risk: TDD, acceptance-criteria driven, tracked task ledger, parallel work on disjoint files | 0.1.0 |
 
 ## Product Intelligence
 
@@ -22,6 +23,18 @@ Reusable, independently installable skills for AI coding agents. They follow the
 It never edits application code, implements features, opens application PRs or deploys.
 
 **Architecture** — agent-neutral core (method, schemas, validators, role definitions, helper CLI) + thin adapters (Claude Code, Codex). Approval gates, lifecycle, scoring and source protection are checked by a zero-dependency Node helper and validator, not just by instructions. The gates are tamper-evident rather than tamper-proof: an agent with a shell can still run the commands, so the real gate is you (see [usage](docs/usage.md#helper-cli)) Details: [docs/architecture.md](docs/architecture.md).
+
+## Implementer
+
+Takes a feature spec (for example from product-intelligence) or a raw idea and delivers it on a feature branch: the lead triages the work into
+tiers T0-T3, uses only the roles needed, plans tasks as a dependency graph (`.implementation/<name>/tasks.json`, edited via `impl.mjs`),
+runs independent tasks in parallel worktrees, enforces TDD and acceptance criteria, keeps tests few and valuable, and gates "done" on recorded
+evidence. Claude Code only for now. See [`adapters/claude-code/README.md`](skills/implementer/adapters/claude-code/README.md) and
+[`docs/superpowers/specs/2026-11-17-implementer-design.md`](docs/superpowers/specs/2026-11-17-implementer-design.md).
+
+```bash
+npx skills add sourav-ojha/agent-skills --skill implementer -a claude-code
+```
 
 ## Install (only this skill)
 

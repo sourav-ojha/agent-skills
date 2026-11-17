@@ -4,6 +4,12 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (implementer skill 0.1.0)
+- New skill `implementer`: tier-triaged (T0-T3) multi-role implementation (architect, software-engineer, QA, reviewer, optional security/database lenses), TDD and acceptance-criteria driven, few high-value tests with pruning, plan sign-off for T2/T3, commits on a feature branch.
+- `core/scripts/impl.mjs`: dependency-graph task ledger with file-ownership-aware parallel batches; only a recorded command with exit 0 and criteria mapped to tests can mark a task passed. Rulings log.
+- `install-agents.mjs` generates Claude Code agents (`impl-*.md`) from `roles.json`; read-only roles get no edit or shell tools.
+- Repo validator: adapter-sync check applies only to skills that export `renderAll`.
+
 ### Fixed (third independent review)
 - `gates.human_confirmation: "tty"` now works from a real terminal (the earlier build never accepted "yes"); it is documented as a deterrent, not a boundary.
 - `decide` refuses to append to a Decision Log that already fails its integrity check, so a damaged log cannot be made to look legitimate.
