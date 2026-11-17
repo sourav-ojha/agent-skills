@@ -4,6 +4,11 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (arsenal: vendoring and bootstrap)
+- `skills.lock.json` plus `scripts/skills.mjs` (`status`, `check`, `vendor`, `update`, `accept`, `bootstrap`): pinned, license-tracked vendoring with a dry-run-first `update` and a safe `bootstrap` that never overwrites unmanaged items or follows symlinks.
+- Ported from the global skills, chosen by real usage: autonomous, pr-review, pr-review-orchestrator, phased-review, retro, and the deep-pr-review and pr-review commands (imported as-is). Vendored a Superpowers subset (MIT, v7.0.2, namespace rewritten): writing-plans, executing-plans, subagent-driven-development, brainstorming, finishing-a-development-branch, systematic-debugging, test-driven-development, requesting/receiving-code-review, using-git-worktrees, using-superpowers, verification-before-completion. graphify and security-audit are pin-only (external).
+- Repo validator reads the lock: imported and vendored skills get spec-level checks only, and lock consistency (entries, hashes, licenses) is enforced.
+
 ### Added (run telemetry)
 - `pi` and `impl` write a metadata-only run log (`.skill-runs/<skill>.jsonl`, self-ignoring; off with `SKILL_RUNLOG=off`): command, outcome, duration, ids and counts, never prompts, code or free text. `impl` records tier, input spec id, plan size, fix rounds, blocked tasks, rulings count.
 - New `retro` command on both helpers: a short agent self-report (unclear / skipped / improvised / suggest) logged at the end of a run.

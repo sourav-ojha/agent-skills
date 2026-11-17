@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { lockErrors } from './lib/skillsync.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -16,6 +17,12 @@ const CLAUDE_KEYS = ['when_to_use', 'argument-hint', 'arguments', 'disable-model
 // Host-specific tokens that must not leak into the agent-neutral methodology.
 const HOST_TOKENS = [/AskUserQuestion/, /\bTask tool\b/, /mcp__/, /\$ARGUMENTS/, /\$\{CLAUDE_/, /\.claude\//, /\.codex\//, /\.agents\//, /\/plugin\b/, /CLAUDE\.md/];
 const SECRET_PATTERNS = [/AKIA[0-9A-Z]{16}/, /ghp_[A-Za-z0-9]{30,}/, /sk-[A-Za-z0-9]{32,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/];
+
+// Imported (first-party legacy) and vendored (third-party) skills get the spec-level checks only: they are not written to this repo's
+// host-neutral rules, and vendored content must stay identical to upstream. The lock records which are which.
+const LOCK = safeJsonSync(path.join(REPO, 'skills.lock.json'));
+const relaxed = (name) => ['imported', 'vendored'].includes(LOCK?.skills?.[name]?.origin);
+function safeJsonSync(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 
 class SkipSync extends Error {}
 const results = [];
@@ -61,7 +68,16 @@ async function validateSkill(dirName) {
   for (const k of Object.keys(data)) if (![...SPEC_KEYS, ...CLAUDE_KEYS].includes(k)) S('warn', `unknown frontmatter key "${k}" (not in Agent Skills spec or Claude Code docs)`);
   const lines = text.split('\n').length;
   if (lines > 500) S('error', `SKILL.md is ${lines} lines (keep under 500; move detail to references/)`);
-  if (!data.license) S('warn', 'no license declared');
+  if (!data.license && !relaxed(dirName)) S('warn', 'no license declared');
+
+  if (relaxed(dirName)) {
+    for (const f of walk(dir)) {
+      if (/\.(png|jpg|gif|ico|zip)$/.test(f)) continue;
+      const t = fs.readFileSync(f, 'utf8');
+      for (const re of SECRET_PATTERNS) if (re.test(t)) S('error', `${path.relative(dir, f)}: looks like a secret (${re})`);
+    }
+    return;
+  }
 
   // --- Required files ---
   const need = [
@@ -186,6 +202,7 @@ for (const s of skills) await validateSkill(s);
 
 // --- Repo-level ---
 if (root === path.join(REPO, 'skills')) {
+  for (const e of lockErrors(REPO)) add('lock', 'error', e);
   for (const f of ['README.md', 'LICENSE', 'CONTRIBUTING.md', 'CHANGELOG.md', '.gitignore', 'docs/installation.md', 'docs/architecture.md', 'docs/usage.md', 'docs/development.md']) {
     if (!fs.existsSync(path.join(REPO, f))) add('repo', 'error', `missing ${f}`);
   }

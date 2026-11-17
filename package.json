@@ -12,6 +12,7 @@
     "check": "npm run validate && npm test",
     "agents:generate": "node skills/product-intelligence/core/scripts/install-agents.mjs --generate-defaults",
     "package": "node scripts/package-skill.mjs product-intelligence",
+    "skills": "node scripts/skills.mjs",
     "package:implementer": "node scripts/package-skill.mjs implementer",
     "package:skill-insights": "node scripts/package-skill.mjs skill-insights"
   }

@@ -83,3 +83,21 @@ npm run check    # repo validator + test suite (Node 22+, no dependencies)
 ## Contributing and license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/development.md](docs/development.md). MIT licensed, see [LICENSE](LICENSE). Prior art and attribution: [docs/architecture.md](docs/architecture.md#prior-art-researched-2026-11-16-ideas-only-no-text-or-code-copied).
+
+## Your arsenal on any machine
+
+Everything you rely on lives here and is tracked in [`skills.lock.json`](skills.lock.json): your own skills (`authored`), skills copied in
+from your old global folder (`imported`), third-party skills vendored at a pinned version with their license in `third_party/` (`vendored`),
+and tools only referenced (`external`). Which skills were worth porting was decided from real usage (`skill-insights`).
+
+```bash
+node scripts/skills.mjs bootstrap --scope user      # new machine: install everything into ~/.claude (--dry-run first)
+node scripts/skills.mjs status                      # local edits, missing items, lock problems
+node scripts/skills.mjs check                       # newer upstream versions of vendored skills
+node scripts/skills.mjs update <name> --ref v7.1.0  # show what upstream changed; add --apply to take it
+node scripts/skills.mjs vendor <name> --repo URL --ref TAG --path P --license MIT   # pin a new third-party skill
+```
+
+Bootstrap never overwrites skills it did not install (`--force` moves them aside as `<name>.pre-bootstrap`). Vendored Superpowers skills are
+installed under bare names (`brainstorming`, not `superpowers:brainstorming`; the lock records a transform that rewrites in-text references)
+and do not include the plugin's hooks or agents. If you also keep the Superpowers plugin enabled you will have two copies: pick one.
