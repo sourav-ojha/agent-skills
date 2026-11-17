@@ -4,6 +4,12 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (implementer skill 0.1.0)
+- New skill `implementer`: tier-triaged (T0-T3) multi-role implementation (architect, software-engineer, QA, reviewer, optional security/database lenses), TDD and acceptance-criteria driven, few high-value tests with pruning, plan sign-off for T2/T3, commits on a feature branch.
+- `core/scripts/impl.mjs`: dependency-graph task ledger with file-ownership-aware parallel batches; only a recorded command with exit 0 and criteria mapped to tests can mark a task passed. Rulings log.
+- `install-agents.mjs` generates Claude Code agents (`impl-*.md`) from `roles.json`; read-only roles get no edit or shell tools.
+- Repo validator: adapter-sync check applies only to skills that export `renderAll`.
+
 ### Added (run modes)
 - `widen` modifier: broader competitor reach (`research.widen_competitor_multiplier`), new source types, a second discovery pass targeting `research.widen_target_candidates` candidates examined. Admission test and confidence caps unchanged.
 - `override` modifier: rerun regardless of freshness; approvals are not reset. (Freshness was never enforced in code; the agent could mistake fresh research for "nothing to do".)
