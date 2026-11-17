@@ -17,6 +17,7 @@ const CLAUDE_KEYS = ['when_to_use', 'argument-hint', 'arguments', 'disable-model
 const HOST_TOKENS = [/AskUserQuestion/, /\bTask tool\b/, /mcp__/, /\$ARGUMENTS/, /\$\{CLAUDE_/, /\.claude\//, /\.codex\//, /\.agents\//, /\/plugin\b/, /CLAUDE\.md/];
 const SECRET_PATTERNS = [/AKIA[0-9A-Z]{16}/, /ghp_[A-Za-z0-9]{30,}/, /sk-[A-Za-z0-9]{32,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/];
 
+class SkipSync extends Error {}
 const results = [];
 const safeJson = (p, S) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
 function add(skill, level, msg) { results.push({ skill, level, msg }); }
@@ -108,6 +109,7 @@ async function validateSkill(dirName) {
     }
     try {
       const inst = await import(pathToFileURL(path.join(dir, 'core/scripts/install-agents.mjs')).href);
+      if (typeof inst.renderAll !== 'function') throw new SkipSync(); // skills that generate agents on demand only (no committed adapter copies)
       const { loadConfig } = await import(pathToFileURL(path.join(dir, 'core/scripts/lib/config.mjs')).href);
       const { config } = loadConfig(null);
       for (const f of inst.renderAll(config)) {
@@ -115,7 +117,7 @@ async function validateSkill(dirName) {
         if (!fs.existsSync(p)) S('error', `adapter file missing: adapters/${f.platform}/agents/${f.file}`);
         else if (fs.readFileSync(p, 'utf8') !== f.content) S('error', `adapter file out of sync with roles/config: adapters/${f.platform}/agents/${f.file} (run install-agents.mjs --generate-defaults)`);
       }
-    } catch (e) { S('error', `adapter sync check failed: ${e.message}`); }
+    } catch (e) { if (!(e instanceof SkipSync)) S('error', `adapter sync check failed: ${e.message}`); }
   }
 
   // --- Cross-agent portability: neutral core ---
