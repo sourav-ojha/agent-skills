@@ -13,6 +13,7 @@ import { computeScore, computeTier, parseRatings } from './lib/score.mjs';
 import { loadConfig, readJson, CORE_DIR } from './lib/config.mjs';
 import { saveSnapshot, diffSnapshot, clearSnapshot } from './lib/snapshot.mjs';
 import { validateProject, todayStr } from '../validators/validate-artifacts.mjs';
+import { logEvent, runId } from './lib/runlog.mjs';
 import { daysBetween, findPlaceholders } from './lib/evidence.mjs';
 
 const lifecycle = readJson(path.join(CORE_DIR, 'schemas', 'lifecycle.json'));
@@ -42,6 +43,7 @@ const [cmd, ...rest] = pos;
 const dir = path.resolve(flags.dir || '.');
 const pdir = path.join(dir, '.product');
 const today = todayStr();
+const extra = {}; // metadata for the run log (lib/runlog.mjs): ids and counts only, never content
 const out = (o) => console.log(typeof o === 'string' ? o : JSON.stringify(o, null, 2));
 
 function read(p) { return fs.readFileSync(p, 'utf8'); }
@@ -345,8 +347,16 @@ const commands = {
     if (!d.clean) { console.error('pi: application files changed during research. Report this to the user; do not continue silently.'); process.exitCode = 2; }
     else if (flags.discard) clearSnapshot(dir, flags.tag || 'default');
   },
+  retro() {
+    // Agent self-report of friction with this skill: short, no code or secrets. Exported redacted by skill-insights.
+    const notes = Object.fromEntries(['unclear', 'skipped', 'improvised', 'suggest'].filter((k) => typeof flags[k] === 'string').map((k) => [k, flags[k]]));
+    if (!Object.keys(notes).length) die('retro needs at least one of --unclear, --skipped, --improvised, --suggest');
+    Object.assign(extra, notes);
+    out('retro logged');
+  },
   validate() {
     const v = validateProject(dir, { today });
+    extra.errors = v.errors.length; extra.warnings = v.warnings.length;
     if (flags.json) out(v);
     else {
       for (const e of v.errors) console.log(`ERROR   ${e}`);
@@ -377,8 +387,13 @@ usage: node pi.mjs <command> [--dir <project>] [flags]
   snapshot | verify-clean [--discard] [--tag T]
                                   prove application files were not modified (snapshot at the start of every run that reads the repo; --discard clears it after a clean check)
   validate [--json]               check all .product artifacts
-  config                          show effective configuration`);
+  config                          show effective configuration
+  retro [--unclear T] [--skipped T] [--improvised T] [--suggest T]
+                                  record a short self-report of friction with this skill (run once at the end of a run)`);
   process.exit(cmd && cmd !== 'help' ? 1 : 0);
 }
 if (flags.delegated && cmd !== 'approve-product') die('--delegated applies only to approve-product in an autonomous run; opportunity decisions and every other gate always come from the user\'s own message.');
+const t0 = Date.now();
+if (/^OPP-\d+$/.test(rest[0] || '')) { extra.opp = rest[0]; if (rest[1]) extra[cmd === 'decide' ? 'decision' : 'to'] = rest[1]; }
+process.on('exit', (code) => logEvent(dir, 'product-intelligence', runId('pi', today), { event: cmd, ok: code === 0, ms: Date.now() - t0, ...extra }));
 try { commands[cmd](); } catch (e) { die(e.message); }

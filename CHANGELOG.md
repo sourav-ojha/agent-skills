@@ -4,6 +4,11 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (run telemetry)
+- `pi` and `impl` write a metadata-only run log (`.skill-runs/<skill>.jsonl`, self-ignoring; off with `SKILL_RUNLOG=off`): command, outcome, duration, ids and counts, never prompts, code or free text. `impl` records tier, input spec id, plan size, fix rounds, blocked tasks, rulings count.
+- New `retro` command on both helpers: a short agent self-report (unclear / skipped / improvised / suggest) logged at the end of a run.
+- `si export` (skill-insights 0.2.0): one redacted bundle per project (run summaries, self-report, transcript cost) to bring back for skill improvement.
+
 ### Added (skill-insights 0.1.0)
 - New skill `skill-insights`: read-only analyzer over Claude Code transcripts. `si inventory` (real usage per skill, installed-but-unused), `si runs`, `si report` (tokens, wall time, tool errors, repeated reads, large outputs per skill). Detects both model-invoked and slash-command skill runs. Output is redacted: no paths, project names or message text.
 

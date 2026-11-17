@@ -93,4 +93,6 @@ A spec must never keep saying `ready` after work on it landed. Tell the user: wh
 and assumptions, what is not done or not verified (including non-code follow-ups that wait on a person or on time), and the exact next step (open a PR only if they asked). Status per task and run:
 DONE, DONE_WITH_CONCERNS, or BLOCKED.
 
+**Run record** (once, last): `impl retro --name <slug> --unclear "..." --skipped "..." --improvised "..." --suggest "..."`, at most a sentence each (any field may be omitted; never code, secrets or user data): what was unclear, what you skipped, what you improvised, one improvement. Helper commands are logged automatically (metadata only) to `.skill-runs/`. Tell the user they can bring the run to the skill author with `skill-insights` (`si export`).
+
 Host setup (optional native agents, permissions): [adapters/claude-code/README.md](adapters/claude-code/README.md).

@@ -4,11 +4,11 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', '.product', '.remember', '.DS_Store']);
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.product', '.skill-runs', '.remember', '.DS_Store']);
 const MAX_HASH_BYTES = 8 * 1024 * 1024;
 
 // Never application state: git internals and our own artifacts.
-const ALWAYS_SKIP = /(^|\/)(\.git|\.product)(\/|$)/;
+const ALWAYS_SKIP = /(^|\/)(\.git|\.product|\.skill-runs)(\/|$)/;
 // Bulk build/dependency/cache folders. Skipped only for UNTRACKED files: anything git tracks is application
 // source, even when it lives in a folder that happens to be called build/ or dist/.
 const BULK = /(^|\/)(node_modules|\.venv|venv|__pycache__|dist|build|out|target|coverage|vendor|\.next|\.nuxt|\.cache|\.turbo|\.parcel-cache|\.gradle|\.terraform|\.tox|\.mypy_cache|\.pytest_cache|\.idea|\.vscode)(\/|$)/;

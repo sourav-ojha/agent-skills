@@ -72,7 +72,7 @@ async function validateSkill(dirName) {
     'core/scripts/pi.mjs', 'core/validators/validate-artifacts.mjs', 'core/roles/roles.json', 'agents/openai.yaml',
     'adapters/claude-code/README.md', 'adapters/codex/README.md',
   ];
-  if (dirName === 'skill-insights') for (const f of ['references/metrics.md', 'core/scripts/si.mjs', 'core/scripts/lib/transcripts.mjs', 'core/scripts/lib/analyze.mjs', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
+  if (dirName === 'skill-insights') for (const f of ['references/metrics.md', 'core/scripts/si.mjs', 'core/scripts/lib/transcripts.mjs', 'core/scripts/lib/analyze.mjs', 'core/scripts/lib/runs.mjs', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
   if (dirName === 'implementer') for (const f of ['references/triage.md', 'references/tdd-and-acceptance.md', 'templates/mini-spec.md', 'core/config.default.json', 'core/scripts/impl.mjs', 'core/scripts/lib/ledger.mjs', 'core/scripts/install-agents.mjs', 'core/roles/roles.json', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
   if (dirName === 'product-intelligence') for (const f of need) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
 
