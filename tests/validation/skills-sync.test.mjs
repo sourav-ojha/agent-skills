@@ -176,3 +176,17 @@ test('bootstrap adopts unmanaged copies that are identical to the repo (no --for
   fs.rmSync(path.join(proj, '.claude/skills/foo/.agent-skills-managed'));
   assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', proj).code, 0);
 });
+
+test('SEC bootstrap: symlinked backup folder (--force) and symlinked marker (adopt) never write outside the install folder', () => {
+  const root = bootRoot(); const victim = tmpDir('victim-');
+  const p1 = tmpDir('proj-'); w(p1, '.claude/skills/foo/SKILL.md', 'different');
+  fs.symlinkSync(victim, path.join(p1, '.claude/.agent-skills-backup'));
+  assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p1, '--force').code, 0);
+  assert.deepEqual(fs.readdirSync(victim), []);
+  assert.equal(fs.readFileSync(path.join(p1, '.claude/skills/foo/SKILL.md'), 'utf8'), 'different');
+  const p2 = tmpDir('proj-'); w(p2, '.claude/skills/foo/SKILL.md', fs.readFileSync(path.join(root, 'skills/foo/SKILL.md'), 'utf8'));
+  const target = path.join(victim, 'planted.txt');
+  fs.symlinkSync(target, path.join(p2, '.claude/skills/foo/.agent-skills-managed'));
+  skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p2);
+  assert.ok(!fs.existsSync(target), 'marker written through a symlink');
+});

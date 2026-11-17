@@ -164,6 +164,8 @@ if (cmd === 'status') {
     const st = lst(d); if (st && (st.isSymbolicLink() || !st.isDirectory())) problems.push(`${d} is a symlink or not a directory; refusing to install into a project that redirects it`);
   }
   if (lst(mf)?.isSymbolicLink()) problems.push(`${mf} is a symlink; refusing`);
+  const bkRoot = path.join(base, '.agent-skills-backup');
+  { const st = lst(bkRoot); if (st && (st.isSymbolicLink() || !st.isDirectory())) problems.push(`${bkRoot} is a symlink or not a directory; refusing`); }
   if (problems.length) { problems.forEach((p) => console.error(`skills: ${p}`)); process.exit(1); }
   for (const [n, e] of Object.entries(lock.skills)) {
     if (e.origin === 'external') { plan.push({ n, hint: e.install || `see ${e.source?.repo || 'upstream'}` }); continue; }
@@ -176,6 +178,7 @@ if (cmd === 'status') {
     // An unmanaged copy that is byte-identical to the repo's is simply adopted (marked as managed); anything different needs --force.
     let same = false;
     if (st && !managed) { try { same = e.kind === 'command' ? fs.readFileSync(src).equals(fs.readFileSync(dest)) : treeHash(src) === treeHash(dest); } catch { same = false; } }
+    if (same && lst(path.join(dest, MARKER))) { problems.push(`${n}: ${path.join(dest, MARKER)} exists but does not mark a managed copy (symlink?); refusing`); continue; }
     if (st && !managed && !same && !f.force) { problems.push(`${n}: ${dest} exists, differs from the repo copy and is not managed by agent-skills (use --force to move it aside)`); continue; }
     plan.push({ n, e, src, dest, adopt: same, aside: st && !managed && !same });
   }
@@ -189,7 +192,11 @@ if (cmd === 'status') {
     fs.mkdirSync(path.dirname(p.dest), { recursive: true });
     if (p.adopt) {
       if (p.e.kind === 'command') manifest[p.n] = { from: 'agent-skills' };
-      else fs.writeFileSync(path.join(p.dest, MARKER), JSON.stringify({ name: p.n, from: 'agent-skills' }) + '\n');
+      else { // temp file + rename: replaces the marker entry itself, never writes through a link
+        const t = path.join(p.dest, `${MARKER}.new-${process.pid}`);
+        fs.writeFileSync(t, JSON.stringify({ name: p.n, from: 'agent-skills' }) + '\n', { flag: 'wx' });
+        fs.renameSync(t, path.join(p.dest, MARKER));
+      }
       continue;
     }
     if (p.aside) { // outside skills/ and commands/, so a backed-up skill is never loaded as a duplicate
