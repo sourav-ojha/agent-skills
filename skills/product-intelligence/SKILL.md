@@ -120,3 +120,5 @@ Intermediate agent output is temporary; keep only condensed, cited evidence. Run
 ## Closing every run
 
 `pi verify-clean` (application files untouched) → `pi validate` → tell the user: what was done, what evidence is weak or unknown, whether the review was independent, which agents/models ran, what is waiting on their decision, and the exact next command.
+
+**Run record** (once, last): `pi retro --unclear "..." --skipped "..." --improvised "..." --suggest "..."` with at most a sentence each (any field may be omitted, never include code, secrets or user data): what instruction was unclear, what you skipped, what you improvised, one improvement. Commands are logged automatically (metadata only) to `.skill-runs/`. Tell the user they can bring the run to the skill author with the `skill-insights` skill (`si export`).
