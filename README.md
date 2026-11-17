@@ -6,6 +6,7 @@ Reusable, independently installable skills for AI coding agents. They follow the
 |---|---|---|
 | [`product-intelligence`](skills/product-intelligence/SKILL.md) | Understands your product, researches the market with cited evidence, finds and prioritizes opportunities, and writes implementation-ready feature specs, with human approval at every decision | 0.1.0 |
 | [`implementer`](skills/implementer/SKILL.md) | Implements an approved spec or a raw idea with architect, engineer, QA and reviewer roles chosen by size and risk: TDD, acceptance-criteria driven, tracked task ledger, parallel work on disjoint files | 0.1.0 |
+| [`skill-insights`](skills/skill-insights/SKILL.md) | Reads your session transcripts to show what each skill costs (tokens, time, errors), which installed skills you actually use, and what to improve; read-only and redacted | 0.1.0 |
 
 ## Product Intelligence
 
