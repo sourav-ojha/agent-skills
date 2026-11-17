@@ -25,3 +25,8 @@ Read-only roles (architect, reviewer, security, database) get no edit or shell t
 - Parallel writers use git worktrees; the lead integrates and commits.
 - Optional: if gstack is installed, the lead may use its `/review` or `/ship`; otherwise it does both inline. Nothing here depends on gstack.
 - Ledger integrity is tamper-evident, not tamper-proof: the real gate is the user reading the plan, diff and rulings.
+
+## Where the helper lives
+Installed skills live in `<project>/.claude/skills/implementer` (project install) or `~/.claude/skills/implementer` (global). `impl` is
+`node <that folder>/core/scripts/impl.mjs`; it is not copied into your project. Project-level `pi` is in `.claude/skills/product-intelligence`.
+Update both with `npx skills update`.

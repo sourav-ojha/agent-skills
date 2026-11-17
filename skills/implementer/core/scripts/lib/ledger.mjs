@@ -122,3 +122,14 @@ export function passTask(plan, id, { cmd, exit, at } = {}) {
   t.passes = true;
   t.evidence = { cmd, exit, at: at || new Date().toISOString() };
 }
+
+// What is actually delivered: criteria of passed tasks only. Everything else is pending.
+export function deliveryReport(plan) {
+  const delivered = [];
+  const pending = [];
+  for (const t of plan.tasks) {
+    for (const c of t.criteria) (t.passes ? delivered : pending).push({ id: c.id, text: c.text, task: t.id });
+  }
+  const state = !delivered.length ? 'none' : pending.length ? 'partial' : 'complete';
+  return { state, delivered, pending };
+}

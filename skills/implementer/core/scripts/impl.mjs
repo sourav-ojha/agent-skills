@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Task-ledger helper for the implementer skill. Zero dependencies.
-// usage: node impl.mjs <init|plan|batch|start|finish|pass|block|ruling|status> [id] --name N [--dir D] ...
+// usage: node impl.mjs <init|plan|batch|start|finish|reopen|pass|map|block|unblock|ruling|status|report> [id] --name N [--dir D] ...
 import fs from 'node:fs';
 import path from 'node:path';
-import { validatePlan, nextBatch, startTask, finishTask, blockTask, unblockTask, reopenTask, mapCriterion, passTask, safeName, TIERS } from './lib/ledger.mjs';
+import { validatePlan, nextBatch, startTask, finishTask, blockTask, unblockTask, reopenTask, mapCriterion, passTask, deliveryReport, safeName, TIERS } from './lib/ledger.mjs';
 
 const die = (m) => { console.error(`error: ${m}`); process.exit(1); };
 const argv = process.argv.slice(2);
@@ -13,7 +13,7 @@ for (let i = 0; i < argv.length; i++) {
   if (argv[i].startsWith('--')) opt[argv[i].slice(2)] = argv[++i]; else pos.push(argv[i]);
 }
 const [cmd, id] = pos;
-const HELP = 'commands: init --tier T0-T3 | plan --file F | batch [--max N] | start ID | finish ID | reopen ID | pass ID --cmd C --exit 0 | map ID --criterion C (--tests a,b | --no-test R) | block ID --reason R | unblock ID | ruling --what W --why Y --cost C | status (all need --name N, optional --dir D)';
+const HELP = 'commands: init --tier T0-T3 | plan --file F | batch [--max N] | start ID | finish ID | reopen ID | pass ID --cmd C --exit 0 | map ID --criterion C (--tests a,b | --no-test R) | block ID --reason R | unblock ID | ruling --what W --why Y --cost C | status | report (all need --name N, optional --dir D)';
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
 
 let name;
@@ -87,4 +87,10 @@ if (cmd === 'init') {
   for (const t of p.tasks) console.log(`  ${t.id} ${t.status}${t.passes ? ' passed' : ''} - ${t.title}`);
   const nb = nextBatch(p);
   console.log(passed === p.tasks.length && p.tasks.length ? 'next: all passed; run the final review' : `next batch: ${nb.join(', ') || '(none ready)'}`);
+} else if (cmd === 'report') {
+  // Facts for the spec's Delivery log: passed tasks are delivered, everything else pending.
+  const r = deliveryReport(load());
+  console.log(`state: ${r.state}`);
+  console.log(`delivered: ${r.delivered.map((c) => c.id).join(', ') || '-'}`);
+  console.log(`pending: ${r.pending.map((c) => c.id).join(', ') || '-'}`);
 } else die(HELP);
