@@ -8,6 +8,8 @@ Reusable, independently installable skills for AI coding agents. They follow the
 | [`implementer`](skills/implementer/SKILL.md) | Implements an approved spec or a raw idea with architect, engineer, QA and reviewer roles chosen by size and risk: TDD, acceptance-criteria driven, tracked task ledger, parallel work on disjoint files | 0.1.0 |
 | [`skill-insights`](skills/skill-insights/SKILL.md) | Reads your session transcripts to show what each skill costs (tokens, time, errors), which installed skills you actually use, and what to improve; plus an `export` bundle of per-project run logs and agent self-reports; read-only and redacted | 0.2.0 |
 
+**Guides:** how to use each skill, which to pick and how they combine: [docs/guides](docs/guides/README.md).
+
 ## Product Intelligence
 
 **Why it exists.** Agents are good at building and bad at deciding *what* to build: they invent requirements, repeat competitor features without a user problem, and mix guesses with facts. Product Intelligence is a read-only product-strategy workflow with hard approval gates and an evidence standard, ending in specs an implementation agent can consume without inventing requirements.
