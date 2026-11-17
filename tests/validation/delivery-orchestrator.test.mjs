@@ -818,3 +818,24 @@ test('SEC the live CI re-check cannot be switched off by editing "ci" in the sta
   assert.match(e.d('merge', 'FEATURE-001').json.reason, /does not show the required checks passing/, 'no required or named checks and no --no-ci: refused even if the file says unverified');
   assert.equal(e.gh().prs[0].state, 'OPEN');
 });
+
+test('SEC the account token is only offered to the configured host: remote URL parsing', async () => {
+  const { remoteHost, isHttps } = await import(path.join(SK, 'core', 'scripts', 'lib', 'config.mjs'));
+  assert.equal(remoteHost('https://github.com/o/r.git'), 'github.com');
+  assert.equal(remoteHost('git@github.com:o/r.git'), 'github.com');
+  assert.equal(remoteHost('ssh://git@GitHub.com/o/r.git'), 'github.com');
+  assert.equal(remoteHost('https://github.com@evil.example/o/r.git'), 'evil.example', 'userinfo tricks do not fool the host');
+  assert.equal(remoteHost('https://github.com.evil.example/o/r.git'), 'github.com.evil.example');
+  assert.equal(remoteHost('/tmp/some/local/repo.git'), null);
+  assert.equal(isHttps('https://github.com/o/r.git'), true);
+  assert.equal(isHttps('git@github.com:o/r.git'), false);
+  assert.equal(isHttps('http://github.com/o/r.git'), false);
+});
+
+test('SEC init refuses an origin on a different host than github.host, so the token cannot be sent elsewhere', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], github: { account: 'work' } } });
+  sh(e.work, 'remote', 'set-url', 'origin', 'https://github.com.evil.example/o/r.git');
+  assert.match(e.d('init').err, /origin points at host "github\.com\.evil\.example" but github\.host is "github\.com"/);
+  sh(e.work, 'remote', 'set-url', 'origin', 'git@ghe.example.com:o/r.git');
+  assert.match(e.d('init').err, /github\.host is "github\.com"/);
+});

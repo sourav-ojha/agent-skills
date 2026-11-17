@@ -110,3 +110,12 @@ export function globToRegex(g) {
 export const matchesAny = (name, globs) => globs.some((g) => globToRegex(g).test(name));
 export const isProtectedBranch = (branch, patterns) => matchesAny(branch, patterns);
 export { FEATURE_ID };
+
+// Host a git remote URL points at (https, ssh://, or scp-like git@host:path). null when it cannot be read.
+export function remoteHost(url) {
+  const u = String(url || '').trim();
+  const scp = u.match(/^(?:[\w.-]+@)?([\w.-]+):(?!\/\/)[^/].*$/);
+  if (scp && !/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return scp[1].toLowerCase();
+  try { return new URL(u).hostname.toLowerCase() || null; } catch { return null; }
+}
+export const isHttps = (url) => { try { return new URL(String(url).trim()).protocol === 'https:'; } catch { return false; } };

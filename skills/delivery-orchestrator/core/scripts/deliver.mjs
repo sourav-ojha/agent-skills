@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { logEvent, runId } from './lib/runlog.mjs';
 import { FEATURE_ID, TRANSITIONS, transition, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
-import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny } from './lib/config.mjs';
+import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -42,12 +42,16 @@ const run = (bin, args, env) => { const r = spawnSync(bin, args, { cwd: root, en
 const git = (...a) => run('git', a);
 const gh = (...a) => run('gh', REPO && a[0] === 'pr' ? [...a, '--repo', REPO] : a, GH_ENV);
 // Network git (fetch, push, ls-remote): with a configured account and an https remote, credentials come from that account's token. SSH remotes use your SSH key.
-const gitNet = (...a) => (GH_ENV.GH_TOKEN || GH_ENV.GH_ENTERPRISE_TOKEN) && /^https:/i.test(git('config', '--get', 'remote.origin.url').out)
-  ? run('git', ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', ...a], GH_ENV) : git(...a);
+let GH_HOSTNAME = null;
+// The token is only ever offered to the configured host: both the fetch and the push URL (after any insteadOf rewriting) must be https on exactly that host.
+const tokenSafeRemote = () => { const f = git('remote', 'get-url', 'origin').out, p = git('remote', 'get-url', '--push', 'origin').out; return !!GH_HOSTNAME && [f, p].every((u) => isHttps(u) && remoteHost(u) === GH_HOSTNAME); };
+const gitNet = (...a) => (GH_ENV.GH_TOKEN || GH_ENV.GH_ENTERPRISE_TOKEN) && tokenSafeRemote()
+  ? run('git', ['-c', 'credential.helper=', '-c', `credential.https://${GH_HOSTNAME}.helper=!gh auth git-credential`, ...a], GH_ENV) : git(...a);
 function useAccount(account, host) {
   if (!account) return;
   const t = run('gh', ['auth', 'token', '--user', account, '--hostname', host]);
   if (t.code !== 0 || !t.out) die(`gh has no login for "${account}" on ${host}; run "gh auth login --hostname ${host}" for that account`);
+  GH_HOSTNAME = host.toLowerCase();
   GH_ENV = host === 'github.com' ? { GH_TOKEN: t.out } : { GH_ENTERPRISE_TOKEN: t.out, GH_HOST: host };
   const who = run('gh', ['api', 'user', '--jq', '.login'], GH_ENV);
   if (who.code !== 0 || who.out.toLowerCase() !== account.toLowerCase()) die(`the token for "${account}" resolves to "${flat(who.out, 40)}": check "gh auth status"`);
@@ -155,6 +159,8 @@ C.init = () => {
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,viewerPermission'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
   if (!['WRITE', 'MAINTAIN', 'ADMIN'].includes(repo.viewerPermission)) die(`the GitHub account in use has "${repo.viewerPermission}" permission on ${repo.nameWithOwner}; it needs WRITE or higher${config.github.account ? '' : ' (set github.account in the config if gh has several accounts)'}`);
   const url = git('config', '--get', 'remote.origin.url').out;
+  const originHost = remoteHost(url);
+  if (originHost !== config.github.host.toLowerCase()) die(`git's origin points at host "${flat(originHost || url, 60)}" but github.host is "${config.github.host}": set github.host in the config (for GitHub Enterprise) or fix the remote`);
   const origin = url.toLowerCase().replace(/\.git$/, '');
   if (!origin.endsWith(`/${repo.nameWithOwner.toLowerCase()}`) && !origin.endsWith(`:${repo.nameWithOwner.toLowerCase()}`)) die(`git's origin (${flat(origin, 100)}) is not the repository gh targets (${repo.nameWithOwner}); fix it, for example with "gh repo set-default"`);
   const base = opt.base || config.base || repo.defaultBranchRef?.name;
