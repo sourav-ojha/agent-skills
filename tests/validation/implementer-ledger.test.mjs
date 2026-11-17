@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { REPO, tmpDir } from './helpers.mjs';
-import { validatePlan, nextBatch, startTask, finishTask, passTask, blockTask, reopenTask, unblockTask, mapCriterion, ownsOverlap } from '../../skills/implementer/core/scripts/lib/ledger.mjs';
+import { validatePlan, nextBatch, startTask, finishTask, passTask, blockTask, reopenTask, unblockTask, mapCriterion, ownsOverlap, deliveryReport } from '../../skills/implementer/core/scripts/lib/ledger.mjs';
 
 const IMPL = path.join(REPO, 'skills/implementer/core/scripts/impl.mjs');
 const task = (id, o = {}) => ({
@@ -117,4 +117,27 @@ test('AC1 CLI: plan file cannot preset status or passes; non-object ledger and e
   const r = run('status', '--name', 'x');
   assert.notEqual(r.code, 0);
   assert.doesNotMatch(r.out, /TypeError|at /);
+});
+
+test('AC8 deliveryReport separates delivered from pending criteria; only passed tasks count as delivered', () => {
+  const p = plan(task('A'), task('B', { deps: ['A'] }));
+  assert.equal(deliveryReport(p).state, 'none');
+  startTask(p, 'A'); finishTask(p, 'A'); passTask(p, 'A', { cmd: 'npm test', exit: 0 });
+  const part = deliveryReport(p);
+  assert.equal(part.state, 'partial');
+  assert.deepEqual(part.delivered.map((c) => c.id), ['A-c1']);
+  assert.deepEqual(part.pending.map((c) => c.id), ['B-c1']);
+  startTask(p, 'B'); finishTask(p, 'B'); passTask(p, 'B', { cmd: 'npm test', exit: 0 });
+  assert.equal(deliveryReport(p).state, 'complete');
+});
+
+test('AC8 CLI report prints a delivery table and state', () => {
+  const dir = tmpDir('impl-');
+  const run = (...a) => spawnSync('node', [IMPL, ...a, '--dir', dir], { encoding: 'utf8' });
+  run('init', '--name', 'r', '--tier', 'T2');
+  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify({ tasks: [task('A')] }));
+  run('plan', '--name', 'r', '--file', path.join(dir, 'plan.json'));
+  const out = run('report', '--name', 'r').stdout;
+  assert.match(out, /state: none/);
+  assert.match(out, /pending: A-c1/);
 });

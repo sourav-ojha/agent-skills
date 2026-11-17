@@ -4,6 +4,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed (implementer skill)
+- Delivery status is now written back. Close-out records a `## Delivery log` row and `delivery: none|partial|complete` in the spec, sets `status: implemented` plus `pi transition ... Implemented` only when every criterion is delivered, and lists non-code pending items. New `impl report` derives delivered vs pending criteria from the ledger. The skill also says where the helper lives and to stop (T2/T3) if it is missing.
+
 ### Added (implementer skill 0.1.0)
 - New skill `implementer`: tier-triaged (T0-T3) multi-role implementation (architect, software-engineer, QA, reviewer, optional security/database lenses), TDD and acceptance-criteria driven, few high-value tests with pruning, plan sign-off for T2/T3, commits on a feature branch.
 - `core/scripts/impl.mjs`: dependency-graph task ledger with file-ownership-aware parallel batches; only a recorded command with exit 0 and criteria mapped to tests can mark a task passed. Rulings log.

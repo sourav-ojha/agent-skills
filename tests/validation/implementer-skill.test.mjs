@@ -22,3 +22,13 @@ test('AC7 size caps hold, every role has a file, every linked file exists', () =
   assert.ok(links.length > 0);
   for (const l of links) assert.ok(fs.existsSync(path.join(DIR, l)), `broken link ${l}`);
 });
+
+test('AC8 close-out write-back (delivery key + Delivery log row) keeps a product spec valid', async () => {
+  const { projectFrom, validateJson, edit } = await import('./helpers.mjs');
+  const dir = projectFrom('a');
+  const before = validateJson(dir).errors.length;
+  edit(dir, '.product/features/FEATURE-001.md', (t) =>
+    t.replace(/^status: draft$|^status: ready$/m, (m) => `${m}\ndelivery: partial`) +
+    '\n## Delivery log\n| Date | Branch / PR | Delivered | Pending (code) | Pending (non-code) | Notes |\n|---|---|---|---|---|---|\n| 2026-11-17 | feat/x | AC-1 | AC-2 | owner review | wave 1 |\n');
+  assert.equal(validateJson(dir).errors.length, before);
+});

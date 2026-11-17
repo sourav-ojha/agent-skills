@@ -14,7 +14,8 @@ metadata:
 You are the **lead**: you triage, plan, delegate only what pays for itself, verify, and close. One agent by default; roles and
 parallelism are added only when the work needs them (multi-agent runs cost many times the tokens of one agent).
 
-`<skill-dir>` is the directory containing this file. `impl` means `node <skill-dir>/core/scripts/impl.mjs` (always with `--name <slug>`).
+`<skill-dir>` is the directory containing this file (the folder you loaded `SKILL.md` from; the helper is not in the target project). `impl` means `node <skill-dir>/core/scripts/impl.mjs` (always with `--name <slug>`).
+If `core/scripts/impl.mjs` cannot be found, stop for T2/T3 and tell the user to reinstall; do not silently run without the ledger.
 The target project is the current working directory. State lives in `.implementation/<slug>/` (`tasks.json` ledger, `log.md` rulings);
 only the lead runs `impl` (no locking) and never commits `.implementation/`.
 
@@ -86,8 +87,10 @@ conflict you cannot resolve, or a task blocked after 3 fix rounds.
 
 ## Close
 
-Run the full test command once more. Tell the user: what changed, evidence (commands and exit codes), tests added/removed and why, rulings
-and assumptions, what is not done or not verified, and the exact next step (open a PR only if they asked). Status per task and run:
+Run the full test command once more. **Record delivery in the spec** before you report: [references/close-out.md](references/close-out.md)
+(`impl report`, a `## Delivery log` row, `delivery:` frontmatter, `pi transition ... Implemented` only when every criterion is delivered).
+A spec must never keep saying `ready` after work on it landed. Tell the user: what changed, evidence (commands and exit codes), tests added/removed and why, rulings
+and assumptions, what is not done or not verified (including non-code follow-ups that wait on a person or on time), and the exact next step (open a PR only if they asked). Status per task and run:
 DONE, DONE_WITH_CONCERNS, or BLOCKED.
 
 Host setup (optional native agents, permissions): [adapters/claude-code/README.md](adapters/claude-code/README.md).
