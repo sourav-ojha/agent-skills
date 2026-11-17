@@ -164,6 +164,8 @@ if (cmd === 'status') {
     const st = lst(d); if (st && (st.isSymbolicLink() || !st.isDirectory())) problems.push(`${d} is a symlink or not a directory; refusing to install into a project that redirects it`);
   }
   if (lst(mf)?.isSymbolicLink()) problems.push(`${mf} is a symlink; refusing`);
+  const bkRoot = path.join(base, '.agent-skills-backup');
+  { const st = lst(bkRoot); if (st && (st.isSymbolicLink() || !st.isDirectory())) problems.push(`${bkRoot} is a symlink or not a directory; refusing`); }
   if (problems.length) { problems.forEach((p) => console.error(`skills: ${p}`)); process.exit(1); }
   for (const [n, e] of Object.entries(lock.skills)) {
     if (e.origin === 'external') { plan.push({ n, hint: e.install || `see ${e.source?.repo || 'upstream'}` }); continue; }
@@ -173,17 +175,36 @@ if (cmd === 'status') {
     let st = null; try { st = fs.lstatSync(dest); } catch { /* new */ }
     if (st?.isSymbolicLink()) { problems.push(`${n}: destination is a symlink, refusing (${dest})`); continue; }
     const managed = st && (e.kind === 'command' ? fs.existsSync(path.join(base, '.agent-skills-manifest.json')) && (JSON.parse(fs.readFileSync(path.join(base, '.agent-skills-manifest.json'), 'utf8'))[n]) : fs.existsSync(path.join(dest, MARKER)));
-    if (st && !managed && !f.force) { problems.push(`${n}: ${dest} exists and is not managed by agent-skills (use --force to move it aside)`); continue; }
-    plan.push({ n, e, src, dest, aside: st && !managed });
+    // An unmanaged copy that is byte-identical to the repo's is simply adopted (marked as managed); anything different needs --force.
+    let same = false;
+    if (st && !managed) { try { same = e.kind === 'command' ? fs.readFileSync(src).equals(fs.readFileSync(dest)) : treeHash(src) === treeHash(dest); } catch { same = false; } }
+    if (same && lst(path.join(dest, MARKER))) { problems.push(`${n}: ${path.join(dest, MARKER)} exists but does not mark a managed copy (symlink?); refusing`); continue; }
+    if (st && !managed && !same && !f.force) { problems.push(`${n}: ${dest} exists, differs from the repo copy and is not managed by agent-skills (use --force to move it aside)`); continue; }
+    plan.push({ n, e, src, dest, adopt: same, aside: st && !managed && !same });
   }
   if (problems.length) { problems.forEach((p) => console.error(`skills: ${p}`)); process.exit(1); }
+  const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
   const manifest = fs.existsSync(mf) ? JSON.parse(fs.readFileSync(mf, 'utf8')) : {};
   for (const p of plan) {
     if (p.hint) { console.log(`external ${p.n}: install separately -> ${p.hint}`); continue; }
-    console.log(`${f['dry-run'] ? 'would install' : 'install'} ${p.n} -> ${p.dest}${p.aside ? ' (existing moved to .pre-bootstrap)' : ''}`);
+    console.log(`${f['dry-run'] ? 'would ' : ''}${p.adopt ? 'adopt (identical, now managed)' : 'install'} ${p.n} -> ${p.dest}${p.aside ? ' (existing moved to .agent-skills-backup)' : ''}`);
     if (f['dry-run']) continue;
     fs.mkdirSync(path.dirname(p.dest), { recursive: true });
-    if (p.aside) { const a = `${p.dest}.pre-bootstrap`; if (lst(a)) die(`${a} already exists; remove it first`); fs.renameSync(p.dest, a); }
+    if (p.adopt) {
+      if (p.e.kind === 'command') manifest[p.n] = { from: 'agent-skills' };
+      else { // temp file + rename: replaces the marker entry itself, never writes through a link
+        const t = path.join(p.dest, `${MARKER}.new-${process.pid}`);
+        fs.writeFileSync(t, JSON.stringify({ name: p.n, from: 'agent-skills' }) + '\n', { flag: 'wx' });
+        fs.renameSync(t, path.join(p.dest, MARKER));
+      }
+      continue;
+    }
+    if (p.aside) { // outside skills/ and commands/, so a backed-up skill is never loaded as a duplicate
+      const a = path.join(base, '.agent-skills-backup', stamp, p.e.kind === 'command' ? 'commands' : 'skills', path.basename(p.dest));
+      if (lst(a)) die(`${a} already exists; remove it first`);
+      fs.mkdirSync(path.dirname(a), { recursive: true });
+      fs.renameSync(p.dest, a);
+    }
     if (p.e.kind === 'command') { fs.copyFileSync(p.src, p.dest); manifest[p.n] = { from: 'agent-skills' }; }
     else {
       const t = `${p.dest}.new-${process.pid}`; rm(t);

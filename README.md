@@ -98,6 +98,6 @@ node scripts/skills.mjs update <name> --ref v7.1.0  # show what upstream changed
 node scripts/skills.mjs vendor <name> --repo URL --ref TAG --path P --license MIT   # pin a new third-party skill
 ```
 
-Bootstrap never overwrites skills it did not install (`--force` moves them aside as `<name>.pre-bootstrap`). Vendored Superpowers skills are
+Bootstrap adopts existing copies that are identical to the repo's, and never overwrites different ones it did not install (`--force` moves them to `.claude/.agent-skills-backup/`, outside the skills folder so they are not loaded twice). Vendored Superpowers skills are
 installed under bare names (`brainstorming`, not `superpowers:brainstorming`; the lock records a transform that rewrites in-text references)
 and do not include the plugin's hooks or agents. If you also keep the Superpowers plugin enabled you will have two copies: pick one.

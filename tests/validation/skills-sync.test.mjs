@@ -104,7 +104,11 @@ test('AC5 bootstrap never overwrites unmanaged or symlinked destinations (--forc
   assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p1).code, 0);
   assert.equal(fs.readFileSync(path.join(p1, '.claude/skills/foo/SKILL.md'), 'utf8'), 'mine');
   assert.equal(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p1, '--force').code, 0);
-  assert.equal(fs.readFileSync(path.join(p1, '.claude/skills/foo.pre-bootstrap/SKILL.md'), 'utf8'), 'mine');
+  const bk = path.join(p1, '.claude/.agent-skills-backup');
+  assert.ok(fs.existsSync(bk), 'moved aside outside skills/ so it is not loaded as a duplicate skill');
+  assert.ok(!fs.existsSync(path.join(p1, '.claude/skills/foo.pre-bootstrap')));
+  const saved = fs.readdirSync(bk).map((d) => path.join(bk, d)).flatMap((d) => (fs.statSync(d).isDirectory() ? fs.readdirSync(d).map((x) => path.join(d, x)) : [d]));
+  assert.ok(saved.length >= 1);
   const p2 = tmpDir('proj-'); const victim = tmpDir('victim-');
   fs.mkdirSync(path.join(p2, '.claude/skills'), { recursive: true }); fs.symlinkSync(victim, path.join(p2, '.claude/skills/foo'));
   assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p2, '--force').code, 0);
@@ -157,4 +161,32 @@ test('SEC project bootstrap refuses a symlinked .claude, skills dir or manifest 
   const p3 = tmpDir('proj-'); fs.mkdirSync(path.join(p3, '.claude'), { recursive: true }); fs.symlinkSync(path.join(victim, 'keep.txt'), path.join(p3, '.claude/.agent-skills-manifest.json'));
   assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p3).code, 0);
   assert.equal(fs.readFileSync(path.join(victim, 'keep.txt'), 'utf8'), 'KEEP');
+});
+
+test('bootstrap adopts unmanaged copies that are identical to the repo (no --force, nothing moved), but not different ones', () => {
+  const root = bootRoot(); const proj = tmpDir('proj-');
+  w(proj, '.claude/skills/foo/SKILL.md', fs.readFileSync(path.join(root, 'skills/foo/SKILL.md'), 'utf8'));
+  w(proj, '.claude/commands/bar.md', 'bar command\n');
+  const r = skills(root, 'bootstrap', '--scope', 'project', '--project-dir', proj);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /adopt/i);
+  assert.ok(fs.existsSync(path.join(proj, '.claude/skills/foo/.agent-skills-managed')));
+  assert.ok(!fs.existsSync(path.join(proj, '.claude/.agent-skills-backup')));
+  w(proj, '.claude/skills/foo/SKILL.md', 'changed');
+  fs.rmSync(path.join(proj, '.claude/skills/foo/.agent-skills-managed'));
+  assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', proj).code, 0);
+});
+
+test('SEC bootstrap: symlinked backup folder (--force) and symlinked marker (adopt) never write outside the install folder', () => {
+  const root = bootRoot(); const victim = tmpDir('victim-');
+  const p1 = tmpDir('proj-'); w(p1, '.claude/skills/foo/SKILL.md', 'different');
+  fs.symlinkSync(victim, path.join(p1, '.claude/.agent-skills-backup'));
+  assert.notEqual(skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p1, '--force').code, 0);
+  assert.deepEqual(fs.readdirSync(victim), []);
+  assert.equal(fs.readFileSync(path.join(p1, '.claude/skills/foo/SKILL.md'), 'utf8'), 'different');
+  const p2 = tmpDir('proj-'); w(p2, '.claude/skills/foo/SKILL.md', fs.readFileSync(path.join(root, 'skills/foo/SKILL.md'), 'utf8'));
+  const target = path.join(victim, 'planted.txt');
+  fs.symlinkSync(target, path.join(p2, '.claude/skills/foo/.agent-skills-managed'));
+  skills(root, 'bootstrap', '--scope', 'project', '--project-dir', p2);
+  assert.ok(!fs.existsSync(target), 'marker written through a symlink');
 });
