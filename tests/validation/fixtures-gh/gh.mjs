@@ -9,6 +9,7 @@ const sp = process.env.FAKE_GH_STATE;
 const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
 const args = process.argv.slice(2);
 st.calls.push(args);
+(st.tokens ||= []).push(process.env.GH_TOKEN || null);
 const save = () => fs.writeFileSync(sp, JSON.stringify(st, null, 2));
 const out = (o) => { save(); console.log(typeof o === 'string' ? o : JSON.stringify(o)); process.exit(0); };
 const fail = (m, code = 1) => { save(); console.error(m); process.exit(code); };
@@ -27,7 +28,10 @@ const pushCommit = (branch, msg) => {
 };
 
 const [a, b] = args;
-if (a === 'repo' && b === 'view') out({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'main' } });
+const accounts = st.accounts || { work: 'tok-work', personal: 'tok-personal' };
+if (a === 'auth' && b === 'token') { const u = flag('--user'); if (!accounts[u]) fail(`no token found for ${u}`); out(accounts[u]); }
+if (a === 'api' && b === 'user') { const t = process.env.GH_TOKEN; const who = Object.keys(accounts).find((k) => accounts[k] === t); out(st.loginOverride || who || 'default-user'); }
+if (a === 'repo' && b === 'view') out({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'main' }, viewerPermission: st.permission || 'WRITE' });
 if (a === 'pr' && b === 'list') { const h = flag('--head'); out([...(st.cross || []).filter((p) => p.head === h), ...st.prs.filter((p) => p.head === h && p.state === 'OPEN').map((p) => ({ number: p.number, url: p.url, isCrossRepository: false }))]); }
 if (a === 'pr' && b === 'create') {
   const p = { number: st.prs.length + 1, head: flag('--head'), base: flag('--base'), title: flag('--title'), state: 'OPEN', draft: false, mergeState: 'CLEAN' };

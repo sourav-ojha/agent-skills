@@ -3,7 +3,10 @@
 ## What the pipeline will and will not do
 | Action | Rule |
 |---|---|
-| Merge | Only with `--merge` and the user's words as `--note`; only squash; only the commit CI verified |
+| Merge | Only with `--merge` and the user's words as `--note`, or the config's standing `merge.mode: squash`; only squash; only the commit CI verified |
+| Protected branches | Never merged into (default main, master, prod, production, release/*), whatever the flags say; only the committed config can change the list |
+| Policy file | Must be committed and identical on the base branch; a feature that edits it is held; the run keeps the policy it started with |
+| Account | If `github.account` is set, its token is used for gh (and git over https), verified to be that login with write access; the token is never stored or printed |
 | Push | Feature branches only, never forced, never the base |
 | Bypass | No `--admin`, no `--auto`, no hook skipping, no protection or CI edits |
 | CI evidence | Required checks (or `--checks` names) must pass. A passing scanner or linter alone is not proof of tests: the run stops and says which checks ran. `--no-ci` is the only way to merge without a verified test check |

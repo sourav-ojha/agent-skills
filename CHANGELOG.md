@@ -9,6 +9,7 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - Guard rails: merges only with `--merge` and the user's words; the run stops when the repo has no CI (`--no-ci` is explicit); T3 work and changes to CI or `CODEOWNERS` files are held for a person; capped CI fix rounds; circuit breaker; never force-push, `--admin` or `--auto`; stale head, behind and conflicting PRs handled; titles and reasons sanitised, no shell.
 - `implementer --unattended` and `--name <slug>`: nothing waits for a person; every "stop and ask" case ends the run as `BLOCKED` with the question.
 - Tests run a real git repo with a bare origin against a fake `gh`.
+- Project config `.product/delivery.json` (`deliver config [--write]`): GitHub account (token held in memory, verified login and write access), base branch, `protected_branches` (default main, master, prod, production, release/*: never merged into, flags cannot override), standing merge mode, required and ignored CI checks, `local_checks` run by the orchestrator, `hold_paths`, limits, `implementer_notes`. The file must be committed and identical on the base branch; a feature that edits it is held.
 
 ### Added (arsenal: vendoring and bootstrap)
 - `skills.lock.json` plus `scripts/skills.mjs` (`status`, `check`, `vendor`, `update`, `accept`, `bootstrap`): pinned, license-tracked vendoring with a dry-run-first `update` and a safe `bootstrap` that never overwrites unmanaged items or follows symlinks.

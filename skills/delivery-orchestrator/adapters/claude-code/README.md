@@ -7,6 +7,12 @@ npx skills add sourav-ojha/agent-skills --skill implementer -a claude-code      
 ```
 Add `-g` for all projects. You also need the GitHub CLI logged in (`gh auth status`) and a GitHub remote.
 
+## One-time project setup
+```bash
+node <skill-dir>/core/scripts/deliver.mjs config --write     # creates .product/delivery.json from a template
+```
+Edit it (GitHub account, base branch, protected branches, required and ignored checks, local test commands), then commit it and merge it to the base branch. Reference: [references/config.md](../../references/config.md).
+
 ## Use
 ```
 /delivery-orchestrator --dry-run                    # show the queue, change nothing

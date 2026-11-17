@@ -19,7 +19,7 @@ State lives in `.delivery/queue.json` (self-ignoring, never committed). Exit cod
 
 ## Hard rules
 
-1. **Merge only what the user authorised in this run.** Pass `--merge --note "<their words>"` only if their request asks you to merge. If it does not, run without `--merge`: PRs are opened and checked, nothing is merged, and you say so.
+1. **Merge only what the user authorised.** Either the project config says `merge.mode: "squash"` (their standing authorisation) or you pass `--merge --note "<their words>"` because their request asks you to merge. Otherwise PRs are opened and checked, nothing is merged, and you say so. **Never merge into a protected branch** (`protected_branches` in the config, default main, master, prod, production, release/*): no flag changes that.
 2. **Never bypass a safeguard.** No force push, no `--admin`, no `--auto`, no skipping hooks, no direct push to the base branch, no editing branch protection or CI config to make a check pass, no merging a PR this run did not create. If GitHub refuses a merge, the PR is held for a person.
 3. **The helper's state decides what is next**, not your memory. After any interruption, compaction or new session, run `deliver next`: it resumes the active feature.
 4. **One feature at a time.** Never start feature N+1 before N is merged, blocked, skipped or held. A feature whose dependency did not merge is skipped by the helper, not built on a missing base.
@@ -30,16 +30,19 @@ State lives in `.delivery/queue.json` (self-ignoring, never committed). Exit cod
 
 ## Start
 
+The project's rules live in `.product/delivery.json` (GitHub account, base branch, protected branches, which checks must pass or are ignored, local test commands, hold paths): [references/config.md](references/config.md). `deliver config` shows them; `deliver config --write` creates the file from a template. They must be committed to the base branch before a run.
+
 1. Check: a git repository, `gh auth status` succeeds, the `implementer` skill is installed (if not, stop and say so), the working tree is clean.
-2. `deliver init --dry-run [flags]` and show the queue (id, title, order). Empty: report "no spec with `status: ready`" and suggest product-intelligence `handoff`.
+2. `deliver init --dry-run [flags]` and show the queue (id, title, order) and the effective rules it prints (account, base, whether merging is on, protected base, checks, local checks). Surface any `warnings`. Empty: report "no spec with `status: ready`" and suggest product-intelligence `handoff`.
 3. `deliver init [flags]`. Flags:
 
 | Flag | Meaning |
 |---|---|
-| `--features-dir D` | Specs folder (default `.product/features`; files must be named `FEATURE-NNN.md`) |
+| `--features-dir D` | Specs folder (config `features_dir`, default `.product/features`; files must be named `FEATURE-NNN.md`) |
 | `--only ID,ID` / `--limit N` | Restrict the queue |
 | `--merge --note "..."` | Authorise squash merges (the note records the user's words) |
-| `--checks A,B` | Names of the CI checks that run the tests; each must be reported and pass. Not needed if the base branch's protection already requires checks (those are used) |
+| `--base B` | Override the config's base branch for this run |
+| `--checks A,B` | Names of the CI checks that run the tests; each must be reported and pass (config `checks.required`). Not needed if the base branch's protection already requires checks (those are used) |
 | `--no-ci` | Allow merging when no required or named check exists (or none is reported at all), on the implementer's local test evidence only. Never implied |
 | `--merge-t3` | Also merge T3 work (auth, data, migrations, public API). Default: opened but held for a person |
 | `--max-fix-rounds N` / `--max-failures N` / `--ci-budget S` | CI fix attempts per feature (default 2) / blocked features in a row before the run stops (default 2) / total seconds to wait for CI per feature across calls (default 1800) |
@@ -48,9 +51,9 @@ Order: by `depends_on:` in each spec's frontmatter (comma-separated `FEATURE-NNN
 
 ## The loop
 
-Repeat `deliver next` until it prints `done`. It checks out and fast-forwards the base, creates `feat/<id>-<slug>`, and prints the feature (or resumes the active one).
+Repeat `deliver next` until it prints `done`. It fetches, fast-forwards the base to the latest `origin/<base>`, creates `<branch_prefix><id>-<slug>` from it, and prints the feature (or resumes the active one). Pass its `guidance` (the config's `implementer_notes`) to the implementer.
 
-1. **Build.** Invoke the `implementer` skill: `<spec path> --unattended --name <feature id lower-case>` and tell it not to push or open a PR. If it reports `BLOCKED`, run `deliver block <ID> --reason "<its question>"` and go to the next feature; do not call `built`. Otherwise `deliver built <ID> [--tier Tn]`: it verifies a clean tree, commits ahead of the base and `delivery: complete` in the spec (else it blocks the feature, exit 2), and records the commit. Do not commit after `built` without running it again: `pr` refuses a moved branch.
+1. **Build.** Invoke the `implementer` skill: `<spec path> --unattended --name <feature id lower-case>` and tell it not to push or open a PR. If it reports `BLOCKED`, run `deliver block <ID> --reason "<its question>"` and go to the next feature; do not call `built`. Otherwise `deliver built <ID> [--tier Tn]`: it verifies a clean tree, commits ahead of the base and `delivery: complete` in the spec (else it blocks the feature, exit 2), runs the config's `local_checks` itself (on `local_check_failed`, fix, commit and run `built` again), and records the commit. Do not commit after `built` without running it again: `pr` refuses a moved branch.
 2. **PR.** Write the body to `.delivery/pr-<id>.md` (the helper accepts only files there): what the feature does, criteria delivered (from the spec's delivery log), the verification commands and results, tier, link to the spec. No secrets. `deliver pr <ID> --title "feat: <title>" --body-file .delivery/pr-<id>.md` (pushes without force and opens the PR).
 3. **CI.** `deliver ci <ID> --timeout 540` (one call stays under the shell limit). On `timeout`, run it again: the helper adds up the waiting itself and blocks the feature when `--ci-budget` is used up.
    - `passed` → merge.

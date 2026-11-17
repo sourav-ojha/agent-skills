@@ -19,7 +19,7 @@ function spec(id, { status = 'ready', delivery, deps, title = `Feature ${id}` } 
 }
 
 // A work clone of a bare origin, a fake gh on PATH, and the given specs committed to main.
-function setup(specs = { 'FEATURE-001': {} }) {
+function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [] }, base = null } = {}) {
   const root = tmpDir('deliver-');
   const origin = path.join(root, 'origin.git');
   const work = path.join(root, 'work');
@@ -34,9 +34,11 @@ function setup(specs = { 'FEATURE-001': {} }) {
   sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
   fs.mkdirSync(path.join(work, '.product/features'), { recursive: true });
   for (const [id, o] of Object.entries(specs)) fs.writeFileSync(path.join(work, `.product/features/${id}.md`), spec(id, o));
+  if (config) fs.writeFileSync(path.join(work, '.product/delivery.json'), JSON.stringify(config, null, 2));
   fs.writeFileSync(path.join(work, 'README.md'), 'hi\n');
   sh(work, 'checkout', '-q', '-b', 'main');
   sh(work, 'add', '-A'); sh(work, 'commit', '-q', '-m', 'init'); sh(work, 'push', '-q', '-u', 'origin', 'main');
+  if (base) { sh(work, 'checkout', '-q', '-b', base); sh(work, 'push', '-q', '-u', 'origin', base); sh(work, 'checkout', '-q', 'main'); }
   const state = path.join(root, 'gh-state.json');
   const gs = { origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]] };
   fs.writeFileSync(state, JSON.stringify(gs));
@@ -631,11 +633,188 @@ test('SEC merge asks GitHub again: a forged "CI passed" in the state file does n
   ship(e, 'FEATURE-001');
   e.setGh((s) => { s.checkQueue = [[{ name: 'ci', bucket: 'fail', link: 'x' }]]; });
   const r = e.d('merge', 'FEATURE-001');
-  assert.match(r.json.reason, /no longer shows the required checks passing/);
+  assert.match(r.json.reason, /does not show the required checks passing/);
   assert.equal(e.gh().prs[0].state, 'OPEN');
   const forged = setup();
   forged.d('init', '--merge', '--note', 'ok');
   ship(forged, 'FEATURE-001');
   forged.setGh((s) => { s.required = []; });
-  assert.match(forged.d('merge', 'FEATURE-001').json.reason, /no longer shows/, 'a verified entry with no required or named checks is refused');
+  assert.match(forged.d('merge', 'FEATURE-001').json.reason, /does not show the required checks passing/, 'a verified entry with no required or named checks is refused');
+});
+
+// ---- project config (.product/delivery.json) -----------------------------------------------------------------------
+test('CFG default: with no config file, main and prod-like branches are protected: PRs are opened but never merged', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: null });
+  const init = e.d('init', '--merge', '--note', 'merge please');
+  assert.equal(init.json.protected_base, true);
+  assert.equal(init.json.merge, false);
+  assert.match(init.json.warnings[0], /never merge into it/);
+  ship(e, 'FEATURE-001');
+  const m = e.d('merge', 'FEATURE-001');
+  assert.match(m.json.reason, /protected branch/);
+  assert.equal(e.gh().prs[0].state, 'OPEN');
+  assert.ok(!e.gh().calls.some((c) => c[1] === 'merge'), 'gh pr merge was never called');
+});
+
+test('CFG base branch: features start from the latest base and the PR and merge go to it, not to main', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { base: 'develop', protected_branches: ['main'], merge: { mode: 'squash' } }, base: 'develop' });
+  // base moves on after the repo was set up: the feature must start from the new tip
+  sh(e.work, 'checkout', '-q', 'develop'); fs.writeFileSync(path.join(e.work, 'newer.txt'), 'n'); sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', 'newer base'); sh(e.work, 'push', '-q', 'origin', 'develop'); sh(e.work, 'reset', '-q', '--hard', 'HEAD~1'); sh(e.work, 'checkout', '-q', 'main');
+  const init = e.d('init');
+  assert.equal(init.json.base, 'develop');
+  assert.equal(init.json.merge, true, 'merge.mode squash in the project config is the standing authorisation');
+  const n = e.d('next');
+  assert.equal(sh(e.work, 'rev-parse', 'HEAD'), sh(e.origin, 'rev-parse', 'refs/heads/develop'), 'branch starts at the latest origin/develop');
+  build(e, 'FEATURE-001'); e.d('built', 'FEATURE-001', '--tier', 'T2');
+  e.d('pr', 'FEATURE-001', '--title', 'feat: thing here', '--body-file', body(e));
+  assert.equal(e.gh().prs[0].base, 'develop');
+  assert.equal(e.d('ci', 'FEATURE-001', ...FAST).json.result, 'passed');
+  assert.equal(e.d('merge', 'FEATURE-001').json.state, 'merged');
+  assert.match(sh(e.origin, 'log', '-1', '--format=%s', 'develop'), /thing here \(#1\)/);
+  assert.equal(sh(e.origin, 'log', '-1', '--format=%s', 'main'), 'init', 'main untouched');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(e.work, '.delivery/queue.json'), 'utf8')).authorised_by, 'project config .product/delivery.json');
+});
+
+test('CFG a protected pattern also covers release branches; --base cannot get around it', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: ['release/*'], base: 'release/1.0' } });
+  sh(e.work, 'branch', 'release/1.0'); sh(e.work, 'push', '-q', 'origin', 'release/1.0');
+  assert.equal(e.d('init', '--merge', '--note', 'ok').json.protected_base, true);
+});
+
+test('CFG validation: unknown keys, wrong types and unsafe values are refused with the path of the problem', () => {
+  const bad = setup({ 'FEATURE-001': {} }, { config: { protected_branchs: ['main'], merge: { mode: 'yolo' }, local_checks: [{ name: 'x', command: 'npm test' }], limits: { max_fix_rounds: 99 }, base: '--evil' } });
+  const r = bad.d('init');
+  assert.equal(r.code, 1);
+  for (const m of [/unknown key "protected_branchs"/, /merge\.mode/, /local_checks\[0\]\.command/, /limits\.max_fix_rounds/, /base: a branch name/]) assert.match(r.err, m);
+  const cfg = bad.d('config');
+  assert.equal(cfg.code, 1);
+  assert.ok(cfg.json.errors.length >= 5);
+});
+
+test('CFG config command: effective values without a file, --write creates the template once', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: null });
+  const c = e.d('config');
+  assert.equal(c.json.file, null);
+  assert.deepEqual(c.json.effective.protected_branches, ['main', 'master', 'prod', 'production', 'release/*', 'release-*']);
+  assert.equal(e.d('config', '--write').code, 0);
+  assert.ok(fs.existsSync(path.join(e.work, '.product/delivery.json')));
+  assert.match(e.d('config', '--write').err, /already exists/);
+  assert.equal(e.d('config').json.errors.length, 0, 'the template is valid');
+});
+
+test('CFG the config must be committed and identical to the copy on the base branch', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: null });
+  fs.writeFileSync(path.join(e.work, '.product/delivery.json'), JSON.stringify({ protected_branches: [] }));
+  assert.match(e.d('init').err, /not committed/);
+  sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', 'local only config');
+  assert.match(e.d('init').err, /differs from the copy on origin\/main|has .* but this checkout/);
+  sh(e.work, 'push', '-q', 'origin', 'main');
+  assert.equal(e.d('init', '--dry-run').code, 0);
+
+  const stale = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [] } });
+  sh(stale.work, 'rm', '-q', '.product/delivery.json'); sh(stale.work, 'commit', '-q', '-m', 'drop');
+  assert.match(stale.d('init').err, /origin\/main has .*delivery\.json but this checkout does not/);
+});
+
+test('CFG a feature that changes the config file is held for a person', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [] } });
+  e.d('init', '--merge', '--note', 'ok');
+  e.d('next'); build(e, 'FEATURE-001');
+  fs.writeFileSync(path.join(e.work, '.product/delivery.json'), JSON.stringify({ protected_branches: [], merge: { mode: 'squash' } })); sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', 'relax policy');
+  assert.deepEqual(e.d('built', 'FEATURE-001', '--tier', 'T2').json.ci_files_touched, ['.product/delivery.json']);
+});
+
+test('CFG hold_paths: files under a configured path need a person (for example migrations)', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], hold_paths: ['migrations/', '**/*.sql'] } });
+  e.d('init', '--merge', '--note', 'ok');
+  ship(e, 'FEATURE-001', { build: { file: 'migrations/001_users.sql' } });
+  assert.match(e.d('merge', 'FEATURE-001').json.reason, /CI or ownership files \(migrations\/001_users\.sql\)/);
+});
+
+test('CFG github account: its token is used for every gh call, never written to state; wrong or missing logins and read-only access are refused', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], github: { account: 'work' } } });
+  assert.equal(e.d('init', '--merge', '--note', 'ok').json.account, 'work');
+  ship(e, 'FEATURE-001');
+  const g = e.gh();
+  const prCalls = g.calls.map((c, i) => [c, g.tokens[i]]).filter(([c]) => c[0] === 'pr' || (c[0] === 'repo'));
+  assert.ok(prCalls.length > 3 && prCalls.every(([, t]) => t === 'tok-work'), 'every gh call used the configured account');
+  assert.ok(!fs.readFileSync(path.join(e.work, '.delivery/queue.json'), 'utf8').includes('tok-work'), 'no token in the state file');
+
+  const missing = setup({ 'FEATURE-001': {} }, { config: { github: { account: 'ghost' } } });
+  assert.match(missing.d('init').err, /no login for "ghost"/);
+
+  const wrong = setup({ 'FEATURE-001': {} }, { config: { github: { account: 'work' } } });
+  wrong.setGh((s) => { s.loginOverride = 'someone-else'; });
+  assert.match(wrong.d('init').err, /resolves to "someone-else"/);
+
+  const ro = setup({ 'FEATURE-001': {} }, { config: { github: { account: 'personal' } } });
+  ro.setGh((s) => { s.permission = 'READ'; });
+  assert.match(ro.d('init').err, /"READ" permission.*WRITE or higher/);
+});
+
+test('CFG checks: ignored suites (no e2e here) neither fail nor hold CI; required ones must pass', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], checks: { required: ['unit'], ignored: ['e2e*'] } } });
+  e.d('init', '--merge', '--note', 'ok');
+  e.setGh((s) => { s.checkQueue = [[{ name: 'unit', bucket: 'pass' }, { name: 'e2e-chrome', bucket: 'fail', link: 'x' }, { name: 'e2e-smoke', bucket: 'pending' }]]; });
+  const r = ship(e, 'FEATURE-001');
+  assert.equal(r.json.result, 'passed');
+  assert.deepEqual(r.json.checks, ['unit']);
+  assert.equal(e.d('merge', 'FEATURE-001').json.state, 'merged');
+
+  const strict = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], checks: { required: ['unit'] } } });
+  strict.d('init');
+  strict.setGh((s) => { s.checkQueue = [[{ name: 'unit', bucket: 'pass' }, { name: 'e2e-chrome', bucket: 'fail', link: 'x' }]]; });
+  assert.equal(ship(strict, 'FEATURE-001').json.result, 'failed', 'a failing check that is not ignored still fails');
+});
+
+test('CFG local_checks: the orchestrator runs them itself; failure keeps the feature in building until fixed, and is capped', () => {
+  const cmd = ['node', '-e', "process.exit(require('fs').existsSync('ok.flag') ? 0 : 3)"];
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], local_checks: [{ name: 'unit tests', command: cmd }] } });
+  e.d('init');
+  assert.deepEqual(e.d('next').json.local_checks, ['unit tests']);
+  build(e, 'FEATURE-001');
+  const f1 = e.d('built', 'FEATURE-001', '--tier', 'T2');
+  assert.equal(f1.code, 2);
+  assert.equal(f1.json.result, 'local_check_failed');
+  assert.equal(f1.json.failing[0].exit, 3);
+  assert.equal(e.d('status', '--json').json.features[0].state, 'building');
+  fs.writeFileSync(path.join(e.work, 'ok.flag'), '1'); sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', 'make it pass');
+  assert.equal(e.d('built', 'FEATURE-001', '--tier', 'T2').code, 0);
+
+  const cap = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], limits: { max_fix_rounds: 0 }, local_checks: [{ name: 'unit tests', command: cmd }] } });
+  cap.d('init'); cap.d('next'); build(cap, 'FEATURE-001');
+  assert.equal(cap.d('built', 'FEATURE-001', '--tier', 'T2').json.state, 'building');
+  const second = cap.d('built', 'FEATURE-001', '--tier', 'T2');
+  assert.equal(second.json.state, 'blocked');
+  assert.match(second.json.reason, /still failing after 2 attempts/);
+});
+
+test('CFG branch_prefix, implementer_notes and limits come from the config; flags override limits', () => {
+  const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], branch_prefix: 'delivery/', implementer_notes: 'No e2e infra: unit and integration tests only.', limits: { max_fix_rounds: 1 } } });
+  e.d('init');
+  const n = e.d('next');
+  assert.match(n.json.feature.branch, /^delivery\/feature-001-/);
+  assert.equal(n.json.guidance, 'No e2e infra: unit and integration tests only.');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(e.work, '.delivery/queue.json'), 'utf8')).max_fix_rounds, 1);
+  e.d('reset', '--yes');
+  e.d('block', 'FEATURE-001', '--reason', 'x');
+  sh(e.work, 'checkout', '-q', 'main');
+  assert.equal(e.d('init', '--max-fix-rounds', '3').code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(e.work, '.delivery/queue.json'), 'utf8')).max_fix_rounds, 3);
+});
+
+test('SEC the live CI re-check cannot be switched off by editing "ci" in the state file', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok');
+  ship(e, 'FEATURE-001');
+  const qf = path.join(e.work, '.delivery/queue.json');
+  const st = JSON.parse(fs.readFileSync(qf, 'utf8'));
+  st.features[0].ci = 'unverified';
+  fs.writeFileSync(qf, JSON.stringify(st));
+  e.setGh((s) => { s.required = []; s.checkQueue = [[{ name: 'ci', bucket: 'fail', link: 'x' }]]; });
+  assert.match(e.d('merge', 'FEATURE-001').json.reason, /does not show the required checks passing/);
+  const again = JSON.parse(fs.readFileSync(qf, 'utf8')); again.features[0].state = 'ci_passed'; fs.writeFileSync(qf, JSON.stringify(again)); // as if the hold had not happened
+  e.setGh((s) => { s.checkQueue = [[{ name: 'lint', bucket: 'pass' }]]; });
+  assert.match(e.d('merge', 'FEATURE-001').json.reason, /does not show the required checks passing/, 'no required or named checks and no --no-ci: refused even if the file says unverified');
+  assert.equal(e.gh().prs[0].state, 'OPEN');
 });

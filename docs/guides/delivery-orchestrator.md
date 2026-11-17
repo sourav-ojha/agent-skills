@@ -12,6 +12,25 @@ Takes every ready feature spec and delivers them one by one without you: **branc
 - **The repo has CI that runs your tests**, and the base branch ideally *requires* it (branch protection). If the only checks that ran are a linter or secret scanner, the run stops and tells you which checks it saw: pass `--checks "<your test check>"`. (`--no-ci` accepts the implementer's local test evidence instead; it is never implied.)
 - Ideally the base branch is protected (required checks, and required reviews where you want a person). That, not this skill, is the real gate.
 
+## One-time project setup
+```bash
+node <skill-dir>/core/scripts/deliver.mjs config --write      # creates .product/delivery.json
+```
+Edit it, commit it and merge it to your base branch. The main settings:
+
+| Setting | What it controls |
+|---|---|
+| `github.account` | Which `gh` login to use if you have several |
+| `base` | The branch features start from (always its latest tip) and PRs and merges go to |
+| `protected_branches` | Branches it will **never** merge into (default `main`, `master`, `prod`, `production`, `release/*`) |
+| `merge.mode` | `pr-only` (default) or `squash` (standing permission to merge) |
+| `checks.required` / `checks.ignored` | Which CI checks must pass, and which to ignore (for example `e2e*` if the project has no real e2e) |
+| `local_checks` | Commands it runs itself before opening a PR, such as `["npm","test"]` |
+| `hold_paths` | Paths a person must review before merge, such as `migrations/` |
+| `implementer_notes` | A line passed to the implementer, such as "unit and integration tests only" |
+
+Full reference: [`references/config.md`](../../skills/delivery-orchestrator/references/config.md). Note the default: a repo whose base branch is `main` is treated as protected, so it opens PRs but does not merge until you pick a non-protected base (usually `develop`) or deliberately list your own `protected_branches`.
+
 ## Start small
 ```
 /delivery-orchestrator --dry-run        # show the queue, change nothing
