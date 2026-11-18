@@ -136,6 +136,26 @@ test('C4: tracked .env fails; configured .env.example passes; unignored logs_dir
   pem.cleanup();
 });
 
+test('C4: evaluated on origin/<base>, not the working checkout', async () => {
+  // base tracks .env; the local checkout deleted it (uncommitted) and has an unignored-logs change -> still fail
+  const a = mkRepo({ files: { '.env': 'A=1\n' }, config: { base: 'main' } });
+  fs.rmSync(path.join(a.work, '.env'));
+  sh(a.work, 'rm', '-q', '--cached', '.env');
+  assert.equal((await only(a, 'C4')).C4.status, 'fail');
+  a.cleanup();
+  // a local-only tracked .env (not on base) and a local-only .gitignore do not fail/pass C4
+  const b = mkRepo({ files: { '.gitignore': 'logs/\n' }, config: { app: { logs_dir: 'logs/' } } });
+  fs.writeFileSync(path.join(b.work, '.env'), 'A=1\n'); sh(b.work, 'add', '-f', '.env');
+  assert.equal((await only(b, 'C4')).C4.status, 'pass');
+  fs.writeFileSync(path.join(b.work, '.gitignore'), ''); // local edit dropping the ignore must not matter
+  assert.equal((await only(b, 'C4')).C4.status, 'pass');
+  b.cleanup();
+  const c2 = mkRepo({ config: { app: { logs_dir: 'logs/' } } }); // base does not ignore logs
+  fs.writeFileSync(path.join(c2.work, '.gitignore'), 'logs/\n'); // local-only ignore must not rescue it
+  assert.equal((await only(c2, 'C4')).C4.status, 'fail');
+  c2.cleanup();
+});
+
 test('C5: CODEOWNERS alone fails; CI workflow plus checks.required passes; protection can supply required checks', async () => {
   const co = mkRepo({ files: { '.github/CODEOWNERS': '* @me\n' }, config: { checks: { required: ['test'] } } });
   assert.equal((await only(co, 'C5')).C5.status, 'fail');

@@ -121,18 +121,24 @@ function c2(ctx) {
   return res('pass', 'node and gh ok');
 }
 
-function c4(ctx) {
-  const ls = ctx.git('ls-files');
-  if (ls.code !== 0) return res('fail', 'git ls-files failed');
+// Evaluated on the base tip (same sha as the other checks), never on the working checkout.
+async function c4(ctx) {
+  const sha = baseSha(ctx);
+  if (!sha) return res('fail', `cannot resolve ${baseRef(ctx)}`);
+  const ls = ctx.git('ls-tree', '-r', '--name-only', sha);
+  if (ls.code !== 0) return res('fail', `cannot list files on ${baseRef(ctx)}`);
   const example = ctx.config?.app?.env_example ? path.posix.normalize(ctx.config.app.env_example) : null;
   const bad = ls.out.split('\n').filter(Boolean).filter((f) => f !== example && SECRET_PATTERNS.some((re) => re.test(path.posix.basename(f))));
-  if (bad.length) return res('fail', `tracked secret-like files: ${bad.slice(0, 10).join(', ')}`);
+  if (bad.length) return res('fail', `secret-like files tracked on ${baseRef(ctx)}: ${bad.slice(0, 10).join(', ')}`);
   const logs = ctx.config?.app?.logs_dir;
   if (logs) {
     const probe = path.posix.join(logs.replace(/\\/g, '/'), '.readiness-probe');
-    if (ctx.git('check-ignore', '-q', '--', probe).code !== 0) return res('fail', `logs_dir ${logs} is not git-ignored`);
+    const wt = await ctx.worktree(sha); // the base's own .gitignore applies there
+    try {
+      if (exec('git', ['check-ignore', '-q', '--', probe], wt.dir).code !== 0) return res('fail', `logs_dir ${logs} is not git-ignored on ${baseRef(ctx)}`);
+    } finally { wt.remove(); }
   }
-  return res('pass', 'no tracked secrets');
+  return res('pass', `no tracked secrets on ${baseRef(ctx)}`);
 }
 
 // Required status check names from branch protection / rulesets JSON (either shape).
