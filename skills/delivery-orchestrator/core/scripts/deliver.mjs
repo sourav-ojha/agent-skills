@@ -233,8 +233,11 @@ function baseConfigHash(base) {
 
 // The policy in force is the config committed on origin/<base> right now, never the queue's copy (the builder can edit that).
 function baseConfigNow(base) {
+  // Fail closed: a ref that does not resolve is not "no config". Defaults apply only when the ref resolves and the file is genuinely absent.
+  if (git('rev-parse', '--verify', '--quiet', OR(base)).code !== 0) return null;
+  if (git('cat-file', '-e', `${OR(base)}:${CONFIG_PATH}`).code !== 0) return parseConfig(undefined).config;
   const s = git('show', `${OR(base)}:${CONFIG_PATH}`);
-  if (s.code !== 0) return parseConfig(undefined).config;
+  if (s.code !== 0) return null;
   try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; }
 }
 
@@ -584,20 +587,19 @@ C.push = () => {
 C.merge = () => {
   const q = load(); const f = item(q);
   need(f, 'ci_passed', 'verified');
-  if (f.state === 'ci_passed') { // verification-required projects only merge what the gate verified
-    must(gitNet('fetch', 'origin'), 'git fetch');
-    const bc = baseConfigNow(q.base);
-    if (!bc) die(`${CONFIG_PATH} on origin/${q.base} is invalid: fix it on ${q.base} first`);
-    if (bc.verification.required) die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
-  }
+  must(gitNet('fetch', 'origin'), 'git fetch');
   const hold = (why) => { transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr }); };
   const view = () => ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,isDraft,mergeStateStatus,headRefOid,headRefName,baseRefName,mergeCommit,autoMergeRequest,isCrossRepository'], 'gh pr view');
   let v = view();
   if (v.isCrossRepository || v.headRefName !== f.branch || v.baseRefName !== q.base) die(`PR #${f.pr.number} is ${v.headRefName} -> ${v.baseRefName}${v.isCrossRepository ? ' (from a fork)' : ''}, expected ${f.branch} -> ${q.base} in this repository`);
   if (v.state === 'MERGED' && v.headRefOid === f.ci_sha) return merged(q, f, v.mergeCommit?.oid, ['GitHub had already merged this PR (an earlier run was interrupted)']);
+  if (f.state === 'ci_passed') { // verification-required projects only merge what the gate verified (checked after the already-merged recovery so a hand-merged PR still resolves)
+    const bc = baseConfigNow(q.base);
+    if (!bc) die(`${CONFIG_PATH} on origin/${q.base} cannot be read (missing ref or invalid): fix it first; not assuming defaults`);
+    if (bc.verification.required) die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
+  }
   if (q.protected_base) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
   if (!q.merge) return hold('merging was not authorised for this run (config merge.mode is "pr-only" and --merge was not given): the PR is ready for you');
-  must(gitNet('fetch', 'origin'), 'git fetch');
   if (git('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(gitNet('fetch', 'origin', f.branch), 'git fetch');
   const ci = [...new Set([...(f.ci_files || []), ...ciFiles(q, f.ci_sha)])]; // recomputed on the verified commit, renames included
   if (f.tier === 'T3') { // T3 needs the opt-in AND a passing verdict for this exact commit; otherwise a person reviews it, in every mode
@@ -644,11 +646,16 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   const q = load(); const f = item(q);
   need(f, 'awaiting_human');
   if (!f.pr) die(`${f.id} has no PR`);
-  const note = flat(opt.note);
-  if (f.hold_kind === 'antigaming' && !note) die(`${f.id} is held by an anti-gaming rule: retry needs --note "<why this is acceptable>"; it is recorded on the feature`);
-  const v = ghJson(['pr', 'view', String(f.pr.number), '--json', 'state'], 'gh pr view');
+  const anti = f.hold_kind === 'antigaming';
+  const note = flat(opt.note, 500);
+  if (anti) {
+    // A human decision: needs a real terminal (no env var or flag can stand in for one; the builder controls its own environment).
+    if (!(process.stdin.isTTY && process.stdout.isTTY)) die(`${f.id} is held by an anti-gaming rule: only a person at an interactive terminal can override it`);
+    if (!note || note.startsWith('--')) die(`${f.id} is held by an anti-gaming rule: retry needs --note "<why this is acceptable>"; it is recorded on the feature`);
+  }
+  const v = ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,headRefOid'], 'gh pr view');
   if (v.state !== 'OPEN') die(`PR #${f.pr.number} is ${v.state}`);
-  if (f.hold_kind === 'antigaming') { f.override_note = note.slice(0, 500); f.hold_kind = null; }
+  if (anti) { f.override_note = note; f.override_sha = v.headRefOid; f.hold_kind = null; } // valid for this exact head only: see overrideValid
   if (opt['no-ci']) q.no_ci = true;
   if (opt.checks) q.checks = parseList(opt.checks);
   q.stop = null;

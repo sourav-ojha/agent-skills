@@ -173,18 +173,96 @@ test('T3 with --merge-t3 and no passing verdict holds for a person', () => {
   // The passing-verdict path is exercised in Task 8, once lib/verdict.mjs can read a real verdict file.
 });
 
-test('retry --note: anti-gaming holds need a note, which is recorded; CI holds are unchanged', () => {
+test('retry --note: anti-gaming holds are refused without a terminal; CI holds are unchanged', () => {
   const r = shipped();
   r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = 'antigaming'; f.reason = 'G1'; });
-  const a = r.d({}, 'retry', 'FEATURE-001');
-  assert.notEqual(a.code, 0); assert.match(a.err, /--note/);
+  for (const a of [[], ['--note', 'looked fine to me']]) { // no env var or flag can stand in for a terminal
+    const x = r.d({ CI: '', TERM: 'xterm', DELIVER_TTY: '1' }, 'retry', 'FEATURE-001', ...a);
+    assert.notEqual(x.code, 0); assert.match(x.err, /interactive terminal/);
+  }
   assert.equal(r.feat().state, 'awaiting_human');
-  const b = r.d({}, 'retry', 'FEATURE-001', '--note', 'reviewed the diff, the test change is intended');
-  assert.equal(b.code, 0, b.err);
-  assert.equal(r.feat().state, 'pr_open');
-  assert.equal(r.feat().override_note, 'reviewed the diff, the test change is intended');
-  assert.ok(!r.feat().hold_kind);
+  assert.ok(!r.feat().override_note);
   r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = null; });
-  assert.equal(r.d({}, 'retry', 'FEATURE-001').code, 0, 'a plain hold retries without a note');
+  assert.equal(r.d({}, 'retry', 'FEATURE-001').code, 0, 'a plain hold retries without a note or a terminal');
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
+
+// Run deliver.mjs under a real pseudo-terminal via script(1); null when script is unavailable.
+function underTty(r, ...args) {
+  const devnull = () => [fs.openSync('/dev/null', 'r'), 'pipe', 'pipe']; // script(1) needs a non-socket stdin
+  const has = spawnSync('script', process.platform === 'darwin' ? ['-q', '/dev/null', 'true'] : ['-qec', 'true', '/dev/null'], { encoding: 'utf8', stdio: devnull() });
+  if (has.error || has.status !== 0) return null;
+  const argv = [DELIVER, ...args, '--dir', r.work];
+  const env = { ...process.env, PATH: `${path.join(r.root, 'bin')}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: path.join(r.root, 'gh.json'), SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(r.root, 'fhome') };
+  const x = process.platform === 'darwin'
+    ? spawnSync('script', ['-q', '/dev/null', 'node', ...argv], { encoding: 'utf8', env, stdio: devnull() })
+    : spawnSync('script', ['-qec', ['node', ...argv].map((a) => `'${a}'`).join(' '), '/dev/null'], { encoding: 'utf8', env, stdio: devnull() });
+  return { code: x.status, out: x.stdout, err: x.stderr };
+}
+
+test('retry --note under a real terminal: needs a note, records it bound to the head sha, returns to pr_open', (t) => {
+  const r = shipped();
+  r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = 'antigaming'; f.reason = 'G1'; });
+  const a = underTty(r, 'retry', 'FEATURE-001');
+  if (!a) { t.skip('script(1) is not available: cannot allocate a pseudo-terminal'); fs.rmSync(r.root, { recursive: true, force: true }); return; }
+  assert.notEqual(a.code, 0, a.out); assert.match(a.out + a.err, /--note/);
+  assert.equal(r.feat().state, 'awaiting_human');
+  const flag = underTty(r, 'retry', 'FEATURE-001', '--note', '--no-ci');
+  assert.notEqual(flag.code, 0, 'a flag swallowed as the note value is refused');
+  const b = underTty(r, 'retry', 'FEATURE-001', '--note', 'reviewed the diff, the test change is intended');
+  assert.equal(b.code, 0, b.out + b.err);
+  const f = r.feat();
+  assert.equal(f.state, 'pr_open');
+  assert.equal(f.override_note, 'reviewed the diff, the test change is intended');
+  assert.equal(f.override_sha, f.pr.head_sha);
+  assert.ok(Q.overrideValid(f, f.pr.head_sha));
+  assert.ok(!f.hold_kind);
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
+
+test('overrideValid: only for the exact head sha the override was given on', () => {
+  const f = { override_note: 'ok', override_sha: 'abc' };
+  assert.equal(Q.overrideValid(f, 'abc'), true);
+  assert.equal(Q.overrideValid(f, 'abd'), false, 'a later push voids it');
+  assert.equal(Q.overrideValid(f, undefined), false);
+  assert.equal(Q.overrideValid({ override_sha: 'abc' }, 'abc'), false, 'no note');
+  assert.equal(Q.overrideValid({ override_note: 'ok' }, 'abc'), false, 'no sha');
+  assert.equal(Q.overrideValid(null, 'abc'), false);
+});
+
+test('merge reads the base config fail-closed: missing ref and invalid JSON refuse; a genuinely absent file means defaults', () => {
+  const git = (cwd, ...a) => { const x = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (x.status !== 0) throw new Error(x.stderr); return x.stdout.trim(); };
+  const pushCfg = (r, content) => {
+    const br = git(r.work, 'rev-parse', '--abbrev-ref', 'HEAD');
+    git(r.work, 'checkout', '-q', 'main');
+    if (content === null) git(r.work, 'rm', '-q', '.product/delivery.json'); else fs.writeFileSync(path.join(r.work, '.product/delivery.json'), content);
+    git(r.work, 'commit', '-q', '-am', 'cfg'); git(r.work, 'push', '-q', 'origin', 'main'); git(r.work, 'checkout', '-q', br);
+  };
+  const bad = shipped();
+  pushCfg(bad, '{ not json');
+  const a = bad.d({}, 'merge', 'FEATURE-001');
+  assert.notEqual(a.code, 0); assert.match(a.err, /cannot be read/);
+  assert.equal(bad.feat().state, 'ci_passed');
+
+  const noRef = shipped();
+  const origin = path.join(noRef.root, 'origin.git');
+  git(origin, 'update-ref', '-d', 'refs/heads/main'); git(noRef.work, 'update-ref', '-d', 'refs/remotes/origin/main');
+  const b = noRef.d({}, 'merge', 'FEATURE-001');
+  assert.notEqual(b.code, 0); assert.match(b.err, /cannot be read/, b.err);
+
+  const none = shipped();
+  pushCfg(none, null);
+  const c = none.d({}, 'merge', 'FEATURE-001');
+  assert.doesNotMatch(c.err, /cannot be read|verification is required/, 'no config file: defaults, merge proceeds to its normal checks');
+  for (const r of [bad, noRef, none]) fs.rmSync(r.root, { recursive: true, force: true });
+});
+
+test('a hand-merged ci_passed feature resolves to merged even when verification is required', () => {
+  const r = shipped({}, { config: { protected_branches: [], verification: { required: true } } });
+  const sha = r.feat().ci_sha;
+  const gp = path.join(r.root, 'gh.json');
+  const g = JSON.parse(fs.readFileSync(gp, 'utf8')); Object.assign(g.prs[0], { state: 'MERGED', headSha: sha, mergeSha: sha }); fs.writeFileSync(gp, JSON.stringify(g));
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m)?.state, 'merged', m.out + m.err + ` (ci_sha ${sha})`);
   fs.rmSync(r.root, { recursive: true, force: true });
 });

@@ -23,6 +23,11 @@ export const TRANSITIONS = {
 export const ACTIVE = ['building', 'built', 'pr_open', 'ci_passed', 'ci_failed', 'fixing', 'verified', 'verify_failed'];
 export const FAILED = ['blocked'];
 
+// A person's anti-gaming override counts only for the exact head commit it was given on; any later push voids it.
+export function overrideValid(f, headSha) {
+  return !!(f && f.override_note && f.override_sha && headSha && f.override_sha === headSha);
+}
+
 export function transition(item, to, reason) {
   if (!(TRANSITIONS[item.state] || []).includes(to)) throw new Error(`${item.id}: cannot go from "${item.state}" to "${to}"`);
   item.state = to;
