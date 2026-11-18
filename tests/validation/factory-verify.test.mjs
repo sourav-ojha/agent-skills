@@ -97,3 +97,94 @@ test('DELIVER_QUEUE must be absolute and not a symlink (file or folder)', () => 
   assert.equal(fs.readFileSync(path.join(real, 'target.json'), 'utf8'), '{}');
   fs.rmSync(r.root, { recursive: true, force: true });
 });
+
+// ---- Task 2: states, fix from verify_failed, T3 verdict rule, retry --note -------------------------------------------
+const Q = await import(path.join(SK, 'core', 'scripts', 'lib', 'queue.mjs'));
+const J = (x) => { try { return JSON.parse(x.out); } catch { return undefined; } };
+
+test('queue: verification transitions allowed, others refused', () => {
+  const ok = [['ci_passed', 'verified'], ['ci_passed', 'verify_failed'], ['verify_failed', 'fixing'], ['verify_failed', 'blocked'], ['verified', 'merged'], ['verified', 'pr_open'], ['verified', 'awaiting_human'], ['verified', 'blocked']];
+  for (const [a, b] of ok) assert.doesNotThrow(() => Q.transition({ id: 'FEATURE-001', state: a, history: [] }, b), `${a} -> ${b}`);
+  for (const [a, b] of [['verify_failed', 'merged'], ['verify_failed', 'verified'], ['pr_open', 'verified'], ['verified', 'ci_passed']]) assert.throws(() => Q.transition({ id: 'FEATURE-001', state: a, history: [] }, b), /cannot go/, `${a} -> ${b}`);
+  assert.ok(Q.ACTIVE.includes('verified') && Q.ACTIVE.includes('verify_failed'));
+});
+
+// Ship FEATURE-001 to ci_passed with the real helper, then let the test edit the queue file directly.
+function shipped(extra = {}, { tier = 'T2', config, init = ['--merge', '--note', 'ok'] } = {}) {
+  const r = repo();
+  const sh = (...a) => { const x = spawnSync('git', a, { cwd: r.work, encoding: 'utf8' }); if (x.status !== 0) throw new Error(x.stderr); };
+  if (config) { fs.writeFileSync(path.join(r.work, '.product/delivery.json'), JSON.stringify(config)); sh('add', '-A'); sh('commit', '-q', '-m', 'cfg'); sh('push', '-q', 'origin', 'main'); }
+  { const i = r.d(extra, 'init', ...init); assert.equal(i.code, 0, i.out + i.err); }
+  assert.equal(J(r.d(extra, 'next')).feature.id, 'FEATURE-001');
+  const spc = path.join(r.work, '.product/features/FEATURE-001.md');
+  fs.mkdirSync(path.join(r.work, 'src'), { recursive: true }); fs.writeFileSync(path.join(r.work, 'src/a.txt'), 'a\n');
+  fs.writeFileSync(spc, fs.readFileSync(spc, 'utf8').replace(/^status: ready/m, 'status: implemented').replace(/^---\n/, '---\ndelivery: complete\n'));
+  sh('add', '-A'); sh('commit', '-q', '-m', 'feat');
+  assert.equal(r.d(extra, 'built', 'FEATURE-001', '--tier', tier).code, 0);
+  fs.mkdirSync(path.join(r.work, '.delivery'), { recursive: true }); fs.writeFileSync(path.join(r.work, '.delivery/pr-body.md'), 'b\n');
+  { const p = r.d(extra, 'pr', 'FEATURE-001', '--title', 'feat: thing', '--body-file', path.join(r.work, '.delivery/pr-body.md')); assert.equal(p.code, 0, p.out + p.err); }
+  { const g = JSON.parse(fs.readFileSync(path.join(r.root, 'gh.json'), 'utf8')); g.checkQueue = [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]]; fs.writeFileSync(path.join(r.root, 'gh.json'), JSON.stringify(g)); }
+  const ci = r.d(extra, 'ci', 'FEATURE-001', '--interval', '0', '--grace', '0', '--timeout', '1');
+  assert.equal(J(ci).result, 'passed', ci.out + ci.err);
+  const qf = path.join(r.work, '.delivery', 'queue.json');
+  r.edit = (fn) => { const q = JSON.parse(fs.readFileSync(qf, 'utf8')); fn(q.features[0], q); fs.writeFileSync(qf, JSON.stringify(q)); };
+  r.feat = () => JSON.parse(fs.readFileSync(qf, 'utf8')).features[0];
+  return r;
+}
+
+test('fix accepts verify_failed and shares max_fix_rounds', () => {
+  const r = shipped();
+  r.edit((f) => { f.state = 'verify_failed'; });
+  const x = r.d({}, 'fix', 'FEATURE-001');
+  assert.equal(x.code, 0, x.err);
+  assert.equal(r.feat().state, 'fixing');
+  assert.equal(r.feat().fix_rounds, 1);
+  const r2 = shipped();
+  r2.edit((f, q) => { f.state = 'verify_failed'; f.fix_rounds = q.max_fix_rounds; });
+  r2.d({}, 'fix', 'FEATURE-001');
+  assert.equal(r2.feat().state, 'blocked');
+  fs.rmSync(r.root, { recursive: true, force: true }); fs.rmSync(r2.root, { recursive: true, force: true });
+});
+
+test('merge accepts verified; ci_passed is accepted unless the base config requires verification', () => {
+  const r = shipped();
+  r.edit((f) => { f.state = 'verified'; });
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m).state, 'merged', m.out + m.err);
+
+  const req = shipped({}, { config: { protected_branches: [], verification: { required: true } } });
+  const a = req.d({}, 'merge', 'FEATURE-001');
+  assert.notEqual(a.code, 0); assert.match(a.err, /verification/);
+  assert.equal(req.feat().state, 'ci_passed');
+  req.edit((f, q) => { q.policy = { ...(q.policy || {}), verification: { required: false } }; }); // the builder-editable queue copy must not matter
+  assert.match(req.d({}, 'merge', 'FEATURE-001').err, /verification/);
+  req.edit((f) => { f.state = 'verified'; });
+  assert.equal(J(req.d({}, 'merge', 'FEATURE-001')).state, 'merged');
+  fs.rmSync(r.root, { recursive: true, force: true }); fs.rmSync(req.root, { recursive: true, force: true });
+});
+
+test('T3 with --merge-t3 and no passing verdict holds for a person', () => {
+  const r = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'] });
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(m.code, 2);
+  assert.equal(J(m).state, 'awaiting_human');
+  assert.match(J(m).reason, /verdict/);
+  fs.rmSync(r.root, { recursive: true, force: true });
+  // The passing-verdict path is exercised in Task 8, once lib/verdict.mjs can read a real verdict file.
+});
+
+test('retry --note: anti-gaming holds need a note, which is recorded; CI holds are unchanged', () => {
+  const r = shipped();
+  r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = 'antigaming'; f.reason = 'G1'; });
+  const a = r.d({}, 'retry', 'FEATURE-001');
+  assert.notEqual(a.code, 0); assert.match(a.err, /--note/);
+  assert.equal(r.feat().state, 'awaiting_human');
+  const b = r.d({}, 'retry', 'FEATURE-001', '--note', 'reviewed the diff, the test change is intended');
+  assert.equal(b.code, 0, b.err);
+  assert.equal(r.feat().state, 'pr_open');
+  assert.equal(r.feat().override_note, 'reviewed the diff, the test change is intended');
+  assert.ok(!r.feat().hold_kind);
+  r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = null; });
+  assert.equal(r.d({}, 'retry', 'FEATURE-001').code, 0, 'a plain hold retries without a note');
+  fs.rmSync(r.root, { recursive: true, force: true });
+});

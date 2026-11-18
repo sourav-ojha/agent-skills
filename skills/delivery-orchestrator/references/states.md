@@ -17,9 +17,17 @@ queued ──next──► building ──built──► built ──pr──►
 | ci_failed | a check failed | `fix ID` (while rounds remain) or `block ID` |
 | fixing | fixing CI on the same branch | `push ID` |
 | ci_passed | the head commit passed CI (or `--no-ci` and none exist) | `merge ID` |
+| verified | the verification gate passed for the head commit (nothing sets it until the driver does) | `merge ID` |
+| verify_failed | the verification gate failed | `fix ID` (shares `max_fix_rounds` with `ci_failed`) or `block ID` |
 | awaiting_human | held: not authorised, T3, CI/ownership files touched, branch protection, no CI evidence | a person acts; a PR they merge is noticed by the next `next`; for CI evidence, `retry ID --checks ...` or `--no-ci` |
 | blocked | could not be delivered; work stashed, base checked out | `skip ID` or fix by hand |
 | merged / skipped | terminal | |
+
+Verification transitions: `ci_passed` → `verified` or `verify_failed`; `verify_failed` → `fixing` or `blocked`; `verified` → `merged`, `pr_open` (stale head), `awaiting_human` or `blocked`.
+
+`merge` accepts `verified`. It accepts `ci_passed` only while `verification.required` is false in the config committed on `origin/<base>` (read at merge time; the copy in the queue file is never used). T3 work merges only with `--merge-t3` or `merge.allow_tier3` **and** a passing verdict for the exact head commit; without a verdict it is held for a person in every mode.
+
+A feature held by an anti-gaming rule (`hold_kind: antigaming`) is released with `retry ID --note "<why>"`: the note is recorded as `override_note` and the feature returns to `pr_open`. Without `--note` the retry is refused. CI holds retry as before.
 
 The helper refuses any other jump (for example `queued` → `merged`), so the file cannot claim a merge that did not go through the merge command.
 

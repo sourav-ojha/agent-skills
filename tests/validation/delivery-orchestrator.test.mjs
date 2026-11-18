@@ -267,7 +267,10 @@ test('merge guards: not authorised, T3, and CI-file changes all hold the PR for 
   const t3ok = setup();
   t3ok.d('init', '--merge', '--note', 'ok', '--merge-t3');
   ship(t3ok, 'FEATURE-001', { tier: 'T3' });
-  assert.equal(t3ok.d('merge', 'FEATURE-001').json.state, 'merged');
+  // Phase 1a: --merge-t3 is no longer enough on its own; a passing verdict for the exact commit is also needed (none exists yet).
+  const held = t3ok.d('merge', 'FEATURE-001');
+  assert.equal(held.json.state, 'awaiting_human');
+  assert.match(held.json.reason, /verdict/);
 });
 
 test('merge guards: head changed after CI is stale; behind updates the branch; conflict blocks; branch protection holds', () => {

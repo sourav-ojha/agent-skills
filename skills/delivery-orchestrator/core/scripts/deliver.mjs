@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
 import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
+import { readVerdict } from './lib/verdict.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -228,6 +229,13 @@ async function readinessGate(config, nameWithOwner, base) {
 function baseConfigHash(base) {
   const shown = spawnSync('git', ['show', `${OR(base)}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
   return shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
+}
+
+// The policy in force is the config committed on origin/<base> right now, never the queue's copy (the builder can edit that).
+function baseConfigNow(base) {
+  const s = git('show', `${OR(base)}:${CONFIG_PATH}`);
+  if (s.code !== 0) return parseConfig(undefined).config;
+  try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; }
 }
 
 C.init = async () => {
@@ -545,8 +553,8 @@ function stopRun(q, f, why) {
 
 C.fix = () => {
   const q = load(); const f = item(q);
-  need(f, 'ci_failed');
-  if (f.fix_rounds >= q.max_fix_rounds) { block(q, f, `CI still failing after ${f.fix_rounds} fix round(s)`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
+  need(f, 'ci_failed', 'verify_failed');
+  if (f.fix_rounds >= q.max_fix_rounds) { block(q, f, `${f.state === 'verify_failed' ? 'verification' : 'CI'} still failing after ${f.fix_rounds} fix round(s)`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
   if (!clean()) die('the working tree is not clean');
   if (branchNow() !== f.branch) must(git('checkout', f.branch), 'git checkout');
   // GitHub may have added commits (an "update branch" merge): start from the remote tip so the fix can be pushed without force.
@@ -575,7 +583,13 @@ C.push = () => {
 
 C.merge = () => {
   const q = load(); const f = item(q);
-  need(f, 'ci_passed');
+  need(f, 'ci_passed', 'verified');
+  if (f.state === 'ci_passed') { // verification-required projects only merge what the gate verified
+    must(gitNet('fetch', 'origin'), 'git fetch');
+    const bc = baseConfigNow(q.base);
+    if (!bc) die(`${CONFIG_PATH} on origin/${q.base} is invalid: fix it on ${q.base} first`);
+    if (bc.verification.required) die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
+  }
   const hold = (why) => { transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr }); };
   const view = () => ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,isDraft,mergeStateStatus,headRefOid,headRefName,baseRefName,mergeCommit,autoMergeRequest,isCrossRepository'], 'gh pr view');
   let v = view();
@@ -586,7 +600,11 @@ C.merge = () => {
   must(gitNet('fetch', 'origin'), 'git fetch');
   if (git('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(gitNet('fetch', 'origin', f.branch), 'git fetch');
   const ci = [...new Set([...(f.ci_files || []), ...ciFiles(q, f.ci_sha)])]; // recomputed on the verified commit, renames included
-  if (f.tier === 'T3' && !q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
+  if (f.tier === 'T3') { // T3 needs the opt-in AND a passing verdict for this exact commit; otherwise a person reviews it, in every mode
+    if (!q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
+    const vd = readVerdict(f.id, f.ci_sha);
+    if (!(vd && vd.verdict === 'pass')) return hold(`T3 work needs a passing verification verdict for commit ${String(f.ci_sha).slice(0, 8)} and there is none: a person reviews it`);
+  }
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
   if (v.headRefOid !== f.ci_sha) { transition(f, 'pr_open'); save(q); return outcome({ id: f.id, result: 'stale', reason: 'the PR head changed after CI passed: wait for CI again', next: 'ci' }); }
@@ -626,8 +644,11 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   const q = load(); const f = item(q);
   need(f, 'awaiting_human');
   if (!f.pr) die(`${f.id} has no PR`);
+  const note = flat(opt.note);
+  if (f.hold_kind === 'antigaming' && !note) die(`${f.id} is held by an anti-gaming rule: retry needs --note "<why this is acceptable>"; it is recorded on the feature`);
   const v = ghJson(['pr', 'view', String(f.pr.number), '--json', 'state'], 'gh pr view');
   if (v.state !== 'OPEN') die(`PR #${f.pr.number} is ${v.state}`);
+  if (f.hold_kind === 'antigaming') { f.override_note = note.slice(0, 500); f.hold_kind = null; }
   if (opt['no-ci']) q.no_ci = true;
   if (opt.checks) q.checks = parseList(opt.checks);
   q.stop = null;
