@@ -700,6 +700,7 @@ test('CFG config command: effective values without a file, --write creates the t
   assert.ok(fs.existsSync(path.join(e.work, '.product/delivery.json')));
   assert.match(e.d('config', '--write').err, /already exists/);
   assert.equal(e.d('config').json.errors.length, 0, 'the template is valid');
+  assert.equal(e.d('config').json.effective.readiness, null, 'the template does not opt into the readiness merge gate (D7)');
 });
 
 test('CFG the config must be committed and identical to the copy on the base branch', () => {

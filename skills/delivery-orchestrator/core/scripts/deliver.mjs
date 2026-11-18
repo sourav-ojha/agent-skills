@@ -52,14 +52,18 @@ let GH_HOSTNAME = null;
 const tokenSafeRemote = () => { const f = git('remote', 'get-url', 'origin').out, p = git('remote', 'get-url', '--push', 'origin').out; return !!GH_HOSTNAME && [f, p].every((u) => isHttps(u) && remoteHost(u) === GH_HOSTNAME); };
 const gitNet = (...a) => (GH_ENV.GH_TOKEN || GH_ENV.GH_ENTERPRISE_TOKEN) && tokenSafeRemote()
   ? run('git', ['-c', 'credential.helper=', '-c', `credential.https://${GH_HOSTNAME}.helper=!gh auth git-credential`, ...a], GH_ENV) : git(...a);
-function useAccount(account, host) {
-  if (!account) return;
+// soft: return the problem as a string (and leave the default gh credentials in place) instead of exiting.
+function useAccount(account, host, { soft = false } = {}) {
+  if (!account) return null;
+  const fail = (m) => { if (soft) return m; die(m); };
   const t = run('gh', ['auth', 'token', '--user', account, '--hostname', host]);
-  if (t.code !== 0 || !t.out) die(`gh has no login for "${account}" on ${host}; run "gh auth login --hostname ${host}" for that account`);
+  if (t.code !== 0 || !t.out) return fail(`gh has no login for "${account}" on ${host}; run "gh auth login --hostname ${host}" for that account`);
+  const env = host === 'github.com' ? { GH_TOKEN: t.out } : { GH_ENTERPRISE_TOKEN: t.out, GH_HOST: host };
+  const who = run('gh', ['api', 'user', '--jq', '.login'], env);
+  if (who.code !== 0 || who.out.toLowerCase() !== account.toLowerCase()) return fail(`the token for "${account}" resolves to "${flat(who.out, 40)}": check "gh auth status"`);
   GH_HOSTNAME = host.toLowerCase();
-  GH_ENV = host === 'github.com' ? { GH_TOKEN: t.out } : { GH_ENTERPRISE_TOKEN: t.out, GH_HOST: host };
-  const who = run('gh', ['api', 'user', '--jq', '.login'], GH_ENV);
-  if (who.code !== 0 || who.out.toLowerCase() !== account.toLowerCase()) die(`the token for "${account}" resolves to "${flat(who.out, 40)}": check "gh auth status"`);
+  GH_ENV = env;
+  return null;
 }
 const must = (r, what) => { if (r.code !== 0) die(`${what} failed: ${(r.err || r.out).split('\n')[0].slice(0, 200)}`); return r.out; };
 const sleep = (ms) => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -76,8 +80,20 @@ const validRef = (s) => typeof s === 'string' && REF.test(s) && !s.includes('..'
 const RECORDED = new Set(['merged', 'skipped', 'blocked', 'awaiting_human']);
 let curQ = null;
 const pending = [];
-const note = (f) => { if (curQ && RECORDED.has(f.state)) pending.push({ f: JSON.parse(JSON.stringify(f)), at: Date.now() }); };
-const transition = (f, to, reason) => { transitionState(f, to, reason); note(f); return f; };
+// A feature waiting for a person is not working: its record window ends when it entered awaiting_human (f.ts_wait), so a later
+// refresh/skip/merge of it does not stretch the window over other features' runs (which would make the token join ambiguous).
+const note = (f, from) => {
+  if (!curQ || !RECORDED.has(f.state)) return;
+  const waited = from === 'awaiting_human' && Number.isFinite(Date.parse(f.ts_wait)) ? Date.parse(f.ts_wait) : null;
+  pending.push({ f: JSON.parse(JSON.stringify(f)), at: waited ?? Date.now() });
+};
+const transition = (f, to, reason) => {
+  const from = f.state;
+  transitionState(f, to, reason);
+  if (to === 'awaiting_human') f.ts_wait = new Date().toISOString();
+  note(f, from);
+  return f;
+};
 let stamps;
 function flushRecords() {
   if (!pending.length) return;
@@ -183,6 +199,7 @@ async function readinessGate(config, nameWithOwner, base) {
   const at = Date.parse(doc.at);
   if (Number.isFinite(at) && at - Date.now() > 86400000) return { refuse: `the readiness result is dated in the future (${flat(doc.at, 40)}): clock skew or an edited file; run "deliver readiness" again` };
   if (!Number.isFinite(at) || Date.now() - at > maxAge * 86400000) return { refuse: `the readiness result is older than ${maxAge} days (or undated): run "deliver readiness" again` };
+  if (doc.base !== base) return { refuse: `the readiness result was computed for base "${flat(doc.base ?? '(unrecorded)', 60)}" but this run's base is "${base}": run "deliver readiness" again for that base` };
   if (!doc.config_hash || doc.config_hash !== baseConfigHash(base)) return { refuse: `config changed since readiness check (${CONFIG_PATH} on origin/${base} is not the one that was checked): run "deliver readiness" again` };
   const ctx = makeCtx({ root, config, base, git, gh, repo: nameWithOwner });
   const fresh = await runChecks(ctx, { only: ['C1', 'C2', 'C4', 'C5'] });
@@ -287,7 +304,7 @@ C.readiness = async () => {
   let parsed = parseConfig(raw);
   if (parsed.errors.length) parsed = parseConfig(undefined); // C1 reports the errors; the other checks run on defaults
   const config = parsed.config;
-  useAccount(config.github.account, config.github.host);
+  const accountError = useAccount(config.github.account, config.github.host, { soft: true }); // C2 reports it; the run continues on gh's default login
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
   const base = opt.base || config.base || repo.defaultBranchRef?.name;
   if (!validRef(base)) die('could not determine a valid base branch; set "base" in the config or pass --base');
@@ -295,7 +312,7 @@ C.readiness = async () => {
   const sha = git('rev-parse', '--verify', `origin/${base}^{commit}`);
   if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
   const configHash = baseConfigHash(base);
-  const ctx = makeCtx({ root, config, base, git, gh, repo: repo.nameWithOwner });
+  const ctx = makeCtx({ root, config, base, git, gh, repo: repo.nameWithOwner, accountError });
   let results = await runChecks(ctx);
   for (let i = 1; i < repeat; i++) {
     const again = new Map((await runChecks(ctx)).map((r) => [r.id, r]));
@@ -304,7 +321,7 @@ C.readiness = async () => {
   const level = computeLevel(results);
   const status = new Map(results.map((r) => [r.id, r]));
   const fixes = CHECKS.filter((c) => c.level > 0 && status.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, status.get(c.id)));
-  const doc = { helper_version: HELPER_VERSION, base_sha: sha.out, config_hash: configHash, level, results, fixes, at: new Date().toISOString() };
+  const doc = { helper_version: HELPER_VERSION, base, base_sha: sha.out, config_hash: configHash, level, results, fixes, at: new Date().toISOString() };
   const where = path.join(factoryHome(), 'readiness', `${repoKey(repo.nameWithOwner)}.json`);
   writeJsonAtomic(where, doc);
   const min = config.readiness?.min_level ?? 1;

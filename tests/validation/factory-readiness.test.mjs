@@ -475,3 +475,100 @@ test('init gate: a readiness result dated more than a day in the future is refus
   assert.match(x.err, /in the future/);
   done(r);
 });
+
+// ---- final-review fixes ------------------------------------------------------------------------------------------------
+test('C6: a ::1-only listener on a localhost ready url counts as port in use', async (t) => {
+  const r = await appRepo('ready');
+  r.ctx.config.app.ready.url = `http://localhost:${r.port}/health`;
+  const srv = net.createServer();
+  const ok = await new Promise((res) => { srv.once('error', () => res(false)); srv.listen(r.port, '::1', () => res(true)); });
+  if (!ok) { r.cleanup(); return t.skip('IPv6 loopback (::1) is not available on this machine'); }
+  try {
+    const x = await only(r, 'C6');
+    assert.equal(x.C6.status, 'fail'); assert.match(x.C6.reason, /port in use/);
+  } finally { srv.close(); r.cleanup(); }
+});
+
+test('C3: a command that leaves a background child still finishes promptly; a timed-out command fails with "timed out"', async () => {
+  const bg = mkRepo({ config: { tests: { all: ['sh', '-c', 'sleep 30 & exit 0'] } } });
+  const t0 = Date.now();
+  assert.equal((await only(bg, 'C3')).C3.status, 'pass');
+  assert.ok(Date.now() - t0 < 10000, `took ${Date.now() - t0}ms`);
+  bg.cleanup();
+  const slow = mkRepo({ config: { tests: { all: ['node', '-e', 'setTimeout(()=>{},30000)'] } } });
+  slow.ctx.config.tests.timeout_s = 1;
+  const x = await only(slow, 'C3');
+  assert.equal(x.C3.status, 'fail'); assert.match(x.C3.reason, /timed out/);
+  slow.cleanup();
+});
+
+test('C3: a timed-out tests.setup fails C3', async () => {
+  const r = mkRepo({ config: { tests: { setup: ['node', '-e', 'setTimeout(()=>{},30000)'], all: ['node', '-e', 'process.exit(0)'] } } });
+  r.ctx.config.tests.timeout_s = 1;
+  const x = await only(r, 'C3');
+  assert.equal(x.C3.status, 'fail'); assert.match(x.C3.reason, /tests\.setup timed out/);
+  r.cleanup();
+});
+
+test('C2: the gh login is compared case-insensitively with github.account', async () => {
+  const r = mkRepo({ config: { base: 'main' } });
+  r.ctx.config.github.account = 'Default-USER'; // the fake gh answers "default-user"
+  assert.equal((await only(r, 'C2')).C2.status, 'pass');
+  r.ctx.config.github.account = 'someone-else';
+  assert.equal((await only(r, 'C2')).C2.status, 'fail');
+  r.cleanup();
+});
+
+test('deliver readiness: an account with no gh login fails C2 with the reason instead of dying', async () => {
+  const r = await cliRepo({ config: { github: { account: 'nobody', host: 'github.com' } } });
+  const x = r.d('readiness', '--json');
+  assert.equal(x.code, 2, x.out + x.err);
+  const doc = JSON.parse(x.out);
+  const c2 = doc.results.find((z) => z.id === 'C2');
+  assert.equal(c2.status, 'fail'); assert.match(c2.reason, /no login for "nobody"/);
+  assert.equal(doc.level, 0);
+  assert.ok(doc.results.length >= 8);
+  done(r);
+});
+
+test('deliver readiness stores the base branch name', async () => {
+  const r = await cliRepo();
+  assert.equal(r.d('readiness').code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(r.file, 'utf8')).base, 'main');
+  done(r);
+});
+
+test('init gate: a readiness result computed for another base is refused', async () => {
+  const r = await gateRepo();
+  assert.equal(r.d('readiness').code, 0);
+  rewriteFile(r, (d) => { d.base = 'develop'; });
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /computed for base "develop"/);
+  rewriteFile(r, (d) => { delete d.base; });
+  assert.equal(r.d(...initArgs).code, 1);
+  done(r);
+});
+
+test('init gate: a protected base with a readiness key is not gated', async () => {
+  const r = await gateRepo({ protected_branches: ['main'] });
+  const x = r.d(...initArgs); // no readiness file exists: a gate would refuse
+  assert.equal(x.code, 0, x.out + x.err);
+  assert.match(fs.readFileSync(path.join(r.work, '.delivery', 'queue.json'), 'utf8'), /"merge": false/);
+  done(r);
+});
+
+test('init gate: a refusal writes no queue file and no info/exclude entries, also with --dry-run', async () => {
+  const r = await gateRepo();
+  const exclude = path.join(r.work, '.git', 'info', 'exclude');
+  const before = fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null;
+  for (const extra of [[], ['--dry-run']]) {
+    const x = r.d(...initArgs, ...extra);
+    assert.equal(x.code, 1, x.out + x.err);
+    assert.match(x.err, /deliver readiness/);
+    assert.equal(fs.existsSync(path.join(r.work, '.delivery', 'queue.json')), false);
+    assert.equal(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null, before);
+    assert.doesNotMatch(before ?? '', /\.delivery\/|\.implementation\//);
+  }
+  done(r);
+});

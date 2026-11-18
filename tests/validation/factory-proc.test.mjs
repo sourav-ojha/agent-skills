@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
 import { REPO } from './helpers.mjs';
 
 const p = await import(path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'lib', 'proc.mjs'));
@@ -157,7 +158,6 @@ test('runCmd timeout kills a same-group grandchild', async (t) => {
 });
 
 test('app is killed when the orchestrator receives SIGTERM', async (t) => {
-  const { spawn } = await import('node:child_process');
   const port = await freePort();
   const orch = spawn(process.execPath, [path.join(FX, 'orchestrator.mjs')], { env: { ...p.allowEnv(null), PORT: String(port) }, stdio: ['ignore', 'pipe', 'inherit'] });
   t.after(() => { orch.kill('SIGKILL'); });
@@ -168,4 +168,67 @@ test('app is killed when the orchestrator receives SIGTERM', async (t) => {
   const ex = await exited;
   assert.equal(ex.code, 143);
   assert.equal(await waitFor(async () => !(await p.portInUse(port)), 5000), true);
+});
+
+// ---- final-review fixes ------------------------------------------------------------------------------------------------
+test('portInUse: a ::1-only listener is detected for localhost and ::1 but not for 127.0.0.1', async (t) => {
+  const s = net.createServer();
+  const ok = await new Promise((res) => { s.once('error', () => res(false)); s.listen(0, '::1', () => res(true)); });
+  if (!ok) return t.skip('IPv6 loopback (::1) is not available on this machine');
+  t.after(() => s.close());
+  const { port } = s.address();
+  assert.equal(await p.portInUse(port), true);
+  assert.equal(await p.portInUse(port, 'localhost'), true);
+  assert.equal(await p.portInUse(port, '[::1]'), true);
+  assert.equal(await p.portInUse(port, '127.0.0.1'), false);
+  assert.equal(p.hostOf('http://localhost:3000/x'), 'localhost');
+});
+
+test('runCmd: returns promptly when the command leaves a background child holding stdout, and kills that child', async (t) => {
+  const cwd = tmp(t); const pidFile = path.join(cwd, 'bg.pid');
+  const t0 = Date.now();
+  const r = await p.runCmd(['sh', '-c', `sleep 30 & echo $! > ${pidFile}; echo started; exit 0`], { cwd, timeoutS: 20 });
+  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0}ms`);
+  assert.equal(r.code, 0); assert.equal(r.timedOut, false); assert.match(r.tail, /started/);
+  const bg = Number(fs.readFileSync(pidFile, 'utf8'));
+  t.after(() => { try { process.kill(bg, 'SIGKILL'); } catch {} });
+  assert.equal(await waitFor(() => !alive(bg), 3000), true);
+});
+
+test('allowEnv: env_example cannot override pinned keys', () => {
+  const e = p.allowEnv('NODE_ENV=development\nCI=0\nPATH=/evil\nHOME=/evil\nLANG=xx\nTMPDIR=/evil\nOK=1\n', { PATH: '/bin', HOME: '/h', LANG: 'C', TMPDIR: '/t' });
+  assert.equal(e.NODE_ENV, 'test'); assert.equal(e.CI, '1'); assert.equal(e.PATH, '/bin'); assert.equal(e.HOME, '/h'); assert.equal(e.LANG, 'C'); assert.equal(e.TMPDIR, '/t'); assert.equal(e.OK, '1');
+  const child = spawnSyncNode('NODE_ENV=development\n');
+  assert.equal(child, 'test');
+});
+function spawnSyncNode(example) {
+  const r = spawnSync(process.execPath, ['-e', 'process.stdout.write(process.env.NODE_ENV)'], { env: p.allowEnv(example), encoding: 'utf8' });
+  return r.stdout;
+}
+
+test('cleanup registry: registered cleanups run on runCleanups and can be unregistered', () => {
+  let n = 0;
+  const un = p.registerCleanup(() => { n++; });
+  p.registerCleanup(() => { n += 10; });
+  un();
+  p.runCleanups();
+  assert.equal(n, 10); assert.equal(p.pendingCleanups(), 0);
+});
+
+test('a worktree left by a readiness run killed by SIGTERM is removed', async (t) => {
+  const dir = tmp(t);
+  const git = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(r.stderr); return r.stdout.trim(); };
+  git(dir, 'init', '-q', '-b', 'main'); git(dir, 'config', 'user.email', 't@x'); git(dir, 'config', 'user.name', 't');
+  fs.writeFileSync(path.join(dir, 'a'), '1'); git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'i');
+  const rdUrl = new URL('file://' + path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'lib', 'readiness.mjs')).href;
+  const script = path.join(tmp(t), 'wt.mjs');
+  fs.writeFileSync(script, `import { gitWorktree } from ${JSON.stringify(rdUrl)};\nconst w = gitWorktree(${JSON.stringify(dir)}, 'HEAD');\nconsole.log('wt ' + w.dir);\nsetInterval(() => {}, 1000);\n`);
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => child.kill('SIGKILL'));
+  const wt = await new Promise((res) => child.stdout.on('data', (d) => { const m = /wt (.+)/.exec(String(d)); if (m) res(m[1].trim()); }));
+  assert.ok(fs.existsSync(wt));
+  const exited = new Promise((res) => child.on('exit', res));
+  child.kill('SIGTERM'); await exited;
+  assert.equal(fs.existsSync(wt), false);
+  assert.doesNotMatch(git(dir, 'worktree', 'list'), /factory-wt/);
 });

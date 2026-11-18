@@ -27,6 +27,5 @@
     "seed": null,
     "env_example": ".env.example"
   },
-  "tests": { "setup": null, "all": ["npm", "test"], "timeout_s": 900 },
-  "readiness": { "min_level": 3, "max_age_days": 14 }
+  "tests": { "setup": null, "all": ["npm", "test"], "timeout_s": 900 }
 }

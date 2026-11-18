@@ -173,6 +173,24 @@ test('awaiting_human then a person merging it gives two records and latestPerFea
   assert.equal(latest[0].outcome, 'merged');
 });
 
+test('leaving awaiting_human later does not stretch the record window over the next feature', () => {
+  const e = setup({ 'FEATURE-001': {}, 'FEATURE-002': {} });
+  e.d('init'); // merging not authorised: FEATURE-001 is held for a person
+  ship(e, 'FEATURE-001');
+  assert.equal(e.d('merge', 'FEATURE-001').code, 2);
+  const held = records(e)[0];
+  const n = e.d('next'); assert.equal(n.json.feature.id, 'FEATURE-002', n.out + n.err);
+  const startB = Date.parse(JSON.parse(fs.readFileSync(path.join(e.work, '.delivery', 'queue.json'), 'utf8')).features.find((f) => f.id === 'FEATURE-002').ts_start);
+  assert.ok(Number.isFinite(startB));
+  e.setGh((s) => { s.prs[0].state = 'MERGED'; });
+  e.d('next'); // refresh discovers the person's merge of FEATURE-001, while FEATURE-002 is in progress
+  const latest = rr.latestPerFeature(records(e)).find((r) => r.feature === 'FEATURE-001');
+  assert.equal(latest.outcome, 'merged');
+  assert.ok(Date.parse(latest.ts_end) <= startB, `${latest.ts_end} should not be after FEATURE-002 started`);
+  assert.equal(latest.ts_end, held.ts_end);
+  assert.equal(latest.wall_ms, held.wall_ms);
+});
+
 test('an awaiting_human stop from ci (no CI reported) is recorded', () => {
   const e = setup();
   e.d('init');

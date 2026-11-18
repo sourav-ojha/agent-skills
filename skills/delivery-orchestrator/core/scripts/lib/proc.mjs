@@ -22,8 +22,6 @@ export function redact(text) {
 export function allowEnv(envExampleText, base = process.env) {
   const env = {};
   for (const k of ALLOWED) if (base[k] !== undefined) env[k] = String(base[k]);
-  env.NODE_ENV = 'test';
-  env.CI = '1';
   for (const raw of String(envExampleText ?? '').split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
@@ -33,6 +31,10 @@ export function allowEnv(envExampleText, base = process.env) {
     if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) v = v.slice(1, -1);
     env[m[1]] = v;
   }
+  // Pinned keys win over anything the env example declares.
+  for (const k of ALLOWED) if (base[k] !== undefined) env[k] = String(base[k]);
+  env.NODE_ENV = 'test';
+  env.CI = '1';
   return env;
 }
 
@@ -43,10 +45,22 @@ const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catc
 
 // Live process groups. Anything still registered is SIGKILLed when this process exits or is signalled.
 const live = new Set();
+// Cleanup callbacks (e.g. temp worktree removal) run on exit or signal too. Each must be synchronous and idempotent.
+const cleanups = new Set();
 let hooked = false;
-const killAll = () => { for (const g of live) killGroup(g, 'SIGKILL'); live.clear(); };
+const killAll = () => {
+  for (const g of live) killGroup(g, 'SIGKILL');
+  live.clear();
+  for (const fn of [...cleanups]) { cleanups.delete(fn); try { fn(); } catch { /* best effort */ } }
+};
+export function registerCleanup(fn) { cleanups.add(fn); hookOnce(); return () => cleanups.delete(fn); }
+export const pendingCleanups = () => cleanups.size;
+export const runCleanups = killAll;
 function track(pgid) {
   live.add(pgid);
+  hookOnce();
+}
+function hookOnce() {
   if (hooked) return;
   hooked = true;
   process.on('exit', killAll);
@@ -66,7 +80,15 @@ export function runCmd(argv, { cwd, env, timeoutS = 900 } = {}) {
     child.stdout.on('data', (d) => { out = append(out, d); });
     child.stderr.on('data', (d) => { out = append(out, d); });
     child.on('error', (e) => { out = append(out, String(e.message)); finish(null); });
-    child.on('close', (code) => { untrackIfDead(child.pid); finish(code); });
+    // Resolve on 'exit', not 'close': a background child holding the pipes must not keep us waiting for the timeout.
+    child.on('exit', (code) => {
+      killGroup(child.pid, 'SIGKILL'); // sweep anything the command left behind in its process group
+      untrackIfDead(child.pid);
+      let settled = false;
+      const end = () => { if (settled) return; settled = true; child.stdout.destroy(); child.stderr.destroy(); finish(code); };
+      child.once('close', end); // pipes close quickly once the group is dead; keep what they still hold
+      setTimeout(end, 500).unref();
+    });
     if (child.pid) track(child.pid);
     timer = setTimeout(() => { timedOut = true; killGroup(child.pid, 'SIGKILL'); }, timeoutS * 1000);
   });
@@ -102,15 +124,21 @@ export function portOf(url) {
   return u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80;
 }
 
-export function portInUse(port) {
-  return new Promise((resolve) => {
-    const s = net.connect({ port, host: '127.0.0.1' });
-    const end = (v) => { s.destroy(); resolve(v); };
-    s.setTimeout(1000, () => end(false));
-    s.on('connect', () => end(true));
-    s.on('error', () => end(false));
-  });
+const probe = (port, host) => new Promise((resolve) => {
+  const s = net.connect({ port, host });
+  const end = (v) => { s.destroy(); resolve(v); };
+  s.setTimeout(1000, () => end(false));
+  s.on('connect', () => end(true));
+  s.on('error', () => end(false));
+});
+
+// `localhost` (the default) is checked on both loopbacks: dev servers may bind only ::1 (Vite on macOS).
+export async function portInUse(port, host = 'localhost') {
+  const hosts = host === 'localhost' ? ['127.0.0.1', '::1'] : [host.replace(/^\[|\]$/g, '')];
+  return (await Promise.all(hosts.map((h) => probe(port, h)))).some(Boolean);
 }
+
+export const hostOf = (url) => new URL(url).hostname;
 
 export async function waitReady(ready, app) {
   const deadline = Date.now() + (ready?.timeout_s ?? 60) * 1000;

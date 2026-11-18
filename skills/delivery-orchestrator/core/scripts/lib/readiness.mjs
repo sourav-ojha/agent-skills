@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { parseConfig, CONFIG_PATH } from './config.mjs';
 import { CI_PATHS } from './queue.mjs';
-import { allowEnv, runCmd, startApp, stopApp, portOf, portInUse, waitReady } from './proc.mjs';
+import { allowEnv, runCmd, startApp, stopApp, portOf, hostOf, portInUse, waitReady, registerCleanup } from './proc.mjs';
 
 export const CHECKS = [
   { id: 'C1', level: 1, runsCommands: false },
@@ -60,17 +60,19 @@ export function gitWorktree(root, sha) {
   const dir = path.join(tmp, 'wt');
   const r = exec('git', ['worktree', 'add', '--detach', dir, sha], root);
   if (r.code !== 0) { fs.rmSync(tmp, { recursive: true, force: true }); throw new Error(`git worktree add failed: ${r.err}`); }
-  return {
-    dir,
-    remove() {
-      exec('git', ['worktree', 'remove', '--force', dir], root);
-      exec('git', ['worktree', 'prune'], root);
-      fs.rmSync(tmp, { recursive: true, force: true });
-    },
+  // Registered with proc's cleanup set so SIGINT/SIGTERM/exit remove the worktree too (the callback is synchronous).
+  let unregister = () => {};
+  const remove = () => {
+    unregister();
+    exec('git', ['worktree', 'remove', '--force', dir], root);
+    exec('git', ['worktree', 'prune'], root);
+    fs.rmSync(tmp, { recursive: true, force: true });
   };
+  unregister = registerCleanup(remove);
+  return { dir, remove };
 }
 
-export function makeCtx({ root, config, base, git, gh, repo, worktree } = {}) {
+export function makeCtx({ root, config, base, git, gh, repo, worktree, accountError } = {}) {
   const g = git ?? ((...a) => exec('git', a, root));
   let ghEnv;
   const h = gh ?? ((...a) => {
@@ -81,7 +83,7 @@ export function makeCtx({ root, config, base, git, gh, repo, worktree } = {}) {
     }
     return exec('gh', a, root, ghEnv);
   });
-  return { root, config, base: base ?? config?.base, git: g, gh: h, repo, worktree: worktree ?? ((sha) => gitWorktree(root, sha)) };
+  return { root, config, base: base ?? config?.base, git: g, gh: h, repo, worktree: worktree ?? ((sha) => gitWorktree(root, sha)), accountError };
 }
 
 const res = (status, reason = '') => ({ status, reason });
@@ -112,12 +114,13 @@ function c1(ctx) {
 }
 
 function c2(ctx) {
+  if (ctx.accountError) return res('fail', ctx.accountError);
   const major = Number(process.versions.node.split('.')[0]);
   if (major < 20) return res('fail', `Node ${process.versions.node}: need 20 or newer`);
   const r = ctx.gh('api', 'user', '--jq', '.login');
   if (r.code !== 0) return res('fail', 'gh is not logged in');
   const want = ctx.config?.github?.account;
-  if (want && r.out !== want) return res('fail', `gh is logged in as a different account than github.account (${want})`);
+  if (want && r.out.toLowerCase() !== want.toLowerCase()) return res('fail', `gh is logged in as a different account than github.account (${want})`);
   return res('pass', 'node and gh ok');
 }
 
@@ -192,9 +195,9 @@ async function c3Attempt(ctx, sha) {
   try {
     const env = envFor(wt.dir, ctx.config);
     const t0 = Date.now();
-    if (t.setup) { const r = await runCmd(t.setup, { cwd: wt.dir, env, timeoutS: t.timeout_s }); if (r.code !== 0) return res('fail', cmdFail('tests.setup', r)); }
+    if (t.setup) { const r = await runCmd(t.setup, { cwd: wt.dir, env, timeoutS: t.timeout_s }); if (r.code !== 0 || r.timedOut) return res('fail', cmdFail('tests.setup', r)); }
     const r = await runCmd(t.all, { cwd: wt.dir, env, timeoutS: t.timeout_s });
-    if (r.code !== 0) return res('fail', cmdFail('tests.all', r));
+    if (r.code !== 0 || r.timedOut) return res('fail', cmdFail('tests.all', r));
     return res('pass', `tests passed in ${Math.round((Date.now() - t0) / 1000)}s`);
   } finally { wt.remove(); }
 }
@@ -211,7 +214,8 @@ async function appAttempt(ctx, sha) {
   const { app } = ctx.config;
   const out = {};
   const port = app.ready?.url ? portOf(app.ready.url) : app.base_url ? portOf(app.base_url) : null;
-  if (port !== null && await portInUse(port)) {
+  const host = app.ready?.url ? hostOf(app.ready.url) : app.base_url ? hostOf(app.base_url) : 'localhost';
+  if (port !== null && await portInUse(port, host)) {
     const r = { ...res('fail', `port in use: ${port} is already listening before start`), final: true };
     return { C6: r, C7: app.logs_dir ? { ...r, reason: 'not run: port in use' } : res('skip', 'app.logs_dir is not configured'), C8: app.seed ? { ...r, reason: 'not run: port in use' } : r };
   }
@@ -221,11 +225,11 @@ async function appAttempt(ctx, sha) {
     env = envFor(wt.dir, ctx.config);
     if (app.setup) {
       const r = await runCmd(app.setup, { cwd: wt.dir, env, timeoutS: 900 });
-      if (r.code !== 0) { const f = res('fail', cmdFail('app.setup', r)); return { C6: f, C7: { ...f, reason: 'not run: app.setup failed' }, C8: { ...f, reason: 'not run: app.setup failed' } }; }
+      if (r.code !== 0 || r.timedOut) { const f = res('fail', cmdFail('app.setup', r)); return { C6: f, C7: { ...f, reason: 'not run: app.setup failed' }, C8: { ...f, reason: 'not run: app.setup failed' } }; }
     }
     if (app.seed) {
       const r = await runCmd(app.seed, { cwd: wt.dir, env, timeoutS: 600 });
-      out.C8 = r.code === 0 ? res('pass', 'app.seed exited 0') : res('fail', cmdFail('app.seed', r));
+      out.C8 = r.code === 0 && !r.timedOut ? res('pass', 'app.seed exited 0') : res('fail', cmdFail('app.seed', r));
     }
     const logsDir = app.logs_dir ? path.join(wt.dir, app.logs_dir) : null;
     const before = logsDir ? snapshot(logsDir) : null;
@@ -237,7 +241,7 @@ async function appAttempt(ctx, sha) {
     await stopApp(running, { stopArgv: app.stop, cwd: wt.dir, env });
     running = null;
     if (!ready) out.C6 = res('fail', `app did not become ready within ${app.ready.timeout_s}s${tail ? `\n${tail}` : ''}`);
-    else if (port !== null && await portInUse(port)) out.C6 = { ...res('fail', `a process is still listening on port ${port} after stop`), final: true };
+    else if (port !== null && await portInUse(port, host)) out.C6 = { ...res('fail', `a process is still listening on port ${port} after stop`), final: true };
     else out.C6 = res('pass', 'app became ready and stopped cleanly');
     out.C7 = res('skip', 'app.logs_dir is not configured');
     if (logsDir) out.C7 = grew ? res('pass', `log files written under ${app.logs_dir}`) : res('fail', `no file under ${app.logs_dir} was created or grew while the app ran`);
