@@ -1,0 +1,10 @@
+{
+  "$comment": "Single source of truth for experience-audit roles. Agent files are generated from this by core/scripts/install-agents.mjs. tier = reasoning | standard | fast. 'browser' means the role needs the host's browser tools, so no tool list is generated for it.",
+  "roles": [
+    { "name": "surveyor", "description": "Discovers routes, drives the browser through the audit matrix (viewports, themes, states), stabilises each page, saves screenshots and probe output. Mechanical; reports exactly what it covered and what blocked it. Read-only on the audited app.", "tier": "fast", "capabilities": ["read", "search", "shell", "browser"] },
+    { "name": "visual-judge", "description": "Looks at screenshots and measurements for problems probes cannot decide (hierarchy, wasted space, footer organisation). Describes first, reports only what is visible, cites an element crop and the numbers. Returns opinion-labelled candidates.", "tier": "reasoning", "capabilities": ["read", "search", "browser"] },
+    { "name": "seo-auditor", "description": "Interprets technical SEO probe output against Google's documented guidance: head tags, canonicals, links, structured data, raw-versus-rendered differences, crawl graph. Never predicts rankings; lists missing data as needs-data.", "tier": "standard", "capabilities": ["read", "search", "shell"] },
+    { "name": "a11y-checker", "description": "Interprets axe results and runs keyboard and focus checks: separates violations from needs-human-check, enables WCAG 2.2 rules, reports evidence per element.", "tier": "standard", "capabilities": ["read", "search", "shell", "browser"] },
+    { "name": "reviewer", "description": "Independent fresh-context attempt to refute the top audit findings using only their evidence and the coverage statement. Returns keep, downgrade or drop with a reason. Read-only.", "tier": "reasoning", "capabilities": ["read", "search"] }
+  ]
+}

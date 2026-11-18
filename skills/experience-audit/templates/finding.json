@@ -1,0 +1,19 @@
+[
+  {
+    "rule": "ux.wasted-space",
+    "route": "/tools/resize",
+    "selector": "section#advanced div.media",
+    "category": "layout",
+    "kind": "judgment",
+    "severity": "Medium",
+    "effort": "S",
+    "title": "Image box leaves a large empty area beside the expanded advanced panel",
+    "group": "layout:advanced-panel",
+    "evidence": { "crop": "resize-advanced-1440.png", "numbers": { "rowHeight": 672, "mediaContentHeight": 160 } },
+    "passes": { "seen": 3, "of": 3 },
+    "proposed_fix": "Stack the panel under the image at this width or make the image column sticky.",
+    "acceptance": [
+      "Given /tools/resize at 1440px wide with the advanced panel expanded, when the row is measured, then the image column fills at least half of the row height"
+    ]
+  }
+]
