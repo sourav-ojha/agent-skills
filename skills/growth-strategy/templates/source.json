@@ -1,0 +1,9 @@
+{
+  "id": "S-001",
+  "type": "serp",
+  "url": "https://www.example.com/search?q=example+query",
+  "title": "SERP check: example query (US)",
+  "accessed": "2026-11-18",
+  "geo": "US",
+  "note": "what ranked: tool pages and one forum"
+}

@@ -104,3 +104,12 @@ Create `.product/config.json` only for what you change; omitted keys use `core/c
 - Independent review needs a second agent. Without one the skill says `self-review` and why.
 - Read-only behaviour for sub-agents: Claude Code agents get read/search/web tool allow-lists, except the repository analyst, which keeps `Bash` for inventory and is read-only by instruction only; elsewhere it is instructions. The post-run `verify-clean` check is the backstop everywhere. Run research in a clean working tree for the clearest signal.
 - The validator checks structure, not truth: a well-formed tag can still cite a weak source. Review the evidence for decisions that matter.
+
+## Other skills
+
+This page covers product-intelligence. Each other skill has a guide in [guides/](guides/README.md); for organic growth research (SEO, keywords, distribution, monetization readiness, a 90-day roadmap) see [growth-strategy](guides/growth-strategy.md):
+
+```
+/growth-strategy init      $growth-strategy init      "plan organic growth for this site"
+/growth-strategy full      (audit ∥ research → plan → independent review → you decide)
+```

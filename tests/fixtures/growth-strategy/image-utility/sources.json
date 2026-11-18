@@ -1,0 +1,75 @@
+[
+  {
+    "id": "S-001",
+    "type": "repo",
+    "ref": "repo:app/routes/",
+    "title": "Route files: 14 tool pages, no guide pages",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-002",
+    "type": "repo",
+    "ref": "repo:public/robots.txt",
+    "title": "robots.txt allows all, no Sitemap line",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-003",
+    "type": "serp",
+    "url": "https://serp.example/search?q=resize+image+to+20kb&gl=in",
+    "title": "SERP check: resize image to 20kb (IN)",
+    "accessed": "2026-11-18",
+    "geo": "IN",
+    "note": "top 10: 8 tool pages, 1 video, 1 forum"
+  },
+  {
+    "id": "S-004",
+    "type": "competitor",
+    "url": "https://imgshrink.example/resize-image-to-20kb",
+    "title": "Competitor dedicated 20kb page with how-to text",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-005",
+    "type": "tool-export",
+    "ref": "file:.growth/imports/keyword-tool-2026-11.csv",
+    "title": "Keyword tool export provided by owner",
+    "accessed": "2026-11-18",
+    "note": "third-party estimates, IN database"
+  },
+  {
+    "id": "S-006",
+    "type": "documentation",
+    "url": "https://developers.google.com/search/docs/fundamentals/creating-helpful-content",
+    "title": "Google Search Central: helpful, reliable, people-first content",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-007",
+    "type": "community",
+    "url": "https://forum.example/r/jobapplications/comments/abc123",
+    "title": "Community thread: members asking how to shrink photos for application forms",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-008",
+    "type": "documentation",
+    "url": "https://support.google.com/adsense/answer/48182",
+    "title": "AdSense Program policies",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-009",
+    "type": "directory",
+    "url": "https://tooldir.example/submit",
+    "title": "Tool directory submission rules (free, manual review)",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-010",
+    "type": "documentation",
+    "url": "https://forum.example/r/jobapplications/rules",
+    "title": "Community rules page: self-promotion allowed only in the weekly thread",
+    "accessed": "2026-11-18"
+  }
+]

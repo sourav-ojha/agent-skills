@@ -1,0 +1,57 @@
+[
+  {
+    "keyword": "budget meal plan for a week",
+    "cluster": "budget meal plans",
+    "intent": "informational",
+    "geo": "global",
+    "language": "en",
+    "volume": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "recipe carousels and long guides",
+    "competitors": [],
+    "target_page": "new: /meal-plans/budget",
+    "priority": "P1",
+    "evidence": "inference",
+    "confidence": "medium",
+    "sources": [
+      "S-001"
+    ],
+    "researched": "2026-11-18"
+  },
+  {
+    "keyword": "lentil soup recipe",
+    "cluster": "recipes: soups",
+    "intent": "informational",
+    "geo": "global",
+    "language": "en",
+    "volume": {
+      "value": 5400,
+      "kind": "measured",
+      "source": "S-002",
+      "note": "impressions, last 28 days"
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "recipe rich results",
+    "competitors": [],
+    "target_page": "/recipes/lentil-soup",
+    "priority": "P2",
+    "evidence": "fact",
+    "confidence": "high",
+    "sources": [
+      "S-002"
+    ],
+    "researched": "2026-11-18"
+  }
+]

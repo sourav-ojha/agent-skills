@@ -1,0 +1,31 @@
+[
+  {
+    "id": "S-001",
+    "type": "repo",
+    "ref": "repo:content/posts/",
+    "title": "120 posts, no category hubs",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-002",
+    "type": "gsc",
+    "ref": "file:.growth/performance/queries.csv",
+    "title": "Search Console queries export (fixture)",
+    "accessed": "2026-11-18",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "id": "S-003",
+    "type": "community",
+    "url": "https://forum.example/r/mealprep/rules",
+    "title": "Meal-prep community rules",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-004",
+    "type": "documentation",
+    "url": "https://developers.google.com/search/docs/appearance/structured-data/recipe",
+    "title": "Recipe structured data documentation",
+    "accessed": "2026-11-18"
+  }
+]

@@ -1,0 +1,60 @@
+[
+  {
+    "keyword": "salon appointment scheduling software",
+    "cluster": "vertical: salons",
+    "intent": "commercial",
+    "geo": "US",
+    "language": "en",
+    "volume": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "listicles and review platforms dominate",
+    "competitors": [
+      "bookrival.example"
+    ],
+    "target_page": "new: /salons",
+    "priority": "P1",
+    "evidence": "fact",
+    "confidence": "medium",
+    "sources": [
+      "S-002"
+    ],
+    "researched": "2026-11-18"
+  },
+  {
+    "keyword": "bookrival alternatives",
+    "cluster": "alternatives",
+    "intent": "commercial",
+    "geo": "US",
+    "language": "en",
+    "volume": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "competitor's own hub ranks first",
+    "competitors": [
+      "bookrival.example"
+    ],
+    "target_page": "new: /alternatives/bookrival",
+    "priority": "P2",
+    "evidence": "inference",
+    "confidence": "medium",
+    "sources": [
+      "S-003"
+    ],
+    "researched": "2026-11-18"
+  }
+]

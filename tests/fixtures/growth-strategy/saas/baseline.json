@@ -1,0 +1,25 @@
+{
+  "name": "SlotBook",
+  "url": "https://slotbook.example",
+  "category": "appointment scheduling SaaS",
+  "audience": [
+    "independent clinics and salons booking clients online"
+  ],
+  "goals": [
+    "organic signups to the free plan",
+    "rank for comparison and alternative queries"
+  ],
+  "geographies": [
+    "US",
+    "GB"
+  ],
+  "languages": [
+    "en"
+  ],
+  "monetization": [
+    "subscription"
+  ],
+  "constraints": [
+    "no outreach that names competitors negatively"
+  ]
+}

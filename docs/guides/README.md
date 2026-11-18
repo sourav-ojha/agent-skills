@@ -15,6 +15,7 @@ One guide per skill, or per small family of skills that are used together. Each 
 | Hand off a task and not be asked questions | `autonomous` (or `full auto` in product-intelligence) | [autonomy-and-memory](autonomy-and-memory.md) |
 | Capture what a session taught you | `retro` | [autonomy-and-memory](autonomy-and-memory.md) |
 | Find what is wrong in the live app (empty space, weak footer, SEO, accessibility) and get fix specs | `experience-audit` | [experience-audit](experience-audit.md) |
+| Get organic traffic: keywords, landing pages, distribution channels, measurement, AdSense readiness, a 90-day roadmap | `growth-strategy` | [growth-strategy](growth-strategy.md) |
 | See what my skills cost, which I actually use, how to improve them | `skill-insights` | [skill-insights](skill-insights.md) |
 
 ## Three ways the skills fit together
@@ -45,7 +46,14 @@ experience-audit ──fix specs──► implementer ──► PR review ──
  (measure, you decide)
 ```
 
-**4. Improvement loop** (the skills improve themselves)
+**4. Grow what is built** (organic acquisition)
+
+```
+growth-strategy ──approved items──► roadmap.md (human tasks) + handoff specs ──► implementer ──► sync ──► refresh
+ (research, you decide)      reads .product/ and .experience/ when present
+```
+
+**5. Improvement loop** (the skills improve themselves)
 
 ```
 any skill runs ──► .skill-runs/ logs + transcripts ──► skill-insights ──► changes to the skill ──► re-measure
@@ -64,6 +72,6 @@ They are alternatives, not layers. Use `implementer` when you have specs from pr
 
 ## Where each skill comes from
 
-Some skills are authored here (`product-intelligence`, `implementer`, `delivery-orchestrator`, `experience-audit`, `skill-insights`), some are vendored from other repositories, and some are imported unchanged from the author's own set. `skills.lock.json` records the origin of each one. The guides for vendored skills describe how they are used in this setup, not their upstream docs.
+Some skills are authored here (`product-intelligence`, `implementer`, `delivery-orchestrator`, `experience-audit`, `growth-strategy`, `skill-insights`), some are vendored from other repositories, and some are imported unchanged from the author's own set. `skills.lock.json` records the origin of each one. The guides for vendored skills describe how they are used in this setup, not their upstream docs.
 
 Install any skill with `npx skills add sourav-ojha/agent-skills --skill <name> -a claude-code` and update with `npx skills update`. See [installation](../installation.md).

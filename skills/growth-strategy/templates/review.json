@@ -1,0 +1,15 @@
+{
+  "verdict": "PASS WITH CHANGES",
+  "checked_sources": [
+    "S-001"
+  ],
+  "findings": [
+    {
+      "severity": "Medium",
+      "item": "GRO-001",
+      "type": "evidence",
+      "summary": "One source only",
+      "fix": "Add a second check"
+    }
+  ]
+}

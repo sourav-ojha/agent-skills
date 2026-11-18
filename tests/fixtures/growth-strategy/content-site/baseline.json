@@ -1,0 +1,25 @@
+{
+  "name": "PantryNotes",
+  "url": "https://pantrynotes.example",
+  "category": "recipe and meal-planning blog",
+  "audience": [
+    "home cooks planning weekly meals on a budget"
+  ],
+  "goals": [
+    "grow returning readers",
+    "improve ad revenue per session without hurting experience"
+  ],
+  "geographies": [
+    "global"
+  ],
+  "languages": [
+    "en"
+  ],
+  "monetization": [
+    "display-ads",
+    "affiliate"
+  ],
+  "constraints": [
+    "one author, two posts a week at most"
+  ]
+}

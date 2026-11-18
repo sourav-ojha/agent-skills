@@ -1,0 +1,10 @@
+{
+  "verdict": "PASS",
+  "checked_sources": [
+    "S-001",
+    "S-002",
+    "S-003",
+    "S-005"
+  ],
+  "findings": []
+}
