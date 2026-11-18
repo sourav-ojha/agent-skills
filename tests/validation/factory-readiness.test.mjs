@@ -321,6 +321,20 @@ test('deliver readiness: ready fixture reaches level 4, stores the result, no en
   assert.doesNotMatch(fs.readFileSync(r.file, 'utf8') + x.out + x.err, /secret-token-value-123/);
   fs.rmSync(r.root, { recursive: true, force: true });
 });
+test('deliver readiness runs commands from the reviewed config on origin/<base>, never an unreviewed working copy', async () => {
+  const r = await cliRepo();
+  const marker = path.join(r.root, 'pwned');
+  const p = path.join(r.work, '.product/delivery.json');
+  const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+  cfg.tests.all = ['node', '-e', `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`];
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2)); // uncommitted edit: not the reviewed copy
+  const x = r.d('readiness', '--json');
+  assert.equal(fs.existsSync(marker), false, 'a command from the unreviewed working-copy config ran');
+  const res = new Map(JSON.parse(x.out).results.map((z) => [z.id, z.status]));
+  assert.equal(res.get('C1'), 'fail');
+  assert.equal(res.get('C3'), 'pass'); // the reviewed tests.all (exit 0) ran instead
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
 test('deliver readiness: --repeat 2 gives identical statuses', async () => {
   const r = await cliRepo();
   const a = r.d('readiness'); assert.equal(a.code, 0, a.out + a.err);

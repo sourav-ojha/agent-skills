@@ -312,7 +312,13 @@ C.readiness = async () => {
   const sha = git('rev-parse', '--verify', `origin/${base}^{commit}`);
   if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
   const configHash = baseConfigHash(base);
-  const ctx = makeCtx({ root, config, base, git, gh, repo: repo.nameWithOwner, accountError });
+  // Commands (tests, app, seed) come only from the reviewed copy on origin/<base>, never from the working copy:
+  // an unmerged edit must not get to run code. C1 still compares the two and fails when they differ.
+  const shown = git('show', `origin/${base}:${CONFIG_PATH}`);
+  let reviewed = null;
+  if (shown.code === 0) { try { const pr = parseConfig(JSON.parse(shown.out)); if (!pr.errors.length) reviewed = pr.config; } catch { /* C1 reports it */ } }
+  const runConfig = reviewed || parseConfig(undefined).config;
+  const ctx = makeCtx({ root, config: runConfig, base, git, gh, repo: repo.nameWithOwner, accountError });
   let results = await runChecks(ctx);
   for (let i = 1; i < repeat; i++) {
     const again = new Map((await runChecks(ctx)).map((r) => [r.id, r]));
@@ -324,7 +330,7 @@ C.readiness = async () => {
   const doc = { helper_version: HELPER_VERSION, base, base_sha: sha.out, config_hash: configHash, level, results, fixes, at: new Date().toISOString() };
   const where = path.join(factoryHome(), 'readiness', `${repoKey(repo.nameWithOwner)}.json`);
   writeJsonAtomic(where, doc);
-  const min = config.readiness?.min_level ?? 1;
+  const min = runConfig.readiness?.min_level ?? 1;
   extra.level = level;
   if (opt.json) emit({ ...doc, file: where, min_level: min });
   else {
