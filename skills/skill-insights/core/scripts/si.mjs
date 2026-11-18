@@ -133,7 +133,9 @@ function runsFactory() {
   // The record's project hash is sha1 of the real path with non-alphanumerics as "-"; transcripts live in the folder of that name.
   const folder = dir.replace(/[^A-Za-z0-9]/g, '-');
   const turns = [];
-  if (fs.existsSync(path.join(projectsDir, folder))) {
+  const haveFolder = fs.existsSync(path.join(projectsDir, folder));
+  if (!haveFolder) console.log('no transcript folder found for this project: token columns and attribution coverage are unavailable');
+  if (haveFolder) {
     for (const s of loadSessions(folder, { subagents: true })) {
       for (const e of s.entries) if (e.usage) turns.push({ project: s.project, ts: e.ts, tokens: { in: e.usage.in, out: e.usage.out, cache_create: e.usage.cacheWrite, cache_read: e.usage.cacheRead } });
     }
@@ -145,7 +147,8 @@ function runsFactory() {
     console.log('feature | tier | outcome | turns | in | out | cache-create | cache-read | status');
     for (const r of rows) console.log(`${r.feature} | ${r.tier ?? '-'} | ${r.outcome} | ${r.turns} | ${k(r.tokens_in)} | ${k(r.tokens_out)} | ${k(r.cache_create)} | ${k(r.cache_read)} | ${r.status}${r.ambiguous_turns ? ` (${r.ambiguous_turns} shared turn(s), ${k(r.ambiguous_tokens)} tokens)` : ''}`);
   }
-  for (const c of cov) console.log(`attribution run ${c.run}: ${(c.ratio_tokens * 100).toFixed(0)}% of tokens, ${(c.ratio_turns * 100).toFixed(0)}% of ${c.turns_total} turn(s) in the run window fall inside a feature window`);
+  const pct = (v) => (v == null ? 'n/a' : `${(v * 100).toFixed(0)}%`);
+  for (const c of cov) console.log(`attribution run ${c.run}: ${pct(c.ratio_tokens)} of tokens, ${pct(c.ratio_turns)} of ${c.turns_total} turn(s) in the run window fall inside a feature window`);
   if (rows.some((r) => r.status === 'ambiguous')) console.log('note: ambiguous rows share turns with another feature; their tokens are counted in each row, so do not sum ambiguous rows');
 }
 

@@ -202,3 +202,31 @@ test('F6 --out refuses to overwrite the source run log (also via a symlinked pat
   }
   assert.equal(fs.readFileSync(src, 'utf8'), before);
 });
+
+test('F7 coverage with zero turns in the run window is null (not 100%)', () => {
+  const [c] = coverage([rec('f1', 0, 10)], []);
+  assert.equal(c.turns_total, 0);
+  assert.equal(c.ratio_turns, null); assert.equal(c.ratio_tokens, null);
+  const [d] = coverage([rec('f1', 0, 10)], [turn(50, tk(1))]); // the only turn is outside the window
+  assert.equal(d.ratio_turns, null);
+});
+
+test('F8 CLI runs-factory without a transcript folder says so and prints n/a, never 100%', () => {
+  const f = factoryFixture();
+  const empty = path.join(f.root, 'no-projects'); fs.mkdirSync(empty);
+  const r = si('runs-factory', '--dir', f.real, '--projects-dir', empty);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /no transcript folder found for this project/);
+  assert.match(r.out, /n\/a of tokens, n\/a of 0 turn/);
+  assert.doesNotMatch(r.out, /100%/);
+});
+
+test('F9 CLI runs-factory with a transcript folder but no turns in the window prints n/a', () => {
+  const f = factoryFixture();
+  const pd = path.join(f.projects, fs.readdirSync(f.projects)[0]);
+  fs.rmSync(pd, { recursive: true, force: true }); fs.mkdirSync(pd); // folder exists, no transcripts
+  const r = si('runs-factory', '--dir', f.real, '--projects-dir', f.projects);
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.out, /no transcript folder/);
+  assert.match(r.out, /n\/a of tokens/);
+});

@@ -47,7 +47,7 @@ export function coverage(records, turns) {
       c.turns_total++; c.tokens_total += n;
       if (ws.some((x) => x.project === t.project && t.ts >= x.w[0] && t.ts <= x.w[1])) { c.turns_attributed++; c.tokens_attributed += n; }
     }
-    out.push({ ...c, ratio_tokens: c.tokens_total ? c.tokens_attributed / c.tokens_total : 1, ratio_turns: c.turns_total ? c.turns_attributed / c.turns_total : 1 });
+    out.push({ ...c, ratio_tokens: c.tokens_total ? c.tokens_attributed / c.tokens_total : null, ratio_turns: c.turns_total ? c.turns_attributed / c.turns_total : null }); // null: no turns in the window, nothing to attribute
   }
   return out;
 }
