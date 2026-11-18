@@ -131,7 +131,7 @@ test('duplicate tracked heading is an error and both occurrences are hashed', ()
 });
 
 test('odd number formats and indented headings are recognised', () => {
-  const t = SPEC.replace('## 10. Acceptance criteria', '## 10 Acceptance criteria').replace('## 11. Edge cases', '  ## 11) Edge cases').replace('## 12. Error', '## §12 Error');
+  const t = SPEC.replace('## 10. Acceptance criteria', '## 10 Acceptance criteria').replace('## 11. Edge cases', '  ## 11) Edge cases').replace('## 12. Error', '## 12) Error');
   const c = ex(t);
   assert.equal(c.ok, true); assert.equal(c.ac.length, 2); assert.equal(c.ec.length, 2); assert.equal(c.er.length, 1);
   assert.equal(ex(SPEC.replace('## 12. Error and failure scenarios', '## 12. Failure scenarios')).er.length, 1);
@@ -160,7 +160,7 @@ test('a heading inside a comment starts no section but is hashed with the enclos
   const t = SPEC.replace('- EC-1:', '<!--\n## 12. Error and failure scenarios\n-->\n- EC-1:');
   const c = ex(t);
   assert.equal(c.ok, true); assert.deepEqual(c.ec.map((x) => x.id), ['EC-1', 'EC-2']);
-  assert.ok(c.sections.includes('<!--') && c.sections.includes('## 12. Error and failure scenarios\n-->'));
+  assert.ok(c.sections.includes('<!--') && c.sections.includes('## 12. Error and failure scenarios') && c.sections.includes('-->'));
   assert.notEqual(cr.criteriaHash(c.sections), cr.criteriaHash(ex(SPEC).sections));
   // commented-out IDs are not parsed
   assert.deepEqual(ex(SPEC.replace('- EC-2:', '<!-- - EC-7: hidden -->\n- EC-2:')).ec.map((x) => x.id), ['EC-1', 'EC-2']);
@@ -195,4 +195,69 @@ test('duplicate and non-canonical ids are errors; bold AC ids accepted', () => {
   assert.match(errs(SPEC.replace('EC-2:', 'EC-1:')), /duplicate EC id/);
   const b = ex(SPEC.replace('| AC-2 |', '| **AC-2** |'));
   assert.equal(b.ok, true); assert.deepEqual(b.ac.map((x) => x.id), ['AC-1', 'AC-2']);
+});
+
+// ---- round 2: near-miss headings, unclosed constructs, hash encoding, reviewer bypass table -----------------------------------
+const AC = '## 10. Acceptance criteria\n\n| ID | C |\n|---|---|\n| AC-1 | Given x When y Then z |\n\n';
+const bad = (t, re) => { const c = ex(t); assert.equal(c.ok, false, 'expected !ok'); assert.match(c.errors.join(' | '), re); };
+
+test('near-miss tracked headings are errors (emphasis, colon, comment, zero-width, level, blockquote, suffix)', () => {
+  const body = '\n\n- EC-1: foo\n';
+  for (const h of ['## 11. **Edge cases**', '## 11. Edge cases:', '## 11. Edge cases <!-- n -->', '## 11. Edge​ cases', '##  Edge cases',
+    '# Edge cases', '### Edge cases', '#### Edge cases', '> ## Edge cases', '## 11. Edge cases (optional)', '## 11. Edge cases - later', '## _Edge cases_']) {
+    bad(AC + '## 9b. Notes\n\n' + h + body, /imitates tracked section|outside its tracked/);
+  }
+  bad(AC.replace('## 10.', '### 10.') + '## 11. Edge cases' + body, /imitates tracked section "acceptance criteria"/);
+  // canonical heading with closing hashes stays fine; an unrelated longer title is not a near miss
+  assert.equal(ex(AC + '## 11. Edge cases ##' + body).ok, true);
+  assert.equal(ex(AC + '## 11. Edge cases in the importer' + body.replace('EC-1: foo', 'x')).ok, true);
+});
+
+test('backstop: ID-shaped and contract lines outside their tracked section are errors', () => {
+  bad(AC + '## 13. Security\n\n- EC-5: hidden\n', /EC item outside/);
+  bad('- EC-5: before any heading\n' + AC, /EC item outside/);
+  bad(AC + '## 13. Security\n\n- `POST /x`\n', /contract line outside/);
+  bad(AC + '## 11. Edge cases\n\n- `POST /x`\n', /contract line outside/);
+  assert.equal(ex(AC + '## 13. Security\n\nThe client calls `GET /x` here.\n').ok, true, 'prose mentions are fine');
+});
+
+test('unclosed fence / comment at EOF are errors; they no longer swallow later sections silently', () => {
+  bad(AC + '## 13. Security\n\n```\n## HTTP contract\n\n- `POST /x`\n', /unclosed code fence/);
+  bad(AC + '## 13. Security\n\n<!-- todo\n## HTTP contract\n\n- `POST /x`\n', /unclosed HTML comment/);
+  bad(AC.replace('| AC-1', '```\n| AC-1') + '## 11. Edge cases\n\n- EC-1: foo\n', /unclosed code fence/);
+});
+
+test('CommonMark fences: backtick info string with a backtick is not a fence; closer must match char and length', () => {
+  const e = ex(AC + '## 11. Edge cases\n\n```a`b\n- EC-1: foo\n- EC-2: bar\n');
+  assert.equal(e.ok, true); assert.equal(e.ec.length, 2);
+  const e2 = ex(AC + '## 11. Edge cases\n\n````\n```\n## 13. X\n- EC-9: q\n````\n- EC-1: foo\n');
+  assert.equal(e2.ok, true); assert.deepEqual(e2.ec.map((x) => x.id), ['EC-1']);
+  const e3 = ex(AC + '## 11. Edge cases\n\n~~~\n```\n~~~\n- EC-1: foo\n');
+  assert.equal(e3.ok, true); assert.deepEqual(e3.ec.map((x) => x.id), ['EC-1']);
+});
+
+test('hash encoding: indented code block does not hash like a real section', () => {
+  const real = ex(AC.trimEnd() + '\n\n## 11. Edge cases\n- EC-1: foo\n');
+  const code = ex(AC.trimEnd() + '\n\n    ## 11. Edge cases\n    - EC-1: foo\n');
+  assert.notEqual(cr.criteriaHash(real.sections), cr.criteriaHash(code.sections));
+  assert.deepEqual(code.ec, []);
+});
+
+test('BOM is stripped; CR-only newlines parse; long lines are an error and fast', () => {
+  const t = AC + '## 11. Edge cases\n\n- EC-1: foo\n';
+  assert.equal(ex('﻿' + t).ok, true);
+  assert.equal(ex('﻿' + t).sections, ex(t).sections);
+  assert.equal(ex(t.replace(/\n/g, '\r')).ok, true);
+  const t0 = Date.now();
+  bad('## a' + ' \t'.repeat(40000) + 'x\n' + t, /longer than/);
+  bad('## ' + ' '.repeat(20000) + 'x\n' + t, /longer than/);
+  assert.ok(Date.now() - t0 < 1000);
+});
+
+test('specFromBase: base validation and non-regular entries', () => {
+  const w = mkRepo(); const g = git(w);
+  for (const b of ['main~1', 'main^{commit}', 'a..b', '-x', 'main:x', '', 'a b', 'x/']) assert.deepEqual(cr.specFromBase(g, b, 'docs/s.md'), { ok: false, reason: 'invalid_base' }, b);
+  fs.symlinkSync('s.md', path.join(w, 'docs', 'link.md')); sh(w, 'add', '.'); sh(w, 'commit', '-m', 'l'); sh(w, 'push', 'origin', 'main'); sh(w, 'fetch', 'origin');
+  assert.deepEqual(cr.specFromBase(g, 'main', 'docs/link.md'), { ok: false, reason: 'not_a_file' });
+  assert.equal(cr.specFromBase(g, 'main', 'docs/s.md').ok, true);
 });
