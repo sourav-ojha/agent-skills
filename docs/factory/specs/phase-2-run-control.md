@@ -90,6 +90,8 @@ Enforcement, all between sessions or by session limits:
 | Feature | Feature → `awaiting_human`, reason `budget`; work stays on the branch (committed by the driver, see P2.4); attention entry; next independent feature continues; **not** counted by the circuit breaker. Continue with `factory run --raise-budget ID[=tokens]` |
 | Day | Run → `paused`, kind `day_budget`; with `wait_for_reset` on, resumes after local midnight; otherwise stops |
 
+State transitions added for budget holds: `building`, `fixing`, `ci_failed` and `verify_failed` → `awaiting_human` (reason `budget`); `awaiting_human` (reason `budget`) → `building` or `fixing` when `--raise-budget` resumes it, restoring the step it was in.
+
 ## P2.4 Interruption handling
 
 ### Kinds
@@ -190,6 +192,8 @@ If no real usage-limit capture exists, criteria 1–2 are reported as "fixtures 
 - `skills/delivery-orchestrator/core/scripts/factory.mjs`: run control, `status`, `stop`, `--continue`, `--raise-budget`
 - `core/scripts/lib/`: `budget.mjs`, `runstate.mjs`, `interrupt.mjs`, `lock.mjs`, `attention.mjs`, `notify.mjs`, `localconfig.mjs` (new); `config.mjs` (`autonomy`, `budgets`); `sessions.mjs`
 - `deliver.mjs`: refuse under a live factory lock or stop flag when called interactively
+- `core/scripts/lib/queue.mjs`: budget-hold transitions
+- `skills/skill-insights/core/scripts/si.mjs`: `runs-factory` also reads `~/.factory/records/<repo-key>.jsonl` (driver mode)
 - `skills/implementer/SKILL.md`: continue brief
 - `references/run-control.md` (new), `references/config.md`, `references/safety.md`, `templates/delivery.json`, `SKILL.md`
 - `docs/factory/specs/phase-1-verification-gate.md`: action-table rows for interruptions

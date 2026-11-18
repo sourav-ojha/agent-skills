@@ -13,7 +13,7 @@ Before anything runs unattended, know whether a repo can be worked safely, and h
 | P0.3 | Limit-detection spike and failure classifier | Spike + small feature |
 | P0.4 | Sandbox deny proof, delivered as a rerunnable probe | Spike |
 
-Non-goals: the evaluator, external scenarios, budgets, wait-and-resume, the kill switch (Phases 1–2); fast-feedback checks such as affected-test selection (Phase 4).
+Non-goals: the evaluator, external scenarios, budgets, wait-and-resume, the kill switch (Phases 1–2); fast-feedback checks such as affected-test selection (Phase 3).
 
 ## Decisions
 
@@ -74,7 +74,7 @@ Each check returns `pass`, `fail`, `skip` (not configured) or `unstable`, with a
 | C2 | 1 | Tools | Node 20+; `gh` logged in as the configured account (non-fatal check, unlike `useAccount`) |
 | C3 | 2 | Tests run | In a temp worktree of the base tip: `tests.setup` then `tests.all` exit 0 within `timeout_s`; duration recorded |
 | C4 | 2 | No tracked secrets | No tracked file matches the secret patterns (`.env`, `.env.*` except the `env_example` file, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.p12`); `logs_dir` is git-ignored |
-| C5 | 3 | CI gate | At least one CI config on the base branch (same paths as `CI_PATHS`) **and** `checks.required` is non-empty or branch protection/rulesets on `base` list required checks |
+| C5 | 3 | CI gate | At least one CI config on the base branch (`CI_PATHS` excluding `CODEOWNERS`) **and** `checks.required` is non-empty or branch protection/rulesets on `base` list required checks |
 | C6 | 4 | App starts and stops | In a temp worktree: port of `ready.url` is free first (else `fail`, to avoid a false pass from an already-running server); `app.setup`, then `app.start` reaches `ready` within its timeout using the allowlisted environment; stop leaves no process listening on that port |
 | C7 | 4 | Logs on disk | During C6, at least one file under `logs_dir` is created or grows |
 | C8 | 4 | Seed | `app.seed` exits 0 before C6, or no seed is declared and the app reaches ready with `env_example` alone |
@@ -120,7 +120,7 @@ One item per non-pass check: check ID, what failed, the config key or file to ch
 
 ### When a record is written
 
-On every transition into `merged`, `skipped` or `blocked`, and on every entry into `awaiting_human`, from all code paths that cause them: `transition()`, `merged()`, `block()`, dependency skips in `pickNext()`, and merges discovered by `refresh()`. Each record is keyed by `(run, feature)`; a feature can have several records (for example `awaiting_human`, then `merged`). Readers keep the latest record per key.
+On every transition into `merged`, `skipped` or `blocked`, and on every entry into `awaiting_human`. Records are written by the `deliver.mjs` callers after the transition, never inside `queue.mjs` (which stays pure, no I/O): `next`, `merge` and `merged()`, `block()`, `stopRun()`, dependency skips returned by `pickNext()`, and merges discovered by `refresh()`. Each record is keyed by `(run, feature)`; a feature can have several records (for example `awaiting_human`, then `merged`). Readers keep the latest record per key.
 
 ### Fields
 
@@ -159,6 +159,7 @@ Questions, answered for the installed Claude Code version with evidence:
 6. How to read the `session_id` from `-p` output, and whether `claude -p --resume <id>` works after a limit hit.
 7. Whether the share of the 5-hour window used can be read at all (status line fields, `/usage`), since Phase 2 budgets depend on it.
 8. Whether a skill can be invoked under `claude -p`, and whether `--output-format stream-json` needs `--verbose`.
+9. The usage fields in `-p` JSON output (input, output, cache creation, cache read), and whether `total_cost_usd` is populated on a subscription.
 
 Method: a `StopFailure` hook and a headless wrapper that save redacted failure payloads to `~/.factory/captures/`, left on during normal use until a session-limit event (and, if possible, a weekly one) is captured.
 
@@ -180,6 +181,7 @@ Also answered here, for Phase 1:
 - Whether `--settings` deny rules win over a repo's own `.claude/settings*.json`, and how to start a session with restricted setting sources, only chosen MCP servers, and plugins and hooks disabled.
 - Whether a separate `CLAUDE_CONFIG_DIR` per role keeps subscription auth working, so author and evaluator transcripts land outside the builder's reach.
 - Whether the builder can be denied writes to `.git/config` and `.git/hooks`, and denied running `gh` and `git push`.
+- Whether `claude -p` exits when its parent process dies or its output pipe closes (Phase 2 relies on sessions not outliving the driver).
 
 Routes to probe from inside a builder session:
 - Claude Code tools: Read, Grep, Glob, WebFetch with `file://`, subagents, MCP filesystem tools if installed.

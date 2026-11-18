@@ -100,7 +100,8 @@ The implementer gains a `--fix-brief <file>` input for the two fix kinds.
 | built | — | `deliver pr` with the builder's `.delivery/pr-<ID>.md` |
 | pr_open | `ci` passed | → verification |
 | pr_open | `ci` failed (exit 2) | `deliver fix`, builder session (CI fix), `deliver push` |
-| pr_open | `ci` timeout or `none` | wait again within budget, or stop with attention entry |
+| pr_open | `ci` timeout | wait again within the CI budget |
+| pr_open | `ci` unconfirmed (no required check reported) | feature is `awaiting_human` (existing stop rule); attention entry; run stops |
 | ci_passed | verification pass | post `factory/verified` status, `gh pr edit` to add the verified line, → `verified` |
 | ci_passed | verification fail | → `verify_failed`; `deliver fix`, builder session (symptom fix), `deliver push` |
 | ci_passed | usage limit | stays `ci_passed`, run paused |
@@ -207,13 +208,13 @@ Computed by the driver from the git diff (no code executed), on added lines only
 
 | Check | Fails when | At built | At merge |
 |---|---|---|---|
-| G1 Existing tests changed | A test file present on base is modified or deleted | Hold for a person | Hold |
+| G1 Existing tests changed | A test file present on base is modified or deleted | Continue to PR, then hold at `pr_open` | Hold |
 | G2 Skips added | `.skip(`, `.only(`, `xit(`, `xdescribe(`, `@pytest.mark.skip`, `@pytest.mark.xfail`, `@Disabled`, `t.Skip(` | Builder fix attempt | Hold |
 | G3 Stub markers | `NotImplementedError`, `unimplemented!(`, `todo!(`, `throw new Error("not implemented")` in non-test code | Builder fix attempt | Hold |
-| G4 Protected files | Test configuration; the `scripts` keys of `package.json` used by `tests.all` or `local_checks`; CI config; `.claude/`, `.mcp.json`, `CLAUDE.md`, `AGENTS.md`, `.gitattributes`, `.gitmodules` | Hold | Hold |
-| G5 Criteria changed | Edits to criteria, edge-case, failure or HTTP-contract sections of any spec | Hold | Hold |
+| G4 Protected files | Test configuration; the `scripts` keys of `package.json` used by `tests.all` or `local_checks`; CI config; `.product/delivery.json`; `.claude/`, `.mcp.json`, `CLAUDE.md`, `AGENTS.md`, `.gitattributes`, `.gitmodules` | Continue to PR, then hold at `pr_open` | Hold |
+| G5 Criteria changed | Edits to criteria, edge-case, failure or HTTP-contract sections of any spec | Continue to PR, then hold at `pr_open` | Hold |
 
-G1 holds even for legitimate refactors: a person approves the test change with `deliver retry ID --note`. Test-file patterns: `*.test.*`, `*.spec.*`, `test_*.py`, `*_test.go`, `__tests__/`, `tests/`, plus `verification.test_globs`.
+"Hold at `pr_open`" uses the existing `pr_open → awaiting_human` transition, so a PR exists for the person to review. G1 holds even for legitimate refactors: the person approves with `deliver retry ID --note "<reason>"` (a new `--note` option on `retry`, recorded in the run record), and the driver continues with CI and verification. Test-file patterns: `*.test.*`, `*.spec.*`, `test_*.py`, `*_test.go`, `__tests__/`, `tests/`, plus `verification.test_globs`.
 
 ## P1.4 Orchestrator integration (1a)
 
@@ -229,7 +230,6 @@ ci_passed ──verify──► verified ──merge──► merged
 - New `TRANSITIONS`: `ci_passed → verified | verify_failed`; `verify_failed → fixing | blocked`; `verified → merged | pr_open | awaiting_human | blocked`.
 - `verified` and `verify_failed` join `ACTIVE`.
 - `fix` accepts `verify_failed`. Fix rounds are shared between CI and verification failures.
-- `retry` and `refresh` treat `verified` like `ci_passed`.
 - Verification is a driver step, not a `deliver` command.
 
 ### Merge rule
@@ -240,7 +240,7 @@ When `verification.required` is true (read from `origin/<base>`):
 
 When `verification.required` is false, `merge` accepts `ci_passed` as today.
 
-T3 work merges only when `--merge-t3` or `merge.allow_tier3` is set **and** a passing verdict exists; otherwise it is held. The existing T3 merge test is updated.
+T3 work, in every mode (driver or interactive, verification required or not), merges only when `--merge-t3` or `merge.allow_tier3` is set **and** a passing verdict exists; otherwise it is held for a person. Without the driver there is no verdict, so interactive T3 work is always held. The existing T3 merge test is updated.
 
 ### Config
 
@@ -300,14 +300,13 @@ Prompts are tuned only on the tuning set. `bench run` runs the held-out set; twi
 
 ## Files expected to change
 
-- `skills/delivery-orchestrator/core/scripts/factory.mjs` (new driver), `deliver.mjs` (states, merge rule, policy from base)
+- `skills/delivery-orchestrator/core/scripts/factory.mjs` (new driver), `deliver.mjs` (states, merge rule, policy from base, `retry --note`, queue path configurable and separate from the `.delivery/` directory that holds PR body files)
 - `core/scripts/lib/`: `scenarios.mjs`, `apicheck.mjs`, `antigaming.mjs`, `sandbox.mjs`, `sessions.mjs`, `evaluator.mjs` (1b) (new); `queue.mjs`, `config.mjs`
 - `core/prompts/{scenario-author,evaluator}.md`, `core/settings/{builder,author,evaluator}.json` (new)
 - `references/verification.md`, `references/factory-driver.md` (new); `references/states.md`, `references/config.md`, `references/safety.md`, `templates/delivery.json`, `SKILL.md`
 - `skills/implementer/SKILL.md`: `--fix-brief`, `result.json`
 - `skills/product-intelligence/templates/feature-specification.md`: EC/ER IDs, HTTP contract section
 - `bench/factory/`, `tests/validation/`, `scripts/validate-skills.mjs`
-- `docs/factory/specs/phase-0-foundations.md`: P0.3/P0.4 questions listed under Prerequisites
 
 ## Risks
 

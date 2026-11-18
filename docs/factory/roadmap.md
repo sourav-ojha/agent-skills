@@ -24,7 +24,7 @@ Status: phases 0–2 are to be specified in detail first. Phases 3–8 are outli
 6. Plain files and portable skills. No services unless measurements demand them.
 7. Few, high-value tests over many weak ones.
 8. Measure first, then strip scaffolding that no longer helps.
-9. Budgets are in tokens, turns and subscription-window share; dollars are optional.
+9. Budgets are in tokens and turns (subscription-window share once it can be read); dollars are optional.
 
 ## Phases
 
@@ -45,52 +45,24 @@ Order follows dependencies: nothing relies on a later phase. Autonomy levels are
 
 ### Phase 0 — Foundations
 
-Goal: know whether a repo can be worked unattended, and have the plumbing every later phase measures with.
+Spec: [specs/phase-0-foundations.md](specs/phase-0-foundations.md).
 
-Scope:
-- **Readiness check:** scores one start command, logs on disk, seed or mock data, a runnable test suite with affected-test selection, CI present, branch protection, config present. Outputs a score and a fix list. The orchestrator refuses unattended runs below a configurable minimum.
-- **Run record:** one line per feature in a run log: tier, tokens, turns, wall time, verdicts, fix rounds, merge result, skill versions (from `skills.lock.json`). This is the baseline for every later metric.
-- **Spike — limit detection:** confirm how the installed Claude Code reports a usage-limit hit (exit code, JSON fields, `rate_limit_event`, `CLAUDE_CODE_RETRY_WATCHDOG` under `-p`).
-- **Spike — sandbox deny proof:** show that a builder session cannot read a denied path by any route (Read, Bash `cat`, subagents).
+Readiness check that outputs a level (0–4), per-check results and a fix list, and gates merging for repos that opt in; run records per feature with token totals joined from transcripts; a spike and classifier for usage-limit detection; a sandbox deny proof delivered as a rerunnable probe.
+Exit: see the spec (same level and check results on repeat runs, at least 90% of transcript tokens attributed, both spikes documented with evidence).
 
-Exit:
-- Tested on 3 real repos (one ready, two not). Running twice gives the same score. Each fix item maps to a check that flips after the fix.
-- Run records appear for every feature and agree with skill-insights within 10%.
-- Both spikes produce a written answer with evidence.
+### Phase 1 — Verification gate (1a and 1b)
 
-### Phase 1 — Verification gate (the core bet)
+Spec: [specs/phase-1-verification-gate.md](specs/phase-1-verification-gate.md).
 
-Goal: merged work is proven by checks the builder can neither see nor edit.
-
-Scope:
-- **External scenarios:** acceptance scenarios written at spec time and stored outside the repo and worktree (for example `~/.factory/scenarios/<repo>/`). The builder runs with sandbox deny rules on that path; only the evaluator process mounts it. A diff check is a backstop, not the control.
-- **Evaluator:** fresh context, skeptical prompt. Starts the app with seed or mock environment only (no real credentials, no network beyond localhost), drives each scenario through browser, CLI or API, and returns a verdict with evidence. App output, DOM and logs are treated as untrusted input. Leftover processes are killed on timeout.
-- **Anti-gaming checks:** flag edited or deleted tests, stubs, `skip`/`only`, and gaps between visible and held-out results.
-- **Orchestrator gate:** the evaluator verdict becomes a required gate beside CI; failures feed the existing fix rounds. `--merge-t3` / `merge.allow_tier3` also requires a passing verdict.
-- **Factory test suite:** a seeded-bad benchmark (stubs, test edits, wrong behaviour, off-by-one) plus 5–10 past tasks. It reruns whenever a skill or model changes.
-
-Exit:
-- At least 20 seeded-bad cases across the 4 categories: catch rate at least 90%.
-- At least 10 known-good implementations: false rejects at most 10%.
-- The evaluator uses at most 30% of the tokens per feature.
-- Two runs agree on at least 90% of verdicts.
+A non-LLM factory driver runs builder, scenario author and evaluator as separate sessions under an explicit trust model. Hidden scenarios live outside the repo. API scenarios run as executable checks by the driver (1a); a fresh-context LLM evaluator drives UI scenarios (1b). Anti-gaming checks on the diff, verdicts bound to the merged commit and enforced by a `factory/verified` status, and a seeded benchmark (fixture app; stub, wrong-behaviour, edge, test-edit and isolation cases).
+Exit: the spec's 1a and 1b criteria (1a requires every held-out API bad case caught; 1b at least 90% for UI).
 
 ### Phase 2 — Run control (minimal)
 
-Goal: long unattended runs that stay inside user-set limits and survive interruptions.
+Spec: [specs/phase-2-run-control.md](specs/phase-2-run-control.md).
 
-Scope:
-- **Autonomy levels:** ship L0 (supervised) and L1 (merge on green). L2 is enabled at the end of Phase 6 and L3 at the end of Phase 8.
-- **Hard stops at every level:** secrets and production credentials, destructive data operations, billing/IAM/security settings, disabling CI or branch protection or the audit log, editing the autonomy config. Enforced by permissions and sandbox rules.
-- **Budgets:** tokens and turns per feature, run and day, and share of the 5-hour window. Optional dollar caps.
-- **Wait and resume:** `wait_for_reset` (default off), `max_wait`, `max_wait_weekly` (default stop and notify). On a limit hit: write state atomically, sleep in wall-clock slices, keep the machine awake, probe after the reset plus jitter, resume the session with the same flags. A lost session re-queues the task; commits are never lost.
-- **Kill switch:** a file flag checked on every orchestrator call and between implementer tasks.
-- **Attention queue:** reuse the `.product/attention.md` pattern.
-
-Exit:
-- The kill switch halts within 60 seconds or one helper call.
-- An injected limit hit resumes from the same state with zero lost commits, 3 out of 3 trials.
-- An over-budget run stops as `paused_budget` with an attention-queue entry.
+Autonomy levels L0 and L1; hard stops backed by real mechanisms; budgets per feature and per day in tokens and turns (window share and dollar caps deferred); interruption handling that commits work and resumes with a continue brief (or `--resume` if Phase 0 proves it), with optional waiting for usage-limit resets (`max_wait_h`, `max_wait_weekly_h`); kill switch checked before every step and every 5 seconds; single-driver lock; attention queue and notifications.
+Exit: the spec's criteria, including a usage limit injected at each of four points with no lost work; a feature-cap hit goes to `awaiting_human` (reason `budget`), a day cap pauses the run (kind `day_budget`).
 
 ### Phase 3 — Lean test gate (outline)
 
