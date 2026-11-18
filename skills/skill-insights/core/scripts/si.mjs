@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // skill-insights: read-only analysis of Claude Code session transcripts. Zero dependencies. Never prints paths or message text.
-// usage: node si.mjs <inventory|runs|report|export> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--json]
+// usage: node si.mjs <inventory|runs|report|export|runs-factory> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--json]
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { parseSession } from './lib/transcripts.mjs';
 import { windows, inventory } from './lib/analyze.mjs';
 import { parseRunLog, summarizeRuns } from './lib/runs.mjs';
+import { joinTokens, coverage, latestPerFeature } from './lib/factory.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -20,14 +21,14 @@ for (let i = 1; i < argv.length; i++) {
   else if (a.startsWith('--')) opt[a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = argv[++i];
 }
 const die = (m) => { console.error(`si: ${m}`); process.exit(1); };
-if (!['inventory', 'runs', 'report', 'export'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--no-notes] [--json]');
+if (!['inventory', 'runs', 'report', 'export', 'runs-factory'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export|runs-factory> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--no-notes] [--json]\n  runs-factory [--dir PROJECT] [--out FILE]   join <PROJECT>/.skill-runs/factory-runs.jsonl (latest per feature) to transcript tokens, subagents included');
 const home = os.homedir();
 const projectsDir = path.resolve(opt.projectsDir || path.join(home, '.claude', 'projects'));
 const skillDirs = (opt.skillsDir.length ? opt.skillsDir : [path.join(home, '.claude', 'skills')]).map((d) => path.resolve(d));
-if (cmd !== 'export' && !fs.existsSync(projectsDir)) die('projects dir not found (use --projects-dir)');
+if (cmd !== 'export' && cmd !== 'runs-factory' && !fs.existsSync(projectsDir)) die('projects dir not found (use --projects-dir)');
 const hash = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 6);
 
-function loadSessions(onlyDir) {
+function loadSessions(onlyDir, { subagents = false } = {}) {
   const out = [];
   for (const p of fs.readdirSync(projectsDir, { withFileTypes: true })) {
     if (!p.isDirectory() || (onlyDir && p.name !== onlyDir)) continue;
@@ -41,6 +42,20 @@ function loadSessions(onlyDir) {
       const date = new Date(s.entries[0].ts).toISOString().slice(0, 10);
       if (opt.since && date < opt.since) continue;
       out.push({ project: hash(p.name), sessionId: hash(f), date, ...s });
+    }
+    if (!subagents) continue;
+    // Subagent transcripts live at <project>/<session-id>/subagents/agent-*.jsonl; tag them with the parent project hash.
+    for (const sd of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!sd.isDirectory()) continue;
+      const sub = path.join(dir, sd.name, 'subagents');
+      let names; try { names = fs.readdirSync(sub); } catch { continue; }
+      for (const f of names) {
+        if (!f.endsWith('.jsonl')) continue;
+        let text; try { text = fs.readFileSync(path.join(sub, f), 'utf8'); } catch { continue; }
+        const s = parseSession(text);
+        if (!s.entries.length) continue;
+        out.push({ project: hash(p.name), sessionId: hash(`${sd.name}/${f}`), date: new Date(s.entries[0].ts).toISOString().slice(0, 10), subagent: true, ...s });
+      }
     }
   }
   return out;
@@ -106,7 +121,34 @@ function exportBundle() {
   emit(L.join('\n'));
 }
 
+function runsFactory() {
+  let dir = path.resolve(opt.dir || '.');
+  try { dir = fs.realpathSync(dir); } catch { /* keep resolved path */ }
+  const log = path.join(dir, '.skill-runs', 'factory-runs.jsonl');
+  if (!fs.existsSync(log)) { console.log('no factory run records found (.skill-runs/factory-runs.jsonl is missing). Run `deliver.mjs run` first.'); return; }
+  const parsed = [];
+  for (const l of fs.readFileSync(log, 'utf8').split('\n')) { if (!l.trim()) continue; try { parsed.push(JSON.parse(l)); } catch { /* skip */ } }
+  const records = latestPerFeature(parsed).filter((r) => Number.isFinite(Date.parse(r.ts_start)) && Number.isFinite(Date.parse(r.ts_end)));
+  // The record's project hash is sha1 of the real path with non-alphanumerics as "-"; transcripts live in the folder of that name.
+  const folder = dir.replace(/[^A-Za-z0-9]/g, '-');
+  const turns = [];
+  if (fs.existsSync(path.join(projectsDir, folder))) {
+    for (const s of loadSessions(folder, { subagents: true })) {
+      for (const e of s.entries) if (e.usage) turns.push({ project: s.project, ts: e.ts, tokens: { in: e.usage.in, out: e.usage.out, cache_create: e.usage.cacheWrite, cache_read: e.usage.cacheRead } });
+    }
+  }
+  const rows = joinTokens(records, turns);
+  const cov = coverage(records, turns);
+  if (opt.out) emit(rows.map((r) => JSON.stringify(r)).join('\n'));
+  else {
+    console.log('feature | tier | outcome | turns | in | out | cache-create | cache-read | status');
+    for (const r of rows) console.log(`${r.feature} | ${r.tier ?? '-'} | ${r.outcome} | ${r.turns} | ${k(r.tokens_in)} | ${k(r.tokens_out)} | ${k(r.cache_create)} | ${k(r.cache_read)} | ${r.status}`);
+  }
+  console.log(`attribution: ${(cov.ratio * 100).toFixed(0)}% of ${cov.total} turn(s) fall inside a run window${rows.some((r) => r.status === 'ambiguous') ? '; ambiguous = overlapping windows in one project' : ''}`);
+}
+
 if (cmd === 'export') { exportBundle(); process.exit(0); }
+if (cmd === 'runs-factory') { runsFactory(); process.exit(0); }
 const sessions = loadSessions();
 if (!sessions.length) { console.log('no sessions found (0 sessions in range)'); process.exit(0); }
 
