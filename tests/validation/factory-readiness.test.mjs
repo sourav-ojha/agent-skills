@@ -49,6 +49,7 @@ test('isLocalUrl: only http localhost / 127.0.0.1 with a port', () => {
 
 // ---- readiness checks (Task 3) -----------------------------------------------------------------------------------------
 import fs from 'node:fs';
+import os from 'node:os';
 import net from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -335,4 +336,54 @@ test('deliver readiness: below min_level exits 2 with fix items', async () => {
   const doc = JSON.parse(fs.readFileSync(r.file, 'utf8'));
   assert.ok(doc.level < 4 && doc.fixes.some((f) => f.id === 'C3'));
   fs.rmSync(r.root, { recursive: true, force: true });
+});
+
+test('deliver readiness: a failing test command that prints its environment leaks no secret', async () => {
+  const r = await cliRepo({ config: { tests: { all: ['node', '-e', 'console.log(JSON.stringify(process.env)); console.error(process.env.GH_TOKEN, process.env.MY_SECRET_SENTINEL); process.exit(1)'] } } });
+  const env = { MY_SECRET_SENTINEL: 'sentinel-value-987' };
+  const run = spawnSync('node', [DELIVER, 'readiness', '--dir', r.work], { encoding: 'utf8', env: { ...process.env, ...env, PATH: `${path.join(r.root, 'bin')}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: path.join(r.root, 'gh.json'), SKILL_RUNLOG: 'off', FACTORY_HOME: r.home, GH_TOKEN: 'secret-token-value-123' } });
+  assert.equal(run.status, 2, run.stdout + run.stderr);
+  const doc = fs.readFileSync(r.file, 'utf8');
+  assert.match(doc, /"id": "C3"/); assert.match(doc, /"status": "fail"/);
+  for (const s of ['secret-token-value-123', 'sentinel-value-987']) for (const t of [doc, run.stdout, run.stderr]) assert.ok(!t.includes(s), `leaked ${s}`);
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
+
+// ---- factoryhome.mjs ---------------------------------------------------------------------------------------------------
+const fh = await import(path.join(SK, 'core', 'scripts', 'lib', 'factoryhome.mjs'));
+test('factoryhome: repoKey and factoryHome', () => {
+  assert.equal(fh.repoKey('a/b'), 'a__b');
+  const saved = process.env.FACTORY_HOME;
+  try {
+    process.env.FACTORY_HOME = '/x/y'; assert.equal(fh.factoryHome(), '/x/y');
+    delete process.env.FACTORY_HOME; assert.equal(fh.factoryHome(), path.join(os.homedir(), '.factory'));
+  } finally { if (saved === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = saved; }
+});
+test('factoryhome: readJson returns null for missing or invalid files', () => {
+  const d = tmpDir('fh-');
+  assert.equal(fh.readJson(path.join(d, 'nope.json')), null);
+  fs.writeFileSync(path.join(d, 'bad.json'), '{x');
+  assert.equal(fh.readJson(path.join(d, 'bad.json')), null);
+  fs.writeFileSync(path.join(d, 'ok.json'), '{"a":1}');
+  assert.deepEqual(fh.readJson(path.join(d, 'ok.json')), { a: 1 });
+  fs.rmSync(d, { recursive: true, force: true });
+});
+test('factoryhome: writeJsonAtomic writes, refuses symlinked dir and target, and leaves no tmp file on failure', () => {
+  const d = tmpDir('fh-');
+  const good = path.join(d, 'sub', 'a.json');
+  fh.writeJsonAtomic(good, { v: 1 });
+  assert.deepEqual(fh.readJson(good), { v: 1 });
+  const real = path.join(d, 'real'); fs.mkdirSync(real);
+  fs.symlinkSync(real, path.join(d, 'linkdir'));
+  assert.throws(() => fh.writeJsonAtomic(path.join(d, 'linkdir', 'a.json'), {}), /symlink/);
+  assert.deepEqual(fs.readdirSync(real), []);
+  const victim = path.join(d, 'victim.txt'); fs.writeFileSync(victim, 'keep');
+  fs.symlinkSync(victim, path.join(d, 'sub', 'link.json'));
+  assert.throws(() => fh.writeJsonAtomic(path.join(d, 'sub', 'link.json'), {}), /symlink/);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'keep');
+  // forced rename failure: the target is a directory
+  fs.mkdirSync(path.join(d, 'sub', 'dirtarget'));
+  assert.throws(() => fh.writeJsonAtomic(path.join(d, 'sub', 'dirtarget'), {}));
+  assert.deepEqual(fs.readdirSync(path.join(d, 'sub')).filter((n) => n.includes('.tmp-')), []);
+  fs.rmSync(d, { recursive: true, force: true });
 });
