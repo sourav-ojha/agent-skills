@@ -9,6 +9,9 @@ import { logEvent, runId } from './lib/runlog.mjs';
 import { FEATURE_ID, TRANSITIONS, transition, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { factoryHome, repoKey, writeJsonAtomic } from './lib/factoryhome.mjs';
+import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
 const argv = process.argv.slice(2);
@@ -25,6 +28,7 @@ const outcome = (o) => { emit(o); process.exitCode = 2; };
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
   next | built ID [--tier T] | pr ID --title T --body-file .delivery/F | ci ID [--timeout S] [--interval S] [--grace S] | fix ID | push ID | merge ID [--settle S]
   retry ID [--no-ci] [--checks A,B] | block ID --reason R | skip ID --reason R | status [--json] | reset --yes
+  readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
 
@@ -204,6 +208,52 @@ C.init = () => {
   if (ex) { const ep = path.resolve(root, ex); const cur = fs.existsSync(ep) ? fs.readFileSync(ep, 'utf8') : ''; const add = ['.delivery/', '.implementation/'].filter((l) => !cur.split('\n').includes(l)); if (add.length) { fs.mkdirSync(path.dirname(ep), { recursive: true }); fs.appendFileSync(ep, `${cur && !cur.endsWith('\n') ? '\n' : ''}${add.join('\n')}\n`); } }
   extra.count = features.length;
   emit({ initialised: true, ...summary, warnings, queue: features.map((f) => ({ id: f.id, title: f.title, deps: f.deps })) });
+};
+
+
+const HELPER_VERSION = '0.1.0';
+C.readiness = async () => {
+  const top = git('rev-parse', '--show-toplevel');
+  if (top.code !== 0) die('not a git repository');
+  if (fs.realpathSync(top.out) !== fs.realpathSync(root)) die(`run from the repository root (${top.out}); --dir points at a subfolder`);
+  const repeat = opt.repeat === undefined ? 1 : Number(opt.repeat);
+  if (!Number.isInteger(repeat) || repeat < 1 || repeat > 5) die('--repeat must be an integer 1-5');
+  let raw;
+  const p = path.join(root, CONFIG_PATH);
+  if (fs.existsSync(p)) { try { raw = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { raw = undefined; } }
+  let parsed = parseConfig(raw);
+  if (parsed.errors.length) parsed = parseConfig(undefined); // C1 reports the errors; the other checks run on defaults
+  const config = parsed.config;
+  useAccount(config.github.account, config.github.host);
+  const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
+  const base = opt.base || config.base || repo.defaultBranchRef?.name;
+  if (!validRef(base)) die('could not determine a valid base branch; set "base" in the config or pass --base');
+  must(gitNet('fetch', 'origin'), 'git fetch');
+  const sha = git('rev-parse', '--verify', `origin/${base}^{commit}`);
+  if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
+  const shown = spawnSync('git', ['show', `origin/${base}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
+  const configHash = shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
+  const ctx = makeCtx({ root, config, base, git, gh, repo: repo.nameWithOwner });
+  let results = await runChecks(ctx);
+  for (let i = 1; i < repeat; i++) {
+    const again = new Map((await runChecks(ctx)).map((r) => [r.id, r]));
+    results = results.map((r) => (again.get(r.id)?.status === r.status ? r : { ...r, status: 'unstable', reason: `status differed between repeated runs (${r.status} then ${again.get(r.id)?.status}): ${r.reason}` }));
+  }
+  const level = computeLevel(results);
+  const status = new Map(results.map((r) => [r.id, r]));
+  const fixes = CHECKS.filter((c) => c.level > 0 && status.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, status.get(c.id)));
+  const doc = { helper_version: HELPER_VERSION, base_sha: sha.out, config_hash: configHash, level, results, fixes, at: new Date().toISOString() };
+  const where = path.join(factoryHome(), 'readiness', `${repoKey(repo.nameWithOwner)}.json`);
+  writeJsonAtomic(where, doc);
+  const min = config.readiness?.min_level ?? 1;
+  extra.level = level;
+  if (opt.json) emit({ ...doc, file: where, min_level: min });
+  else {
+    console.log(`readiness level ${level} (required ${min}) for ${repo.nameWithOwner} at ${base} ${sha.out.slice(0, 8)}`);
+    for (const r of results) console.log(`  ${r.id} ${r.status}${r.reason ? `: ${flat(r.reason, 160)}` : ''}`);
+    console.log(`${fixes.length} fix item${fixes.length === 1 ? '' : 's'}; saved to ${where}`);
+  }
+  if (level < min) process.exitCode = 2;
 };
 
 C.next = () => {
@@ -509,4 +559,4 @@ const pub = (f) => ({ id: f.id, title: f.title, spec: path.relative(root, f.file
 const counts = (q) => Object.fromEntries(Object.entries(summarize(q)).map(([k, v]) => [k, v.map((f) => f.id)]));
 
 if (!C[cmd]) die(`unknown command "${cmd}". ${HELP}`);
-try { C[cmd](); } catch (e) { die(e.message); }
+try { await C[cmd](); } catch (e) { die(e.message); }

@@ -51,6 +51,7 @@ test('isLocalUrl: only http localhost / 127.0.0.1 with a port', () => {
 import fs from 'node:fs';
 import net from 'node:net';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpDir } from './helpers.mjs';
 
 const FIX = path.join(REPO, 'tests', 'fixtures', 'factory-apps');
@@ -278,4 +279,60 @@ test('unconfigured command checks skip', async () => {
   const x = await only(r, 'C3', 'C6', 'C7', 'C8');
   for (const id of ['C3', 'C6', 'C7', 'C8']) assert.equal(x[id].status, 'skip', id);
   r.cleanup();
+});
+
+// ---- deliver readiness command (Task 4) --------------------------------------------------------------------------------
+const DELIVER = path.join(SK, 'core', 'scripts', 'deliver.mjs');
+async function cliRepo({ config = {}, files = {} } = {}) {
+  const port = await freePort();
+  const root = tmpDir('rdcli-');
+  const origin = path.join(root, 'origin.git'), work = path.join(root, 'work'), bin = path.join(root, 'bin'), home = path.join(root, 'fhome');
+  fs.mkdirSync(bin);
+  fs.copyFileSync(FAKE_GH, path.join(bin, 'gh.mjs'));
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nexec node "${path.join(bin, 'gh.mjs')}" "$@"\n`, { mode: 0o755 });
+  sh(root, 'init', '-q', '--bare', '-b', 'main', origin);
+  sh(root, 'clone', '-q', origin, work);
+  sh(work, 'config', 'user.email', 't@x'); sh(work, 'config', 'user.name', 't');
+  sh(work, 'config', `url.${origin}.insteadOf`, 'git@github.com:o/r.git');
+  sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
+  const cfg = { checks: { required: ['test'] }, tests: { all: ['node', '-e', 'process.exit(0)'] }, app: { start: ['node', path.join(FIX, 'ready.mjs')], ready: { url: `http://127.0.0.1:${port}/health`, timeout_s: 5 }, env_example: '.env.example', logs_dir: 'logs/' }, readiness: { min_level: 4 }, ...config };
+  const all = { '.env.example': `PORT=${port}\n`, '.gitignore': 'logs/\n', '.github/workflows/ci.yml': 'on: push\n', '.product/delivery.json': JSON.stringify(cfg, null, 2), 'README.md': 'hi\n', ...files };
+  for (const [f, body] of Object.entries(all)) { fs.mkdirSync(path.dirname(path.join(work, f)), { recursive: true }); fs.writeFileSync(path.join(work, f), body); }
+  sh(work, 'checkout', '-q', '-b', 'main');
+  sh(work, 'add', '-A'); sh(work, 'commit', '-q', '-m', 'init'); sh(work, 'push', '-q', '-u', 'origin', 'main');
+  const state = path.join(root, 'gh.json');
+  fs.writeFileSync(state, JSON.stringify({ origin, prs: [], calls: [] }));
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: home, GH_TOKEN: 'secret-token-value-123' };
+  const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); return { code: r.status, out: r.stdout, err: r.stderr }; };
+  return { root, work, home, d, file: path.join(home, 'readiness', 'o__r.json') };
+}
+
+test('deliver readiness: ready fixture reaches level 4, stores the result, no env values', async () => {
+  const r = await cliRepo();
+  const x = r.d('readiness');
+  assert.equal(x.code, 0, x.out + x.err);
+  assert.match(x.out, /level 4/);
+  const doc = JSON.parse(fs.readFileSync(r.file, 'utf8'));
+  assert.equal(doc.level, 4);
+  assert.equal(doc.base_sha, sh(r.work, 'rev-parse', 'origin/main'));
+  assert.equal(doc.config_hash, `sha256:${createHash('sha256').update(fs.readFileSync(path.join(r.work, '.product/delivery.json'))).digest('hex')}`);
+  assert.ok(doc.helper_version && doc.at && Array.isArray(doc.fixes));
+  assert.doesNotMatch(fs.readFileSync(r.file, 'utf8') + x.out + x.err, /secret-token-value-123/);
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
+test('deliver readiness: --repeat 2 gives identical statuses', async () => {
+  const r = await cliRepo();
+  const a = r.d('readiness'); assert.equal(a.code, 0, a.out + a.err);
+  const one = JSON.parse(fs.readFileSync(r.file, 'utf8')).results.map((z) => [z.id, z.status]);
+  const b = r.d('readiness', '--repeat', '2', '--json'); assert.equal(b.code, 0, b.out + b.err);
+  assert.deepEqual(JSON.parse(b.out).results.map((z) => [z.id, z.status]), one);
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
+test('deliver readiness: below min_level exits 2 with fix items', async () => {
+  const r = await cliRepo({ config: { tests: { all: ['node', '-e', 'process.exit(1)'] } } });
+  const x = r.d('readiness');
+  assert.equal(x.code, 2, x.out + x.err);
+  const doc = JSON.parse(fs.readFileSync(r.file, 'utf8'));
+  assert.ok(doc.level < 4 && doc.fixes.some((f) => f.id === 'C3'));
+  fs.rmSync(r.root, { recursive: true, force: true });
 });
