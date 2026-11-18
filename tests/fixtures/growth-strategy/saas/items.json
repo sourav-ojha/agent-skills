@@ -41,6 +41,9 @@
     "owner": "human",
     "risks": [
       "do not incentivise reviews"
+    ],
+    "acceptance": [
+      "Done when the vendor profile is claimed and lists the free plan, without incentivised reviews"
     ]
   },
   {

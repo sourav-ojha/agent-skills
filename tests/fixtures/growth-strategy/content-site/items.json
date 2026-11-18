@@ -58,6 +58,9 @@
     "owner": "human",
     "risks": [
       "needs consistent cadence"
+    ],
+    "acceptance": [
+      "Done when four plans are published and their Search Console impressions are compared at the next refresh"
     ]
   }
 ]

@@ -120,16 +120,31 @@ function main() {
     'claude-code': scope === 'user' ? path.join(os.homedir(), '.claude', 'agents') : path.join(projectDir, '.claude', 'agents'),
     codex: scope === 'user' ? path.join(os.homedir(), '.codex', 'agents') : path.join(projectDir, '.codex', 'agents'),
   };
+  // A cloned project could ship .claude or .codex (or the agent files) as symlinks pointing elsewhere: never write or delete
+  // through one. User scope only checks the agent files themselves, since ~/.claude is often a deliberate dotfiles link.
+  const isLink = (q) => { try { return fs.lstatSync(q).isSymbolicLink(); } catch { return false; } };
+  const checkRoot = (root) => {
+    if (scope !== 'project') return;
+    for (let q = root; q.startsWith(projectDir + path.sep); q = path.dirname(q)) if (isLink(q)) { console.error(`install-agents: refusing ${q}: it is a symbolic link`); process.exit(1); }
+  };
   for (const f of rendered) {
     if (agent !== 'all' && f.platform !== agent) continue;
     const dest = path.join(roots[f.platform], f.file);
+    checkRoot(roots[f.platform]);
+    if (isLink(dest)) { console.error(`install-agents: refusing ${dest}: it is a symbolic link`); process.exit(1); }
     if (has('remove')) {
       console.log(`${has('dry-run') ? '[dry-run] ' : ''}remove ${dest}`);
       if (!has('dry-run')) fs.rmSync(dest, { force: true });
       continue;
     }
     console.log(`${has('dry-run') ? '[dry-run] ' : ''}write  ${dest}`);
-    if (!has('dry-run')) { fs.mkdirSync(roots[f.platform], { recursive: true }); fs.writeFileSync(dest, f.content); }
+    if (!has('dry-run')) {
+      fs.mkdirSync(roots[f.platform], { recursive: true });
+      checkRoot(roots[f.platform]);
+      const F = fs.constants, tmp = `${dest}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, f.content, { flag: F.O_WRONLY | F.O_CREAT | F.O_EXCL | (F.O_NOFOLLOW || 0) });
+      fs.renameSync(tmp, dest);
+    }
   }
 }
 

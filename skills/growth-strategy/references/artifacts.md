@@ -15,7 +15,7 @@ Structured data where it is filtered, validated or exported; markdown where it i
 | `content-strategy.md` | markdown | plan | clusters, landing-page roadmap, internal links, quality rules |
 | `measurement-plan.md` | markdown | plan | Search Console, analytics events, referrals, funnels, retention |
 | `monetization.md` | markdown | plan | readiness, content quality, UX, consent and policy, ad placement |
-| `reviews/R-NNN.json` | JSON | `gs review record` | full reviewer report bound to the plan hash |
+| `reviews/R-NNN.json` | JSON | `gs review record` | full reviewer report bound to the plan hash; its sha256 is kept in `growth.json`, so an edited file is refused |
 | `roadmap.md` | markdown | `gs roadmap` | 90-day roadmap from approved items; proposals listed separately |
 | `decisions.md` | markdown | helper only | human-readable decision log |
 | `handoff/GRO-NNN.md` | markdown | `gs handoff` | implementer specs; then edited by the implementer's close-out |
@@ -33,7 +33,7 @@ proposed ─► approved ─► handed-off ─► done          (implementer ite
    └─► superseded (by a newer item; any non-done state)
 ```
 
-Helper-owned fields (`status`, `superseded_by`, keyword `performance`) cannot be set from input files. A decided item cannot be edited; add a new one and supersede. Decisions, reviews and refreshes are append-only.
+Helper-owned fields (`status`, `superseded_by`, keyword `performance`) cannot be set from input files, and an item status that disagrees with the decision log is a validation error. `gsc` and `analytics` sources are created only by `gs import`. These checks stop hand edits and hostile cloned state; an agent that rewrites every state file at once could still forge it, so the real gate stays the user reading `decisions.md`. A decided item cannot be edited; add a new one and supersede. Decisions, reviews and refreshes are append-only.
 
 ## Versioning
 

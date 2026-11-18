@@ -1,9 +1,8 @@
 {
   "id": "S-001",
-  "type": "serp",
-  "url": "https://www.example.com/search?q=example+query",
-  "title": "SERP check: example query (US)",
+  "type": "tool-export",
+  "title": "Keyword Planner export (US, provided by the owner)",
   "accessed": "2026-11-18",
-  "geo": "US",
-  "note": "what ranked: tool pages and one forum"
+  "note": "ranges, not exact volumes",
+  "ref": "file:.growth/imports/keyword-planner-2026-11.csv"
 }

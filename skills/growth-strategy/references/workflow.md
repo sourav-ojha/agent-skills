@@ -15,12 +15,12 @@ INIT ─► Gate 1 (baseline) ─► AUDIT ∥ RESEARCH ─► CONSOLIDATE ─�
 | audit | `gs phase done audit` | baseline not approved or changed since; `seo-audit.md` has placeholders or missing sections; evidence errors |
 | research | `gs phase done research` | as above for `competitors.md`, `distribution.md`; no keywords |
 | plan | `gs phase done plan` | audit or research not done; plan files unfinished; no items |
-| review | `gs review record` | plan not done; malformed report; independent without `--reviewer`; self without `--reason` |
-| Gate 2 | `gs decide` | no review; plan changed since the review; self-review while `gates.require_independent_review` is on; approving an item with a Critical/High finding |
-| roadmap | `gs roadmap` | never: it shows approved items as the roadmap and everything else as "not approved" |
+| review | `gs review start`, `gs review record` | plan not done; malformed report; report's `plan_hash` is not the current plan; independent without `--reviewer`; self without `--reason` |
+| Gate 2 | `gs decide` | a phase not done (for example during a refresh); no review; plan changed since the review; a review file edited after recording; self-review while `gates.require_independent_review` is on; approving while any review of this plan has a Critical/High finding on the item or the plan, or a FAIL verdict |
+| roadmap | `gs roadmap` | validation errors, including item statuses that do not match the decision log; shows approved items with their done conditions, everything else as "not approved" |
 | handoff | `gs handoff` | only approved implementer items; each file written once |
 
-The review is bound to a hash of the plan (item content, keyword content, the three plan files). Decisions and performance imports do not change it; any content edit does.
+The review is bound to a hash of the plan (approved baseline, item content, keyword content, the three plan files), printed by `review start` and echoed in the report. Decisions and performance imports do not change it; any content edit does.
 
 ## Selecting agents (do not launch everything)
 

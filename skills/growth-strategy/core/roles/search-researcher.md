@@ -11,11 +11,11 @@ The approved growth baseline (product, audience, geographies, languages), today'
 3. **Cluster.** Group keywords one page can satisfy (same intent and SERP overlap). One primary keyword per cluster; others are secondary.
 4. **Competitor coverage.** For 3-5 sites that rank, note which clusters they cover with dedicated pages and the page format.
 5. **Geography and audience.** Note language/region differences in queries and SERPs for the baseline's geographies.
-6. **Prioritize** P1-P3 by intent fit, product fit, SERP winnability (qualitative) and evidence strength.
+6. **Prioritize** P1-P3 with the signal ladder in the skill's references/research-standards.md: score intent fit, product fit and winnability 1-3; P1 needs two independent signals.
 
 ## Rules
 - **Never fabricate volume, difficulty, CPC or traffic.** A number is allowed only if it came from a user-provided tool export or Search Console data with its source id, as `measured` (Search Console) or `estimate` (third-party tool). Otherwise the metric is `unknown` with value null. Qualitative demand signals ("autocomplete shows it", "SERP has 4 tool pages") go in notes.
-- Record the SERP check you did: query, geo, date, what ranked (URLs).
+- Record the SERP check you did: query, the location results were actually served from, date, what ranked (URLs). If you could not observe the target country, say so and list the queries for the user to check.
 - Verify each important competitor or SERP claim with a second look before reporting it as fact.
 
 ## Output (under 1000 words + JSON)

@@ -8,7 +8,7 @@ The approved growth baseline (product, audience, geographies, brand constraints 
 ## Procedure
 1. **Communities.** Find where the audience asks the problems the product solves (Reddit subreddits, Quora topics, Stack Exchange sites, forums, Discord/Slack listed publicly). For each: link, rough activity signal you observed (posts in last week), the rules on self-promotion (quote the rule briefly, link it), and a fit verdict.
 2. **Social.** Pinterest, YouTube, short video, X/Bluesky, LinkedIn: only where the product's output is visual or teachable. Note format that fits.
-3. **Brand-first anonymous presence.** How to participate as the brand (not a personal account), what disclosure the platform requires, what counts as spam there.
+3. **Brand-first anonymous presence.** How to participate as the brand (not a personal account), what disclosure the platform requires, account-age or karma limits, what counts as spam there. Default to helpful answers without links; links only where rules allow.
 4. **Directories and listings.** Tool directories, "alternatives to" sites, open-source lists: submission rules, cost (free/paid), nofollow if visible. Do not submit.
 5. **Backlinks and partnerships.** Resource pages, educational institutions, complementary tools, newsletters; why they would link.
 6. **Execution notes** per channel: first three actions, cadence, what to measure (referral source, UTM).

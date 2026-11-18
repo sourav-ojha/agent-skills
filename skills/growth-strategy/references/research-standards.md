@@ -26,11 +26,24 @@ Keyword `volume`, `difficulty` and `cpc` are `{ value, kind, source }`:
 - `estimate`: only from a keyword-tool export the user provided (`tool-export`) or a number the user stated (`user`). Name the tool and database or region.
 - `unknown`: value `null`. This is the default. A SERP or autocomplete observation is a qualitative note in `serp_notes`, never a volume.
 
+A Keyword Planner range is an estimate with `value: null, min, max` (for example 1000 to 10000), never its midpoint.
+
 Roadmap items never carry traffic numbers; impact is H/M/L judgment with rationale. `gs validate` also warns (heuristic) on markdown lines with a number next to a search or traffic word and no `S-NNN`.
+
+## Prioritising without search volumes
+
+Most independent sites have no paid keyword tool. Use free signals, strongest first, and record each as a source:
+1. Search Console impressions and clicks for the query or page (`measured`, from `gs import gsc`).
+2. A Keyword Planner export from the user's free Ads account (`estimate` range).
+3. Relative interest by region in Google Trends (qualitative; a `serp`/`web` source with the date and region).
+4. Autocomplete and "People also ask" showing the phrasing exists (qualitative).
+5. How many dedicated pages rank, and whether forums or small sites appear in the top results (winnability).
+
+Score intent fit, product fit and winnability 1-3 each with the reason. P1 needs at least two independent signals from this list and a product that actually solves the query. A new domain should prefer specific long-tail tasks where large platforms do not fill the results.
 
 ## SERP and competitor checks
 
-- Record each SERP check as a `serp` source: the query, geography, date and what ranked (page types, domains, features). Results differ by location, language and personalisation: say which you saw.
+- Record each SERP check as a `serp` source: the query, geography, date and what ranked (page types, domains, features). Results differ by location, language and personalisation: record where results were actually served from (your search tool is often not in the target country). When a P1 decision depends on a country you could not observe, list the exact queries for the user to check from that country instead of claiming the SERP.
 - Verify any finding that drives a P1 item twice: a second query variant or a direct page read.
 - Competitor coverage is what you saw on their site (dedicated pages, formats). Their traffic is unknown unless the user provides a tool export.
 - Large platforms dominating a SERP is a finding, not a reason to promise rankings.

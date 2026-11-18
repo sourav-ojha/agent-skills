@@ -7,6 +7,7 @@ import { RECORDS, MD_FILES, today, daysBetween, sha256, normKw } from './state.m
 
 export const CLASSES = ['fact', 'inference', 'estimate', 'hypothesis', 'assumption', 'unknown'];
 const SOURCED = ['fact', 'inference', 'estimate'];
+export const IMPORTED = ['gsc', 'analytics'];
 const MAX_MEDIUM = ['inference', 'estimate', 'assumption'];
 const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
 const GWT = /\bgiven\b[\s\S]*\bwhen\b[\s\S]*\bthen\b/i;
@@ -32,7 +33,7 @@ export function checkSource(s, at = 'source') {
   const e = shape(s, 'source', at);
   unsafeText(s, at, e);
   if (!s.url && !s.ref) e.push(`${at}: needs a url or ref (repo:, file:, user:, tool:)`);
-  if (s.url && !/^https?:\/\/[^\s]+$/.test(s.url)) e.push(`${at}: url must be an http(s) address`);
+  if (s.url && !/^https?:\/\/[^\s|<>()"'`\\]+$/.test(s.url)) e.push(`${at}: url must be an http(s) address without spaces, quotes, brackets, | or < > (percent-encode them)`);
   if (/^\d{4}-\d{2}-\d{2}$/.test(s.accessed || '') && s.accessed > today()) e.push(`${at}: accessed date ${s.accessed} is in the future`);
   if (['gsc', 'analytics'].includes(s.type) && !s.sha256) e.push(`${at}: ${s.type} sources are imported files and need a sha256`);
   return e;
@@ -40,8 +41,12 @@ export function checkSource(s, at = 'source') {
 
 function checkMetric(m, at, byId, e) {
   if (!m || typeof m !== 'object') return;
-  if (m.kind === 'unknown') { if (m.value !== null) e.push(`${at}: kind unknown, so value must be null (never guess a number)`); return; }
-  if (m.value === null) { e.push(`${at}: kind ${m.kind} needs a value, or use kind unknown`); return; }
+  const range = m.min !== undefined || m.max !== undefined;
+  if (m.kind === 'unknown') { if (m.value !== null || range) e.push(`${at}: kind unknown, so value must be null and there is no range (never guess a number)`); return; }
+  if (range) {
+    if (m.kind !== 'estimate' || m.value !== null) e.push(`${at}: a range (min/max) is only for estimates, with value null`);
+    if (!(m.min <= m.max)) e.push(`${at}: a range needs both min and max, min <= max`);
+  } else if (m.value === null) { e.push(`${at}: kind ${m.kind} needs a value or a min/max range, or use kind unknown`); return; }
   if (!m.source) { e.push(`${at}: a ${m.kind} value needs a source`); return; }
   const src = byId.get(m.source);
   if (!src) { e.push(`${at}: unknown source ${m.source}`); return; }
@@ -63,6 +68,7 @@ export function checkKeyword(k, byId, at = 'keyword') {
   unsafeText(k, at, e);
   if (e.length) return e;
   for (const m of ['volume', 'difficulty', 'cpc']) checkMetric(k[m], `${at} "${k.keyword}" ${m}`, byId, e);
+  for (const re of TRAFFIC) if (re.test(k.serp_notes || '')) e.push(`${at} "${k.keyword}": serp_notes contains a search or traffic number; numbers go in the metric fields with a source`);
   checkClaim(k, `${at} "${k.keyword}"`, byId, e);
   return e;
 }
@@ -74,6 +80,7 @@ export function checkItem(i, byId, at = 'item') {
   const label = `${at} ${i.id || `"${i.title}"`}`;
   for (const re of TRAFFIC) if (re.test(`${i.title} ${i.rationale}`)) e.push(`${label}: contains a traffic number; impact stays qualitative (H/M/L), numbers live only in keyword metrics with a source`);
   if (i.owner === 'implementer' && (!(i.acceptance || []).length || !i.acceptance.every((a) => GWT.test(a)))) e.push(`${label}: implementer items need acceptance criteria written as Given/When/Then`);
+  if (i.owner === 'human' && !(i.acceptance || []).length) e.push(`${label}: human items need at least one acceptance line ("Done when ...") so a person knows when it is finished`);
   if (i.confidence === 'low' && i.window === 'weeks 1-4' && !(['measurement', 'technical-seo'].includes(i.type) && i.effort === 'S')) e.push(`${label}: low-confidence items cannot start in weeks 1-4 (only small measurement or technical-seo foundations can)`);
   checkClaim(i, label, byId, e);
   return e;
@@ -129,8 +136,9 @@ export function validateAll(s, config) {
     if (src.sha256 && file) {
       if (!file.startsWith(s.p.root + path.sep)) out.errors.push(`source ${src.id}: path escapes the project`);
       else if (!fs.existsSync(file) || !fs.statSync(file).isFile()) out.warnings.push(`source ${src.id}: ${src.ref} not found, cannot verify its sha256`);
-      else if (sha256(fs.readFileSync(file)) !== src.sha256) out.warnings.push(`source ${src.id}: ${src.ref} changed since it was cited; re-check the claims that use it`);
+      else if (sha256(fs.readFileSync(file)) !== src.sha256) (IMPORTED.includes(src.type) ? out.errors : out.warnings).push(`source ${src.id}: ${src.ref} changed since it was ${IMPORTED.includes(src.type) ? 'imported' : 'cited'}; re-check the claims that use it`);
     }
+    if (IMPORTED.includes(src.type) && !src.ref?.startsWith('file:')) out.errors.push(`source ${src.id}: ${src.type} sources are created by gs import from a file in the project`);
   }
   const seen = new Map();
   s.keywords.forEach((k, i) => {
@@ -153,6 +161,12 @@ export function validateAll(s, config) {
     }
   });
   for (const [kw, ids] of byKw) if (ids.length > 1) out.warnings.push(`possible keyword cannibalization: "${kw}" is targeted by ${ids.join(', ')}`);
+  // Item status must agree with the append-only decision log: a status edited by hand (or shipped in a cloned repo) is not a decision.
+  const EXPECT = { approved: 'approve', 'handed-off': 'approve', done: 'approve', rejected: 'reject', deferred: 'defer', 'needs-research': 'research', superseded: 'supersede' };
+  for (const it of s.items) {
+    const last = (s.growth?.decisions || []).filter((d) => d.target === it.id).at(-1);
+    if (it.status === 'proposed' ? last : last?.decision !== EXPECT[it.status]) out.errors.push(`${it.id}: status ${it.status} does not match the decision log (${last ? last.decision : 'no decision'}); statuses change only through gs`);
+  }
   for (const f of MD_FILES) {
     const file = s.p.md(f);
     if (fs.existsSync(file)) checkMarkdown(f, fs.readFileSync(file, 'utf8'), byId, out);

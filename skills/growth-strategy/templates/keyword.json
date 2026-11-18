@@ -6,8 +6,11 @@
   "language": "en",
   "volume": {
     "value": null,
-    "kind": "unknown",
-    "source": null
+    "min": 1000,
+    "max": 10000,
+    "kind": "estimate",
+    "source": "S-001",
+    "note": "keyword planner range exported by the user"
   },
   "difficulty": {
     "value": null,

@@ -8,7 +8,7 @@
 ## Readiness
 | Check | State | Evidence |
 |---|---|---|
-| {{unique helpful content, policy pages, site navigation, traffic quality}} | {{ok, missing, unknown}} | {{evidence tag}} |
+| {{unique helpful content, policy pages, how uploaded files are handled, site navigation, traffic quality}} | {{ok, missing, unknown}} | {{evidence tag}} |
 
 ## Content quality
 {{thin or template pages that would hurt ad approval or value}}

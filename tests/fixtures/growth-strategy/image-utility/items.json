@@ -63,13 +63,16 @@
     "effort": "S",
     "window": "weeks 1-4",
     "owner": "human",
-    "risks": []
+    "risks": [],
+    "acceptance": [
+      "Done when the Search Console domain property is verified and the four funnel events appear in the analytics debug view"
+    ]
   },
   {
     "id": "GRO-004",
     "type": "distribution",
-    "title": "Answer resize questions in the weekly self-promotion thread of the job-applications community",
-    "rationale": "Members ask how to meet form photo limits; rules allow self-promotion only in the weekly thread.",
+    "title": "Answer photo-size questions in the job-applications community as the disclosed brand account",
+    "rationale": "Members ask how to meet form photo limits; rules allow self-promotion links only in the weekly thread, so answers elsewhere carry no link.",
     "keywords": [],
     "sources": [
       "S-007",
@@ -83,6 +86,9 @@
     "owner": "human",
     "risks": [
       "ban risk outside the weekly thread"
+    ],
+    "acceptance": [
+      "Done when three helpful answers are posted from the disclosed brand account, without links unless the thread rules allow one"
     ]
   },
   {
@@ -101,6 +107,9 @@
     "effort": "M",
     "window": "weeks 9-13",
     "owner": "human",
-    "risks": []
+    "risks": [],
+    "acceptance": [
+      "Done when the readiness table in monetization.md has no missing rows"
+    ]
   }
 ]

@@ -33,24 +33,23 @@
     "geo": "global",
     "language": "en",
     "volume": {
-      "value": 5400,
-      "kind": "measured",
-      "source": "S-002",
-      "note": "impressions, last 28 days"
+      "value": null,
+      "kind": "unknown",
+      "source": null
     },
     "difficulty": {
       "value": null,
       "kind": "unknown",
       "source": null
     },
-    "serp_notes": "recipe rich results",
+    "serp_notes": "recipe rich results; impressions will come from the Search Console import",
     "competitors": [],
     "target_page": "/recipes/lentil-soup",
     "priority": "P2",
-    "evidence": "fact",
-    "confidence": "high",
+    "evidence": "inference",
+    "confidence": "medium",
     "sources": [
-      "S-002"
+      "S-001"
     ],
     "researched": "2026-11-18"
   }

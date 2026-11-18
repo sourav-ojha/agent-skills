@@ -21,6 +21,13 @@ const fails = (r, re) => { assert.notEqual(r.code, 0, `expected failure:\n${r.al
 const fx = (name, f) => path.join(FIX, name, f);
 const readG = (dir, f) => JSON.parse(fs.readFileSync(path.join(dir, '.growth', f), 'utf8'));
 const writeTmp = (obj) => { const f = path.join(tmpDir('gs-in-'), 'in.json'); fs.writeFileSync(f, JSON.stringify(obj)); return f; };
+// The reviewer echoes the plan hash printed by `review start`; this writes a report bound to the current plan.
+const report = (dir, rep) => {
+  const r = gs(dir, ['review', 'start']);
+  ok(r, 'review start');
+  return writeTmp({ ...rep, plan_hash: r.out.match(/plan hash: ([0-9a-f]{64})/)[1] });
+};
+const fxReport = (name) => JSON.parse(fs.readFileSync(fx(name, 'review.json'), 'utf8'));
 const copyMd = (name, dir, files) => { for (const f of files) fs.copyFileSync(fx(name, `md/${f}`), path.join(dir, '.growth', f)); };
 
 // Drive a fixture project through the documented flow up to a recorded review. stop = phase to stop after.
@@ -41,7 +48,7 @@ function build(name, stop = 'review') {
   copyMd(name, dir, ['content-strategy.md', 'measurement-plan.md', 'monetization.md']);
   ok(gs(dir, ['phase', 'done', 'plan']), 'phase plan');
   if (stop === 'plan') return dir;
-  ok(gs(dir, ['review', 'record', '--file', fx(name, 'review.json'), '--mode', 'independent', '--reviewer', 'gs-growth-reviewer']), 'review');
+  ok(gs(dir, ['review', 'record', '--file', report(dir, fxReport(name)), '--mode', 'independent', '--reviewer', 'gs-growth-reviewer']), 'review');
   return dir;
 }
 
@@ -100,11 +107,18 @@ test('evidence: fabricated or unsupported numbers are rejected', () => {
     [{ ...base, keyword: 'k8', evidence: 'hypothesis', confidence: 'high' }, /hypothesis.*low/],
     [{ ...base, keyword: 'k9', evidence: 'fact', confidence: 'high', sources: ['S-007'] }, /community/],
     [{ ...base, keyword: 'k10', intent: 'buying' }, /intent/],
+    [{ ...base, keyword: 'k11', serp_notes: 'about 50,000 searches per month' }, /serp_notes contains/],
+    [{ ...base, keyword: 'k12', volume: { value: null, min: 9000, max: 1000, kind: 'estimate', source: 'S-005' } }, /min <= max/],
+    [{ ...base, keyword: 'k13', volume: { value: null, min: 10, max: 100, kind: 'unknown', source: null } }, /no range/],
   ];
+  // a Keyword Planner style range is a valid estimate and exports as min-max
+  ok(gs(dir, ['add', 'keywords', '--file', writeTmp([{ ...base, keyword: 'resize photo to 100kb', volume: { value: null, min: 1000, max: 10000, kind: 'estimate', source: 'S-005' } }])]));
+  ok(gs(dir, ['export', 'keywords']));
+  assert.match(fs.readFileSync(path.join(dir, '.growth/keywords.csv'), 'utf8'), /resize photo to 100kb,[^\n]*,1000-10000,estimate,S-005/);
   for (const [kw, re] of cases) fails(gs(dir, ['add', 'keywords', '--file', writeTmp([kw])]), re);
   fails(gs(dir, ['add', 'keywords', '--file', writeTmp([{ ...base, keyword: 'resize image to 20kb ' }])]), /duplicate keyword/);
   // nothing was written by the failed adds
-  assert.equal(readG(dir, 'keywords.json').length, 4);
+  assert.equal(readG(dir, 'keywords.json').length, 5);
 });
 
 test('evidence: sources need a valid date (not future), a URL or ref, and file hashes for imported data', () => {
@@ -114,7 +128,8 @@ test('evidence: sources need a valid date (not future), a URL or ref, and file h
   fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ ...s, accessed: '2026-12-01' }])]), /future/);
   fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ ...s, url: undefined }])]), /url or ref/);
   fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ ...s, url: 'javascript:alert(1)' }])]), /http/);
-  fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ type: 'gsc', ref: 'file:x.csv', title: 't', accessed: TODAY }])]), /sha256/);
+  fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ type: 'gsc', ref: 'user:trust me', title: 't', accessed: TODAY, sha256: '0'.repeat(64) }])]), /only by gs import/);
+  fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ ...s, url: 'https://x.example/a)|<img/src=x>|' }])]), /percent-encode/);
   fails(gs(dir, ['add', 'sources', '--file', writeTmp([{ ...s, title: 'line\nbreak' }])]), /control/);
   const r = gs(dir, ['add', 'sources', '--file', writeTmp([s])]);
   ok(r);
@@ -129,6 +144,8 @@ test('evidence: items carry no traffic numbers; implementer items need Given/Whe
   fails(gs(dir, ['add', 'items', '--file', writeTmp([{ ...base, acceptance: ['the sitemap exists'] }])]), /Given\/When\/Then/);
   fails(gs(dir, ['add', 'items', '--file', writeTmp([{ ...base, type: 'landing-page', confidence: 'low', evidence: 'hypothesis', sources: [] }])]), /low-confidence/);
   fails(gs(dir, ['add', 'items', '--file', writeTmp([{ ...base, status: 'approved' }])]), /helper-owned/);
+  fails(gs(dir, ['add', 'items', '--file', writeTmp([{ ...base, owner: 'human', acceptance: [] }])]), /Done when/);
+  fails(gs(dir, ['add', 'items', '--file', writeTmp([{ ...base, id: 'GRO-010' }, { ...base, id: 'GRO-010', title: 'second' }])]), /duplicate id GRO-010/);
   ok(gs(dir, ['add', 'items', '--file', writeTmp([{ ...base, type: 'technical-seo', confidence: 'low', evidence: 'hypothesis', sources: [], effort: 'S' }])]));
   assert.equal(readG(dir, 'items.json')[0].id, 'GRO-001');
   assert.equal(readG(dir, 'items.json')[0].status, 'proposed');
@@ -179,23 +196,35 @@ test('phase order: plan needs audit and research; review needs plan', () => {
   ok(gs(dir, ['approve-baseline', ...BY]));
   fails(gs(dir, ['phase', 'done', 'plan']), /audit.*research/);
   fails(gs(dir, ['review', 'record', '--file', fx('saas', 'review.json'), '--mode', 'independent', '--reviewer', 'r']), /plan phase/);
+  fails(gs(dir, ['review', 'start']), /plan phase/);
 });
 
 test('gate 2: decisions need a review bound to the current plan; independent by default; critical findings block approval', () => {
   const dir = build('image-utility', 'plan');
   fails(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]), /no review/);
   // self-review is recorded honestly but cannot unlock decisions by default
-  ok(gs(dir, ['review', 'record', '--file', fx('image-utility', 'review.json'), '--mode', 'self', '--reason', 'no sub-agents on this host']));
+  ok(gs(dir, ['review', 'record', '--file', report(dir, fxReport('image-utility')), '--mode', 'self', '--reason', 'no sub-agents on this host']));
   assert.match(gs(dir, ['status']).out, /review: self \(not independent\)/);
   fails(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]), /independent review/);
   // a report must be well formed
-  fails(gs(dir, ['review', 'record', '--file', writeTmp({ verdict: 'OK', findings: [] }), '--mode', 'independent', '--reviewer', 'r']), /verdict/);
-  fails(gs(dir, ['review', 'record', '--file', fx('image-utility', 'review.json'), '--mode', 'independent']), /--reviewer/);
+  fails(gs(dir, ['review', 'record', '--file', report(dir, { verdict: 'OK', findings: [] }), '--mode', 'independent', '--reviewer', 'r']), /verdict/);
+  // a report about another plan (wrong or missing hash) is refused
+  fails(gs(dir, ['review', 'record', '--file', writeTmp({ ...fxReport('image-utility'), plan_hash: 'a'.repeat(64) }), '--mode', 'independent', '--reviewer', 'r']), /different plan/);
+  fails(gs(dir, ['review', 'record', '--file', report(dir, fxReport('image-utility')), '--mode', 'independent']), /--reviewer/);
   // independent review with a critical finding on GRO-002
   const rep = JSON.parse(fs.readFileSync(fx('image-utility', 'review.json'), 'utf8'));
   rep.findings.push({ severity: 'Critical', item: 'GRO-002', type: 'fabricated-metric', summary: 'x', fix: 'y' });
-  ok(gs(dir, ['review', 'record', '--file', writeTmp(rep), '--mode', 'independent', '--reviewer', 'gs-growth-reviewer']));
+  ok(gs(dir, ['review', 'record', '--file', report(dir, rep), '--mode', 'independent', '--reviewer', 'gs-growth-reviewer']));
   fails(gs(dir, ['decide', 'GRO-002', 'approve', ...BY]), /Critical/);
+  // a second, clean review of the same plan does not wash out the Critical finding
+  ok(gs(dir, ['review', 'record', '--file', report(dir, { verdict: 'PASS', findings: [] }), '--mode', 'independent', '--reviewer', 'other']));
+  fails(gs(dir, ['decide', 'GRO-002', 'approve', ...BY]), /Critical/);
+  // editing a recorded review file is detected
+  const rf = path.join(dir, '.growth/reviews/R-002.json');
+  const saved = fs.readFileSync(rf, 'utf8');
+  fs.writeFileSync(rf, saved.replace(/"severity": "Critical"/, '"severity": "Low"'));
+  fails(gs(dir, ['decide', 'GRO-002', 'approve', ...BY]), /changed after it was recorded/);
+  fs.writeFileSync(rf, saved);
   ok(gs(dir, ['decide', 'GRO-002', 'reject', '--by', 'Sam', '--note', 'not now']));
   ok(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]));
   fails(gs(dir, ['decide', 'GRO-003', 'approve', '--by', 'Sam']), /--note/);
@@ -204,7 +233,7 @@ test('gate 2: decisions need a review bound to the current plan; independent by 
   fs.appendFileSync(path.join(dir, '.growth/monetization.md'), '\nNew idea.\n');
   fails(gs(dir, ['decide', 'GRO-003', 'approve', ...BY]), /plan changed since the last review/);
   // the user may turn the independence requirement off in their own config
-  ok(gs(dir, ['review', 'record', '--file', fx('image-utility', 'review.json'), '--mode', 'self', '--reason', 'no sub-agents']));
+  ok(gs(dir, ['review', 'record', '--file', report(dir, fxReport('image-utility')), '--mode', 'self', '--reason', 'no sub-agents']));
   fs.writeFileSync(path.join(dir, '.growth/config.json'), JSON.stringify({ gates: { require_independent_review: false } }));
   ok(gs(dir, ['decide', 'GRO-003', 'approve', ...BY]));
   ok(gs(dir, ['roadmap']));
@@ -297,4 +326,73 @@ test('writes never follow symbolic links planted in .growth', () => {
   fs.symlinkSync(outside, path.join(dir, '.growth/decisions.md'));
   fails(gs(dir, ['approve-baseline', ...BY]), /symbolic link/);
   assert.equal(fs.readFileSync(outside, 'utf8'), 'keep');
+});
+
+test('review hardening: a re-approved baseline, a stale refresh or a FAIL verdict stop decisions', () => {
+  // baseline changed and re-approved after the review: phases reopen and the review no longer covers the plan
+  let dir = build('saas');
+  const b = JSON.parse(fs.readFileSync(fx('saas', 'baseline.json'), 'utf8'));
+  ok(gs(dir, ['baseline', 'set', '--file', writeTmp({ ...b, geographies: ['JP'] })]));
+  ok(gs(dir, ['approve-baseline', ...BY]));
+  assert.match(gs(dir, ['status']).out, /audit: stale/);
+  fails(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]), /plan changed since the last review/);
+  // refresh started: no decisions until the phases are done again
+  dir = build('saas');
+  ok(gs(dir, ['refresh', 'start', '--note', 'q1']));
+  fails(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]), /phases not done/);
+  // FAIL verdict or a plan-level High finding blocks every approval, but not rejections
+  dir = build('saas', 'plan');
+  ok(gs(dir, ['review', 'record', '--file', report(dir, { verdict: 'FAIL', findings: [{ severity: 'High', item: null, type: 'expectations', summary: 'x', fix: 'y' }] }), '--mode', 'independent', '--reviewer', 'r']));
+  fails(gs(dir, ['decide', 'GRO-003', 'approve', ...BY]), /FAIL/);
+  ok(gs(dir, ['decide', 'GRO-003', 'reject', ...BY]));
+});
+
+test('statuses come only from the decision log: hand-edited approvals are refused by validate, roadmap and handoff', () => {
+  const dir = build('image-utility');
+  const items = readG(dir, 'items.json');
+  items.find((i) => i.id === 'GRO-001').status = 'approved';
+  fs.writeFileSync(path.join(dir, '.growth/items.json'), JSON.stringify(items));
+  const v = JSON.parse(gs(dir, ['validate', '--json']).out);
+  assert.ok(v.errors.some((e) => /GRO-001.*does not match the decision log/.test(e)), v.errors.join('\n'));
+  fails(gs(dir, ['roadmap']), /decision log/);
+  fails(gs(dir, ['handoff']), /decision log/);
+  assert.ok(!fs.existsSync(path.join(dir, '.growth/handoff/GRO-001.md')));
+});
+
+test('supersede needs a live replacement; imported data sources cannot be forged or silently changed', () => {
+  const dir = build('image-utility');
+  ok(gs(dir, ['decide', 'GRO-004', 'reject', ...BY]));
+  fails(gs(dir, ['supersede', 'GRO-002', '--with', 'GRO-004', ...BY]), /must be proposed or approved/);
+  fs.mkdirSync(path.join(dir, '.growth/performance'));
+  const csv = path.join(dir, '.growth/performance/q.csv');
+  fs.writeFileSync(csv, 'Query,Clicks,Impressions,CTR,Position\nresize image to 20kb,5,50,10%,9\n');
+  ok(gs(dir, ['import', 'gsc', '--file', csv]));
+  fs.appendFileSync(csv, 'resize image to 50kb,1,9,11%,12\n');
+  const v = JSON.parse(gs(dir, ['validate', '--json']).out);
+  assert.ok(v.errors.some((e) => /changed since it was imported/.test(e)), v.errors.join('\n'));
+});
+
+test('Search Console import skips a keyword tracked for several geos unless --geo picks one', () => {
+  const dir = build('image-utility', 'research');
+  const base = readG(dir, 'keywords.json')[0];
+  ok(gs(dir, ['add', 'keywords', '--file', writeTmp([{ ...base, geo: 'US' }])]));
+  fs.mkdirSync(path.join(dir, '.growth/performance'));
+  const csv = path.join(dir, '.growth/performance/q.csv');
+  fs.writeFileSync(csv, 'Top queries,Clicks,Impressions,CTR,Position\nresize image to 20kb,5,50,10%,9\n');
+  assert.match(gs(dir, ['import', 'gsc', '--file', csv]).out, /1 skipped/);
+  assert.ok(readG(dir, 'keywords.json').every((k) => !k.performance));
+  ok(gs(dir, ['import', 'gsc', '--file', csv, '--geo', 'IN']));
+  const kws = readG(dir, 'keywords.json');
+  assert.equal(kws.find((k) => k.geo === 'IN').performance.clicks, 5);
+  assert.equal(kws.find((k) => k.geo === 'US').performance, undefined);
+});
+
+test('native agent install refuses symlinked project folders', () => {
+  const proj = tmpDir('gs-agents-');
+  const elsewhere = tmpDir('gs-elsewhere-');
+  fs.symlinkSync(elsewhere, path.join(proj, '.claude'));
+  const r = spawnSync('node', [path.join(REPO, 'skills/growth-strategy/core/scripts/install-agents.mjs'), '--agent', 'claude-code', '--scope', 'project', '--project-dir', proj], { encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /symbolic link/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
 });

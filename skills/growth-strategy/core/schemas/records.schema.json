@@ -187,6 +187,14 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 200
+        },
+        "min": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max": {
+          "type": "number",
+          "minimum": 0
         }
       }
     },
@@ -446,7 +454,8 @@
       "additionalProperties": false,
       "required": [
         "verdict",
-        "findings"
+        "findings",
+        "plan_hash"
       ],
       "properties": {
         "verdict": {
@@ -514,6 +523,10 @@
               }
             }
           }
+        },
+        "plan_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         }
       }
     }

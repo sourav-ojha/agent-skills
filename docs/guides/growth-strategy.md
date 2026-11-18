@@ -12,6 +12,13 @@ Design: [design spec](../superpowers/specs/2026-11-18-growth-strategy-design.md)
 ## What you need
 Web search and fetch in your agent, the project folder (read-only), and ideally a Search Console query export or a keyword-tool export. Without exports, search volumes and difficulty stay **unknown**: the skill never guesses them.
 
+## Solo quickstart
+1. Export what you can for free and put it in `.growth/performance/` (git-ignored): Search Console → Performance → Queries, Pages and Countries; a Keyword Planner file from a free Google Ads account (ranges are fine).
+2. `/growth-strategy init`, read the baseline, reply "approved" (or correct it).
+3. `/growth-strategy full`, then answer the decision sheet in one message.
+4. Do the human items in `roadmap.md`; give `handoff/GRO-NNN.md` files to `/implementer`.
+5. Next month: export Search Console again and run `/growth-strategy refresh`.
+
 ## Start
 ```
 /growth-strategy init        # drafts the baseline, then waits for your approval
@@ -41,7 +48,7 @@ init ─► you approve the baseline ─► audit ∥ (search research ∥ distr
 `measured` numbers only come from imported Search Console or analytics exports. Roadmap items have qualitative impact (H/M/L), never traffic promises.
 
 ## Decisions
-The skill shows the items, the reviewer's verdict and the unknowns, then stops. Reply in chat, for example: `approve GRO-001 and GRO-003, defer GRO-004, research GRO-005`. Your words are recorded in `.growth/decisions.md`. Items with a Critical or High review finding cannot be approved until the plan is fixed and reviewed again. Without a separate reviewer agent the review is a self-review, and decisions stay blocked unless you turn that off in `.growth/config.json`.
+The skill shows the items, the reviewer's verdict and the unknowns, then stops. Reply in chat, for example: `approve GRO-001 and GRO-003, defer GRO-004, research GRO-005`. Your words are recorded in `.growth/decisions.md`. Items with a Critical or High review finding cannot be approved until the plan is fixed and reviewed again. Without a separate reviewer agent the review is a self-review, and decisions stay blocked unless you add `{"gates": {"require_independent_review": false}}` to `.growth/config.json` yourself.
 
 ## What you get
 `.growth/roadmap.md` (approved items by weeks 1-4, 5-8, 9-13; everything else under "Not approved"), `keywords.json` and `keywords.csv`, `seo-audit.md`, `competitors.md`, `distribution.md`, `content-strategy.md`, `measurement-plan.md`, `monetization.md`, `sources.json` (provenance), `decisions.md`, and `handoff/GRO-NNN.md` specs for approved technical items.

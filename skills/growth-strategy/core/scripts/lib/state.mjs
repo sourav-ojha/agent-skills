@@ -79,10 +79,10 @@ export const baselineHash = (b) => sha256(stable(Object.fromEntries(BASELINE_KEY
 export const ITEM_STATE = ['status', 'superseded_by'];
 const content = (o, drop) => Object.fromEntries(Object.entries(o).filter(([k]) => !drop.includes(k)));
 // The plan a review covers: item content, keyword content and the plan markdown. Status and imported performance are excluded,
-// so decisions and data imports do not invalidate a review, but any content edit (including a refresh) does.
+// so decisions and data imports do not invalidate a review, but any content edit (including a refresh) or a re-approved baseline does.
 export function planHash(s) {
   const md = PLAN_MD.map((f) => { try { return fs.readFileSync(s.p.md(f), 'utf8'); } catch { return ''; } });
-  return sha256(stable({ items: s.items.map((i) => content(i, ITEM_STATE)), keywords: s.keywords.map((k) => content(k, ['performance'])), md }));
+  return sha256(stable({ baseline: s.growth.baseline.content_hash || null, items: s.items.map((i) => content(i, ITEM_STATE)), keywords: s.keywords.map((k) => content(k, ['performance'])), md }));
 }
 
 export const nextId = (list, prefix) => {
@@ -98,7 +98,8 @@ const csvCell = (v) => {
 };
 export const KEYWORD_CSV = ['keyword', 'cluster', 'intent', 'geo', 'language', 'volume', 'volume_kind', 'volume_source', 'difficulty', 'difficulty_kind', 'difficulty_source', 'priority', 'evidence', 'confidence', 'target_page', 'serp_notes', 'competitors', 'sources', 'researched', 'clicks', 'impressions', 'ctr', 'position', 'performance_period'];
 export function keywordsCsv(keywords) {
-  const rows = keywords.map((k) => [k.keyword, k.cluster, k.intent, k.geo, k.language, k.volume.value, k.volume.kind, k.volume.source, k.difficulty.value, k.difficulty.kind, k.difficulty.source,
+  const val = (m) => (m.value !== null ? m.value : m.min !== undefined ? `${m.min}-${m.max}` : null);
+  const rows = keywords.map((k) => [k.keyword, k.cluster, k.intent, k.geo, k.language, val(k.volume), k.volume.kind, k.volume.source, val(k.difficulty), k.difficulty.kind, k.difficulty.source,
     k.priority, k.evidence, k.confidence, k.target_page, k.serp_notes, (k.competitors || []).join('; '), k.sources.join('; '), k.researched,
     k.performance?.clicks, k.performance?.impressions, k.performance?.ctr, k.performance?.position, k.performance?.period]);
   return [KEYWORD_CSV, ...rows].map((r) => r.map(csvCell).join(',')).join('\n') + '\n';

@@ -107,3 +107,13 @@ Verdict: PROCEED WITH CHANGES. Resolutions (these override the text above):
 | 10 | Low | delivery-orchestrator | Documented: GRO files never go in `features_dir`. |
 | 11 | Low | P1 loophole | Low-confidence early items allowed only for `measurement`/`technical-seo` with `effort: S`. |
 | 12 | Low | Status line | Fixed. |
+
+## Implementation review (independent, 2026-11-18)
+Code review verdict PASS WITH CHANGES; audience review (solo site owner) "safe and honest, but not yet actionable"; automated security review flagged agent install through symlinks. All fixed with regression tests (each gate fix mutation-checked):
+- H1 review wash-out / tampering: findings from every review of the current plan count; review file sha256 stored and verified; FAIL verdicts and plan-level Critical/High block approvals.
+- H2 forged measured data: `gsc`/`analytics` sources only via `gs import`; hash mismatch is an error.
+- M1-M4: baseline re-approval reopens phases and is part of the plan hash; statuses must match the decision log (roadmap/handoff refuse otherwise); reviewer echoes the plan hash from `review start`; no decisions while phases are stale.
+- Lows: duplicate ids in input, supersede needs a live target, strict source URLs, traffic numbers in `serp_notes`, geo-aware GSC import, review id validation.
+- Audience: free-signal prioritisation ladder (P1 needs two signals), Keyword Planner ranges (`min`/`max` estimates), "Done when" required for human items and printed in the roadmap, served-location for SERP checks, no-link-by-default community guidance, AdSense invalid-traffic / low-value-content / certified CMP / Core Web Vitals / hreflang / upload-handling trust notes, solo quickstart.
+- Security: project-scope `install-agents` refuses symlinked `.claude`/`.codex` paths and agent files and writes by temp file + rename.
+Not changed (stated limit): an agent able to rewrite every state file at once can still forge state; the gate remains the user reading `decisions.md`.
