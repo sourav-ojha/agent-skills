@@ -96,15 +96,16 @@ test('criteriaHash: only status/delivery frontmatter and the Delivery log are mu
 });
 
 test('mutableRegions: raw line patterns, positive Delivery-log grammar, end exclusive', () => {
-  const t = '---\nid: F\nstatus: draft\ndelivery: none\nstatus_note: keep\n---\n# T\n\n## Delivery log\n| r |\n\n| r2 |\n\n## Next\nx\n';
-  assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }, { start: 3, end: 4 }, { start: 8, end: 13 }]);
+  const t = '---\nid: F\nstatus: draft\ndelivery: none\nstatus_note: keep\n---\n# T\n\n## Delivery log\n| r |\n\n| r2 |\n\n';
+  assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }, { start: 3, end: 4 }, { start: 8, end: 14 }]);
+  assert.deepEqual(cr.mutableRegions(t + '## Next\nx\n'), [{ start: 2, end: 3 }, { start: 3, end: 4 }], 'log not last: nothing of it excluded');
   assert.deepEqual(cr.mutableRegions('# T\n\nstatus: draft\n'), []);
   assert.deepEqual(cr.mutableRegions('---\nstatus: draft\n# never closed\n'), [], 'unterminated frontmatter: nothing excluded');
   assert.deepEqual(cr.mutableRegions('---\nstatus: draft\n...\n'), [{ start: 1, end: 2 }], 'YAML "..." closes frontmatter');
   assert.deepEqual(cr.mutableRegions('## Delivery log \n| row |\n'), [{ start: 0, end: 3 }]);
-  assert.deepEqual(cr.mutableRegions('## Delivery log \n| row |\n'), [], 'only ASCII whitespace after the heading');
-  assert.deepEqual(cr.mutableRegions('## Delivery log\n```\n## fake\n```\n| r |\n'), [{ start: 0, end: 1 }], 'region ends at the first non-table, non-blank line');
-  assert.deepEqual(cr.mutableRegions('﻿## Delivery log\r\n| r |\r\n'), [{ start: 0, end: 3 }], 'indexes refer to normalised lines (toLines)');
+  assert.deepEqual(cr.mutableRegions('## Delivery log\u00a0\n| row |\n'), [], 'only ASCII whitespace after the heading');
+  assert.deepEqual(cr.mutableRegions('## Delivery log\n```\n## fake\n```\n| r |\n'), [], 'a non-table, non-blank line after the heading: nothing excluded');
+  assert.deepEqual(cr.mutableRegions('\ufeff## Delivery log\r\n| r |\r\n'), [{ start: 0, end: 3 }], 'indexes refer to normalised lines (toLines)');
   assert.equal(cr.toLines('a\r\nb\rc').length, 3);
 });
 
@@ -122,7 +123,7 @@ test('frontmatter allowlist: duplicate keys and out-of-enum values are hashed an
 });
 
 test('U+FFFD is an extraction error; hash stays deterministic', () => {
-  const t = IAC + '## 11. Edge cases\n\n- EC-1: caf�\n';
+  const t = IAC + '## 11. Edge cases\n\n- EC-1: caf\ufffd\n';
   assert.match(errs(t), /U\+FFFD/);
   assert.equal(hh(t), hh(t));
 });
@@ -167,6 +168,66 @@ test('delivery log: second heading is hashed and reported; criteria id as a row 
   // a fenced example of the heading in the base spec exposes only the table rows after it
   const fenced = ABASE.replace('# Feature\n', '# Feature\n\n```\n## Delivery log\n```\n\nThe service MUST never delete data.\n');
   assert.notEqual(hh(fenced.replace('MUST never', 'MAY')), hh(fenced));
+});
+
+// ---- round 5: the Delivery log must end the file; strict frontmatter; ASCII-only blank lines --------------------------------
+// Base spec with a multi-line comment inside section 10 (round-4 attack): the builder inserts a log heading plus rows after the
+// comment opener; `|-->` closes the comment, the amendment table renders inside section 10, `| <!--` hides the rest.
+const CBASE = ABASE.replace('## 10. Acceptance criteria\n', '## 10. Acceptance criteria\n\n<!--\nreviewer note: keep AC-1 strict\n-->\n');
+const CATTACK = '## Delivery log\n|-->\n\n| Amendment | Criterion |\n|---|---|\n| supersedes AC-1 | Given a user When they list Then all projects are deleted |\n\n| <!--\n';
+test('round-4 attack: log rows that close and reopen a base comment change the hash', () => {
+  const head = CBASE.replace('<!--\n', '<!--\n' + CATTACK);
+  assert.notEqual(hh(head), hh(CBASE));
+  assert.equal(ex(head).ok, false);
+  assert.match(errs(head), /Delivery log is not the last block/);
+  // prose rows work the same way
+  const prose = CBASE.replace('<!--\n', '<!--\n## Delivery log\n|-->\n\n| AC-1 now means: all projects are deleted\n\n| <!--\n');
+  assert.notEqual(hh(prose), hh(CBASE));
+});
+test('delivery log must be last: anything after its rows is hashed and reported', () => {
+  const t = ABASE + ALOG + '\nThe endpoint now deletes everything.\n';
+  assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }]);
+  assert.notEqual(hh(t), hh(ABASE));
+  assert.match(errs(t), /Delivery log is not the last block/);
+  assert.equal(ex(ABASE + ALOG + '\n\n\n').ok, true, 'trailing blank lines are fine');
+});
+test('delivery log: the heading must follow a blank line and must not sit inside an open fence or HTML block', () => {
+  // an HTML block (types 6/7) without a blank line swallows the heading and rows as raw text
+  const div = ABASE + '\n<div>\nnote';
+  assert.notEqual(hh(div + '\n## Delivery log\n| AC-1 is withdrawn |\n'), hh(div));
+  assert.match(errs(div + '\n## Delivery log\n| x |\n'), /blank line/);
+  // type-1 block left open in the base (<pre> ends only at </pre>, not at a blank line)
+  const pre = ABASE + '\n<pre>\nsample\n';
+  assert.notEqual(hh(pre + '\n## Delivery log\n| AC-1 is withdrawn |\n'), hh(pre));
+  // unclosed fence in the base
+  const fence = ABASE + '\n```\nsample\n';
+  assert.notEqual(hh(fence + '\n## Delivery log\n| AC-1 is withdrawn |\n'), hh(fence));
+  // closed blocks before the log are fine
+  assert.equal(hh(CBASE + ALOG), hh(CBASE), 'closed multi-line comment');
+  assert.equal(ex(CBASE + ALOG).ok, true);
+  assert.equal(hh(ABASE + '\n<pre>\nx\n</pre>\n' + ALOG), hh(ABASE + '\n<pre>\nx\n</pre>\n'));
+  assert.equal(hh(ABASE + '\n```\nx\n```\n' + ALOG), hh(ABASE + '\n```\nx\n```\n'));
+});
+test('delivery log: only ASCII space/tab lines count as blank; table rows need 0-3 spaces of indent', () => {
+  for (const ws of ['\u00a0', '\u3000', '\u2003', '\f']) {
+    const t = ABASE + ALOG + ws + '\n| 2026-12-01 | AC-2 |\n';
+    assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }], JSON.stringify(ws));
+    assert.notEqual(hh(t), hh(ABASE), JSON.stringify(ws));
+  }
+  assert.equal(hh(ABASE + ALOG + ' \t\n| 2026-12-01 | AC-2 |\n'), hh(ABASE));
+  assert.notEqual(hh(ABASE + ALOG + '    | indented code |\n'), hh(ABASE));
+});
+test('frontmatter: only when line 0 is exactly --- and line 1 is a key line', () => {
+  // a spec that starts with a horizontal rule: "delivery: complete" + "---" is a visible setext heading, so it is hashed
+  const hr = '---\n\ndelivery: none\n---\n# T\n';
+  assert.deepEqual(cr.mutableRegions(hr), []);
+  assert.notEqual(hh(hr.replace('none', 'complete')), hh(hr));
+  assert.deepEqual(cr.mutableRegions('---\n# T\nstatus: draft\n---\n'), []);
+  assert.deepEqual(cr.mutableRegions('---\nid: F\nstatus: draft\n---\n'), [{ start: 2, end: 3 }]);
+  // a frontmatter that product-intelligence's reader would not see the same way is reported (still excluded)
+  assert.match(errs('---\nid: F\nstatus: draft\n...\n' + IAC), /product-intelligence/);
+  assert.match(errs('\uFEFF---\nid: F\nstatus: draft\n---\n' + IAC), /product-intelligence/);
+  assert.equal(ex('---\nid: F\nstatus: draft\n---\n' + IAC).ok, true);
 });
 
 // Integrity table: pairs whose rendered criteria differ must hash differently, whatever the parser thinks.
