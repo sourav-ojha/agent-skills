@@ -151,6 +151,11 @@ function cmdAdd(kind) {
     const seen = new Set();
     for (const [i, k] of list.entries()) {
       for (const f of STATE_KEYS) if (f in (k || {})) errs.push(`keywords[${i}]: "${f}" is helper-owned`);
+      for (const m of ['volume', 'difficulty', 'cpc']) {
+        const src = k?.[m]?.kind === 'measured' ? byId.get(k[m].source) : null;
+        const file = src?.ref?.startsWith('file:') ? path.resolve(dir, src.ref.slice(5)) : null;
+        if (src && (!file || !file.startsWith(dir + path.sep) || !fs.existsSync(file) || sha256(fs.readFileSync(file)) !== src.sha256)) errs.push(`keywords[${i}] ${m}: measured data must cite an import whose file is present and unchanged (${k[m].source})`);
+      }
       errs.push(...checkKeyword(k, byId, `keywords[${i}]`));
       if (errs.length) continue;
       const key = normKw(k);
@@ -272,6 +277,9 @@ function cmdDecide() {
   const stale = PHASES.filter((ph) => phaseState(s.growth, ph) !== 'done');
   if (stale.length) die(`phases not done (${stale.join(', ')}): finish the refresh and review the plan again before deciding`);
   if (rev.mode !== 'independent' && config().gates.require_independent_review) die('decisions need an independent review (a separate reviewer agent); only the user can turn this off in .growth/config.json: {"gates": {"require_independent_review": false}}');
+  const listed = new Set(s.growth.reviews.map((r) => `${r.id}.json`));
+  const orphan = fs.existsSync(p.reviews) ? fs.readdirSync(p.reviews).filter((f) => f.endsWith('.json') && !listed.has(f)) : [];
+  if (orphan.length) die(`review file(s) ${orphan.join(', ')} are not in growth.json: the review list was edited; restore it from git`);
   // Findings from every review of this exact plan count: a second, cleaner review cannot wash out a Critical finding.
   const current = s.growth.reviews.filter((r) => r.plan_hash === rev.plan_hash).map(reviewFile);
   const all = current.flatMap((r) => r.findings);
@@ -343,6 +351,8 @@ function cmdRoadmap() {
 
 function cmdHandoff() {
   const s = load(dir); guard();
+  requireBaseline(s);
+  { const open = PHASES.filter((ph) => phaseState(s.growth, ph) !== 'done'); if (open.length) die(`phases not done (${open.join(', ')}): finish the refresh, review and re-decide before handing off`); }
   { const v = validateAll(s, config()); if (v.errors.length) die(`fix validation errors first (gs validate):\n${v.errors.join('\n')}`); }
   ensureDir(p.handoff);
   const src = sourceIndex(s);
@@ -418,6 +428,7 @@ function cmdImportGsc() {
   const s = load(dir); guard();
   if (!opt.file || opt.file === true) die('--file is required (Search Console > Performance > Export > Queries.csv)');
   const file = path.resolve(opt.file);
+  if (!file.startsWith(dir + path.sep)) die('put the export inside the project (for example .growth/performance/, which is git-ignored) so its hash can be checked later');
   let buf; try { buf = fs.readFileSync(file); } catch (e) { die(`cannot read ${opt.file}: ${e.message}`); }
   const rows = parseCsv(buf.toString('utf8').replace(/^﻿/, ''));
   const head = (rows[0] || []).map((h) => h.trim().toLowerCase());
@@ -427,7 +438,7 @@ function cmdImportGsc() {
   const period = opt.period && opt.period !== true ? String(opt.period) : today().slice(0, 7);
   if (!/^\d{4}-\d{2}(-\d{2})?( to \d{4}-\d{2}-\d{2})?$/.test(period)) die('--period must look like 2026-11 or 2026-10-01 to 2026-10-28');
   const hash = sha256(buf);
-  const rel = file.startsWith(dir + path.sep) ? path.relative(dir, file).split(path.sep).join('/') : path.basename(file);
+  const rel = path.relative(dir, file).split(path.sep).join('/');
   let srcRec = s.sources.find((x) => x.type === 'gsc' && x.sha256 === hash);
   if (!srcRec) { srcRec = { id: nextId(s.sources, 'S'), type: 'gsc', ref: `file:${rel}`, title: `Search Console queries export ${period}`.slice(0, 200), accessed: today(), sha256: hash }; s.sources.push(srcRec); }
   const num = (v) => { const n = Number(String(v).replace(/[%,\s]/g, '')); return Number.isFinite(n) ? n : 0; };

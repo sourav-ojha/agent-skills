@@ -127,11 +127,14 @@ function main() {
     if (scope !== 'project') return;
     for (let q = root; q.startsWith(projectDir + path.sep); q = path.dirname(q)) if (isLink(q)) { console.error(`install-agents: refusing ${q}: it is a symbolic link`); process.exit(1); }
   };
-  for (const f of rendered) {
-    if (agent !== 'all' && f.platform !== agent) continue;
-    const dest = path.join(roots[f.platform], f.file);
+  const chosen = rendered.filter((f) => agent === 'all' || f.platform === agent);
+  for (const f of chosen) { // check everything before touching anything
     checkRoot(roots[f.platform]);
+    const dest = path.join(roots[f.platform], f.file);
     if (isLink(dest)) { console.error(`install-agents: refusing ${dest}: it is a symbolic link`); process.exit(1); }
+  }
+  for (const f of chosen) {
+    const dest = path.join(roots[f.platform], f.file);
     if (has('remove')) {
       console.log(`${has('dry-run') ? '[dry-run] ' : ''}remove ${dest}`);
       if (!has('dry-run')) fs.rmSync(dest, { force: true });

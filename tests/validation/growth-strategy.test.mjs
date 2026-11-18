@@ -303,7 +303,8 @@ test('refresh: stale research is listed, phases reopen, decisions and approved i
   assert.equal(src.type, 'gsc');
   assert.match(src.sha256, /^[0-9a-f]{64}$/);
   assert.match(fs.readFileSync(path.join(dir, '.growth/.gitignore'), 'utf8'), /performance\//);
-  fails(gs(dir, ['import', 'gsc', '--file', writeTmp({})], later), /CSV/);
+  fs.writeFileSync(path.join(dir, '.growth/performance/bad.csv'), '{}');
+  fails(gs(dir, ['import', 'gsc', '--file', path.join(dir, '.growth/performance/bad.csv')], later), /CSV/);
 });
 
 test('CSV export escapes quotes and commas and neutralises spreadsheet formulas', () => {
@@ -370,6 +371,29 @@ test('supersede needs a live replacement; imported data sources cannot be forged
   fs.appendFileSync(csv, 'resize image to 50kb,1,9,11%,12\n');
   const v = JSON.parse(gs(dir, ['validate', '--json']).out);
   assert.ok(v.errors.some((e) => /changed since it was imported/.test(e)), v.errors.join('\n'));
+});
+
+test('forged state is caught: measured data needs a present import file, orphan review files block decisions, no handoff while stale', () => {
+  let dir = build('image-utility', 'research');
+  const src = readG(dir, 'sources.json');
+  src.push({ id: 'S-050', type: 'gsc', ref: 'file:nope.csv', title: 'forged', accessed: TODAY, sha256: 'a'.repeat(64) });
+  fs.writeFileSync(path.join(dir, '.growth/sources.json'), JSON.stringify(src));
+  const base = readG(dir, 'keywords.json')[0];
+  fails(gs(dir, ['add', 'keywords', '--file', writeTmp([{ ...base, keyword: 'k-forged', volume: { value: 99000, kind: 'measured', source: 'S-050' } }])]), /import whose file is present/);
+  fails(gs(dir, ['import', 'gsc', '--file', writeTmp({})]), /inside the project/);
+  dir = build('image-utility', 'plan');
+  const rep = fxReport('image-utility');
+  rep.findings.push({ severity: 'Critical', item: 'GRO-001', type: 'evidence', summary: 'x', fix: 'y' });
+  ok(gs(dir, ['review', 'record', '--file', report(dir, rep), '--mode', 'independent', '--reviewer', 'r']));
+  ok(gs(dir, ['review', 'record', '--file', report(dir, fxReport('image-utility')), '--mode', 'independent', '--reviewer', 'r']));
+  const g = readG(dir, 'growth.json');
+  g.reviews.shift();
+  fs.writeFileSync(path.join(dir, '.growth/growth.json'), JSON.stringify(g));
+  fails(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]), /not in growth.json/);
+  dir = build('image-utility');
+  ok(gs(dir, ['decide', 'GRO-001', 'approve', ...BY]));
+  ok(gs(dir, ['refresh', 'start', '--note', 'q1']));
+  fails(gs(dir, ['handoff']), /phases not done/);
 });
 
 test('Search Console import skips a keyword tracked for several geos unless --geo picks one', () => {
