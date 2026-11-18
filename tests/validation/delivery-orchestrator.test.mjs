@@ -42,7 +42,7 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   const state = path.join(root, 'gh-state.json');
   const gs = { origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]] };
   fs.writeFileSync(state, JSON.stringify(gs));
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off' };
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
   const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
   const gh = () => JSON.parse(fs.readFileSync(state, 'utf8'));
   const setGh = (fn) => { const s = gh(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };
@@ -700,6 +700,7 @@ test('CFG config command: effective values without a file, --write creates the t
   assert.ok(fs.existsSync(path.join(e.work, '.product/delivery.json')));
   assert.match(e.d('config', '--write').err, /already exists/);
   assert.equal(e.d('config').json.errors.length, 0, 'the template is valid');
+  assert.equal(e.d('config').json.effective.readiness, null, 'the template does not opt into the readiness merge gate (D7)');
 });
 
 test('CFG the config must be committed and identical to the copy on the base branch', () => {

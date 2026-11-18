@@ -11,6 +11,9 @@ const strList = (v, at, errs, max = 100) => {
   if (!Array.isArray(v) || v.length > max || v.some((x) => typeof x !== 'string' || !x.trim() || x.length > 200 || /[\u0000-\u001f]/.test(x))) { errs.push(`${at}: expected a list of up to ${max} short strings`); return []; }
   return v.map((x) => x.trim());
 };
+const relPath = (v) => typeof v === 'string' && v && !v.startsWith('/') && !v.split('/').includes('..');
+// Local-only app URL: http://localhost:<port> or http://127.0.0.1:<port>, optional path. Never https, never another host.
+export const isLocalUrl = (u) => typeof u === 'string' && /^http:\/\/(?:localhost|127\.0\.0\.1):\d{1,5}(?:\/[^\s@]*)?$/.test(u);
 const keys = (o, allowed, at, errs) => { for (const k of Object.keys(o)) if (!allowed.includes(k)) errs.push(`${at}: unknown key "${k}" (allowed: ${allowed.join(', ')})`); };
 
 export function defaults() {
@@ -27,6 +30,9 @@ export function defaults() {
     hold_paths: [],
     limits: { max_fix_rounds: 2, max_failures: 2, ci_budget_s: 1800 },
     implementer_notes: '',
+    app: { setup: null, start: null, stop: null, base_url: null, ready: null, logs_dir: null, seed: null, env_example: null },
+    tests: { setup: null, all: null, timeout_s: 900 },
+    readiness: null, // null = not opted in
   };
 }
 
@@ -36,7 +42,7 @@ export function parseConfig(raw) {
   const errs = [];
   if (raw === undefined) return { config: cfg, errors: errs };
   if (!isObj(raw)) return { config: cfg, errors: ['config must be a JSON object'] };
-  keys(raw, ['version', 'github', 'base', 'branch_prefix', 'features_dir', 'protected_branches', 'merge', 'checks', 'local_checks', 'hold_paths', 'limits', 'implementer_notes'], 'config', errs);
+  keys(raw, ['version', 'github', 'base', 'branch_prefix', 'features_dir', 'protected_branches', 'merge', 'checks', 'local_checks', 'hold_paths', 'limits', 'implementer_notes', 'app', 'tests', 'readiness'], 'config', errs);
   if (raw.version !== undefined && raw.version !== 1) errs.push('version: only 1 is supported');
   if (raw.github !== undefined) {
     if (!isObj(raw.github)) errs.push('github: expected an object');
@@ -91,6 +97,49 @@ export function parseConfig(raw) {
     }
   }
   if (raw.implementer_notes !== undefined) { if (typeof raw.implementer_notes === 'string' && raw.implementer_notes.length <= 500 && !/[\u0000-\u0008\u000b-\u001f]/.test(raw.implementer_notes)) cfg.implementer_notes = raw.implementer_notes; else errs.push('implementer_notes: text up to 500 characters'); }
+  if (raw.app !== undefined) {
+    if (!isObj(raw.app)) errs.push('app: expected an object');
+    else {
+      keys(raw.app, Object.keys(cfg.app), 'app', errs);
+      for (const k of ['setup', 'start', 'stop', 'seed']) if (raw.app[k] !== undefined && raw.app[k] !== null) { const l = strList(raw.app[k], `app.${k}`, errs, 30); if (!l.length) errs.push(`app.${k}: an argument list such as ["npm","run","dev"]`); else cfg.app[k] = l; }
+      if (raw.app.base_url !== undefined && raw.app.base_url !== null) { if (isLocalUrl(raw.app.base_url)) cfg.app.base_url = raw.app.base_url; else errs.push('app.base_url: http://localhost:<port> or http://127.0.0.1:<port>'); }
+      for (const k of ['logs_dir', 'env_example']) if (raw.app[k] !== undefined && raw.app[k] !== null) { if (relPath(raw.app[k])) cfg.app[k] = raw.app[k]; else errs.push(`app.${k}: a relative path inside the repository`); }
+      if (raw.app.ready !== undefined && raw.app.ready !== null) {
+        const r = raw.app.ready;
+        if (!isObj(r)) errs.push('app.ready: expected an object');
+        else {
+          keys(r, ['url', 'log_pattern', 'timeout_s'], 'app.ready', errs);
+          const t = r.timeout_s === undefined ? 120 : r.timeout_s;
+          if (!Number.isInteger(t) || t < 1 || t > 600) errs.push('app.ready.timeout_s: an integer 1-600');
+          if ((r.url === undefined) === (r.log_pattern === undefined)) errs.push('app.ready: exactly one of "url" or "log_pattern"');
+          else if (r.url !== undefined) { if (isLocalUrl(r.url)) cfg.app.ready = { url: r.url, timeout_s: t }; else errs.push('app.ready.url: http://localhost:<port> or http://127.0.0.1:<port>'); }
+          else {
+            let ok = typeof r.log_pattern === 'string' && r.log_pattern.length > 0 && r.log_pattern.length <= 200;
+            if (ok) { try { new RegExp(r.log_pattern); } catch { ok = false; } }
+            if (ok) cfg.app.ready = { log_pattern: r.log_pattern, timeout_s: t }; else errs.push('app.ready.log_pattern: a valid regular expression up to 200 characters');
+          }
+        }
+      }
+    }
+  }
+  if (raw.tests !== undefined) {
+    if (!isObj(raw.tests)) errs.push('tests: expected an object');
+    else {
+      keys(raw.tests, ['setup', 'all', 'timeout_s'], 'tests', errs);
+      for (const k of ['setup', 'all']) if (raw.tests[k] !== undefined && raw.tests[k] !== null) { const l = strList(raw.tests[k], `tests.${k}`, errs, 30); if (!l.length) errs.push(`tests.${k}: an argument list such as ["npm","test"]`); else cfg.tests[k] = l; }
+      if (raw.tests.timeout_s !== undefined) { const t = raw.tests.timeout_s; if (Number.isInteger(t) && t >= 1 && t <= 3600) cfg.tests.timeout_s = t; else errs.push('tests.timeout_s: an integer 1-3600'); }
+    }
+  }
+  if (raw.readiness !== undefined && raw.readiness !== null) {
+    if (!isObj(raw.readiness)) errs.push('readiness: expected an object');
+    else {
+      keys(raw.readiness, ['min_level', 'max_age_days'], 'readiness', errs);
+      const rd = { min_level: 3, max_age_days: 14 };
+      const bounds = { min_level: [1, 4], max_age_days: [1, 90] };
+      for (const [k, [lo, hi]] of Object.entries(bounds)) if (raw.readiness[k] !== undefined) { if (Number.isInteger(raw.readiness[k]) && raw.readiness[k] >= lo && raw.readiness[k] <= hi) rd[k] = raw.readiness[k]; else errs.push(`readiness.${k}: an integer ${lo}-${hi}`); }
+      cfg.readiness = rd;
+    }
+  }
   return { config: cfg, errors: errs };
 }
 

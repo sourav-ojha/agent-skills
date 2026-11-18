@@ -4,6 +4,13 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (delivery-orchestrator: factory phase 0)
+- `deliver readiness [--repeat N] [--json]`: scores a repo from level 0 to 4 (config, tests run, CI gate, app starts with logs and seed) with a result and fix item per check, run in a temporary worktree with an allowlisted environment. The result is saved outside the repo in `~/.factory/readiness/` (`FACTORY_HOME` overrides). Exit `2` when below `readiness.min_level`. New optional config keys: `app`, `tests`, `readiness`.
+- Merge gate in `deliver init`: when merging is authorised and the config has a `readiness` key, `init` refuses on a missing, stale, future-dated or config-mismatched result, or a level below `min_level` (it re-runs the cheap checks and can only lower the stored level). Repos without the key behave as before.
+- Run records: every merged, skipped, blocked or awaiting-human outcome is appended to `.skill-runs/factory-runs.jsonl` (metadata only, written even with `SKILL_RUNLOG=off`), keyed by a per-run `run_id`.
+- `si runs-factory` (skill-insights): joins those records to transcript tokens, subagents included, with per-run coverage and `ambiguous` rows for overlapping features; `--out` never overwrites the source log.
+- Spikes: usage-limit classifier and passive capture tooling (fixtures only so far), and a rerunnable sandbox isolation probe. Notes: `docs/factory/spikes/`. Reference: `references/readiness.md`.
+
 ### Added (growth-strategy 0.1.0)
 - New skill `growth-strategy`: evidence-backed organic growth strategy for independent websites and products. Roles: product-seo-auditor, search-researcher, distribution-researcher (parallel), growth-reviewer (independent); commands `init`, `audit`, `research`, `plan`, `review`, `full`, `refresh`, `status`. Design: `docs/superpowers/specs/2026-11-18-growth-strategy-design.md` (independently reviewed; resolutions recorded there).
 - `.growth/` state: `growth.json` (baseline, phases, reviews, append-only decision log, refreshes, performance imports), `sources.json` (provenance with access dates and file hashes), `keywords.json` (+ `gs export keywords` CSV, formula-safe), `items.json` (roadmap candidates), six markdown artifacts with required sections, `roadmap.md` from approved items only, `handoff/GRO-NNN.md` implementer specs.

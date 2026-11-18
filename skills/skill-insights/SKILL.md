@@ -24,6 +24,7 @@ You measure skills, you do not run them. Everything is read-only and private: th
 | Cost and friction per skill | `si report [--skill <name>] [--since ...]` |
 | Per-run detail (JSON for deeper digging) | `si runs --skill <name> --json` |
 | Package one project's skill runs to bring for review | `si export [--dir <project>] [--out file]` |
+| Tokens per delivered feature (delivery-orchestrator run records) | `si runs-factory [--dir <project>] [--out file]` |
 
 Defaults (transcript and skills folders) are in the host adapter. Add each skills folder you care about (project and
 global) with `--skills-dir` so "never used" is accurate. Use `--since` to avoid ancient history skewing results.

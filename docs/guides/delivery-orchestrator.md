@@ -57,6 +57,19 @@ Order: `depends_on: FEATURE-001, FEATURE-002` in a spec's frontmatter, then by i
 
 It also stops the whole run on: no verified test check (see above), two blocked features in a row, a base branch that cannot be fast-forwarded.
 
+## Readiness
+Before letting a repo run unattended, check it: `node <skill-dir>/core/scripts/deliver.mjs readiness` (add `--repeat 2` to catch flaky checks, `--json` for machine output). It runs your declared test and app commands in a throwaway worktree and gives a level:
+
+| Level | Meaning |
+|---|---|
+| 0 | Not configured |
+| 1 | Config committed, tools ready |
+| 2 | Tests run from a clean checkout, no tracked secrets |
+| 3 | CI gate trustworthy: safe to merge on green |
+| 4 | App starts, logs and seeds from a clean checkout |
+
+Each failing check comes with a fix item. The result is stored in `~/.factory/readiness/`, outside your repo. To enforce it, add `"readiness": {"min_level": 3, "max_age_days": 14}` to `.product/delivery.json`: a run that may merge then refuses to start without a fresh result at that level. Without that key nothing changes. Each feature outcome is also logged to `.skill-runs/factory-runs.jsonl`; `si runs-factory` adds token cost. Details: [`references/readiness.md`](../../skills/delivery-orchestrator/references/readiness.md).
+
 ## What you get
 A final report: merged features (PR and sha), PRs waiting for you (and why), blocked or skipped features (and where the partial work is: a branch plus `git stash list`), and non-code follow-ups from the specs' delivery logs.
 

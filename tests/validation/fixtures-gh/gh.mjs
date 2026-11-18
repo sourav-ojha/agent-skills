@@ -30,6 +30,8 @@ const pushCommit = (branch, msg) => {
 const [a, b] = args;
 const accounts = st.accounts || { work: 'tok-work', personal: 'tok-personal' };
 if (a === 'auth' && b === 'token') { const u = flag('--user'); if (!accounts[u]) fail(`no token found for ${u}`); out(accounts[u]); }
+if (a === 'api' && /^repos\/[^/]+\/[^/]+\/branches\/[^/]+\/protection$/.test(b || '')) { if (st.protection) out(st.protection); fail('gh: Not Found (HTTP 404)'); }
+if (a === 'api' && /^repos\/[^/]+\/[^/]+\/rules\/branches\/[^/]+$/.test(b || '')) { if (st.rules) out(st.rules); fail('gh: Not Found (HTTP 404)'); }
 if (a === 'api' && b === 'user') { const t = process.env.GH_TOKEN; const who = Object.keys(accounts).find((k) => accounts[k] === t); out(st.loginOverride || who || 'default-user'); }
 if (a === 'repo' && b === 'view') out({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'main' }, viewerPermission: st.permission || 'WRITE' });
 if (a === 'pr' && b === 'list') { const h = flag('--head'); out([...(st.cross || []).filter((p) => p.head === h), ...st.prs.filter((p) => p.head === h && p.state === 'OPEN').map((p) => ({ number: p.number, url: p.url, isCrossRepository: false }))]); }

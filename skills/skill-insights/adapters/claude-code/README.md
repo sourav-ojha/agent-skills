@@ -8,3 +8,7 @@ body; model-invoked runs appear as `Skill` tool calls. Both are detected. Instal
 `<project>/.claude/skills`.
 
 Quick use: `node ~/.claude/skills/skill-insights/core/scripts/si.mjs report --since 2026-11-01`
+
+## Transcript location
+
+Transcripts are under `~/.claude/projects/<project-folder>/`; subagent transcripts are in `<project-folder>/<session-id>/subagents/`. See references/metrics.md for the layout and `runs-factory`.

@@ -6,9 +6,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { FEATURE_ID, TRANSITIONS, transition, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
+import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
+import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
+import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
 const argv = process.argv.slice(2);
@@ -25,6 +29,7 @@ const outcome = (o) => { emit(o); process.exitCode = 2; };
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
   next | built ID [--tier T] | pr ID --title T --body-file .delivery/F | ci ID [--timeout S] [--interval S] [--grace S] | fix ID | push ID | merge ID [--settle S]
   retry ID [--no-ci] [--checks A,B] | block ID --reason R | skip ID --reason R | status [--json] | reset --yes
+  readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
 
@@ -47,14 +52,18 @@ let GH_HOSTNAME = null;
 const tokenSafeRemote = () => { const f = git('remote', 'get-url', 'origin').out, p = git('remote', 'get-url', '--push', 'origin').out; return !!GH_HOSTNAME && [f, p].every((u) => isHttps(u) && remoteHost(u) === GH_HOSTNAME); };
 const gitNet = (...a) => (GH_ENV.GH_TOKEN || GH_ENV.GH_ENTERPRISE_TOKEN) && tokenSafeRemote()
   ? run('git', ['-c', 'credential.helper=', '-c', `credential.https://${GH_HOSTNAME}.helper=!gh auth git-credential`, ...a], GH_ENV) : git(...a);
-function useAccount(account, host) {
-  if (!account) return;
+// soft: return the problem as a string (and leave the default gh credentials in place) instead of exiting.
+function useAccount(account, host, { soft = false } = {}) {
+  if (!account) return null;
+  const fail = (m) => { if (soft) return m; die(m); };
   const t = run('gh', ['auth', 'token', '--user', account, '--hostname', host]);
-  if (t.code !== 0 || !t.out) die(`gh has no login for "${account}" on ${host}; run "gh auth login --hostname ${host}" for that account`);
+  if (t.code !== 0 || !t.out) return fail(`gh has no login for "${account}" on ${host}; run "gh auth login --hostname ${host}" for that account`);
+  const env = host === 'github.com' ? { GH_TOKEN: t.out } : { GH_ENTERPRISE_TOKEN: t.out, GH_HOST: host };
+  const who = run('gh', ['api', 'user', '--jq', '.login'], env);
+  if (who.code !== 0 || who.out.toLowerCase() !== account.toLowerCase()) return fail(`the token for "${account}" resolves to "${flat(who.out, 40)}": check "gh auth status"`);
   GH_HOSTNAME = host.toLowerCase();
-  GH_ENV = host === 'github.com' ? { GH_TOKEN: t.out } : { GH_ENTERPRISE_TOKEN: t.out, GH_HOST: host };
-  const who = run('gh', ['api', 'user', '--jq', '.login'], GH_ENV);
-  if (who.code !== 0 || who.out.toLowerCase() !== account.toLowerCase()) die(`the token for "${account}" resolves to "${flat(who.out, 40)}": check "gh auth status"`);
+  GH_ENV = env;
+  return null;
 }
 const must = (r, what) => { if (r.code !== 0) die(`${what} failed: ${(r.err || r.out).split('\n')[0].slice(0, 200)}`); return r.out; };
 const sleep = (ms) => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -64,6 +73,38 @@ const ghJson = (args, what) => { const r = gh(...args); if (r.code !== 0) die(`$
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/; // never starts with "-": a value can not be read as a git option
 const SHA = /^[0-9a-f]{40}$/;
 const validRef = (s) => typeof s === 'string' && REF.test(s) && !s.includes('..');
+// Always the remote-tracking ref, fully qualified: a local tag or branch named "origin/<x>" must never shadow it.
+const OR = (b) => `refs/remotes/origin/${b}`;
+
+// ---- run records ------------------------------------------------------------------------------------------------------
+// A record per transition into merged, skipped, blocked or awaiting_human. Snapshots are taken at the transition and written
+// by save(), so a record exists only for a state that was persisted. queue.mjs stays pure; this is the only writer.
+const RECORDED = new Set(['merged', 'skipped', 'blocked', 'awaiting_human']);
+let curQ = null;
+const pending = [];
+// A feature waiting for a person is not working: its record window ends when it entered awaiting_human (f.ts_wait), so a later
+// refresh/skip/merge of it does not stretch the window over other features' runs (which would make the token join ambiguous).
+const note = (f, from) => {
+  if (!curQ || !RECORDED.has(f.state)) return;
+  const waited = from === 'awaiting_human' && Number.isFinite(Date.parse(f.ts_wait)) ? Date.parse(f.ts_wait) : null;
+  pending.push({ f: JSON.parse(JSON.stringify(f)), at: waited ?? Date.now() });
+};
+const transition = (f, to, reason) => {
+  const from = f.state;
+  transitionState(f, to, reason);
+  if (to === 'awaiting_human') f.ts_wait = new Date().toISOString();
+  note(f, from);
+  return f;
+};
+let stamps;
+function flushRecords() {
+  if (!pending.length) return;
+  let project; try { project = projectHash(fs.realpathSync(root)); } catch { project = projectHash(root); }
+  stamps ??= skillStamps(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'));
+  for (const { f, at } of pending.splice(0)) appendRecord(root, buildRecord({ q: curQ, f, run: curQ.run_id || runId('deliver', 'run'), project, skills: stamps, now: at }));
+}
+let ciStart = 0;
+const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_wait_ms || 0) + (Date.now() - ciStart); };
 
 // ---- state -----------------------------------------------------------------------------------------------------------
 function load() {
@@ -79,6 +120,7 @@ function load() {
     if (!FEATURE_ID.test(f.id) || !(f.state in TRANSITIONS) || (f.branch && !validRef(f.branch)) || (f.ci_sha && !SHA.test(f.ci_sha)) || (f.built_sha && !SHA.test(f.built_sha)) || (f.pr && !Number.isInteger(f.pr.number))) die(`queue file has an invalid entry for ${f.id}; reset and re-init`);
   }
   REPO = q.repo;
+  curQ = q;
   useAccount(q.policy.github.account, q.policy.github.host);
   return q;
 }
@@ -89,6 +131,8 @@ function save(q) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n');
   fs.renameSync(tmp, file);
+  curQ = q;
+  flushRecords();
 }
 function item(q, id = arg) {
   if (!FEATURE_ID.test(id || '')) die(`need a feature id like FEATURE-001, got ${JSON.stringify(id)}`);
@@ -109,7 +153,7 @@ function refresh(q) {
     if (f.state !== 'awaiting_human' || !f.pr) continue;
     const r = gh('pr', 'view', String(f.pr.number), '--json', 'state,mergeCommit');
     if (r.code !== 0) continue;
-    try { const v = JSON.parse(r.out); if (v.state === 'MERGED') { transition(f, 'merged', 'merged by a person'); f.merged_sha = v.mergeCommit?.oid || null; } } catch { /* ignore */ }
+    try { const v = JSON.parse(r.out); if (v.state === 'MERGED') { f.merged_sha = v.mergeCommit?.oid || null; transition(f, 'merged', 'merged by a person'); } } catch { /* ignore */ }
   }
 }
 
@@ -146,7 +190,39 @@ C.config = () => {
   if (errors.length) process.exitCode = 1;
 };
 
-C.init = () => {
+// Merging runs in an opted-in project need a fresh readiness result for the config now on origin/<base>.
+// The cheap checks (C1, C2, C4, C5) are re-run and merged over the stored results before the level is recomputed.
+async function readinessGate(config, nameWithOwner, base) {
+  const { min_level: min, max_age_days: maxAge } = config.readiness;
+  const where = path.join(factoryHome(), 'readiness', `${repoKey(nameWithOwner)}.json`);
+  const doc = readJson(where);
+  const fixList = (r) => (r.length ? `\n${r.map((f) => `  - ${f.id}: ${flat(f.what, 160)} -> ${flat(f.help, 200)}`).join('\n')}` : '');
+  if (!doc || !Array.isArray(doc.results) || !Number.isInteger(doc.level)) return { refuse: `readiness is required to merge (readiness.min_level ${min}) but there is no usable result for ${nameWithOwner}: run "deliver readiness" first` };
+  const at = Date.parse(doc.at);
+  if (Number.isFinite(at) && at - Date.now() > 86400000) return { refuse: `the readiness result is dated in the future (${flat(doc.at, 40)}): clock skew or an edited file; run "deliver readiness" again` };
+  if (!Number.isFinite(at) || Date.now() - at > maxAge * 86400000) return { refuse: `the readiness result is older than ${maxAge} days (or undated): run "deliver readiness" again` };
+  if (doc.base !== base) return { refuse: `the readiness result was computed for base "${flat(doc.base ?? '(unrecorded)', 60)}" but this run's base is "${base}": run "deliver readiness" again for that base` };
+  if (!doc.config_hash || doc.config_hash !== baseConfigHash(base)) return { refuse: `config changed since readiness check (${CONFIG_PATH} on origin/${base} is not the one that was checked): run "deliver readiness" again` };
+  const ctx = makeCtx({ root, config, base, git, gh, repo: nameWithOwner });
+  const fresh = await runChecks(ctx, { only: ['C1', 'C2', 'C4', 'C5'] });
+  const freshIds = new Set(fresh.map((r) => r.id));
+  const merged = [...doc.results.filter((r) => !freshIds.has(r.id)), ...fresh];
+  const level = Math.min(computeLevel(merged), doc.level); // the re-run can only lower the stored level, never raise it
+  if (level < min) {
+    const st = new Map(merged.map((r) => [r.id, r]));
+    const fixes = CHECKS.filter((c) => c.level > 0 && st.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, st.get(c.id)));
+    return { refuse: `readiness level ${level} is below the required ${min}; fix these and run "deliver readiness" again:${fixList(fixes)}` };
+  }
+  return { level };
+}
+
+// sha256 of the raw bytes of the config file on origin/<base> (null when absent); shared by `readiness` and the init gate.
+function baseConfigHash(base) {
+  const shown = spawnSync('git', ['show', `${OR(base)}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
+  return shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
+}
+
+C.init = async () => {
   if (fs.existsSync(file)) { const q = load(); if (q.features.some((f) => !['merged', 'skipped'].includes(f.state))) die('a run is in progress; use status, or reset --yes to discard its state'); }
   const top = git('rev-parse', '--show-toplevel');
   if (top.code !== 0) die('not a git repository');
@@ -168,7 +244,7 @@ C.init = () => {
   must(gitNet('fetch', 'origin'), 'git fetch');
   if (gitNet('ls-remote', '--exit-code', '--heads', 'origin', base).code !== 0) die(`the base branch "${base}" does not exist on origin`);
   // The policy in force must be the one on the base branch (reviewed and merged there), not a local edit.
-  const onBase = git('show', `origin/${base}:${CONFIG_PATH}`);
+  const onBase = git('show', `${OR(base)}:${CONFIG_PATH}`);
   if (raw === undefined && onBase.code === 0) die(`origin/${base} has ${CONFIG_PATH} but this checkout does not: update your checkout first`);
   if (raw !== undefined) {
     let theirs; try { theirs = JSON.parse(onBase.out); } catch { /* handled below */ }
@@ -193,11 +269,21 @@ C.init = () => {
     authorised_by: wantsMerge ? (opt.merge ? flat(opt.note, 300) : `project config ${CONFIG_PATH}`) : null,
     max_fix_rounds: num(opt['max-fix-rounds'], config.limits.max_fix_rounds, 0, 5), max_failures: num(opt['max-failures'], config.limits.max_failures, 1, 10), ci_budget_s: num(opt['ci-budget'], config.limits.ci_budget_s, 1, 86400),
     policy: config, features,
+    run_id: `${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`, // one id per init: records of separate runs never share a (run, feature) key
   };
   const summary = { base, repo: q.repo, account: config.github.account || '(gh default)', merge: q.merge, protected_base: protectedBase, no_ci: q.no_ci, checks: q.checks, ignored_checks: config.checks.ignored, local_checks: config.local_checks.map((c) => c.name), hold_paths: config.hold_paths, git_auth: /^https:/i.test(url) ? 'https (uses the configured account)' : 'ssh/other (git uses your own key; the account setting applies to gh only)' };
   const warnings = [];
   if (protectedBase) warnings.push(`"${base}" matches protected_branches: PRs will be opened and checked but this skill will never merge into it`);
   if (!q.merge && !protectedBase) warnings.push('merging is off for this run (config merge.mode is "pr-only" and --merge was not given)');
+  if (q.merge && config.readiness) {
+    const g = await readinessGate(config, repo.nameWithOwner, base);
+    if (g.refuse) die(g.refuse);
+    q.readiness_level = g.level;
+  } else {
+    q.readiness_level = null;
+    const stored = readJson(path.join(factoryHome(), 'readiness', `${repoKey(repo.nameWithOwner)}.json`));
+    if (stored && Number.isInteger(stored.level) && stored.level < 3) warnings.push(`stored readiness level is ${stored.level} (below 3); run "deliver readiness" to see the fix list`);
+  }
   if (opt['dry-run'] || !features.length) return emit({ dry_run: !!opt['dry-run'], ...summary, warnings, queue: features.map((f) => ({ id: f.id, title: f.title, deps: f.deps })), note: features.length ? 'nothing written' : 'no feature with status: ready (and not already delivered) in the features directory' });
   save(q);
   const ex = git('rev-parse', '--git-path', 'info/exclude').out;
@@ -206,18 +292,83 @@ C.init = () => {
   emit({ initialised: true, ...summary, warnings, queue: features.map((f) => ({ id: f.id, title: f.title, deps: f.deps })) });
 };
 
+
+const HELPER_VERSION = '0.1.0';
+C.readiness = async () => {
+  const top = git('rev-parse', '--show-toplevel');
+  if (top.code !== 0) die('not a git repository');
+  if (fs.realpathSync(top.out) !== fs.realpathSync(root)) die(`run from the repository root (${top.out}); --dir points at a subfolder`);
+  const repeat = opt.repeat === undefined ? 1 : Number(opt.repeat);
+  if (!Number.isInteger(repeat) || repeat < 1 || repeat > 5) die('--repeat must be an integer 1-5');
+  let raw;
+  const p = path.join(root, CONFIG_PATH);
+  if (fs.existsSync(p)) { try { raw = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { raw = undefined; } }
+  let parsed = parseConfig(raw);
+  if (parsed.errors.length) parsed = parseConfig(undefined); // C1 reports the errors; the other checks run on defaults
+  const config = parsed.config;
+  // The working-copy config is untrusted: it is used only to pick credentials for the fetch below.
+  let accountError = useAccount(config.github.account, config.github.host, { soft: true }); // C2 reports it; the run continues on gh's default login
+  const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
+  must(gitNet('fetch', 'origin'), 'git fetch');
+  const committedConfig = (ref) => {
+    const s = git('show', `${OR(ref)}:${CONFIG_PATH}`);
+    if (s.code !== 0) return null;
+    try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; } // C1 reports it
+  };
+  // The base comes from the person (--base) or from the config committed on the default branch, never from the working copy:
+  // otherwise an unreviewed edit could point readiness at any branch on origin and run that branch's commands.
+  const def = repo.defaultBranchRef?.name;
+  const defConfig = validRef(def) ? committedConfig(def) : null;
+  const base = opt.base || defConfig?.base || def;
+  if (!validRef(base)) die('could not determine a valid base branch; set "base" in the config on the default branch or pass --base');
+  const sha = git('rev-parse', '--verify', `${OR(base)}^{commit}`);
+  if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
+  const configHash = baseConfigHash(base);
+  // Commands (tests, app, seed) and every other setting come only from the reviewed copy on origin/<base>.
+  // C1 still compares the working copy with it and fails when they differ.
+  const reviewed = committedConfig(base);
+  const runConfig = reviewed || parseConfig(undefined).config;
+  if ((runConfig.github.account || null) !== (config.github.account || null) || runConfig.github.host !== config.github.host) {
+    GH_ENV = {}; GH_HOSTNAME = null; // drop the bootstrap credentials; use the reviewed account (or gh's default)
+    accountError = useAccount(runConfig.github.account, runConfig.github.host, { soft: true });
+  }
+  const ctx = makeCtx({ root, config: runConfig, base, git, gh, repo: repo.nameWithOwner, accountError });
+  let results = await runChecks(ctx);
+  for (let i = 1; i < repeat; i++) {
+    const again = new Map((await runChecks(ctx)).map((r) => [r.id, r]));
+    results = results.map((r) => (again.get(r.id)?.status === r.status ? r : { ...r, status: 'unstable', reason: `status differed between repeated runs (${r.status} then ${again.get(r.id)?.status}): ${r.reason}` }));
+  }
+  const level = computeLevel(results);
+  const status = new Map(results.map((r) => [r.id, r]));
+  const fixes = CHECKS.filter((c) => c.level > 0 && status.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, status.get(c.id)));
+  const doc = { helper_version: HELPER_VERSION, base, base_sha: sha.out, config_hash: configHash, level, results, fixes, at: new Date().toISOString() };
+  const where = path.join(factoryHome(), 'readiness', `${repoKey(repo.nameWithOwner)}.json`);
+  writeJsonAtomic(where, doc);
+  const min = runConfig.readiness?.min_level ?? 1;
+  extra.level = level;
+  if (opt.json) emit({ ...doc, file: where, min_level: min });
+  else {
+    console.log(`readiness level ${level} (required ${min}) for ${repo.nameWithOwner} at ${base} ${sha.out.slice(0, 8)}`);
+    for (const r of results) console.log(`  ${r.id} ${r.status}${r.reason ? `: ${flat(r.reason, 160)}` : ''}`);
+    console.log(`${fixes.length} fix item${fixes.length === 1 ? '' : 's'}; saved to ${where}`);
+  }
+  if (level < min) process.exitCode = 2;
+};
+
 C.next = () => {
   const q = load();
   refresh(q);
   const stop = runStop(q);
+  const before = new Map(q.features.map((x) => [x.id, x.state]));
   const { item: f, resume } = pickNext(q);
+  for (const x of q.features) if (before.get(x.id) !== x.state) note(x); // dependency skips are made inside queue.mjs
   save(q);
   if (f && resume) { extra.feature = f.id; return emit({ resume: true, feature: pub(f), base: q.base }); }
   if (stop || !f) return emit({ done: true, reason: stop || 'queue finished', summary: counts(q) });
   if (!clean()) die('the working tree is not clean; resolve it before starting the next feature');
   must(gitNet('fetch', 'origin'), 'git fetch');
   must(git('checkout', q.base), `git checkout ${q.base}`);
-  if (git('merge', '--ff-only', `origin/${q.base}`).code !== 0) die(`local ${q.base} has diverged from origin/${q.base}; fix it by hand, then run next again`);
+  if (git('merge', '--ff-only', OR(q.base)).code !== 0) die(`local ${q.base} has diverged from origin/${q.base}; fix it by hand, then run next again`);
   const branch = `${q.policy.branch_prefix}${f.id.toLowerCase()}-${slugify(f.title)}`;
   if (git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0) {
     // A crash between creating the branch and saving state leaves a branch at the base tip: reuse it. Anything else is someone's work.
@@ -225,6 +376,8 @@ C.next = () => {
     must(git('checkout', branch), 'git checkout');
   } else must(git('checkout', '-b', branch), 'git checkout -b');
   f.branch = branch;
+  f.base_sha = git('rev-parse', 'HEAD').out;
+  f.ts_start ||= new Date().toISOString();
   transition(f, 'building');
   save(q);
   extra.feature = f.id;
@@ -237,7 +390,7 @@ C.built = () => {
   need(f, 'building', 'built');
   if (branchNow() !== f.branch) die(`expected to be on ${f.branch}, on ${branchNow()}`);
   if (!clean()) die('uncommitted changes remain; commit them (or discard) before reporting built');
-  const ahead = Number(git('rev-list', '--count', `origin/${q.base}..HEAD`).out);
+  const ahead = Number(git('rev-list', '--count', `${OR(q.base)}..HEAD`).out);
   if (!(ahead >= 1)) { block(q, f, 'no commits on the feature branch'); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
   const delivery = (frontmatter(fs.readFileSync(f.file, 'utf8')).delivery || 'none').toLowerCase();
   if (delivery !== 'complete') { block(q, f, `spec delivery is "${delivery}", not complete`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
@@ -271,7 +424,7 @@ C.built = () => {
 };
 // -z: NUL-separated, never quoted or escaped, so a path with unusual characters cannot hide from the pattern list. A failing diff holds the merge.
 const ciFiles = (q, rev) => {
-  const r = spawnSync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', `origin/${q.base}...${rev}`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', `${OR(q.base)}...${rev}`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   if (r.status !== 0) return ['(could not list the changed files)'];
   const files = r.stdout.split('\0').filter(Boolean);
   const policy = files.filter((x) => x.toLowerCase() === CONFIG_PATH || matchesAny(x, q.policy.hold_paths)); // the config itself, and paths the project wants a person to review
@@ -324,6 +477,7 @@ C.ci = () => {
   const timeout = Number(opt.timeout ?? 1800) * 1000, interval = Number(opt.interval ?? 20) * 1000, grace = Number(opt.grace ?? 90) * 1000;
   if (![timeout, interval, grace].every((n) => Number.isFinite(n) && n >= 0)) die('--timeout, --interval and --grace are seconds (numbers >= 0)');
   const start = Date.now();
+  ciStart = start;
   let unstable = 0;
   for (;;) {
     // Head and checks are read around each other: checks of an older commit are never stamped onto a newer head.
@@ -337,9 +491,10 @@ C.ci = () => {
     const failed = checks.filter((c) => ['fail', 'cancel'].includes(c.bucket));
     const pending = checks.some((c) => c.bucket === 'pending');
     const elapsed = Date.now() - start;
-    const verified = (how, names) => { f.pr.head_sha = sha; f.ci_sha = sha; f.ci = how; f.ci_checks = names; transition(f, 'ci_passed'); save(q); return emit({ id: f.id, result: how === 'verified' ? 'passed' : 'unverified-allowed', checks: names, sha, ...(how === 'verified' ? {} : { note: 'no required or allowlisted check exists; proceeding because the run was started with --no-ci' }) }); };
+    const verified = (how, names) => { tallyCi(f); f.pr.head_sha = sha; f.ci_sha = sha; f.ci = how; f.ci_checks = names; transition(f, 'ci_passed'); save(q); return emit({ id: f.id, result: how === 'verified' ? 'passed' : 'unverified-allowed', checks: names, sha, ...(how === 'verified' ? {} : { note: 'no required or allowlisted check exists; proceeding because the run was started with --no-ci' }) }); };
 
     if (failed.length) {
+      tallyCi(f);
       f.pr.head_sha = sha;
       transition(f, 'ci_failed', `failed: ${failed.map((c) => flat(c.name, 60)).join(', ')}`.slice(0, 200));
       const failing = failed.map((c) => ({ name: flat(c.name, 80), link: flat(c.link, 300) }));
@@ -367,12 +522,14 @@ C.ci = () => {
   }
 };
 function waited(q, f, elapsed, more) {
+  tallyCi(f);
   f.ci_waited_s = (f.ci_waited_s || 0) + Math.round(elapsed / 1000);
   if (f.ci_waited_s >= q.ci_budget_s) { block(q, f, `CI did not finish within ${q.ci_budget_s}s`); return outcome({ id: f.id, result: 'timeout', state: f.state, reason: f.reason }); }
   save(q);
   return outcome({ id: f.id, result: 'timeout', waited_total_s: f.ci_waited_s, budget_s: q.ci_budget_s, ...more });
 }
 function stopRun(q, f, why) {
+  tallyCi(f);
   q.stop = why;
   transition(f, 'awaiting_human', flat(why, 160)); save(q);
   return outcome({ id: f.id, result: 'unconfirmed', stop: why });
@@ -386,7 +543,7 @@ C.fix = () => {
   if (branchNow() !== f.branch) must(git('checkout', f.branch), 'git checkout');
   // GitHub may have added commits (an "update branch" merge): start from the remote tip so the fix can be pushed without force.
   must(gitNet('fetch', 'origin', f.branch), 'git fetch');
-  if (git('merge', '--ff-only', `origin/${f.branch}`).code !== 0) die(`local ${f.branch} and origin/${f.branch} have diverged; resolve it by hand`);
+  if (git('merge', '--ff-only', OR(f.branch)).code !== 0) die(`local ${f.branch} and origin/${f.branch} have diverged; resolve it by hand`);
   f.fix_rounds++;
   transition(f, 'fixing');
   save(q);
@@ -451,7 +608,7 @@ function merged(q, f, sha, warn = []) {
   f.merged_sha = sha || null;
   transition(f, 'merged');
   gitNet('push', 'origin', '--delete', f.branch); // best effort: many repos delete merged branches themselves
-  if (git('checkout', q.base).code !== 0 || gitNet('fetch', 'origin').code !== 0 || git('merge', '--ff-only', `origin/${q.base}`).code !== 0) warn.push(`could not fast-forward local ${q.base}; fix it before the next feature`);
+  if (git('checkout', q.base).code !== 0 || gitNet('fetch', 'origin').code !== 0 || git('merge', '--ff-only', OR(q.base)).code !== 0) warn.push(`could not fast-forward local ${q.base}; fix it before the next feature`);
   if (git('rev-parse', '--verify', '--quiet', `refs/heads/${f.branch}`).code === 0) git('branch', '-D', f.branch);
   save(q);
   emit({ id: f.id, state: 'merged', pr: f.pr.url, merged_sha: f.merged_sha, ...(warn.length ? { warnings: warn } : {}) });
@@ -509,4 +666,4 @@ const pub = (f) => ({ id: f.id, title: f.title, spec: path.relative(root, f.file
 const counts = (q) => Object.fromEntries(Object.entries(summarize(q)).map(([k, v]) => [k, v.map((f) => f.id)]));
 
 if (!C[cmd]) die(`unknown command "${cmd}". ${HELP}`);
-try { C[cmd](); } catch (e) { die(e.message); }
+try { await C[cmd](); } catch (e) { die(e.message); }
