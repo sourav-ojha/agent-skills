@@ -159,13 +159,14 @@ async function readinessGate(config, nameWithOwner, base) {
   const fixList = (r) => (r.length ? `\n${r.map((f) => `  - ${f.id}: ${flat(f.what, 160)} -> ${flat(f.help, 200)}`).join('\n')}` : '');
   if (!doc || !Array.isArray(doc.results) || !Number.isInteger(doc.level)) return { refuse: `readiness is required to merge (readiness.min_level ${min}) but there is no usable result for ${nameWithOwner}: run "deliver readiness" first` };
   const at = Date.parse(doc.at);
+  if (Number.isFinite(at) && at - Date.now() > 86400000) return { refuse: `the readiness result is dated in the future (${flat(doc.at, 40)}): clock skew or an edited file; run "deliver readiness" again` };
   if (!Number.isFinite(at) || Date.now() - at > maxAge * 86400000) return { refuse: `the readiness result is older than ${maxAge} days (or undated): run "deliver readiness" again` };
   if (!doc.config_hash || doc.config_hash !== baseConfigHash(base)) return { refuse: `config changed since readiness check (${CONFIG_PATH} on origin/${base} is not the one that was checked): run "deliver readiness" again` };
   const ctx = makeCtx({ root, config, base, git, gh, repo: nameWithOwner });
   const fresh = await runChecks(ctx, { only: ['C1', 'C2', 'C4', 'C5'] });
   const freshIds = new Set(fresh.map((r) => r.id));
   const merged = [...doc.results.filter((r) => !freshIds.has(r.id)), ...fresh];
-  const level = computeLevel(merged);
+  const level = Math.min(computeLevel(merged), doc.level); // the re-run can only lower the stored level, never raise it
   if (level < min) {
     const st = new Map(merged.map((r) => [r.id, r]));
     const fixes = CHECKS.filter((c) => c.level > 0 && st.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, st.get(c.id)));

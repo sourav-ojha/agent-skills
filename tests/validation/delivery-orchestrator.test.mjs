@@ -42,7 +42,7 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   const state = path.join(root, 'gh-state.json');
   const gs = { origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]] };
   fs.writeFileSync(state, JSON.stringify(gs));
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off' };
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
   const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
   const gh = () => JSON.parse(fs.readFileSync(state, 'utf8'));
   const setGh = (fn) => { const s = gh(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };

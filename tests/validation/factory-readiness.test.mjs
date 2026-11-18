@@ -142,7 +142,7 @@ test('C4: evaluated on origin/<base>, not the working checkout', async () => {
   // base tracks .env; the local checkout deleted it (uncommitted) and has an unignored-logs change -> still fail
   const a = mkRepo({ files: { '.env': 'A=1\n' }, config: { base: 'main' } });
   fs.rmSync(path.join(a.work, '.env'));
-  sh(a.work, 'rm', '-q', '--cached', '.env');
+  sh(a.work, 'rm', '-q', '.env');
   assert.equal((await only(a, 'C4')).C4.status, 'fail');
   a.cleanup();
   // a local-only tracked .env (not on base) and a local-only .gitignore do not fail/pass C4
@@ -454,5 +454,24 @@ test('init gate: merge.mode pr-only is not gated and warns when the stored level
   const x = r.d('init', '--dry-run');
   assert.equal(x.code, 0, x.out + x.err);
   assert.match(JSON.parse(x.out).warnings.join('\n'), /readiness level is 2/);
+  done(r);
+});
+test('init gate: a later fix cannot raise the stored level (capped at stored)', async () => {
+  const r = await gateRepo({}, { files: { '.env': 'X=1\n' } });
+  const a = r.d('readiness'); assert.equal(a.code, 2, a.out + a.err);
+  assert.ok(JSON.parse(fs.readFileSync(r.file, 'utf8')).level <= 1);
+  sh(r.work, 'rm', '-q', '.env'); sh(r.work, 'commit', '-q', '-m', 'untrack env'); sh(r.work, 'push', '-q', 'origin', 'main');
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /below the required 4/);
+  done(r);
+});
+test('init gate: a readiness result dated more than a day in the future is refused', async () => {
+  const r = await gateRepo();
+  assert.equal(r.d('readiness').code, 0);
+  rewriteFile(r, (d) => { d.at = new Date(Date.now() + 3 * 86400000).toISOString(); });
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /in the future/);
   done(r);
 });
