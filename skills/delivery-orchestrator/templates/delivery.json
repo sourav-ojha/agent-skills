@@ -16,5 +16,16 @@
   ],
   "hold_paths": ["migrations/", "infra/"],
   "limits": { "max_fix_rounds": 2, "max_failures": 2, "ci_budget_s": 1800 },
-  "implementer_notes": "No e2e infrastructure here: unit and integration tests only."
+  "implementer_notes": "No e2e infrastructure here: unit and integration tests only.",
+  "app": {
+    "setup": ["npm", "ci"],
+    "start": ["npm", "run", "dev"],
+    "stop": null,
+    "base_url": "http://localhost:3000",
+    "ready": { "url": "http://localhost:3000/health", "timeout_s": 120 },
+    "logs_dir": ".logs",
+    "seed": null,
+    "env_example": ".env.example"
+  },
+  "tests": { "setup": null, "all": ["npm", "test"], "timeout_s": 900 }
 }

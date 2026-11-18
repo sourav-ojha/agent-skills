@@ -38,6 +38,21 @@ Every key is optional. An unknown key or a wrong type is an error, so a typo can
 | `limits` | CI fix rounds per feature; blocked features in a row before the run stops; total CI wait per feature (seconds) | 2, 2, 1800 |
 | `implementer_notes` | Up to 500 characters shown to the implementer for every feature (for example which kinds of tests exist) | `""` |
 
+## Readiness keys: `app`, `tests`, `readiness`
+
+All optional. `readiness` absent (`null`) means the project has not opted in to readiness checks. Commands are argument lists, never shell strings (at most 30 arguments).
+
+| Key | Meaning | Default |
+|---|---|---|
+| `app.setup`, `app.start`, `app.stop`, `app.seed` | Commands to prepare, start, stop and seed the app locally (argument lists) | `null` |
+| `app.base_url` | Where the running app answers. Only `http://localhost:<port>` or `http://127.0.0.1:<port>` | `null` |
+| `app.ready` | How to know the app is up: exactly one of `url` (local URL, same rule as `base_url`) or `log_pattern` (regular expression, up to 200 characters), plus `timeout_s` (1-600) | `null`, `timeout_s` 120 |
+| `app.logs_dir`, `app.env_example` | Relative paths inside the repository (same rule as `features_dir`) | `null` |
+| `tests.setup`, `tests.all` | Commands that prepare and run the full test suite (argument lists) | `null` |
+| `tests.timeout_s` | Time limit for the suite, an integer 1-3600 | `900` |
+| `readiness.min_level` | Lowest acceptable readiness level, an integer 1-4 | `3` when `readiness` is present |
+| `readiness.max_age_days` | How old a readiness result may be, an integer 1-90 | `14` when `readiness` is present |
+
 ## Safety of the file itself
 - It must be **committed and identical to the copy on `origin/<base>`** when a run starts, so the rules in force are the ones that were reviewed and merged. A local edit, or a copy that only exists on a feature branch, is refused.
 - A feature that changes it is held for a person, and the run keeps using the policy it started with.

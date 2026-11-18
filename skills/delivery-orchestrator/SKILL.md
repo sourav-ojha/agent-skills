@@ -63,6 +63,10 @@ Repeat `deliver next` until it prints `done`. It fetches, fast-forwards the base
 
 When a feature is blocked mid-way, uncommitted work is stashed (nothing is deleted) and the base is checked out; the branch and the stash stay for the user.
 
+## Readiness (optional gate)
+
+`deliver readiness [--repeat N] [--json]` scores the repo from level 0 to 4 (config, tests run, CI gate, app drivable), saves the result outside the repo and lists fixes; exit `2` when below `readiness.min_level`. Repos that add a `readiness` key to the config get a gate in `deliver init` when merging is authorised: it refuses on a missing, stale, future-dated, config-mismatched or other-base result, or a level below the minimum. Every feature outcome is also recorded in `.skill-runs/factory-runs.jsonl` (join to tokens with `si.mjs runs-factory`). Details: [references/readiness.md](references/readiness.md).
+
 ## Stop and report (do not push through)
 
 No CI evidence (see `unconfirmed`) · the run's circuit breaker trips · the base cannot be fast-forwarded · `gh` is not logged in or the remote is not GitHub · the implementer reports `BLOCKED` on something only a person can decide · anything unexpected about what a command printed. Say what you saw and the exact next command.

@@ -6,6 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { REPO, tmpDir } from './helpers.mjs';
 import { parseSession } from '../../skills/skill-insights/core/scripts/lib/transcripts.mjs';
 import { windows, inventory } from '../../skills/skill-insights/core/scripts/lib/analyze.mjs';
+import crypto from 'node:crypto';
+import { joinTokens, coverage, latestPerFeature } from '../../skills/skill-insights/core/scripts/lib/factory.mjs';
 
 const SI = path.join(REPO, 'skills/skill-insights/core/scripts/si.mjs');
 const T = (min) => new Date(Date.UTC(2026, 10, 17, 10, min)).toISOString();
@@ -111,4 +113,120 @@ test('AC6 SKILL.md within size cap, name matches directory, links resolve', () =
   assert.match(text, /^name: skill-insights$/m);
   assert.ok(text.split('\n').length <= 150);
   for (const [, l] of text.matchAll(/\]\(([^)#]+)\)/g)) if (!/^https?:/.test(l)) assert.ok(fs.existsSync(path.join(dir, l)), `broken link ${l}`);
+});
+
+// ---- runs-factory: join factory run records to transcript tokens ----
+const tk = (i, o = 0, cc = 0, cr = 0) => ({ in: i, out: o, cache_create: cc, cache_read: cr });
+const rec = (feature, startMin, endMin, project = 'aaaaaa', run = 'r1') => ({ kind: 'factory-run', run, feature, project, outcome: 'merged', ts_start: T(startMin), ts_end: T(endMin) });
+const turn = (min, tokens, project = 'aaaaaa') => ({ project, ts: Date.parse(T(min)), tokens });
+
+test('F1 joinTokens sums turns in non-overlapping windows; other projects and outside turns are not counted', () => {
+  const out = joinTokens([rec('f1', 0, 10), rec('f2', 20, 30)], [turn(1, tk(10, 1, 2, 3)), turn(5, tk(20, 2, 4, 6)), turn(25, tk(7, 7, 7, 7)), turn(15, tk(999)), turn(2, tk(999), 'bbbbbb')]);
+  assert.deepEqual([out[0].tokens_in, out[0].tokens_out, out[0].cache_create, out[0].cache_read, out[0].turns, out[0].status], [30, 3, 6, 9, 2, 'ok']);
+  assert.deepEqual([out[1].tokens_in, out[1].turns, out[1].status], [7, 1, 'ok']);
+  assert.equal(out[0].feature, 'f1');
+});
+
+test('F2 a turn inside two windows of the same project marks both records ambiguous', () => {
+  const out = joinTokens([rec('f1', 0, 10), rec('f2', 5, 15)], [turn(7, tk(5)), turn(1, tk(1))]);
+  assert.deepEqual(out.map((r) => r.status), ['ambiguous', 'ambiguous']);
+  assert.equal(out[0].tokens_in, 6);
+  // same window times in different projects do not collide
+  const sep = joinTokens([rec('f1', 0, 10, 'aaaaaa'), rec('f2', 0, 10, 'bbbbbb')], [turn(1, tk(1), 'aaaaaa')]);
+  assert.deepEqual(sep.map((r) => r.status), ['ok', 'ok']);
+});
+
+test('F3 coverage is per run, by tokens and turns, inside the run window only', () => {
+  // run window 0..10 (features 0..4 and 6..10); minute 5 is inside the run but in no feature window.
+  const recs = [rec('f1', 0, 4), rec('f2', 6, 10)];
+  const turns = [turn(1, tk(100)), turn(8, tk(100)), turn(5, tk(200)), turn(50, tk(9999)), turn(-30, tk(9999)), turn(2, tk(9999), 'bbbbbb')];
+  const [c] = coverage(recs, turns);
+  assert.deepEqual([c.run, c.turns_total, c.turns_attributed, c.tokens_total, c.tokens_attributed], ['r1', 3, 2, 400, 200]);
+  assert.equal(c.ratio_tokens, 0.5);
+  const full = coverage([rec('f1', 0, 10)], Array.from({ length: 20 }, (_, i) => turn(i === 19 ? 50 : 1 + (i % 5), tk(1))))[0];
+  assert.equal(full.ratio_turns, 1); // the turn at minute 50 is outside the run window
+  const ov = joinTokens([rec('f1', 0, 10), rec('f2', 5, 15)], [turn(7, tk(5, 1))]);
+  assert.deepEqual([ov[0].ambiguous_turns, ov[0].ambiguous_tokens], [1, 6]);
+});
+
+test('F4 latestPerFeature keeps the last record per (run, feature)', () => {
+  const a = { ...rec('f1', 0, 1), outcome: 'failed' }; const b = { ...rec('f1', 0, 2), outcome: 'merged' };
+  const out = latestPerFeature([a, b, rec('f1', 0, 1, 'aaaaaa', 'r2'), { kind: 'other' }]);
+  assert.equal(out.length, 2);
+  assert.equal(out.find((r) => r.run === 'r1').outcome, 'merged');
+});
+
+function factoryFixture() {
+  const root = tmpDir('si-f-');
+  const real = path.join(root, 'repo'); fs.mkdirSync(path.join(real, '.skill-runs'), { recursive: true });
+  const link = path.join(root, 'link'); fs.symlinkSync(real, link);
+  const rp = fs.realpathSync(real);
+  const folder = rp.replace(/[^A-Za-z0-9]/g, '-');
+  const project = crypto.createHash('sha1').update(folder).digest('hex').slice(0, 6);
+  const projects = path.join(root, 'projects');
+  const pd = path.join(projects, folder); fs.mkdirSync(path.join(pd, 'sess1', 'subagents'), { recursive: true });
+  fs.writeFileSync(path.join(pd, 'sess1.jsonl'), [asst('a1', 1, usage(100, 10, 5, 1000), [{ type: 'text', text: 'SECRET TEXT' }]), asst('a2', 3, usage(50, 5))].map((o) => JSON.stringify(o)).join('\n') + '\n');
+  fs.writeFileSync(path.join(pd, 'sess1', 'subagents', 'agent-x.jsonl'), JSON.stringify(asst('s1', 2, usage(1000, 100))) + '\n');
+  fs.writeFileSync(path.join(pd, 'sess1', 'subagents', 'agent-x.meta.json'), '{}');
+  const r1 = { ...rec('f1', 0, 5, project), outcome: 'failed' };
+  fs.writeFileSync(path.join(real, '.skill-runs', 'factory-runs.jsonl'), [r1, { ...r1, outcome: 'merged' }, rec('f2', 30, 40, project)].map((o) => JSON.stringify(o)).join('\n') + '\n');
+  return { root, real, link, projects };
+}
+
+test('F5 CLI runs-factory: resolves symlinked --dir, counts subagent transcripts, prints a table, no text leaks, --out writes enriched copy', () => {
+  const f = factoryFixture();
+  const r = si('runs-factory', '--dir', f.link, '--projects-dir', f.projects);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /f1/); assert.match(r.out, /f2/);
+  assert.doesNotMatch(r.out, /SECRET TEXT/); assert.ok(!r.out.includes(f.root));
+  const out = path.join(f.root, 'enriched.jsonl');
+  const w = si('runs-factory', '--dir', f.real, '--projects-dir', f.projects, '--out', out);
+  assert.equal(w.code, 0, w.out);
+  const rows = fs.readFileSync(out, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(rows.length, 2);
+  const f1 = rows.find((x) => x.feature === 'f1');
+  assert.equal(f1.outcome, 'merged');
+  assert.deepEqual([f1.tokens_in, f1.tokens_out, f1.cache_create, f1.cache_read, f1.turns, f1.status], [1150, 115, 1000, 5, 3, 'ok']);
+  assert.equal(rows.find((x) => x.feature === 'f2').turns, 0);
+  assert.ok(!fs.readFileSync(path.join(f.real, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('tokens_in'), 'source log untouched');
+});
+
+test('F6 --out refuses to overwrite the source run log (also via a symlinked path)', () => {
+  const f = factoryFixture();
+  const src = path.join(f.real, '.skill-runs', 'factory-runs.jsonl');
+  const before = fs.readFileSync(src, 'utf8');
+  for (const out of [src, path.join(f.link, '.skill-runs', 'factory-runs.jsonl')]) {
+    const r = si('runs-factory', '--dir', f.real, '--projects-dir', f.projects, '--out', out);
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /source run log/);
+  }
+  assert.equal(fs.readFileSync(src, 'utf8'), before);
+});
+
+test('F7 coverage with zero turns in the run window is null (not 100%)', () => {
+  const [c] = coverage([rec('f1', 0, 10)], []);
+  assert.equal(c.turns_total, 0);
+  assert.equal(c.ratio_turns, null); assert.equal(c.ratio_tokens, null);
+  const [d] = coverage([rec('f1', 0, 10)], [turn(50, tk(1))]); // the only turn is outside the window
+  assert.equal(d.ratio_turns, null);
+});
+
+test('F8 CLI runs-factory without a transcript folder says so and prints n/a, never 100%', () => {
+  const f = factoryFixture();
+  const empty = path.join(f.root, 'no-projects'); fs.mkdirSync(empty);
+  const r = si('runs-factory', '--dir', f.real, '--projects-dir', empty);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /no transcript folder found for this project/);
+  assert.match(r.out, /n\/a of tokens, n\/a of 0 turn/);
+  assert.doesNotMatch(r.out, /100%/);
+});
+
+test('F9 CLI runs-factory with a transcript folder but no turns in the window prints n/a', () => {
+  const f = factoryFixture();
+  const pd = path.join(f.projects, fs.readdirSync(f.projects)[0]);
+  fs.rmSync(pd, { recursive: true, force: true }); fs.mkdirSync(pd); // folder exists, no transcripts
+  const r = si('runs-factory', '--dir', f.real, '--projects-dir', f.projects);
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.out, /no transcript folder/);
+  assert.match(r.out, /n\/a of tokens/);
 });

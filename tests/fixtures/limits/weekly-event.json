@@ -1,0 +1,2 @@
+[{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1795100000,"rateLimitType":"seven_day"}},
+ {"type":"result","is_error":true,"result":"limit reached","session_id":"<uuid>"}]
