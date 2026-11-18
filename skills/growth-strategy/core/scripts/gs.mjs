@@ -253,9 +253,13 @@ function cmdReviewRecord() {
   const count = (sev) => r.findings.filter((f) => f.severity === sev).length;
   const { findings, checked_sources, ...summary } = rec;
   if (fs.existsSync(path.join(p.reviews, `${id}.json`))) die(`reviews/${id}.json exists but is not in growth.json (an earlier record failed half-way?); move it aside and record again`);
+  // Write the report under a pending name first, save state, then rename: a failure at any step leaves no listed review without its file.
+  const final = path.join(p.reviews, `${id}.json`), pending = `${final}.pending`;
+  writeFile(pending, text);
   s.growth.reviews.push({ ...summary, file_sha256: sha256(text), counts: { Critical: count('Critical'), High: count('High'), Medium: count('Medium'), Low: count('Low') } });
   save(s, ['growth']);
-  writeFile(path.join(p.reviews, `${id}.json`), text, 'create'); // if this fails, decide reports the review file missing and refuses
+  assertNoLink(final);
+  fs.renameSync(pending, final);
   extra.mode = mode; extra.findings = r.findings.length;
   console.log(`${id}: ${mode === 'self' ? 'self-review (not independent)' : `independent review by ${reviewer}`}, ${r.verdict}, ${r.findings.length} finding(s)`);
 }
@@ -271,7 +275,7 @@ function cmdReviewStart() {
 function reviewFile(r) {
   if (!/^R-\d{3,}$/.test(String(r.id))) die(`invalid review id ${JSON.stringify(r.id)} in growth.json`);
   const f = path.join(p.reviews, `${r.id}.json`);
-  let text; try { text = fs.readFileSync(f, 'utf8'); } catch { die(`review file ${r.id}.json is missing: record the review again`); }
+  let text; try { text = fs.readFileSync(f, 'utf8'); } catch { die(`review file ${r.id}.json is missing: restore it from git (or reviews/${r.id}.json.pending after a failed record); a new review cannot replace a listed one`); }
   if (sha256(text) !== r.file_sha256) die(`review file ${r.id}.json was changed after it was recorded: record the review again`);
   let full; try { full = JSON.parse(text); } catch { die(`review file ${r.id}.json is not valid JSON: record the review again`); }
   if (full?.plan_hash !== r.plan_hash || full?.mode !== r.mode) die(`review file ${r.id}.json was changed after it was recorded: record the review again`);
