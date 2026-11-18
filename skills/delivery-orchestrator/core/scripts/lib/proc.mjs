@@ -41,6 +41,19 @@ const append = (buf, chunk) => { buf += chunk; return buf.length > MAX_BUF ? buf
 const killGroup = (pgid, sig) => { try { process.kill(-pgid, sig); return true; } catch { return false; } };
 const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 
+// Live process groups. Anything still registered is SIGKILLed when this process exits or is signalled.
+const live = new Set();
+let hooked = false;
+const killAll = () => { for (const g of live) killGroup(g, 'SIGKILL'); live.clear(); };
+function track(pgid) {
+  live.add(pgid);
+  if (hooked) return;
+  hooked = true;
+  process.on('exit', killAll);
+  for (const [sig, n] of [['SIGINT', 2], ['SIGTERM', 15], ['SIGHUP', 1]]) process.on(sig, () => { killAll(); process.exit(128 + n); });
+}
+const untrackIfDead = (pgid) => { if (!groupAlive(pgid)) live.delete(pgid); };
+
 export function runCmd(argv, { cwd, env, timeoutS = 900 } = {}) {
   return new Promise((resolve) => {
     const t0 = Date.now();
@@ -53,7 +66,8 @@ export function runCmd(argv, { cwd, env, timeoutS = 900 } = {}) {
     child.stdout.on('data', (d) => { out = append(out, d); });
     child.stderr.on('data', (d) => { out = append(out, d); });
     child.on('error', (e) => { out = append(out, String(e.message)); finish(null); });
-    child.on('close', (code) => finish(code));
+    child.on('close', (code) => { untrackIfDead(child.pid); finish(code); });
+    if (child.pid) track(child.pid);
     timer = setTimeout(() => { timedOut = true; killGroup(child.pid, 'SIGKILL'); }, timeoutS * 1000);
   });
 }
@@ -64,12 +78,14 @@ export function startApp(argv, { cwd, env } = {}) {
   child.stdout.on('data', (d) => { out = append(out, d); });
   child.stderr.on('data', (d) => { out = append(out, d); });
   child.on('error', (e) => { out = append(out, String(e.message)); });
+  if (child.pid) track(child.pid);
   return { pid: child.pid, pgid: child.pid, output: () => redact(out) };
 }
 
 export async function stopApp(app, { stopArgv, cwd, env, graceMs = 10000 } = {}) {
   if (stopArgv && stopArgv.length) await runCmd(stopArgv, { cwd, env, timeoutS: Math.max(1, Math.ceil(graceMs / 1000)) });
-  if (!app?.pgid || !groupAlive(app.pgid)) return;
+  if (!app?.pgid) return;
+  if (!groupAlive(app.pgid)) { live.delete(app.pgid); return; }
   killGroup(app.pgid, 'SIGTERM');
   const until = Date.now() + graceMs;
   while (Date.now() < until && groupAlive(app.pgid)) await sleep(100);
@@ -78,6 +94,7 @@ export async function stopApp(app, { stopArgv, cwd, env, graceMs = 10000 } = {})
     const end = Date.now() + 2000;
     while (Date.now() < end && groupAlive(app.pgid)) await sleep(50);
   }
+  untrackIfDead(app.pgid);
 }
 
 export function portOf(url) {
@@ -102,8 +119,8 @@ export async function waitReady(ready, app) {
     if (re && re.test(app.output())) return true;
     if (ready?.url) {
       try {
-        const res = await fetch(ready.url, { signal: AbortSignal.timeout(2000) });
-        if (res.status >= 200 && res.status < 400) return true;
+        const res = await fetch(ready.url, { redirect: 'manual', signal: AbortSignal.timeout(2000) });
+        if (res.status >= 200 && res.status < 300) return true;
       } catch { /* not up yet */ }
     }
     if (!re && !ready?.url) return false;

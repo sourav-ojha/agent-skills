@@ -124,3 +124,48 @@ test('detached fixture: grandchild keeps the port after the parent exits', async
   while (Date.now() < until && !(await p.portInUse(port))) await new Promise((r) => setTimeout(r, 100));
   assert.equal(await p.portInUse(port), true);
 });
+
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const waitFor = async (fn, ms = 10000) => { const end = Date.now() + ms; while (Date.now() < end) { if (await fn()) return true; await new Promise((r) => setTimeout(r, 100)); } return false; };
+
+test('waitReady: 302 is not ready, only 2xx', async (t) => {
+  const { app, port } = await launch(t, 'ready');
+  assert.equal(await p.waitReady({ url: `http://127.0.0.1:${port}/health`, timeout_s: 15 }, app), true);
+  assert.equal(await p.waitReady({ url: `http://127.0.0.1:${port}/redirect`, timeout_s: 2 }, app), false);
+});
+
+test('stopApp kills a same-group grandchild', async (t) => {
+  const cwd = tmp(t); const pidFile = path.join(cwd, 'gc.pid');
+  const { app, port } = await launch(t, 'family', { CHILD_PID_FILE: pidFile }, cwd);
+  assert.equal(await waitFor(() => p.portInUse(port)), true);
+  const gc = Number(fs.readFileSync(pidFile, 'utf8'));
+  t.after(() => { try { process.kill(gc, 'SIGKILL'); } catch {} });
+  assert.ok(alive(gc));
+  await p.stopApp(app, { graceMs: 3000 });
+  assert.equal(await waitFor(() => !alive(gc), 3000), true);
+  assert.equal(await p.portInUse(port), false);
+});
+
+test('runCmd timeout kills a same-group grandchild', async (t) => {
+  const cwd = tmp(t); const pidFile = path.join(cwd, 'gc.pid'); const port = await freePort();
+  const r = await p.runCmd(['node', path.join(FX, 'family.mjs')], { cwd, env: { ...p.allowEnv(null), PORT: String(port), CHILD_PID_FILE: pidFile }, timeoutS: 2 });
+  assert.equal(r.timedOut, true);
+  const gc = Number(fs.readFileSync(pidFile, 'utf8'));
+  t.after(() => { try { process.kill(gc, 'SIGKILL'); } catch {} });
+  assert.equal(await waitFor(() => !alive(gc), 3000), true);
+  assert.equal(await p.portInUse(port), false);
+});
+
+test('app is killed when the orchestrator receives SIGTERM', async (t) => {
+  const { spawn } = await import('node:child_process');
+  const port = await freePort();
+  const orch = spawn(process.execPath, [path.join(FX, 'orchestrator.mjs')], { env: { ...p.allowEnv(null), PORT: String(port) }, stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => { orch.kill('SIGKILL'); });
+  await new Promise((res) => orch.stdout.on('data', (d) => /started/.test(String(d)) && res()));
+  assert.equal(await waitFor(() => p.portInUse(port)), true);
+  const exited = new Promise((res) => orch.on('exit', (code, sig) => res({ code, sig })));
+  orch.kill('SIGTERM');
+  const ex = await exited;
+  assert.equal(ex.code, 143);
+  assert.equal(await waitFor(async () => !(await p.portInUse(port)), 5000), true);
+});
