@@ -4,6 +4,13 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (delivery-orchestrator)
+- New skill `delivery-orchestrator`: works through `FEATURE-NNN.md` specs with `status: ready` one at a time (optional `depends_on`): feature branch, the implementer skill, PR, wait for CI, squash merge of the exact commit CI verified, sync the base, next. State in `.delivery/queue.json` (resumable); a helper (`deliver.mjs`) enforces the state machine and every merge precondition.
+- Guard rails: merges only with `--merge` and the user's words; the run stops when the repo has no CI (`--no-ci` is explicit); T3 work and changes to CI or `CODEOWNERS` files are held for a person; capped CI fix rounds; circuit breaker; never force-push, `--admin` or `--auto`; stale head, behind and conflicting PRs handled; titles and reasons sanitised, no shell.
+- `implementer --unattended` and `--name <slug>`: nothing waits for a person; every "stop and ask" case ends the run as `BLOCKED` with the question.
+- Tests run a real git repo with a bare origin against a fake `gh`.
+- Project config `.product/delivery.json` (`deliver config [--write]`): GitHub account (token held in memory, verified login and write access), base branch, `protected_branches` (default main, master, prod, production, release/*: never merged into, flags cannot override), standing merge mode, required and ignored CI checks, `local_checks` run by the orchestrator, `hold_paths`, limits, `implementer_notes`. The file must be committed and identical on the base branch; a feature that edits it is held.
+
 ### Added (arsenal: vendoring and bootstrap)
 - `skills.lock.json` plus `scripts/skills.mjs` (`status`, `check`, `vendor`, `update`, `accept`, `bootstrap`): pinned, license-tracked vendoring with a dry-run-first `update` and a safe `bootstrap` that never overwrites unmanaged items or follows symlinks.
 - Ported from the global skills, chosen by real usage: autonomous, pr-review, pr-review-orchestrator, phased-review, retro, and the deep-pr-review and pr-review commands (imported as-is). Vendored a Superpowers subset (MIT, v7.0.2, namespace rewritten): writing-plans, executing-plans, subagent-driven-development, brainstorming, finishing-a-development-branch, systematic-debugging, test-driven-development, requesting/receiving-code-review, using-git-worktrees, using-superpowers, verification-before-completion. graphify and security-audit are pin-only (external).

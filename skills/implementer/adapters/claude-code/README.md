@@ -18,7 +18,7 @@ Tiers map to model aliases in `core/config.default.json` (`reasoning: opus`, `st
 Read-only roles (architect, reviewer, security, database) get no edit or shell tools.
 
 ## Use
-`/implementer docs/spec.md` or `/implementer add rate limiting to the upload API`. Add `--no-tdd` to waive TDD, `--pr` to allow a PR.
+`/implementer docs/spec.md` or `/implementer add rate limiting to the upload API`. Add `--no-tdd` to waive TDD, `--pr` to allow a PR, `--unattended` to never wait for a person (used by delivery-orchestrator: questions become a `BLOCKED` report).
 
 ## Tips
 - Add `.implementation/` to `.gitignore` (the lead never commits it).

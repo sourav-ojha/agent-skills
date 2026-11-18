@@ -8,6 +8,7 @@ One guide per skill, or per small family of skills that are used together. Each 
 |---|---|---|
 | Decide *what* to build (market, competitors, prioritised ideas, specs) | `product-intelligence` | [product-intelligence](product-intelligence.md) |
 | Build an approved spec or a raw idea, with tests and evidence | `implementer` | [implementer](implementer.md) |
+| Deliver every ready spec unattended: PR, CI, squash merge, next | `delivery-orchestrator` | [delivery-orchestrator](delivery-orchestrator.md) |
 | Explore an idea, plan it, execute the plan step by step | `brainstorming` → `writing-plans` → `executing-plans` / `subagent-driven-development` | [build-workflow](build-workflow.md) |
 | Review a PR (quick or deep) or respond to review feedback | `pr-review`, `pr-review-orchestrator`, `requesting-code-review`, `receiving-code-review` | [review-and-quality](review-and-quality.md) |
 | Fix a bug properly, or prove work is really done | `systematic-debugging`, `verification-before-completion` | [review-and-quality](review-and-quality.md) |
@@ -24,6 +25,8 @@ product-intelligence ──specs──► implementer ──► PR review ──
  (what to build)                (build it)      (review-and-quality)
         ▲                            │
         └──── delivery written back to the spec (status: Implemented) ────┘
+
+Hands-off version: delivery-orchestrator runs implementer → PR → CI → squash merge for every ready spec, one by one.
 ```
 
 **2. Build workflow, no product research** (you already know what you want)
@@ -53,6 +56,6 @@ They are alternatives, not layers. Use `implementer` when you have specs from pr
 
 ## Where each skill comes from
 
-Some skills are authored here (`product-intelligence`, `implementer`, `skill-insights`), some are vendored from other repositories, and some are imported unchanged from the author's own set. `skills.lock.json` records the origin of each one. The guides for vendored skills describe how they are used in this setup, not their upstream docs.
+Some skills are authored here (`product-intelligence`, `implementer`, `delivery-orchestrator`, `skill-insights`), some are vendored from other repositories, and some are imported unchanged from the author's own set. `skills.lock.json` records the origin of each one. The guides for vendored skills describe how they are used in this setup, not their upstream docs.
 
 Install any skill with `npx skills add sourav-ojha/agent-skills --skill <name> -a claude-code` and update with `npx skills update`. See [installation](../installation.md).
