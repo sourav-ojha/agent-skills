@@ -47,6 +47,7 @@ Put these after the command: `research widen`, `full override`, `full auto widen
 `.product/PRODUCT.md` (approved baseline), `.product/opportunities.md` (landscape, registry, decision log), `.product/features/FEATURE-NNN.md` (specs), and with `auto`, `.product/attention.md`.
 
 ## Combine with
+- **[experience-audit](experience-audit.md)**: this skill decides what to add; experience-audit finds what is wrong with what already exists (UX, footer, SEO). It reads `.product/PRODUCT.md` when present.
 - **[implementer](implementer.md)**: give it a spec with status Ready for Implementation. It writes delivery back to the spec and moves it to Implemented.
 - **[autonomy-and-memory](autonomy-and-memory.md)**: `full auto` is this skill's own unattended mode; the generic `autonomous` skill is for other work.
 - **[skill-insights](skill-insights.md)**: measure what a run cost.

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "environment": "staging",
+  "limits": {
+    "max_routes": 10,
+    "viewports": [1440, 768, 390],
+    "top_findings": 25,
+    "judgment_passes": 3,
+    "judgment_min_agree": 2
+  },
+  "thresholds": {
+    "imbalance_min_row_px": 300,
+    "imbalance_min_empty_px": 200,
+    "imbalance_max_fill": 0.5,
+    "imbalance_min_share": 0.2,
+    "section_gap_multiplier": 3,
+    "section_gap_min_px": 200,
+    "tap_target_min_px": 24,
+    "footer_min_links": 8,
+    "footer_missing_feature_share": 0.4,
+    "click_depth_max": 3
+  },
+  "models": {
+    "claude-code": { "reasoning": "opus", "standard": "sonnet", "fast": "haiku" }
+  }
+}

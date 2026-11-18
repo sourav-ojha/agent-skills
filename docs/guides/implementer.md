@@ -39,6 +39,7 @@ Destructive operations, security-sensitive actions, pushes/merges/deploys, a spe
 
 ## Combine with
 - **[product-intelligence](product-intelligence.md)** upstream: specs in, delivery status out.
+- **[experience-audit](experience-audit.md)**: its `.experience/fixes/FIX-NNN.md` files are small, ready specs you can pass in.
 - **[review-and-quality](review-and-quality.md)** downstream: `/deep-pr-review` once you open the PR.
 - **[skill-insights](skill-insights.md)**: `si export` packages the run for review.
 - It applies the same test-first discipline as `test-driven-development` and the same "evidence before claims" rule as `verification-before-completion`, built in.

@@ -58,6 +58,11 @@
       "upstreamHash": "sha256-7a595477d84d368e048e0e6fbc646e6a597c8511305d8f195ac912df31fea117",
       "hash": "sha256-7a595477d84d368e048e0e6fbc646e6a597c8511305d8f195ac912df31fea117"
     },
+    "experience-audit": {
+      "kind": "skill",
+      "origin": "authored",
+      "path": "skills/experience-audit"
+    },
     "finishing-a-development-branch": {
       "kind": "skill",
       "origin": "vendored",

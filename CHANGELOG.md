@@ -4,6 +4,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (experience-audit 0.1.0)
+- New skill `experience-audit`: audits a live web app in a browser for layout/UX, footer and navigation, accessibility and technical SEO. A read-only collector probe returns a JSON snapshot; deterministic checks in `ea.mjs analyze` turn it into findings (measured, rule, or capped judgment) with severity, effort and root-cause group. A ledger, decision log, ranked report, fix specs for the implementer (`ea fix`) and re-audit verification (`ea reaudit`) complete the loop. Design: `docs/superpowers/specs/2026-11-18-experience-audit-design.md`.
+
 ### Added (delivery-orchestrator)
 - New skill `delivery-orchestrator`: works through `FEATURE-NNN.md` specs with `status: ready` one at a time (optional `depends_on`): feature branch, the implementer skill, PR, wait for CI, squash merge of the exact commit CI verified, sync the base, next. State in `.delivery/queue.json` (resumable); a helper (`deliver.mjs`) enforces the state machine and every merge precondition.
 - Guard rails: merges only with `--merge` and the user's words; the run stops when the repo has no CI (`--no-ci` is explicit); T3 work and changes to CI or `CODEOWNERS` files are held for a person; capped CI fix rounds; circuit breaker; never force-push, `--admin` or `--auto`; stale head, behind and conflicting PRs handled; titles and reasons sanitised, no shell.
