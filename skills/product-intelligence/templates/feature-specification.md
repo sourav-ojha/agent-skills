@@ -61,11 +61,17 @@ product_revision: 0
 
 ## 11. Edge cases
 
-- {{edge case and expected behavior}}
+- EC-1: {{edge case and expected behavior}}
 
 ## 12. Error and failure scenarios
 
-- {{failure}} → {{expected behavior and user-visible message}}
+- ER-1: {{failure}} → {{expected behavior and user-visible message}}
+
+## HTTP contract
+
+<!-- Optional: delete this section if the feature adds no HTTP endpoints. One backticked method and path per line; the verification gate checks each against the running app. -->
+
+- `GET /api/{{resource}}`
 
 ## 13. Security and privacy considerations
 
