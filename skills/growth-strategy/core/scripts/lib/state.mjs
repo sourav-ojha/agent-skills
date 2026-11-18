@@ -81,15 +81,19 @@ const content = (o, drop) => Object.fromEntries(Object.entries(o).filter(([k]) =
 // The plan a review covers: item content, keyword content and the plan markdown. Status and imported performance are excluded,
 // so decisions and data imports do not invalidate a review, but any content edit (including a refresh) or a re-approved baseline does.
 export function planHash(s) {
-  const md = PLAN_MD.map((f) => { try { return fs.readFileSync(s.p.md(f), 'utf8'); } catch { return ''; } });
+  const md = PLAN_MD.map((f) => { try { return fs.readFileSync(s.p.md(f), 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } });
   return sha256(stable({ baseline: s.growth.baseline.content_hash || null, items: s.items.map((i) => content(i, ITEM_STATE)), keywords: s.keywords.map((k) => content(k, ['performance'])), md }));
 }
+
+// Hash of an item's content (what the user approved); stored with each decision so later edits are detected.
+export const itemHash = (i) => sha256(stable(content(i, ITEM_STATE)));
+export const kwText = (k) => String(k).toLowerCase().replace(/\s+/g, ' ').trim();
 
 export const nextId = (list, prefix) => {
   const n = list.map((x) => Number(String(x.id || '').replace(`${prefix}-`, ''))).filter(Number.isFinite);
   return `${prefix}-${String((n.length ? Math.max(...n) : 0) + 1).padStart(3, '0')}`;
 };
-export const normKw = (k) => String(k.keyword).toLowerCase().replace(/\s+/g, ' ').trim() + '|' + String(k.geo || '').toLowerCase();
+export const normKw = (k) => kwText(k.keyword) + '|' + String(k.geo || '').toLowerCase();
 
 const csvCell = (v) => {
   let s = v === null || v === undefined ? '' : String(v);

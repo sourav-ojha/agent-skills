@@ -117,3 +117,10 @@ Code review verdict PASS WITH CHANGES; audience review (solo site owner) "safe a
 - Audience: free-signal prioritisation ladder (P1 needs two signals), Keyword Planner ranges (`min`/`max` estimates), "Done when" required for human items and printed in the roadmap, served-location for SERP checks, no-link-by-default community guidance, AdSense invalid-traffic / low-value-content / certified CMP / Core Web Vitals / hreflang / upload-handling trust notes, solo quickstart.
 - Security: project-scope `install-agents` refuses symlinked `.claude`/`.codex` paths and agent files and writes by temp file + rename.
 Not changed (stated limit): an agent able to rewrite every state file at once can still forge state; the gate remains the user reading `decisions.md`.
+
+## PR review (sourav-ojha/agent-skills#16, 2026-11-19)
+Five specialist reviewers (correctness, architecture, tests, security, error paths); verdict REQUEST CHANGES, all addressed:
+- Decisions store a hash of the approved item content; later edits make `validate`, `roadmap` and `handoff` refuse. `status` routes to an independent review after a self-review and to "fix and re-review" after a FAIL. Traffic numbers are refused in acceptance criteria and risks too. Missing plan files block decide, roadmap and handoff.
+- State is saved before the decision log is appended and before the review file is created; review files are hash-checked before parsing; `file:` source refs must exist inside the project; Search Console exports must sit in `.growth/performance/` and unparsable numbers are refused; `sync` accepts CRLF frontmatter and warns on missing specs; `init` reads templates before writing; `decide` always validates the config.
+- Generated markdown escapes HTML; very long markdown lines skip the numeric heuristic; unused config keys removed; the auditor role leaves page-level checks to experience-audit, which is cited by finding id without a hash.
+- Tests: the surviving mutations (sync, roadmap filter, plan-level and High findings, `--update`, config errors, re-decide, supersede-of-done) are now caught; builds are cached per fixture and stage.

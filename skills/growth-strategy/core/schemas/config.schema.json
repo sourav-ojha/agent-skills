@@ -34,29 +34,7 @@
           "type": "integer",
           "minimum": 1
         },
-        "max_keywords": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "max_competitors": {
-          "type": "integer",
-          "minimum": 1
-        },
         "min_sources_spot_checked": {
-          "type": "integer",
-          "minimum": 1
-        }
-      }
-    },
-    "roadmap": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "days": {
-          "type": "integer",
-          "minimum": 7
-        },
-        "max_items": {
           "type": "integer",
           "minimum": 1
         }

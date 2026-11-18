@@ -6,7 +6,8 @@ import path from 'node:path';
 import { CORE_DIR, loadConfig } from './lib/config.mjs';
 import { logEvent, runId } from './lib/runlog.mjs';
 import { ARTS, PHASES, MD_FILES, paths, ensureDir, assertNoLink, writeFile, exists, load, save, emptyGrowth, baselineHash, planHash, nextId, normKw, keywordsCsv, parseCsv, today, daysBetween, sha256, BASELINE_KEYS } from './lib/state.mjs';
-import { checkSource, checkKeyword, checkItem, checkReview, validateAll, sourceIndex, IMPORTED } from './lib/evidence.mjs';
+import { checkSource, checkKeyword, checkItem, checkReview, validateAll, sourceIndex, IMPORTED, UNSAFE } from './lib/evidence.mjs';
+import { ITEM_STATE, itemHash, kwText, PLAN_MD } from './lib/state.mjs';
 import { validateSchema } from './lib/config.mjs';
 import { RECORDS } from './lib/state.mjs';
 
@@ -42,7 +43,6 @@ const p = paths(dir);
 const t0 = Date.now(), extra = {};
 process.on('exit', (code) => { if (!['status', 'config', 'help', 'validate'].includes(cmd)) logEvent(dir, 'growth-strategy', runId('growth-strategy', 'growth'), { event: [cmd, rest[0]].filter(Boolean).join(' '), ok: code === 0, ms: Date.now() - t0, ...extra }); });
 
-const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
 const str = (k, max, what) => {
   const v = opt[k];
   if (v === undefined || v === true || !String(v).trim()) die(`--${k} is required: ${what}`);
@@ -55,13 +55,25 @@ const readInput = (f) => { if (!f || f === true) die('--file is required'); try 
 const config = () => { const c = loadConfig(dir); if (c.errors.length) die(`invalid .growth/config.json:\n  ${c.errors.join('\n  ')}`); return c.config; };
 // Before any write: refuse planted symlinks anywhere we might write, so a failed command leaves nothing half-written.
 const guard = () => { if (fs.existsSync(p.base)) ensureDir(p.base); for (const f of [p.growth, p.sources, p.keywords, p.items, p.decisions, p.roadmap, p.csv, p.reviews, p.handoff]) assertNoLink(f); };
-const STATE_KEYS = ['status', 'superseded_by', 'performance'];
+const STATE_KEYS = [...ITEM_STATE, 'performance'];
+// Text from research ends up in generated markdown: neutralise HTML so a copied <img> or link tag cannot render.
+const esc = (x) => String(x).replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-function logDecision(s, target, decision, by, note) {
+const pendingLog = [];
+function logDecision(s, target, decision, by, note, content) {
   const at = new Date().toISOString();
-  s.growth.decisions.push({ at, target, decision, by, note });
+  s.growth.decisions.push({ at, target, decision, by, note, ...(content ? { content } : {}) });
+  pendingLog.push(`| ${at.slice(0, 16).replace('T', ' ')} | ${target} | ${decision} | ${esc(by).replace(/\|/g, '/')} | ${esc(note).replace(/\|/g, '/')} |\n`);
+}
+// Called after save(): the readable log never runs ahead of the state it describes.
+function flushLog() {
+  if (!pendingLog.length) return;
   const head = fs.existsSync(p.decisions) ? '' : '# Decision log\n\nAppend-only record of the user\'s decisions (written by the helper).\n\n| When | Target | Decision | By | Note (user\'s words) |\n|---|---|---|---|---|\n';
-  writeFile(p.decisions, `${head}| ${at.slice(0, 16).replace('T', ' ')} | ${target} | ${decision} | ${by.replace(/\|/g, '/')} | ${note.replace(/\|/g, '/')} |\n`, 'append');
+  writeFile(p.decisions, head + pendingLog.splice(0).join(''), 'append');
+}
+function requirePlanFiles() {
+  const missing = PLAN_MD.filter((f) => !fs.existsSync(p.md(f)));
+  if (missing.length) die(`plan file(s) missing: ${missing.join(', ')}; restore them and run phase done plan again`);
 }
 
 function baselineState(g) {
@@ -78,12 +90,12 @@ const latestReview = (s) => s.growth.reviews.at(-1) || null;
 
 function cmdInit() {
   if (exists(dir)) die('.growth/ is already initialised (use status)');
+  const templates = MD_FILES.map((f) => [f, fs.readFileSync(path.join(CORE_DIR, '..', 'templates', f), 'utf8')]); // fail before writing anything
   ensureDir(p.base); ensureDir(p.reviews); ensureDir(p.handoff);
   guard();
-  const s = { p, growth: emptyGrowth(), sources: [], keywords: [], items: [] };
-  save(s);
-  for (const f of MD_FILES) if (!fs.existsSync(p.md(f))) writeFile(p.md(f), fs.readFileSync(path.join(CORE_DIR, '..', 'templates', f), 'utf8'), 'create');
   if (!fs.existsSync(p.gitignore)) writeFile(p.gitignore, '# raw analytics and Search Console exports stay local\nperformance/\n', 'create');
+  for (const [f, text] of templates) if (!fs.existsSync(p.md(f))) writeFile(p.md(f), text, 'create');
+  save({ p, growth: emptyGrowth(), sources: [], keywords: [], items: [] }); // last: growth.json marks the folder as initialised
   const ctx = fs.existsSync(path.join(dir, '.product', 'PRODUCT.md')) ? ' Found .product/PRODUCT.md: use it as baseline input (read-only).' : '';
   console.log(`initialised .growth/ (baseline draft).${ctx} Next: fill the baseline (templates/baseline.json shape), baseline set --file, then the user approves.`);
 }
@@ -101,7 +113,7 @@ function cmdBaselineSet() {
     logDecision(s, 'baseline', 'reopened', 'helper', 'baseline content changed; needs the user\'s approval again');
     for (const ph of PHASES) if (s.growth.phases[ph]?.done_at) s.growth.phases[ph].stale = true; // research was done for another baseline
   }
-  save(s, ['growth']);
+  save(s, ['growth']); flushLog();
   console.log(unchanged ? 'baseline unchanged (still approved)' : 'baseline saved as draft: show it to the user; approve-baseline after their OK');
 }
 
@@ -113,7 +125,7 @@ function cmdApproveBaseline() {
   if (e.length) die(`baseline is incomplete:\n${e.join('\n')}`);
   Object.assign(b, { status: 'approved', content_hash: baselineHash(b), approved_by: by, approved_at: today(), approved_note: note });
   logDecision(s, 'baseline', 'approve', by, note);
-  save(s, ['growth']);
+  save(s, ['growth']); flushLog();
   console.log(`baseline approved by ${by}`);
 }
 
@@ -130,9 +142,10 @@ function cmdAdd(kind) {
       const src = { ...raw };
       if (src.url === undefined) delete src.url;
       if (IMPORTED.includes(src.type)) { errs.push(`sources[${i}]: ${src.type} sources are created only by gs import (measured data needs the real export file)`); continue; }
-      if (src.ref?.startsWith('file:') && !src.sha256) {
+      if (src.ref?.startsWith('file:')) {
         const f = path.resolve(dir, src.ref.slice(5));
-        if (f.startsWith(dir + path.sep) && fs.existsSync(f) && fs.statSync(f).isFile()) src.sha256 = sha256(fs.readFileSync(f));
+        if (!f.startsWith(dir + path.sep) || !fs.existsSync(f) || !fs.statSync(f).isFile()) { errs.push(`sources[${i}]: ${src.ref} must be an existing file inside the project`); continue; }
+        if (!src.sha256) src.sha256 = sha256(fs.readFileSync(f));
       }
       if (src.id && taken.has(src.id)) { if (JSON.stringify(taken.get(src.id)) !== JSON.stringify(src)) errs.push(`sources[${i}]: id ${src.id} is taken by a different source`); continue; }
       if (!src.id) src.id = nextId([...s.sources, ...out], 'S');
@@ -237,11 +250,12 @@ function cmdReviewRecord() {
   const id = nextId(s.growth.reviews, 'R');
   const rec = { id, at: new Date().toISOString(), mode, reviewer, ...(reason ? { reason } : {}), plan_hash: current, verdict: r.verdict, checked_sources: r.checked_sources || [], findings: r.findings };
   const text = JSON.stringify(rec, null, 2) + '\n';
-  writeFile(path.join(p.reviews, `${id}.json`), text, 'create');
   const count = (sev) => r.findings.filter((f) => f.severity === sev).length;
   const { findings, checked_sources, ...summary } = rec;
+  if (fs.existsSync(path.join(p.reviews, `${id}.json`))) die(`reviews/${id}.json exists but is not in growth.json (an earlier record failed half-way?); move it aside and record again`);
   s.growth.reviews.push({ ...summary, file_sha256: sha256(text), counts: { Critical: count('Critical'), High: count('High'), Medium: count('Medium'), Low: count('Low') } });
   save(s, ['growth']);
+  writeFile(path.join(p.reviews, `${id}.json`), text, 'create'); // if this fails, decide reports the review file missing and refuses
   extra.mode = mode; extra.findings = r.findings.length;
   console.log(`${id}: ${mode === 'self' ? 'self-review (not independent)' : `independent review by ${reviewer}`}, ${r.verdict}, ${r.findings.length} finding(s)`);
 }
@@ -258,8 +272,9 @@ function reviewFile(r) {
   if (!/^R-\d{3,}$/.test(String(r.id))) die(`invalid review id ${JSON.stringify(r.id)} in growth.json`);
   const f = path.join(p.reviews, `${r.id}.json`);
   let text; try { text = fs.readFileSync(f, 'utf8'); } catch { die(`review file ${r.id}.json is missing: record the review again`); }
-  const full = JSON.parse(text);
-  if (sha256(text) !== r.file_sha256 || full.plan_hash !== r.plan_hash || full.mode !== r.mode) die(`review file ${r.id}.json was changed after it was recorded: record the review again`);
+  if (sha256(text) !== r.file_sha256) die(`review file ${r.id}.json was changed after it was recorded: record the review again`);
+  let full; try { full = JSON.parse(text); } catch { die(`review file ${r.id}.json is not valid JSON: record the review again`); }
+  if (full?.plan_hash !== r.plan_hash || full?.mode !== r.mode) die(`review file ${r.id}.json was changed after it was recorded: record the review again`);
   return full;
 }
 
@@ -271,12 +286,14 @@ function cmdDecide() {
   const { by, note } = who();
   const s = load(dir); guard();
   requireBaseline(s);
+  requirePlanFiles();
   const rev = latestReview(s);
   if (!rev) die('no review recorded: run the independent growth-reviewer and review record before any decision');
   if (rev.plan_hash !== planHash(s)) die('the plan changed since the last review: review it again (review record) before deciding');
   const stale = PHASES.filter((ph) => phaseState(s.growth, ph) !== 'done');
   if (stale.length) die(`phases not done (${stale.join(', ')}): finish the refresh and review the plan again before deciding`);
-  if (rev.mode !== 'independent' && config().gates.require_independent_review) die('decisions need an independent review (a separate reviewer agent); only the user can turn this off in .growth/config.json: {"gates": {"require_independent_review": false}}');
+  const cfg = config(); // always: an invalid config must fail loudly, not only when it matters
+  if (rev.mode !== 'independent' && cfg.gates.require_independent_review) die('decisions need an independent review (a separate reviewer agent); only the user can turn this off in .growth/config.json: {"gates": {"require_independent_review": false}}');
   const listed = new Set(s.growth.reviews.map((r) => `${r.id}.json`));
   const orphan = fs.existsSync(p.reviews) ? fs.readdirSync(p.reviews).filter((f) => f.endsWith('.json') && !listed.has(f)) : [];
   if (orphan.length) die(`review file(s) ${orphan.join(', ')} are not in growth.json: the review list was edited; restore it from git`);
@@ -293,8 +310,8 @@ function cmdDecide() {
     if (decision === 'approve' && blocking.length) die(`${id} has ${blocking.map((f) => f.severity).join('/')} review finding(s); fix the plan and review again, or reject or defer it`);
     if (decision === 'approve' && (failed || planLevel.length)) die(`the review ${failed ? 'verdict is FAIL' : 'has plan-level Critical/High findings'}; fix the plan and review again before approving anything`);
   }
-  for (const id of ids) { s.items.find((x) => x.id === id).status = MAP[decision]; logDecision(s, id, decision, by, note); }
-  save(s, ['growth', 'items']);
+  for (const id of ids) { const it = s.items.find((x) => x.id === id); it.status = MAP[decision]; logDecision(s, id, decision, by, note, itemHash(it)); }
+  save(s, ['items', 'growth']); flushLog();
   extra.decision = decision; extra.decided = ids.length;
   console.log(`${decision}: ${ids.join(', ')}`);
 }
@@ -305,12 +322,12 @@ function cmdSupersede() {
   const s = load(dir); guard();
   const a = s.items.find((x) => x.id === old), b = s.items.find((x) => x.id === nu);
   if (!a) die(`unknown item ${old}`);
+  if (['done', 'superseded'].includes(a.status)) die(`${old} is ${a.status}`);
   if (!b || nu === old) die('--with must name another existing item');
   if (!['proposed', 'approved'].includes(b.status)) die(`--with ${nu} is ${b.status}; the replacement must be proposed or approved`);
-  if (['done', 'superseded'].includes(a.status)) die(`${old} is ${a.status}`);
   Object.assign(a, { status: 'superseded', superseded_by: nu });
   logDecision(s, old, 'supersede', by, `${note} (by ${nu})`);
-  save(s, ['growth', 'items']);
+  save(s, ['items', 'growth']); flushLog();
   console.log(`${old} superseded by ${nu}; earlier decisions stay in the log`);
 }
 
@@ -324,13 +341,13 @@ const reviewLine = (s) => {
 function cmdRoadmap() {
   const s = load(dir); guard();
   { const v = validateAll(s, config()); if (v.errors.length) die(`fix validation errors first (gs validate):\n${v.errors.join('\n')}`); }
-  const cfg = config();
+  requirePlanFiles();
   const src = sourceIndex(s);
   const cite = (i) => i.sources.map((id) => (src.get(id)?.url ? `[${id}](${src.get(id).url})` : id)).join(', ') || 'none';
-  const row = (i) => `| ${i.id} | ${i.type} | ${i.title.replace(/\|/g, '/')} | ${i.owner} | ${i.effort} | ${i.impact} | ${i.evidence}, ${i.confidence} | ${i.status} | ${cite(i)} |`;
+  const row = (i) => `| ${i.id} | ${i.type} | ${esc(i.title).replace(/\|/g, '/')} | ${i.owner} | ${i.effort} | ${i.impact} | ${i.evidence}, ${i.confidence} | ${i.status} | ${cite(i)} |`;
   const head = '| ID | Type | Item | Owner | Effort | Impact | Evidence | Status | Sources |\n|---|---|---|---|---|---|---|---|---|';
   const live = s.items.filter((i) => ['approved', 'handed-off', 'done'].includes(i.status));
-  const out = [`# ${cfg.roadmap.days}-day growth roadmap: ${s.growth.baseline.name || 'unnamed'}`, '',
+  const out = [`# 90-day growth roadmap: ${s.growth.baseline.name || 'unnamed'}`, '',
     `Generated ${today()} by the growth-strategy helper from approved items only. Review: ${reviewLine(s)}.`,
     'Impact is a qualitative judgment, not a traffic forecast. Owner `human` items are tasks for a person (posting, submissions, outreach); nothing here is done automatically.', ''];
   for (const w of ['weeks 1-4', 'weeks 5-8', 'weeks 9-13']) {
@@ -339,7 +356,7 @@ function cmdRoadmap() {
   }
   if (live.length) {
     out.push('## Item details', '');
-    for (const i of live) out.push(`### ${i.id}: ${i.title}`, '', `${i.rationale}`, '', `Owner: ${i.owner}. ${i.owner === 'human' ? 'Done when:' : 'Acceptance:'}`, ...(i.acceptance || []).map((a) => `- ${a}`), ...(i.risks.length ? ['', 'Risks:', ...i.risks.map((r) => `- ${r}`)] : []), '');
+    for (const i of live) out.push(`### ${i.id}: ${esc(i.title)}`, '', esc(i.rationale), '', `Owner: ${i.owner}. ${i.owner === 'human' ? 'Done when:' : 'Acceptance:'}`, ...(i.acceptance || []).map((a) => `- ${esc(a)}`), ...(i.risks.length ? ['', 'Risks:', ...i.risks.map((r) => `- ${esc(r)}`)] : []), '');
   }
   const pending = s.items.filter((i) => ['proposed', 'deferred', 'needs-research'].includes(i.status));
   out.push('## Not approved (recommendations only)', '', pending.length ? `${head}\n${pending.map(row).join('\n')}` : '_None._', '');
@@ -352,6 +369,7 @@ function cmdRoadmap() {
 function cmdHandoff() {
   const s = load(dir); guard();
   requireBaseline(s);
+  requirePlanFiles();
   { const open = PHASES.filter((ph) => phaseState(s.growth, ph) !== 'done'); if (open.length) die(`phases not done (${open.join(', ')}): finish the refresh, review and re-decide before handing off`); }
   { const v = validateAll(s, config()); if (v.errors.length) die(`fix validation errors first (gs validate):\n${v.errors.join('\n')}`); }
   ensureDir(p.handoff);
@@ -361,12 +379,12 @@ function cmdHandoff() {
     const file = path.join(p.handoff, `${it.id}.md`);
     if (!/^GRO-\d{3,}$/.test(it.id) || path.dirname(file) !== p.handoff) die(`invalid item id ${it.id}`);
     if (!fs.existsSync(file)) {
-      const body = ['---', `id: ${it.id}`, 'status: ready', 'source: growth-strategy', `item: ${it.id}`, `type: ${it.type}`, '---', '', `# ${it.id}: ${it.title}`, '',
-        '## Goal', `${it.rationale} Approved growth roadmap item (${it.window}).`, '',
-        '## Acceptance criteria', ...it.acceptance.map((a, n) => `- AC${n + 1}: ${a}`), '',
+      const body = ['---', `id: ${it.id}`, 'status: ready', 'source: growth-strategy', `item: ${it.id}`, `type: ${it.type}`, '---', '', `# ${it.id}: ${esc(it.title)}`, '',
+        '## Goal', `${esc(it.rationale)} Approved growth roadmap item (${it.window}).`, '',
+        '## Acceptance criteria', ...it.acceptance.map((a, n) => `- AC${n + 1}: ${esc(a)}`), '',
         '## Non-goals', '- Nothing beyond this item. No publishing, posting, directory submissions, account creation or ads changes unless an acceptance criterion says so.', '',
         '## Constraints and assumptions', `- Evidence: ${it.evidence}, ${it.confidence} confidence. Sources: ${it.sources.map((id) => `${id} ${src.get(id)?.url || src.get(id)?.ref || ''}`.trim()).join('; ') || 'none'}.`,
-        ...(it.keywords.length ? [`- Target keywords: ${it.keywords.join(', ')}.`] : []), ...it.risks.map((r) => `- Risk: ${r}`),
+        ...(it.keywords.length ? [`- Target keywords: ${esc(it.keywords.join(', '))}.`] : []), ...it.risks.map((r) => `- Risk: ${esc(r)}`),
         ...(it.needs_design ? ['- Design is open: explore it with the brainstorming skill before implementing.'] : []), '',
         '## Open questions', '- None recorded by growth-strategy.', '',
         '## Measurement', '- After release, compare the target pages in Search Console and the measurement plan (.growth/measurement-plan.md) at the next refresh.', ''].join('\n');
@@ -385,9 +403,9 @@ function cmdSync() {
   const done = [];
   for (const it of s.items.filter((i) => i.status === 'handed-off')) {
     const file = path.join(p.handoff, `${it.id}.md`);
-    if (!fs.existsSync(file)) continue;
-    const fm = (fs.readFileSync(file, 'utf8').match(/^---\n([\s\S]*?)\n---/) || [])[1] || '';
-    if (/^delivery:\s*complete\s*$/m.test(fm) || /^status:\s*implemented\s*$/m.test(fm)) { it.status = 'done'; done.push(it.id); }
+    if (!fs.existsSync(file)) { console.log(`warning: ${it.id}: handoff spec missing; restore it or run handoff after re-approval`); continue; }
+    const fm = (fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').match(/^---\n([\s\S]*?)\n---/) || [])[1] || '';
+    if (/^delivery:[ \t]*complete[ \t]*$/m.test(fm) || /^status:[ \t]*implemented[ \t]*$/m.test(fm)) { it.status = 'done'; done.push(it.id); }
   }
   save(s, ['items']);
   console.log(done.length ? `done: ${done.join(', ')}` : 'no handed-off item has a recorded delivery yet');
@@ -428,7 +446,7 @@ function cmdImportGsc() {
   const s = load(dir); guard();
   if (!opt.file || opt.file === true) die('--file is required (Search Console > Performance > Export > Queries.csv)');
   const file = path.resolve(opt.file);
-  if (!file.startsWith(dir + path.sep)) die('put the export inside the project (for example .growth/performance/, which is git-ignored) so its hash can be checked later');
+  if (!file.startsWith(path.join(p.base, 'performance') + path.sep)) die('put the export in .growth/performance/ (git-ignored: Search Console queries can contain personal data) so its hash can be checked later');
   let buf; try { buf = fs.readFileSync(file); } catch (e) { die(`cannot read ${opt.file}: ${e.message}`); }
   const rows = parseCsv(buf.toString('utf8').replace(/^﻿/, ''));
   const head = (rows[0] || []).map((h) => h.trim().toLowerCase());
@@ -441,22 +459,25 @@ function cmdImportGsc() {
   const rel = path.relative(dir, file).split(path.sep).join('/');
   let srcRec = s.sources.find((x) => x.type === 'gsc' && x.sha256 === hash);
   if (!srcRec) { srcRec = { id: nextId(s.sources, 'S'), type: 'gsc', ref: `file:${rel}`, title: `Search Console queries export ${period}`.slice(0, 200), accessed: today(), sha256: hash }; s.sources.push(srcRec); }
-  const num = (v) => { const n = Number(String(v).replace(/[%,\s]/g, '')); return Number.isFinite(n) ? n : 0; };
+  const num = (v) => { const t = String(v ?? '').replace(/[%\s]/g, ''); return /^\d+(\.\d+)?$/.test(t.replace(/,(?=\d{3}(\D|$))/g, '')) ? Number(t.replace(/,(?=\d{3}(\D|$))/g, '')) : NaN; };
+  const bad = [];
   const geo = opt.geo && opt.geo !== true ? String(opt.geo).toLowerCase() : null;
   const byText = new Map();
-  for (const k of s.keywords) { if (geo && String(k.geo).toLowerCase() !== geo) continue; const n = String(k.keyword).toLowerCase().replace(/\s+/g, ' ').trim(); byText.set(n, [...(byText.get(n) || []), k]); }
+  for (const k of s.keywords) { if (geo && String(k.geo).toLowerCase() !== geo) continue; const n = kwText(k.keyword); byText.set(n, [...(byText.get(n) || []), k]); }
   const totals = { rows: 0, clicks: 0, impressions: 0, matched: 0 };
   let ambiguous = 0;
   for (const r of rows.slice(1)) {
-    totals.rows++; totals.clicks += num(r[ic]); totals.impressions += num(r[ii]);
-    const ks = byText.get(String(r[iq] || '').toLowerCase().replace(/\s+/g, ' ').trim());
+    totals.rows++; totals.clicks += num(r[ic]) || 0; totals.impressions += num(r[ii]) || 0;
+    const ks = byText.get(kwText(r[iq] || ''));
     if (!ks) continue; // untracked queries are never copied: they can contain personal data
     if (ks.length > 1) { ambiguous++; continue; } // same keyword tracked for several geos: pass --geo with a country-filtered export
     const k = ks[0];
+    if ([r[ic], r[ii], r[ir], r[ip]].some((v) => Number.isNaN(num(v)))) { bad.push(r[iq]); continue; }
     const ctr = String(r[ir]).includes('%') ? num(r[ir]) / 100 : num(r[ir]);
     k.performance = { period, clicks: num(r[ic]), impressions: num(r[ii]), ctr: Math.round(ctr * 10000) / 10000, position: num(r[ip]), source: srcRec.id };
     totals.matched++;
   }
+  if (bad.length) die(`cannot parse the numbers for ${bad.length} tracked keyword row(s) (for example "${String(bad[0]).slice(0, 60)}"); export again with plain numbers (Clicks, Impressions, CTR like 3.2%, Position)`);
   s.growth.performance.push({ at: today(), period, source: srcRec.id, totals });
   save(s);
   extra.matched = totals.matched;
@@ -486,7 +507,9 @@ function cmdStatus() {
   if (bs !== 'approved') next = 'fill the baseline (baseline set), show it to the user, and run approve-baseline after their OK';
   else if (['audit', 'research'].some((ph) => phaseState(g, ph) !== 'done')) next = `audit and research (in parallel where possible), then phase done for: ${['audit', 'research'].filter((ph) => phaseState(g, ph) !== 'done').join(', ')}`;
   else if (phaseState(g, 'plan') !== 'done') next = 'plan: consolidate research into items and the plan files, then phase done plan';
-  else if (!rev || rev.plan_hash !== planHash(s)) next = 'independent review with the growth-reviewer, then review record';
+  else if (!rev || rev.plan_hash !== planHash(s)) next = 'independent review with the growth-reviewer (review start, then review record)';
+  else if (rev.mode !== 'independent' && config().gates.require_independent_review) next = 'independent review: a self-review cannot unlock decisions (or the user turns gates.require_independent_review off themselves)';
+  else if (s.growth.reviews.some((r) => r.plan_hash === rev.plan_hash && r.verdict === 'FAIL')) next = 'the review failed: fix the plan and review again (until then the user can only reject or defer items)';
   else if (count('proposed')) next = 'present the plan and the review; the user decides each item (decide ... --by --note)';
   else if (s.items.some((i) => i.status === 'approved' && i.owner === 'implementer')) next = 'roadmap, then handoff for the implementer items';
   else if (count('handed-off')) next = 'sync after the implementer records delivery; refresh when research goes stale';
@@ -526,4 +549,4 @@ try {
     if (!Object.keys(notes).length) die('retro needs at least one of --unclear, --skipped, --improvised, --suggest');
     Object.assign(extra, notes); console.log('retro logged');
   } else die(`unknown command\n${HELP}`);
-} catch (e) { die(e.message); }
+} catch (e) { if (process.env.GS_DEBUG) console.error(e.stack); die(e.message); }

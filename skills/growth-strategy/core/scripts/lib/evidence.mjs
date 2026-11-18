@@ -3,13 +3,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { validateSchema } from './config.mjs';
-import { RECORDS, MD_FILES, today, daysBetween, sha256, normKw } from './state.mjs';
+import { RECORDS, MD_FILES, today, daysBetween, sha256, normKw, kwText, itemHash } from './state.mjs';
 
 export const CLASSES = ['fact', 'inference', 'estimate', 'hypothesis', 'assumption', 'unknown'];
 const SOURCED = ['fact', 'inference', 'estimate'];
 export const IMPORTED = ['gsc', 'analytics'];
 const MAX_MEDIUM = ['inference', 'estimate', 'assumption'];
-const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+export const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
 const GWT = /\bgiven\b[\s\S]*\bwhen\b[\s\S]*\bthen\b/i;
 const TRAFFIC = [
   /\b\d[\d,.]*\s*(k|m|thousand|million)?\+?\s*(new\s+|more\s+|extra\s+|monthly\s+|organic\s+|daily\s+)?(visits|visitors|clicks|searches|sessions|users|pageviews|page views|signups|sign-ups|impressions|downloads)\b/i,
@@ -78,7 +78,7 @@ export function checkItem(i, byId, at = 'item') {
   unsafeText(i, at, e);
   if (e.length) return e;
   const label = `${at} ${i.id || `"${i.title}"`}`;
-  for (const re of TRAFFIC) if (re.test(`${i.title} ${i.rationale}`)) e.push(`${label}: contains a traffic number; impact stays qualitative (H/M/L), numbers live only in keyword metrics with a source`);
+  for (const re of TRAFFIC) if (re.test([i.title, i.rationale, ...(i.acceptance || []), ...(i.risks || [])].join(' '))) e.push(`${label}: contains a traffic number; impact stays qualitative (H/M/L), numbers live only in keyword metrics with a source`);
   if (i.owner === 'implementer' && (!(i.acceptance || []).length || !i.acceptance.every((a) => GWT.test(a)))) e.push(`${label}: implementer items need acceptance criteria written as Given/When/Then`);
   if (i.owner === 'human' && !(i.acceptance || []).length) e.push(`${label}: human items need at least one acceptance line ("Done when ...") so a person knows when it is finished`);
   if (i.confidence === 'low' && i.window === 'weeks 1-4' && !(['measurement', 'technical-seo'].includes(i.type) && i.effort === 'S')) e.push(`${label}: low-confidence items cannot start in weeks 1-4 (only small measurement or technical-seo foundations can)`);
@@ -117,7 +117,7 @@ export function checkMarkdown(name, text, byId, out) {
       else if (date === 'n/a' && SOURCED.includes(cls)) out.errors.push(`${where}: ${cls} needs a date`);
       else if (date !== 'n/a' && date > today()) out.errors.push(`${where}: date ${date} is in the future`);
     }
-    if (!/S-\d{3,}/.test(line) && MD_NUMBER.some((re) => re.test(line))) out.warnings.push(`${where}: number next to a search/traffic metric word with no S-NNN source (heuristic; never invent volumes)`);
+    if (line.length <= 2000 && !/S-\d{3,}/.test(line) && MD_NUMBER.some((re) => re.test(line))) out.warnings.push(`${where}: number next to a search/traffic metric word with no S-NNN source (heuristic; never invent volumes)`);
   });
 }
 
@@ -132,6 +132,7 @@ export function validateAll(s, config) {
   });
   for (const src of s.sources) {
     if (src.accessed && daysBetween(src.accessed, today()) > config.freshness.source_max_age_days) out.warnings.push(`source ${src.id} is stale (accessed ${src.accessed}); refresh before relying on it`);
+    if (src.ref?.startsWith('file:') && !path.resolve(s.p.root, src.ref.slice(5)).startsWith(s.p.root + path.sep)) out.errors.push(`source ${src.id}: ${src.ref} is outside the project`);
     const file = src.ref?.startsWith('file:') ? path.resolve(s.p.root, src.ref.slice(5)) : src.ref?.startsWith('repo:') ? path.resolve(s.p.root, src.ref.slice(5).replace(/[#:].*$/, '')) : null;
     if (src.sha256 && file) {
       if (!file.startsWith(s.p.root + path.sep)) out.errors.push(`source ${src.id}: path escapes the project`);
@@ -146,7 +147,7 @@ export function validateAll(s, config) {
     const key = normKw(k);
     if (seen.has(key)) out.errors.push(`keywords: duplicate keyword "${k.keyword}" (${k.geo})`); else seen.set(key, i);
   });
-  const tracked = new Set(s.keywords.map((k) => String(k.keyword).toLowerCase().trim()));
+  const tracked = new Set(s.keywords.map((k) => kwText(k.keyword)));
   const byKw = new Map();
   const itemIds = new Set();
   s.items.forEach((it, i) => {
@@ -155,7 +156,7 @@ export function validateAll(s, config) {
     else if (itemIds.has(it.id)) out.errors.push(`items: duplicate id ${it.id}`); else itemIds.add(it.id);
     if (['superseded', 'rejected'].includes(it.status)) return;
     for (const kw of it.keywords || []) {
-      const n = kw.toLowerCase().trim();
+      const n = kwText(kw);
       if (!tracked.has(n)) out.warnings.push(`${it.id}: keyword "${kw}" is not in keywords.json`);
       byKw.set(n, [...(byKw.get(n) || []), it.id]);
     }
@@ -166,6 +167,7 @@ export function validateAll(s, config) {
   for (const it of s.items) {
     const last = (s.growth?.decisions || []).filter((d) => d.target === it.id).at(-1);
     if (it.status === 'proposed' ? last : last?.decision !== EXPECT[it.status]) out.errors.push(`${it.id}: status ${it.status} does not match the decision log (${last ? last.decision : 'no decision'}); statuses change only through gs`);
+    else if (['approved', 'handed-off', 'done'].includes(it.status) && last.content !== itemHash(it)) out.errors.push(`${it.id}: content changed after the user approved it; add a new item and supersede this one`);
   }
   for (const f of MD_FILES) {
     const file = s.p.md(f);
