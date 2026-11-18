@@ -24,6 +24,7 @@ function fixture(files) {
     for (const [p, c] of Object.entries(fs_)) {
       const abs = path.join(work, p);
       if (c === null) fs.rmSync(abs);
+      else if (typeof c === 'object' && c.link) { fs.mkdirSync(path.dirname(abs), { recursive: true }); fs.rmSync(abs, { force: true }); fs.symlinkSync(c.link, abs); }
       else { fs.mkdirSync(path.dirname(abs), { recursive: true }); fs.writeFileSync(abs, c); }
     }
   };
@@ -39,7 +40,7 @@ function fixture(files) {
     sh(work, 'add', '-A'); sh(work, 'commit', '-q', '--allow-empty', '-m', 'change');
     return sh(work, 'rev-parse', 'HEAD');
   };
-  return { root, work, git, change };
+  return { root, work, git, change, sh };
 }
 
 const run = (fx, headSha, config = {}, specPaths = [], extra = {}) => ag.checkDiff({ git: fx.git, baseRef: BASE, headSha, config, specPaths, ...extra });
@@ -131,17 +132,19 @@ test('G3 near-miss: markers in test files, pre-existing markers and markers in d
 test('G4: protected paths fire (config, agent files, CI, test configs, hooks)', () => {
   const paths = ['.product/delivery.json', '.claude/settings.json', '.mcp.json', 'CLAUDE.md', 'docs/AGENTS.md', '.gitattributes', '.gitmodules',
     '.github/workflows/ci.yml', 'jest.config.js', 'web/vitest.config.ts', 'pytest.ini', 'tests/conftest.py', '.mocharc.yml', 'tox.ini',
-    'karma.conf.js', 'playwright.config.ts', '.husky/pre-commit', '.githooks/pre-push', 'claude.md'];
+    'karma.conf.js', 'playwright.config.ts', '.husky/pre-commit', '.githooks/pre-push', 'claude.md',
+    'vite.config.ts', '.pytest.ini', 'pytest.toml', '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', 'jest.setup.js', 'vitest.setup.ts',
+    'src/setupTests.ts', 'babel.config.js', '.babelrc', '.babelrc.json', '__mocks__/axios.js', 'src/a/__mocks__/fs.js', '.travis.yml',
+    'bitbucket-pipelines.yml', '.drone.yml', '.gitea/workflows/ci.yml', '.forgejo/workflows/ci.yml'];
   const fx = fixture({});
   for (const p of paths) {
     assert.deepEqual(hit(run(fx, fx.change({ [p]: 'x\n' }, { fresh: true })), 'G4')?.files, [p], p);
   }
 });
-test('G4: pyproject.toml fires only for [tool.pytest] hunks', () => {
-  const base = '[project]\nname = "x"\nversion = "1"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n\n[tool.ruff]\nline-length = 100\n';
-  const fx = fixture({ 'pyproject.toml': base });
-  assert.deepEqual(run(fx, fx.change({ 'pyproject.toml': base.replace('version = "1"', 'version = "2"').replace('100', '120') })), []);
-  assert.deepEqual(hit(run(fx, fx.change({ 'pyproject.toml': base.replace('-q', '-q -k "not slow"') })), 'G4')?.files, ['pyproject.toml']);
+test('G4: any change to Python test configuration files fires (no TOML/INI parsing)', () => {
+  const fx = fixture({ 'pyproject.toml': '[project]\nversion = "1"\n', 'setup.cfg': '[metadata]\nname = x\n' });
+  assert.deepEqual(hit(run(fx, fx.change({ 'pyproject.toml': '[project]\nversion = "2"\n' }, { fresh: true })), 'G4')?.files, ['pyproject.toml']);
+  assert.deepEqual(hit(run(fx, fx.change({ 'setup.cfg': '[metadata]\nname = y\n' }, { fresh: true })), 'G4')?.files, ['setup.cfg']);
 });
 test('G4: package.json scripts named by tests.all / local_checks (and what they call) fire; other keys do not', () => {
   const pkg = (scripts, extra = {}) => `${JSON.stringify({ name: 'x', version: '1.0.0', scripts, ...extra }, null, 2)}\n`;
@@ -221,4 +224,89 @@ test('classify follows the P1.3 table', () => {
 test('holdReason records the antigaming hold kind and the sorted unique G ids', () => {
   assert.deepEqual(ag.holdReason([{ id: 'G5', files: ['s.md'] }, { id: 'G1', files: ['a.test.js'] }, { id: 'G1', files: ['b.test.js'] }]), { kind: 'antigaming', ids: ['G1', 'G5'] });
   assert.equal(ag.holdReason([]), null);
+});
+
+// ---- fix round 1 regressions (reviewer attacks) -------------------------------------------------------------------------
+test('type change (file <-> symlink) does not throw: test file -> G1, protected path -> G4, spec -> G5, other file clean', () => {
+  const fx = fixture({ 'tests/a.test.js': 'it("a", f)\n', '.mcp.json': '{}\n', 'docs/s.md': '# s\n', 'src/a.js': 'x\n' });
+  assert.deepEqual(hit(run(fx, fx.change({ 'tests/a.test.js': { link: '../README.md' } }, { fresh: true })), 'G1')?.files, ['tests/a.test.js']);
+  assert.deepEqual(hit(run(fx, fx.change({ '.mcp.json': { link: 'README.md' } }, { fresh: true })), 'G4')?.files, ['.mcp.json']);
+  assert.deepEqual(hit(run(fx, fx.change({ 'docs/s.md': { link: '../README.md' } }, { fresh: true }), {}, ['docs/s.md']), 'G5')?.files, ['docs/s.md']);
+  assert.deepEqual(run(fx, fx.change({ 'src/a.js': { link: '../README.md' } }, { fresh: true })), []);
+});
+test('G1: a .test / .spec suffix without an extension is a test file', () => {
+  const fx = fixture({ 'src/d.test': 'x\n', 'src/e.spec': 'x\n' });
+  assert.deepEqual(hit(run(fx, fx.change({ 'src/d.test': 'y\n', 'src/e.spec': 'y\n' })), 'G1')?.files, ['src/d.test', 'src/e.spec']);
+});
+test('G4: wildcard / runner script calls protect every script; lifecycle scripts and node --run are protected', () => {
+  const pkg = (scripts) => `${JSON.stringify({ name: 'x', scripts }, null, 2)}\n`;
+  const npmTest = { tests: { all: ['npm', 'test'] } };
+  for (const t of ['run-s "test:*"', 'npm-run-all test:*', 'run-p test:unit', 'concurrently "npm:test:*"', 'pnpm -r --filter ./pkgs/* test:unit']) {
+    const s0 = { test: t, 'test:unit': 'node --test', build: 'tsc' };
+    const fx = fixture({ 'package.json': pkg(s0) });
+    assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkg({ ...s0, 'test:unit': 'true' }) }), npmTest), 'G4')?.files, ['package.json'], t);
+  }
+  const s1 = { test: 'jest', unit: 'jest --ci', postinstall: 'echo', prepare: 'husky' };
+  const fx = fixture({ 'package.json': pkg(s1) });
+  for (const k of ['postinstall', 'prepare', 'preinstall', 'prepack']) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkg({ ...s1, [k]: 'rm -rf tests' }) }, { fresh: true }), {}), 'G4')?.files, ['package.json'], k);
+  }
+  assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkg({ ...s1, test: 'true' }) }, { fresh: true }), { tests: { all: ['node', '--run', 'test'] } }), 'G4')?.files, ['package.json']);
+  assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkg({ ...s1, pretest: 'exit 0' }) }, { fresh: true }), { tests: { all: ['node', '--run=test'] } }), 'G4')?.files, ['package.json']);
+  assert.deepEqual(run(fx, fx.change({ 'package.json': pkg({ ...s1, unit: 'true' }) }, { fresh: true }), { tests: { all: ['node', '--run', 'test'] } }), [], 'unrelated script');
+});
+test('G4: a test-runner dependency pointed at a non-registry specifier fires; a registry version change does not', () => {
+  const pkg = (o) => `${JSON.stringify({ name: 'x', devDependencies: { jest: '^29.0.0', lodash: '^4' }, ...o }, null, 2)}\n`;
+  const fx = fixture({ 'package.json': pkg({}) });
+  const g4 = (o) => hit(run(fx, fx.change({ 'package.json': pkg(o) }, { fresh: true })), 'G4')?.files;
+  assert.equal(g4({ devDependencies: { jest: '^30.0.0', lodash: '^4' } }), undefined, 'registry bump');
+  assert.equal(g4({ devDependencies: { jest: '^29.0.0', lodash: 'file:./lodash' } }), undefined, 'non-runner package');
+  for (const o of [{ devDependencies: { jest: 'file:./fake-jest', lodash: '^4' } }, { devDependencies: { jest: 'github:evil/jest', lodash: '^4' } },
+    { devDependencies: { jest: 'npm:fake-jest@1', lodash: '^4' } }, { devDependencies: { jest: '../fake', lodash: '^4' } },
+    { dependencies: { '@jest/core': 'git+https://x/y.git' } }, { dependencies: { vitest: 'link:../v' } }, { peerDependencies: { mocha: 'https://x/m.tgz' } },
+    { resolutions: { '**/jest': 'portal:./j' } }, { overrides: { foo: { jest: 'file:./j' } } }, { overrides: { 'jest@29': 'patch:jest@29#x' } },
+    { pnpm: { overrides: { '@playwright/test': 'workspace:*' } } }]) assert.deepEqual(g4(o), ['package.json'], JSON.stringify(o));
+});
+test('G2: node:test / jasmine idioms fire in test files; an explicit false option does not', () => {
+  const fx = fixture({});
+  for (const c of ['test("x", { skip: true }, f)', 'test("x", { todo: "later" }, f)', 'it("x", { only: true }, f)', 'it.todo("x")', 'test.todo("x")', 'pending("x")']) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'tests/n.test.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['tests/n.test.js'], c);
+  }
+  assert.equal(hit(run(fx, fx.change({ 'tests/n.test.js': 'test("x", { skip: false, only: false }, f)\n' }, { fresh: true })), 'G2'), undefined);
+  for (const c of ['const t = require("node:test"); t.skip("x")', 'unittest.skip("x")']) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'src/h.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['src/h.js'], c);
+  }
+});
+test('G3: a stub message on the line after the throw fires', () => {
+  const fx = fixture({});
+  assert.deepEqual(hit(run(fx, fx.change({ 'src/i.js': 'throw new Error(\n  "not implemented");\n' })), 'G3')?.files, ['src/i.js']);
+});
+test('a runner result without a string stdout or numeric exit code throws (never reads as clean)', () => {
+  const fx = fixture({});
+  const head = fx.change({ 'tests/z.test.js': 'it.only("x")\n' });
+  for (const bad of [{ code: 0, out: undefined }, { code: null, out: '' }, { code: '0', out: '' }]) {
+    const git = (...a) => (a.includes('--raw') ? bad : fx.git(...a));
+    assert.throws(() => ag.checkDiff({ git, baseRef: BASE, headSha: head, config: {}, specPaths: [] }), /git/, JSON.stringify(bad));
+  }
+});
+test('non-normalised specPaths are refused instead of silently disabling G5', () => {
+  const fx = fixture({});
+  const head = fx.change({ 'x.js': '1\n' });
+  for (const sp of ['./docs/s.md', '../s.md', 'docs/../s.md', '/docs/s.md', 'docs\\s.md', 'docs//s.md', '', 'docs/s.md/', 5]) {
+    assert.throws(() => run(fx, head, {}, [sp]), /spec path/, String(sp));
+  }
+  assert.throws(() => run(fx, head, {}, 'docs/s.md'), /specPaths/);
+});
+test('repo-local diff.external, textconv and a gitattributes diff driver are never run', () => {
+  const fx = fixture({ 'tests/a.test.js': 'it("a", f)\n' });
+  const marker = path.join(fx.root, 'MARKER');
+  const script = path.join(fx.root, 'evil.sh');
+  fs.writeFileSync(script, `#!/bin/sh\ntouch "${marker}"\ncat "$1" 2>/dev/null\n`, { mode: 0o755 });
+  fx.sh(fx.work, 'config', 'diff.external', script);
+  fx.sh(fx.work, 'config', 'diff.evil.textconv', script);
+  fx.sh(fx.work, 'config', 'diff.evil.command', script);
+  fs.writeFileSync(path.join(fx.work, '.git', 'info', 'attributes'), '* diff=evil\n*.js -diff\n');
+  const h = run(fx, fx.change({ 'tests/a.test.js': 'it.only("a", f)\n', 'src/s.js': 'todo!()\n' }));
+  assert.equal(fs.existsSync(marker), false, 'no driver ran');
+  assert.deepEqual(ids(h), ['G1', 'G2', 'G3']);
 });

@@ -6,6 +6,12 @@
 //
 // git is injected: (...argv) => { code, out, err }, run without a shell (the driver passes gitSafe; tests a spawnSync wrapper).
 // Any git failure or unparseable output THROWS (fail closed): the caller must treat an exception as a hold, never as clean.
+// baseRef is `refs/remotes/origin/<branch>` or a raw 40-hex commit sha (e.g. the base sha recorded at merge time).
+//
+// OUT OF SCOPE for this mechanical check (the hidden verification scenarios are the backstop): semantic stubs and hard-coded
+// results; skips built dynamically (`Reflect.get(it, "skip")`, `globalThis['i' + 't']`); stub strings built at runtime; a new
+// Go `_test.go` whose TestMain calls os.Exit(0); a test that patches `assert`; lockfiles; tsconfig; helpers in directories
+// that are not test-file patterns (e.g. `test/` singular) unless listed in verification.test_globs.
 import { globToRegex } from './config.mjs';
 import { CI_PATHS } from './queue.mjs';
 import { canonicalSpec, specRegions, MAX_LINE } from './criteria.mjs';
@@ -13,7 +19,7 @@ import { canonicalSpec, specRegions, MAX_LINE } from './criteria.mjs';
 const SHA = /^[0-9a-f]{40}$/;
 const NULL_SHA = /^0+$/;
 const SPEC_MAX = 256 * 1024; // G5 DoS guard: a bigger head spec is a hit, never parsed
-const BLOB_MAX = 1024 * 1024; // package.json / pyproject.toml / setup.cfg read for G4; bigger = hit
+const BLOB_MAX = 1024 * 1024; // package.json read for G4; bigger = hit
 const SCRIPTS_MAX = 500;
 
 const fail = (msg) => { throw new Error(`antigaming: ${msg}`); };
@@ -32,17 +38,22 @@ function testGlobs(config) {
 }
 export function isTestFile(p, globs = []) {
   const b = base(p);
-  if (/\.test\./i.test(b) || /\.spec\./i.test(b) || /^test_.*\.py$/i.test(b) || /_test\.go$/i.test(b)) return true;
+  if (/\.(?:test|spec)(?:\.|$)/i.test(b) || /^test_.*\.py$/i.test(b) || /_test\.go$/i.test(b)) return true;
   if (dirs(p).some((d) => d === '__tests__' || d === 'tests')) return true;
   return globs.some((re) => re.test(p));
 }
 const isDoc = (p) => /\.(md|mdx|markdown|txt|rst|adoc)$/i.test(p);
 
-const PROTECTED_BASENAMES = new Set(['.mcp.json', 'claude.md', 'claude.local.md', 'agents.md', '.gitattributes', '.gitmodules', 'pytest.ini',
-  'conftest.py', 'tox.ini', '.pre-commit-config.yaml', 'lefthook.yml', 'lefthook.yaml', '.lefthook.yml']);
-const PROTECTED_BASE_RE = [/^jest\.config\./i, /^vitest\.(config|workspace)\./i, /^karma\.conf\./i, /^playwright\.config\./i, /^cypress\.config\./i,
-  /^ava\.config\./i, /^\.mocharc/i, /^\.nycrc/i, /^\.c8rc/i];
-const PROTECTED_DIRS = new Set(['.claude', '.husky', '.githooks']);
+// Python test configuration is protected whole (no TOML/INI parser here: any change to these files holds; over-protects).
+const PROTECTED_BASENAMES = new Set(['.mcp.json', 'claude.md', 'claude.local.md', 'agents.md', '.gitattributes', '.gitmodules',
+  'pytest.ini', '.pytest.ini', 'pytest.toml', 'pyproject.toml', 'setup.cfg', 'conftest.py', 'tox.ini',
+  '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml',
+  '.pre-commit-config.yaml', 'lefthook.yml', 'lefthook.yaml', '.lefthook.yml',
+  '.travis.yml', 'bitbucket-pipelines.yml', '.drone.yml']); // CI systems not in queue.mjs CI_PATHS
+const PROTECTED_BASE_RE = [/^jest\.(config|setup)\./i, /^vitest\.(config|workspace|setup)\./i, /^vite\.config\./i, /^karma\.conf\./i,
+  /^playwright\.config\./i, /^cypress\.config\./i, /^ava\.config\./i, /^\.mocharc/i, /^\.nycrc/i, /^\.c8rc/i, /^setuptests\./i,
+  /^babel\.config\./i, /^\.babelrc/i];
+const PROTECTED_DIRS = new Set(['.claude', '.husky', '.githooks', '__mocks__', '.gitea', '.forgejo']);
 // Case-insensitive: on a case-insensitive file system a lower-case agent file is read under its upper-case name.
 export function isProtectedPath(p) {
   if (p.toLowerCase() === '.product/delivery.json') return true;
@@ -55,13 +66,17 @@ export function isProtectedPath(p) {
 // ---- line patterns (added lines only) ---------------------------------------------------------------------------------------
 // G2 in test files: every listed form plus the trivial dodges: a reference without a call (`const s = it.skip`), bracket or
 // computed access on a test function (`it['sk' + 'ip']`), destructuring (`const { skip } = test`), `.each`/tagged-template
-// chains, bare x-aliases (`const later = xit`) and focus (= only). `.skip` followed by a word is prose and not matched.
+// chains, bare x-aliases (`const later = xit`), focus (= only), node:test / jasmine idioms (`{ skip: true }`, `{ todo: 'x' }`,
+// `it.todo(`, `pending(`). `.skip` followed by a word is prose and not matched. Any `skip|todo|only:` option other than `false`
+// is a hit in a test file (over-protects, e.g. a pagination `{ skip: 2 }` costs one fix round).
 // Matched over the file's added lines joined by "\n" (so `it.\nskip(` is seen), raw and with /* */ comments removed.
 const SKIP_IN_TESTS = [
-  /\.\s*(?:skip|only|skipIf)\b(?!\s+[a-z])/,
-  /\[\s*(['"`])(?:skip|only|skipIf)\1\s*\]/,
+  /\.\s*(?:skip|only|skipIf|todo)\b(?!\s+[a-z])/,
+  /\[\s*(['"`])(?:skip|only|skipIf|todo)\1\s*\]/,
+  /(?<![\w$])(?:skip|todo|only)\s*:(?!\s*false\b)/,
+  /(?<![\w$.])pending\s*\(/,
   /(?<![\w$.])(?:describe|it|test|context|suite|specify|bench)\s*\[/,
-  /\{[^{}]{0,200}(?<![\w$])(?:skip|only|skipIf)(?![\w$])[^{}]{0,200}\}\s*=/, // bounded: no quadratic scan on hostile input
+  /\{[^{}]{0,200}(?<![\w$])(?:skip|only|skipIf|todo)(?![\w$])[^{}]{0,200}\}\s*=/, // bounded: no quadratic scan on hostile input
   /(?<![\w$.])(?:xit|xdescribe|xtest|xcontext|xspecify)(?![\w$])/,
   /(?<![\w$.])(?:fit|fdescribe|fcontext)\s*\(/,
   /\bpytest\s*\.\s*mark\s*\.\s*(?:skip|xfail)/,
@@ -81,13 +96,15 @@ const SKIP_ANYWHERE = [
   /\bpytest\s*\.\s*(?:skip|xfail)\s*\(/,
   /@Disabled\b/,
   /\bt\.Skip(?:Now|f)?\s*\(/,
+  /\bt\s*\.\s*(?:skip|todo)\s*\(/, // node:test context
+  /\bunittest\s*\.\s*(?:skip|expectedFailure)/,
 ];
-// G3 in non-test, non-doc files.
+// G3 in non-test, non-doc files (joined added text, so `throw new Error(\n  "not implemented")` is seen).
 const STUBS = [
   /\bNotImplemented(?:Error|Exception)\b/,
   /\bunimplemented!\s*\(/,
   /\btodo!\s*\(/,
-  /\b(?:throw|raise|panic)\b[^;\n]{0,60}?(['"`])\s*not\s+(?:yet\s+)?implemented/i,
+  /\b(?:throw|raise|panic)\b[^;]{0,60}?(['"`])\s*not\s+(?:yet\s+)?implemented/i,
 ];
 
 // Linear (a lazy /\/\*[\s\S]*?\*\//g rescans to the end for every unclosed "/*": quadratic on hostile input).
@@ -105,8 +122,9 @@ function stripBlockComments(t) {
 // ---- git plumbing -------------------------------------------------------------------------------------------------------------
 function runGit(git, ...args) {
   const r = git('-c', 'core.quotePath=false', ...args);
-  if (!r || r.code !== 0) fail(`git ${args[0]} failed (exit ${r?.code})`);
-  return String(r.out ?? '');
+  if (!r || typeof r.code !== 'number' || r.code !== 0) fail(`git ${args[0]} failed (exit ${r?.code})`);
+  if (typeof r.out !== 'string') fail(`git ${args[0]} returned no output string`); // a missing stdout must never read as clean
+  return r.out;
 }
 
 // git's C-style quoting of a path in a patch header (with core.quotePath=false only ", \ and control bytes are escaped).
@@ -136,8 +154,12 @@ function rawEntries(out) {
 
 // --unified=0 patch -> Map(path -> { added: string[], removed: string[] }). Sections are matched to paths by their exact
 // header (never by order), and hunks are read by their line counts, so file content can never be taken for a header.
-function patchLines(out, paths) {
+// A type change (status T, e.g. file <-> symlink) is printed as two sections (delete + add) with the same header: merged.
+function patchLines(out, entries) {
+  const paths = entries.map((e) => e.path);
   const byHeader = new Map(paths.map((p) => [`diff --git ${cquote(`a/${p}`)} ${cquote(`b/${p}`)}`, p]));
+  const maxSections = new Map(entries.map((e) => [e.path, e.status === 'T' ? 2 : 1]));
+  const seen = new Map();
   const res = new Map();
   const lines = out.split('\n');
   let cur = null;
@@ -145,8 +167,12 @@ function patchLines(out, paths) {
     const l = lines[i];
     if (l.startsWith('diff --git ')) {
       const p = byHeader.get(l);
-      if (p === undefined || res.has(p)) fail('unexpected patch header');
-      cur = { added: [], removed: [] }; res.set(p, cur);
+      if (p === undefined) fail('unexpected patch header');
+      const n = (seen.get(p) ?? 0) + 1;
+      if (n > maxSections.get(p)) fail('unexpected repeated patch header');
+      seen.set(p, n);
+      if (!res.has(p)) res.set(p, { added: [], removed: [] });
+      cur = res.get(p);
       continue;
     }
     if (!cur) { if (l === '' && i === lines.length - 1) continue; fail('patch output before the first header'); }
@@ -176,67 +202,88 @@ function blob(git, sha, max) {
 
 // ---- G4 content checks ------------------------------------------------------------------------------------------------------
 // Script names an argv runs through npm/pnpm/yarn/bun: every non-flag token after the tool, minus run/run-script (an
-// over-approximation: a flag value such as `--prefix web` is also protected, which only protects more).
+// over-approximation: a flag value such as `--prefix web` is also protected, which only protects more); `node --run <name>`.
 const PM = new Set(['npm', 'pnpm', 'yarn', 'bun']);
 const NPM_ALIASES = { t: 'test', tst: 'test' };
+const tool = (a) => String(a).split(/[/\\]/).at(-1).replace(/\.(cmd|exe)$/i, '').toLowerCase();
 function scriptNames(config) {
   const cmds = [config?.tests?.all, ...(Array.isArray(config?.local_checks) ? config.local_checks.map((c) => c?.command) : [])];
   const names = new Set();
   for (const argv of cmds) {
     if (!Array.isArray(argv) || !argv.length) continue;
-    if (!PM.has(String(argv[0]).split(/[/\\]/).at(-1).replace(/\.(cmd|exe)$/i, ''))) continue;
-    for (const a of argv.slice(1)) {
-      const s = String(a);
+    const t = tool(argv[0]); const rest = argv.slice(1).map(String);
+    if (t === 'node') {
+      rest.forEach((a, i) => { if (a === '--run' && rest[i + 1]) names.add(rest[i + 1]); else if (a.startsWith('--run=')) names.add(a.slice(6)); });
+      continue;
+    }
+    if (!PM.has(t)) continue;
+    for (const s of rest) {
       if (!s || s.startsWith('-') || ['run', 'run-script', 'rum', 'urn'].includes(s)) continue;
-      const n = NPM_ALIASES[s] ?? s;
-      names.add(n); names.add(`pre${n}`); names.add(`post${n}`);
+      names.add(NPM_ALIASES[s] ?? s);
     }
   }
   return names;
 }
+// npm lifecycle scripts run by an install (the driver's test setup) or pack: always protected in every package.json.
+const LIFECYCLE = ['prepare', 'preinstall', 'install', 'postinstall', 'prepublish', 'prepublishOnly', 'prepack', 'postpack'];
+// A protected script that selects scripts by pattern (or through a runner that does) can reach any script: protect them all.
+const WILDCARD = /[*?{}[\]/]|(?<![\w-])(?:npm-run-all2?|run-s|run-p|concurrently|wireit)(?![\w-])/;
 const PKG_TEST_KEYS = ['jest', 'mocha', 'ava', 'c8', 'nyc', 'vitest'];
+// Test-runner packages whose dependency may not be pointed at a non-registry specifier (file:, link:, git, URL, workspace:,
+// portal:, patch:, npm: alias, a path or owner/repo shorthand). A registry version/range change is not a hit. Lockfiles are
+// out of scope.
+const RUNNERS = new Set(['jest', 'vitest', 'mocha', 'ava', 'tap', 'playwright', '@playwright/test', 'cypress', 'karma', 'jasmine', 'uvu', 'ts-jest', 'babel-jest', 'c8', 'nyc']);
+const DEP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'resolutions', 'overrides'];
+const nonRegistry = (v) => typeof v === 'string' && (/[:/\\]/.test(v) || /^\s*[.~]/.test(v));
+function runnerName(key) {
+  // "jest", "jest@^29", "**/jest", "foo/jest", "@jest/core", "@jest/core@1" -> runner?
+  const k = String(key).replace(/(?<=.)@[^@/]*$/, '');
+  const last = k.split('/').at(-1); const scoped = k.split('/').slice(-2).join('/');
+  return RUNNERS.has(last) || RUNNERS.has(scoped) || /(^|\/)@jest\/[^/]+$/.test(k);
+}
+// Map "path -> specifier" for runner packages, walking nested npm overrides (bounded depth).
+function runnerSpecs(pkg) {
+  const out = new Map();
+  const walk = (o, at, depth, isRunner) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o) || depth > 8) return;
+    for (const k of Object.keys(o)) {
+      const v = o[k]; const r = isRunner || runnerName(k);
+      if (typeof v === 'string') { if (r) out.set(`${at}>${k}`, v); } else walk(v, `${at}>${k}`, depth + 1, r);
+    }
+  };
+  for (const sct of DEP_SECTIONS) walk(own(pkg, sct), sct, 0, false);
+  walk(own(own(pkg, 'pnpm'), 'overrides'), 'pnpm.overrides', 0, false);
+  return out;
+}
 const own = (o, k) => (o && typeof o === 'object' && !Array.isArray(o) && Object.hasOwn(o, k) ? o[k] : undefined);
 function packageJsonHit(baseText, headText, names) {
   let b; let h;
   try { b = baseText === '' ? {} : JSON.parse(baseText); h = headText === '' ? {} : JSON.parse(headText); } catch { return true; }
   if (PKG_TEST_KEYS.some((k) => JSON.stringify(own(b, k)) !== JSON.stringify(own(h, k)))) return true;
-  if (!names.size) return false;
+  const bd = runnerSpecs(b);
+  for (const [k, v] of runnerSpecs(h)) if (nonRegistry(v) && bd.get(k) !== v) return true;
   const bs = own(b, 'scripts'); const hs = own(h, 'scripts');
   const keys = new Set([...Object.keys(bs && typeof bs === 'object' ? bs : {}), ...Object.keys(hs && typeof hs === 'object' ? hs : {})]);
   if (keys.size > SCRIPTS_MAX) return true;
-  // Close over scripts a protected script calls (any other script name appearing as a token in its base or head value).
-  const prot = new Set(names); const todo = [...names];
+  const changed = (k) => JSON.stringify(own(bs, k)) !== JSON.stringify(own(hs, k));
+  // Close over scripts a protected script calls (any other script name appearing as a token in its base or head value), with
+  // the pre/post hooks of every protected script; a wildcard/runner call protects every script.
+  const prot = new Set(); const todo = [];
+  const add = (n) => { for (const x of [n, `pre${n}`, `post${n}`]) if (!prot.has(x)) { prot.add(x); todo.push(x); } };
+  for (const n of [...names, ...LIFECYCLE]) add(n);
   while (todo.length) {
     const n = todo.pop();
     const vals = [own(bs, n), own(hs, n)].filter((v) => typeof v === 'string').join('\n');
     if (!vals) continue;
+    if (WILDCARD.test(vals)) return [...keys].some(changed);
     const tokens = new Set(vals.split(/[^\w:.-]+/));
     for (const k of keys) {
       if (prot.has(k)) continue;
       // A key with other characters falls back to a substring test (over-protects, never under-protects).
-      if (/^[\w:.-]+$/.test(k) ? tokens.has(k) : vals.includes(k)) { prot.add(k); todo.push(k); }
+      if (/^[\w:.-]+$/.test(k) ? tokens.has(k) : vals.includes(k)) add(k);
     }
   }
-  for (const k of prot) if (JSON.stringify(own(bs, k)) !== JSON.stringify(own(hs, k))) return true;
-  return false;
-}
-
-// Lines inside pytest tables: pyproject.toml [tool.pytest...] (header may use spaces/quotes) or setup.cfg [tool:pytest] / [pytest].
-// A TOML block ends only at an unambiguous bare-key header, so `[true]` inside a multi-line array does not end it.
-function pytestBlocks(text, kind) {
-  const out = []; let inBlock = false;
-  for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
-    if (kind === 'toml') {
-      const hdr = /^\s*\[\[?\s*([A-Za-z_][\w-]*(?:\s*\.\s*[\w-]+)*)\s*\]\]?\s*(?:#.*)?$/.exec(line);
-      const loose = line.trim().startsWith('[') ? line.replace(/[\s"']/g, '') : '';
-      if (/^\[\[?tool\.pytest(?:[.\]]|$)/i.test(loose)) { inBlock = true; out.push(line); continue; }
-      if (hdr && !/^(true|false|inf|nan)$/i.test(hdr[1])) inBlock = false;
-    } else if (/^\[[^\]]*\]/.test(line)) {
-      inBlock = /^\[\s*(tool:pytest|pytest)\s*\]/i.test(line);
-    }
-    if (inBlock) out.push(line);
-  }
-  return JSON.stringify(out);
+  return [...prot].some(changed);
 }
 
 // ---- G5 ---------------------------------------------------------------------------------------------------------------------
@@ -273,6 +320,12 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
   if (typeof git !== 'function') fail('git runner required');
   if (typeof headSha !== 'string' || !SHA.test(headSha)) fail('head must be a 40-hex commit sha');
   if (typeof baseRef !== 'string' || !validBase(baseRef)) fail('base must be refs/remotes/origin/<branch> or a commit sha');
+  if (!Array.isArray(specPaths)) fail('specPaths must be an array');
+  // Exact repo-relative paths: a non-normalised one would silently never match and disable G5, so it is refused.
+  for (const sp of specPaths) {
+    if (typeof sp !== 'string' || !sp || sp.startsWith('/') || sp.includes('\\') || /^[A-Za-z]:/.test(sp) || /[\0\n]/.test(sp)
+      || sp.split('/').some((x) => x === '' || x === '.' || x === '..')) fail(`spec path is not a normalised repo-relative path: ${JSON.stringify(String(sp)).slice(0, 80)}`);
+  }
   const head = runGit(git, 'rev-parse', '--verify', '--quiet', '--end-of-options', `${headSha}^{commit}`).trim();
   runGit(git, 'rev-parse', '--verify', '--quiet', '--end-of-options', `${baseRef}^{commit}`);
   const mb = runGit(git, 'merge-base', '--end-of-options', baseRef, head).trim();
@@ -281,14 +334,14 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
   const common = ['--no-renames', '--no-ext-diff', '--no-textconv', '--no-relative', '--ignore-submodules=none', mb, head, '--'];
   const entries = rawEntries(runGit(git, 'diff', '--raw', '-z', '--no-abbrev', ...common));
   if (!entries.length) return [];
-  const patch = patchLines(runGit(git, 'diff', '--no-color', '--text', '--unified=0', '--src-prefix=a/', '--dst-prefix=b/', ...common), entries.map((e) => e.path));
+  const patch = patchLines(runGit(git, 'diff', '--no-color', '--text', '--unified=0', '--src-prefix=a/', '--dst-prefix=b/', ...common), entries);
 
   const globs = testGlobs(config);
   const names = scriptNames(config);
-  const specs = new Set((Array.isArray(specPaths) ? specPaths : []).map(String));
+  const specs = new Set(specPaths);
   const found = { G1: new Set(), G2: new Set(), G3: new Set(), G4: new Set(), G5: new Set() };
   for (const e of entries) {
-    const p = e.path; const { added, removed } = patch.get(p);
+    const p = e.path; const { added } = patch.get(p);
     const test = isTestFile(p, globs);
     // Raw text and a copy with /* */ comments removed (raw is kept: a "/*" inside a string must not hide a marker).
     const txt = added.join('\n'); const texts = [txt, stripBlockComments(txt)];
@@ -297,19 +350,9 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
     if (any(test ? SKIP_IN_TESTS : SKIP_ANYWHERE)) found.G2.add(p);
     if (!test && !isDoc(p) && any(STUBS)) found.G3.add(p);
     if (isProtectedPath(p)) found.G4.add(p);
-    else {
-      const b = base(p).toLowerCase();
-      if (b === 'package.json' || b === 'pyproject.toml' || b === 'setup.cfg') {
-        const bt = blob(git, e.oldSha, BLOB_MAX); const ht = blob(git, e.newSha, BLOB_MAX);
-        let hitp;
-        if (bt.tooBig || ht.tooBig) hitp = true;
-        else if (b === 'package.json') hitp = packageJsonHit(bt.text, ht.text, names);
-        else {
-          const kind = b === 'setup.cfg' ? 'ini' : 'toml';
-          hitp = pytestBlocks(bt.text, kind) !== pytestBlocks(ht.text, kind) || [...added, ...removed].some((l) => /pytest/i.test(l));
-        }
-        if (hitp) found.G4.add(p);
-      }
+    else if (base(p).toLowerCase() === 'package.json') {
+      const bt = blob(git, e.oldSha, BLOB_MAX); const ht = blob(git, e.newSha, BLOB_MAX);
+      if (bt.tooBig || ht.tooBig || packageJsonHit(bt.text, ht.text, names)) found.G4.add(p);
     }
     if (specs.has(p) && specChanged(git, e, parser)) found.G5.add(p);
   }
