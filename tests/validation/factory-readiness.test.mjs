@@ -44,7 +44,7 @@ test('config: ready accepts log_pattern and base_url/logs_dir', () => {
 });
 test('isLocalUrl: only http localhost / 127.0.0.1 with a port', () => {
   for (const u of ['http://localhost:3000', 'http://127.0.0.1:8080/health']) assert.equal(c.isLocalUrl(u), true, u);
-  for (const u of ['http://localhost', 'https://localhost:3000', 'http://example.com:80', ['http://localhost:3000', 'evil.com'].join('@'), 'http://localhost.evil.com:3000', '']) assert.equal(c.isLocalUrl(u), false, u);
+  for (const u of ['http://localhost', 'https://localhost:3000', 'http://example.com:80', ['http://localhost:3000', 'evil.com'].join('@') /* userinfo trick; joined so secret scanners don't read it as Basic Auth */,'http://localhost.evil.com:3000', '']) assert.equal(c.isLocalUrl(u), false, u);
 });
 
 // ---- readiness checks (Task 3) -----------------------------------------------------------------------------------------
