@@ -1,12 +1,19 @@
-// Spec criteria extraction: AC table, EC / ER lists and the optional HTTP contract; a hash over those sections only.
+// Spec criteria: (1) the INTEGRITY anchor and (2) best-effort extraction for scenario COVERAGE.
 //
-// FAIL-CLOSED: scenarios are bound to criteriaHash(sections), so a parse that silently drops a section would let a spec
-// edit slip past the anchor. extractCriteria therefore returns { errors, ok }. Consumers (the scenario lint, Task 4) MUST
-// refuse to bind or accept scenarios when ok === false. criteriaHash stays a pure function of `sections`.
+// (1) INTEGRITY. criteriaHash(sections) is sha256 over a canonical encoding of the WHOLE spec text except explicit mutable
+// regions found with RAW LINE PATTERNS only (no Markdown model): see mutableRegions(). `sections` (kept under that name for
+// consumers) is that canonical encoding: a JSON array of lines (CRLF/CR -> LF, BOM stripped, trailing spaces/tabs trimmed,
+// leading indentation preserved, blank-line runs collapsed). Any base-spec edit outside the mutable regions, including
+// prose, comments, renumbering or section moves, changes the hash and invalidates bound scenarios (intended). If anything
+// fools the delimiters, MORE text is hashed (worst case a false "spec changed"), never less. The anchor does not depend on
+// any parse of headings, fences or comments.
+// Mutable regions: (a) frontmatter lines whose key is `status` or `delivery` (exactly what the implementer close-out writes:
+// skills/implementer/references/close-out.md, and `pi transition` toggling status); (b) the `## Delivery log` section.
 //
-// Hash notes: `sections` holds, for every tracked section in document order, its normalised heading line (INCLUDING the
-// section number, so renumbering a section invalidates bound scenarios - intended) and its whitespace-collapsed raw body,
-// comments and code fences included. IDs and contract entries are parsed only from text outside comments and fences.
+// (2) EXTRACTION (ids, contract, errors) only drives the scenario coverage lint. It is best-effort, NOT the integrity anchor.
+// It is fail-closed on what it can see (errors/ok; consumers MUST refuse to bind scenarios when ok === false) but it does not
+// model HTML blocks, so visible EC/ER/contract items hidden by HTML-block or comment tricks can be missed: a coverage gap
+// only, never an integrity bypass (the hidden text is still hashed).
 // Contract paths keep placeholders such as /api/projects/{id}; only the query string / fragment is stripped.
 import { createHash } from 'node:crypto';
 
@@ -20,7 +27,7 @@ const TITLES = {
 const METHODS = 'GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS';
 
 const norm = (s) => String(s).replace(/\s+/g, ' ').trim();
-const trackedKey = (title) => TITLES[norm(title.replace(/^[\d.)\s§-]*/, '')).toLowerCase()];
+const trackedKey = (title) => TITLES[norm(title.replace(/^[\d.)\s\u00a7-]*/, '')).toLowerCase()];
 
 // Walk one line outside a fence: returns the visible text (comments removed, inline code respected) and the comment state after it.
 function scanLine(line, inComment) {
@@ -37,22 +44,62 @@ function scanLine(line, inComment) {
       if (close !== -1) { vis += line.slice(i, close + n); i = close + n; continue; }
       vis += line.slice(i, i + n); i += n; continue;
     }
-    if (line.startsWith('<!--', i)) { inComment = true; i += 4; continue; }
+    if (line.startsWith('<!--', i)) {
+      const k = line.indexOf('-->', i + 2); // <!--> and <!---> are complete comments
+      if (k === -1) { inComment = true; break; }
+      i = k + 3; continue;
+    }
     vis += line[i++];
   }
   return { vis, inComment };
 }
 
 const MAX_LINE = 10000;
-const norm_ = norm;
-// Collapse whitespace runs but keep the leading indentation width (tab = 4) as a prefix, so an indented code block that
-// looks like a section does not hash like a real one.
-function normKeepIndent(line) {
-  const rest = norm_(line);
-  if (!rest) return '';
-  let w = 0;
-  for (const ch of line) { if (ch === ' ') w++; else if (ch === '\t') w += 4; else break; }
-  return `${w}:${rest}`;
+// ---- integrity anchor ---------------------------------------------------------------------------------------------------
+const MUTABLE_FM_KEYS = new Set(['status', 'delivery']);
+const toLines = (text) => String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+
+// Mutable line ranges of a spec: [{start, end}] 0-based, end exclusive, indexes into the LF-normalised, BOM-stripped lines.
+export function mutableRegions(specText) {
+  const lines = toLines(specText);
+  const out = [];
+  if (lines[0] !== undefined && /^---[ \t]*$/.test(lines[0])) {
+    const close = lines.findIndex((l, i) => i > 0 && /^---[ \t]*$/.test(l));
+    if (close > 0) {
+      for (let i = 1; i < close; i++) {
+        const m = /^([A-Za-z0-9_-]+)[ \t]*:/.exec(lines[i]);
+        if (m && MUTABLE_FM_KEYS.has(m[1])) out.push({ start: i, end: i + 1 });
+      }
+    }
+  }
+  const d = lines.findIndex((l) => /^## Delivery log[ \t\r]*$/.test(l));
+  if (d !== -1) {
+    let e = lines.length;
+    for (let i = d + 1; i < lines.length; i++) if (lines[i].startsWith('## ')) { e = i; break; }
+    out.push({ start: d, end: e });
+  }
+  return out;
+}
+
+function trimEndSpTab(t) {
+  let b = t.length;
+  while (b > 0 && (t[b - 1] === ' ' || t[b - 1] === '\t')) b--;
+  return t.slice(0, b);
+}
+
+export function canonicalSpec(specText) {
+  const lines = toLines(specText);
+  const skip = new Set();
+  for (const r of mutableRegions(specText)) for (let i = r.start; i < r.end; i++) skip.add(i);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (skip.has(i)) continue;
+    const l = trimEndSpTab(lines[i]);
+    if (l === '' && (out.length === 0 || out[out.length - 1] === '')) continue;
+    out.push(l);
+  }
+  while (out.length && out[out.length - 1] === '') out.pop();
+  return JSON.stringify(out);
 }
 
 function stripComments(t) {
@@ -61,7 +108,7 @@ function stripComments(t) {
     const j = t.indexOf('<!--', i);
     if (j === -1) return out + t.slice(i);
     out += t.slice(i, j);
-    const k = t.indexOf('-->', j + 4);
+    const k = t.indexOf('-->', j + 2); // <!--> and <!---> are complete comments
     if (k === -1) return out;
     i = k + 3;
   }
@@ -79,7 +126,7 @@ function parseAtx(line) {
   const m = /^ {0,3}(#{1,6})/.exec(line);
   if (!m) return null;
   const rest = line.slice(m[0].length);
-  if (rest && rest[0] === '#') return null;
+  if (rest && !/^[ \t]/.test(rest)) return null; // "##x" is not a heading
   let title = trimSpTab(rest);
   let e = title.length;
   while (e > 0 && title[e - 1] === '#') e--;
@@ -87,11 +134,18 @@ function parseAtx(line) {
   return { level: m[1].length, title, spaced: /^[ \t]/.test(rest) };
 }
 
+const CONFUSABLES = { '\u0430': 'a', '\u0435': 'e', '\u043e': 'o', '\u0440': 'p', '\u0441': 'c', '\u0443': 'y', '\u0445': 'x', '\u0456': 'i', '\u0458': 'j', '\u0455': 's', '\u0501': 'd', '\u0261': 'g', '\u03bf': 'o', '\u03bd': 'v', '\u03b9': 'i', '\u0415': 'e', '\u0410': 'a', '\u0421': 'c', '\u041e': 'o', '\u0420': 'p', '\u041d': 'h', '\u041a': 'k', '\u041c': 'm', '\u0422': 't', '\u0425': 'x', '\u0412': 'b' };
+// ASCII skeleton of a title: NFKC, zero-width removed, Unicode spaces to ' ', common Cyrillic/Greek lookalikes folded.
+function skeleton(t) {
+  return String(t).normalize('NFKC').replace(/[\u00ad\u200b-\u200f\u2060\ufeff]/g, '').replace(/\s/g, ' ')
+    .replace(/[^\x00-\x7f]/g, (c) => CONFUSABLES[c] ?? c);
+}
+
 // Title with emphasis, comments, ALL non-ASCII, a trailing colon and the number prefix removed; lower-cased.
 function looseTitle(t, keepNonAscii = false) {
   let x = stripComments(t).replace(/[*_`]/g, '');
   if (!keepNonAscii) x = x.replace(/[^\x00-\x7f]/g, '');
-  x = norm(x.replace(/^[\d.)\s§-]*/, '')).toLowerCase();
+  x = norm(x.replace(/^[\d.)\s\u00a7-]*/, '')).toLowerCase();
   return x;
 }
 
@@ -101,21 +155,31 @@ function looseTitle(t, keepNonAscii = false) {
 function nearMiss(title) {
   const loose = looseTitle(title);
   if (TITLES[loose]) return loose;
+  const sk = looseTitle(skeleton(title));
+  if (TITLES[sk]) return sk;
   const kept = looseTitle(title, true);
   for (const t of Object.keys(TITLES)) {
     if (kept.startsWith(t)) {
       const rem = kept.slice(t.length);
-      if (rem && rem.length <= 40 && /^\s*(\(.*\)|[:\-–—].*)$/.test(rem)) return t;
+      if (rem && rem.length <= 40 && /^\s*(\(.*\)|[:\-\u2013\u2014].*)$/.test(rem)) return t;
     }
   }
   return null;
 }
 
-const ID_LINE = /^\s*(?:[-*+]\s+|\|\s*)\**(AC|EC|ER)[-_ ]?\d+/i;
-const CONTRACT_LINE = new RegExp('^\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?`\\s*(?:' + METHODS + ')\\s+/', 'i');
+// An ID-shaped line: optional list/table marker (-, *, +, 1., 1), |), optional emphasis/backticks, then AC/EC/ER-n. Without a
+// marker it must be followed by : . or ) (a plain "EC-1: ..." paragraph line). Numeric entities are decoded first.
+function idLike(vis) {
+  const d = vis.replace(/&#(x?)([0-9a-f]{1,6});/gi, (m, x, n) => { const c = parseInt(n, x ? 16 : 10); return c < 0x110000 ? String.fromCodePoint(c) : m; });
+  const m = /^\s*((?:[-*+]|\d+[.)])\s+|\|\s*)?[*_`\s]*(AC|EC|ER)[-_ ]?\d+(.?)/i.exec(d);
+  if (!m) return null;
+  return m[1] || /[:.)]/.test(m[3]) ? m[2].toLowerCase() : null;
+}
+const CONTRACT_LINE = new RegExp('^\\s*(?:(?:[-*+]|\\d+[.)])\\s+|\\|\\s*)?`\\s*(?:' + METHODS + ')\\s+/', 'i');
+const UNDERLINE = /^ {0,3}(=+|-+)\s*$/;
 
 function splitSections(text, errors) {
-  const lines = String(text).replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n');
+  const lines = String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
   const found = { ac: [], ec: [], er: [], contract: [] };
   const order = [];
   let fence = null; let inComment = false; let cur = null; let longLine = false;
@@ -146,18 +210,26 @@ function splitSections(text, errors) {
         const key = !inQuote && h.level === 2 && h.spaced && /^[\x00-\x7f]*$/.test(h.title) ? trackedKey(h.title) : undefined;
         if (key) {
           if (found[key].length) errors.push(`duplicate tracked heading "${norm(line)}"`);
-          cur = { key, heading: norm(line), raw: [], vis: [] }; found[key].push(cur); order.push(cur);
+          cur = { key, heading: norm(line), raw: [], vis: [], idLike: 0 }; found[key].push(cur); order.push(cur);
           continue;
         }
         const nm = nearMiss(h.title);
         if (nm) errors.push(`heading "${norm(line)}" imitates tracked section "${nm}" but is not a plain "## " heading; fix the heading`);
         else if (!inQuote && h.level === 2) cur = null;
-      } else if (vis.trim() && !/^\s*[#|>]/.test(vis) && i + 1 < lines.length && /^ {0,3}(=+|-+)\s*$/.test(lines[i + 1]) && (trackedKey(vis) || nearMiss(vis))) {
-        errors.push(`unsupported heading style (setext) for "${norm(vis)}"; use "## " headings`);
+      } else if (vis.trim() && !/^\s*[#|>]/.test(vis)) {
+        if (i + 1 < lines.length && UNDERLINE.test(lines[i + 1]) && (trackedKey(vis) || nearMiss(vis))) {
+          errors.push(`unsupported heading style (setext) for "${norm(vis)}"; use "## " headings`);
+        } else if (i + 2 < lines.length && lines[i + 1].trim() && !UNDERLINE.test(lines[i + 1]) && UNDERLINE.test(lines[i + 2])) {
+          const joined = norm(`${vis} ${lines[i + 1]}`);
+          if (trackedKey(joined) || nearMiss(joined)) errors.push(`unsupported heading style (multi-line setext) for "${joined}"; use "## " headings`);
+        }
       }
       // Backstop: ID-shaped or contract-shaped lines must sit in their own tracked section.
-      const im = ID_LINE.exec(vis);
-      if (im && (!cur || cur.key !== im[1].toLowerCase())) errors.push(`${im[1].toUpperCase()} item outside its tracked section: ${norm(vis).slice(0, 80)}`);
+      const kind = idLike(vis);
+      if (kind) {
+        if (!cur || cur.key !== kind) errors.push(`${kind.toUpperCase()} item outside its tracked section: ${norm(vis).slice(0, 80)}`);
+        else cur.idLike++;
+      }
       if (CONTRACT_LINE.test(vis) && (!cur || cur.key !== 'contract')) errors.push(`HTTP contract line outside the "HTTP contract" section: ${norm(vis).slice(0, 80)}`);
     }
     if (cur) { cur.raw.push(line); cur.vis.push(vis); }
@@ -196,6 +268,10 @@ export function extractCriteria(specText) {
   };
   const ec = list('ec', 'EC');
   const er = list('er', 'ER');
+  for (const [k, items] of [['ac', ac], ['ec', ec], ['er', er]]) {
+    const seen = found[k].reduce((n, sct) => n + sct.idLike, 0);
+    if (seen > items.length) errors.push(`${seen - items.length} unextracted ${k.toUpperCase()} ID item(s) in the ${k.toUpperCase()} section (use "- ${k.toUpperCase()}-<n>: ..." or a table row; no "+"/numbered/backticked items)`);
+  }
   for (const [k, items] of [['AC', ac], ['EC', ec], ['ER', er]]) {
     const seen = new Set();
     for (const { id } of items) { if (seen.has(id)) errors.push(`duplicate ${k} id "${id}"`); seen.add(id); }
@@ -213,7 +289,7 @@ export function extractCriteria(specText) {
   if (!found.ac.length) errors.push('missing "Acceptance criteria" section');
   else if (!ac.length) errors.push('Acceptance criteria section has no parseable AC-<n> rows');
 
-  const sections = JSON.stringify(order.map((s) => [s.heading, s.raw.map(normKeepIndent).filter(Boolean)]));
+  const sections = canonicalSpec(specText);
   return { ac, ec, er, contract, sections, errors, ok: errors.length === 0 };
 }
 

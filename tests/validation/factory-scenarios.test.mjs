@@ -33,7 +33,7 @@ Anything here.
 
 ## 12. Error and failure scenarios
 
-- ER-1: db down → 503 with a retry message
+- ER-1: db down \u2192 503 with a retry message
 
 ## HTTP contract
 
@@ -67,19 +67,108 @@ test('extractCriteria: old specs without EC/ER/contract yield empty arrays', () 
   assert.equal(c.ac.length, 2);
 });
 
-test('criteriaHash: stable across other sections, sensitive to criteria sections', () => {
-  const h = (t) => cr.criteriaHash(cr.extractCriteria(t).sections);
-  const base = h(SPEC);
+const hh = (t) => cr.criteriaHash(cr.extractCriteria(t).sections);
+const DLOG = '\n## Delivery log\n\n| Date | Delivered |\n|---|---|\n| 2026-11-17 | AC-1 |\n';
+
+test('criteriaHash: only status/delivery frontmatter and the Delivery log are mutable', () => {
+  const base = hh(SPEC);
   assert.match(base, /^sha256:[0-9a-f]{64}$/);
-  assert.equal(h(SPEC.replace('status: draft', 'status: ready').replace('Status: in progress.', 'Status: done.  ').replace('Nothing.', 'Something else.')), base);
-  assert.equal(h(SPEC.replace('a user **When**', 'a user   **When**  ')), base, 'whitespace collapsed');
-  assert.notEqual(h(SPEC.replace('see them', 'see none')), base);
-  assert.notEqual(h(SPEC.replace('300 char', '200 char')), base);
-  assert.notEqual(h(SPEC.replace('503', '500')), base);
-  assert.notEqual(h(SPEC.replace('POST /api/projects', 'PUT /api/projects')), base);
-  // moving content between sections changes the hash (headings are part of the text)
-  const moved = SPEC.replace('- EC-2: two projects with the same name are allowed\n', '').replace('- ER-1:', '- EC-2: two projects with the same name are allowed\n- ER-1:');
-  assert.notEqual(h(moved), base);
+  const withLog = SPEC + DLOG;
+  assert.equal(hh(withLog), base, 'a delivery log does not change the hash');
+  assert.equal(hh(withLog.replace('2026-11-17 | AC-1', '2026-12-01 | AC-1, AC-2').replace('| Date', '| Day')), base);
+  assert.equal(hh(SPEC.replace('status: draft', 'status: implemented\ndelivery: complete')), base, 'allowlisted frontmatter keys');
+  assert.equal(hh(SPEC.replace('status: draft', 'status:   ready  ')), base);
+  assert.equal(hh(SPEC.replace(/\n/g, '\r\n')), base, 'CRLF == LF');
+  assert.equal(hh(SPEC.replace(/\n/g, '\r')), base, 'CR == LF');
+  assert.equal(hh('\ufeff' + SPEC), base, 'BOM');
+  assert.equal(hh(SPEC.replace('Nothing.', 'Nothing.  \t ')), base, 'trailing whitespace');
+  assert.equal(hh(SPEC.replace('## 9.', '\n\n\n## 9.')), base, 'blank runs collapse');
+  // everything else is hashed, including prose in other sections, frontmatter ids, and criteria text
+  for (const [a, b] of [['Nothing.', 'Something else.'], ['Anything here.', 'Anything there.'], ['id: FEATURE-001', 'id: FEATURE-002'], ['Status: in progress.', 'Status: done.'],
+    ['see them', 'see none'], ['300 char', '200 char'], ['503', '500'], ['POST /api/projects', 'PUT /api/projects'], ['## 10.', '## 10 '], ['  ', ' ']]) {
+    if (!SPEC.includes(a)) continue;
+    assert.notEqual(hh(SPEC.replace(a, b)), base, `${a} -> ${b}`);
+  }
+  assert.notEqual(hh(SPEC + '\nextra prose\n'), base);
+  assert.notEqual(hh(SPEC.replace('- EC-2:', '    - EC-2:')), base, 'indentation is preserved');
+  // an edit that merely moves a heading after the delivery log marker is still hashed
+  assert.notEqual(hh(SPEC + DLOG + '## 20. Late section\n\nnew criteria\n'), base);
+});
+
+test('mutableRegions: raw line patterns, end exclusive', () => {
+  const t = '---\nid: F\nstatus: draft\ndelivery: none\nstatus_note: keep\n---\n# T\n\n## Delivery log\nrow\n\n## Next\nx\n';
+  assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }, { start: 3, end: 4 }, { start: 8, end: 11 }]);
+  assert.deepEqual(cr.mutableRegions('# T\n\nstatus: x\n'), []);
+  assert.deepEqual(cr.mutableRegions('---\nstatus: x\n# never closed\n'), [], 'unterminated frontmatter: nothing excluded');
+  assert.deepEqual(cr.mutableRegions('## Delivery log \nrow\n'), [{ start: 0, end: 3 }]);
+  assert.deepEqual(cr.mutableRegions('## Delivery log\u00a0\nrow\n'), [], 'only ASCII whitespace after the heading');
+  assert.deepEqual(cr.mutableRegions('## Delivery log\n```\n## fake\n```\nstill\n## Next\n'), [{ start: 0, end: 2 }], 'no fence awareness: the next "## " line ends it');
+});
+
+// Integrity table: pairs whose rendered criteria differ must hash differently, whatever the parser thinks.
+const IAC = '## 10. Acceptance criteria\n\n| ID | C |\n|---|---|\n| AC-1 | Given x When y Then z |\n\n';
+const hiddenEc = (pre, post) => (txt) => IAC + '## 13. Notes\n\n' + pre + '\n\n## 11. Edge cases\n\n- EC-1: ' + txt + '\n\n' + post + '\n';
+const ctr = (pre, post) => (p) => IAC + '## 13. Notes\n\n' + pre + '\n\n## HTTP contract\n\n- `' + p + '`\n\n' + post + '\n';
+const htmlfence = (t) => IAC + '## 13. Notes\n\n<div>\n```\n</div>\n\n## 11. Edge cases\n\n- EC-1: ' + t + '\n\n<div>\n```\n</div>\n';
+const nos = (t) => IAC + '## 11. Edge cases\n\n- EC-1: foo\n##x\n  ' + t + '\n';
+const nb = (t) => IAC + '## 11. Edge cases\n\n- EC-1: ' + t + '\n';
+const INTEGRITY = {
+  'comment trick <!-->': [hiddenEc('<!-->', '<!-- -->')('foo'), hiddenEc('<!-->', '<!-- -->')('DELETE ALL')],
+  'comment trick <!--->': [hiddenEc('<!--->', '<!-- -->')('foo'), hiddenEc('<!--->', '<!-- -->')('DELETE ALL')],
+  'indented code comment': [hiddenEc('Example:\n\n    <!--', '    -->')('foo'), hiddenEc('Example:\n\n    <!--', '    -->')('DELETE ALL')],
+  'escaped comment opener': [hiddenEc('Use \\<!-- markers.', 'see above -->')('foo'), hiddenEc('Use \\<!-- markers.', 'see above -->')('DELETE ALL')],
+  'inline unterminated comment': [hiddenEc('Text <!-- open', 'x -->')('foo'), hiddenEc('Text <!-- open', 'x -->')('DELETE ALL')],
+  'hidden contract section': [ctr('<!-->', '<!-- -->')('GET /a'), ctr('<!-->', '<!-- -->')('DELETE /a')],
+  'fence inside HTML block': [htmlfence('foo'), htmlfence('DELETE ALL')],
+  '##x is not a heading': [nos('and keeps data'), nos('and deletes data')],
+  'NBSP heading': [IAC + '## 11. Edge\u00a0cases\n\n1. EC-1: foo\n', IAC + '## 11. Edge\u00a0cases\n\n1. EC-1: bar\n'],
+  'U+2003 heading': [IAC + '## 11. Edge\u2003cases\n\n- EC-1: foo\n', IAC + '## 11. Edge\u2003cases\n\n- EC-1: bar\n'],
+  'Cyrillic lookalike heading': [IAC + '## 11. \u0415dge cases\n\n- EC-1: foo\n', IAC + '## 11. \u0415dge cases\n\n- EC-1: bar\n'],
+  'indented-code section lookalike': [IAC.trimEnd() + '\n\n## 11. Edge cases\n- EC-1: foo\n', IAC.trimEnd() + '\n\n    ## 11. Edge cases\n    - EC-1: foo\n'],
+  'contract DELETE vs GET': [ctr('', '')('GET /a'), ctr('', '')('DELETE /a')],
+  'text added anywhere': [nb('foo'), nb('foo') + '\nnew prose\n'],
+  'text added before criteria': [nb('foo'), 'Intro.\n\n' + nb('foo')],
+  'tab vs spaces indentation': [nb('foo\n    bar'), nb('foo\n\tbar')],
+  'mid-line tab vs space': [nb('a b'), nb('a\tb')],
+  'NFC vs NFD': [nb('caf\u00e9'), nb('cafe\u0301')],
+  'Cyrillic confusable in content': [nb('pay'), nb('p\u0430y')],
+  'NUL in content': [nb('a\0b'), nb('ab')],
+  'blank line ends lazy continuation': [nb('foo') + 'bar\n', nb('foo') + '\nbar\n'],
+  'JSON-ambiguity attempt': [nb('a",""b'), nb('a') + '"",b\n'],
+};
+for (const [name, [a, b]] of Object.entries(INTEGRITY)) {
+  test(`integrity: differs - ${name}`, () => assert.notEqual(hh(a), hh(b)));
+}
+
+test('extraction: `##x` is not a heading; unicode-space / lookalike tracked titles are errors', () => {
+  assert.equal(ex(IAC + '##Edge cases\n\n- EC-1: x\n').ec.length, 0);
+  assert.match(errs(IAC + '##Edge cases\n\n- EC-1: x\n'), /EC item outside/);
+  for (const t of ['11. Edge\u00a0cases', '11. Edge\u2003cases', '11. \u0415dge cases', '11. Edge cases\u00a0', '11. \uff25dge cases']) bad(IAC + '## 9b. N\n\n## ' + t + '\n\ntext\n', /imitates tracked section/);
+});
+
+test('extraction: <!--> and <!---> are closed comments', () => {
+  for (const o of ['<!-->', '<!--->']) {
+    const c = ex(IAC + '## 11. Edge cases\n\n' + o + '\n- EC-1: foo\n');
+    assert.equal(c.ok, true, o); assert.equal(c.ec.length, 1, o);
+  }
+});
+
+test('extraction: broadened ID backstop and unextracted ID items', () => {
+  for (const item of ['1. EC-1: x', '+ EC-1: x', '- `EC-1`: x', '- &#69;C-1: x', 'EC-1: x', '| EC-1 | x |', '1) EC-1 x', '* **EC-1** x']) {
+    bad(IAC + '## 13. Notes\n\n' + item + '\n', /EC item outside/);
+  }
+  for (const item of ['+ EC-2: y', '1. EC-2: y', '- `EC-2`: y', '- &#69;C-2: y']) {
+    bad(IAC + '## 11. Edge cases\n\n- EC-1: x\n' + item + '\n', /unextracted EC ID/);
+  }
+  bad(IAC.replace('| AC-1 |', '| `AC-1` |'), /unextracted AC ID/);
+  bad(IAC + '## 11. Edge cases\n\n1. ER-1: wrong section\n', /ER item outside/);
+  assert.equal(ex(IAC + '## 11. Edge cases\n\n- EC-1: x\n\nEC-1 is referenced in prose.\n').ok, true, 'no marker and no punctuation: prose');
+  bad(IAC + '## 13. Notes\n\n+ `POST /x`\n', /contract line outside/);
+  bad(IAC + '## 13. Notes\n\n| `POST /x` | a |\n', /contract line outside/);
+});
+
+test('extraction: multi-line setext tracked title is an error', () => {
+  bad(IAC + 'Edge\ncases\n-----\n\ntext\n', /multi-line setext/);
 });
 
 const git = (cwd) => (...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8' }); return { code: r.status, out: (r.stdout || '').trim(), err: r.stderr || '' }; };
@@ -120,7 +209,6 @@ test('prefix-collision headings are not tracked; the real section still is', () 
   const c = ex(t);
   assert.deepEqual(c.ec.map((x) => x.id), ['EC-1', 'EC-2']);
   assert.equal(c.contract.length, 2); assert.equal(c.ok, true);
-  assert.ok(!c.sections.includes('importer'));
 });
 
 test('duplicate tracked heading is an error and both occurrences are hashed', () => {
@@ -203,7 +291,7 @@ const bad = (t, re) => { const c = ex(t); assert.equal(c.ok, false, 'expected !o
 
 test('near-miss tracked headings are errors (emphasis, colon, comment, zero-width, level, blockquote, suffix)', () => {
   const body = '\n\n- EC-1: foo\n';
-  for (const h of ['## 11. **Edge cases**', '## 11. Edge cases:', '## 11. Edge cases <!-- n -->', '## 11. Edge​ cases', '##  Edge cases',
+  for (const h of ['## 11. **Edge cases**', '## 11. Edge cases:', '## 11. Edge cases <!-- n -->', '## 11. Edge\u200b cases', '## \u00a0Edge cases',
     '# Edge cases', '### Edge cases', '#### Edge cases', '> ## Edge cases', '## 11. Edge cases (optional)', '## 11. Edge cases - later', '## _Edge cases_']) {
     bad(AC + '## 9b. Notes\n\n' + h + body, /imitates tracked section|outside its tracked/);
   }
@@ -245,8 +333,8 @@ test('hash encoding: indented code block does not hash like a real section', () 
 
 test('BOM is stripped; CR-only newlines parse; long lines are an error and fast', () => {
   const t = AC + '## 11. Edge cases\n\n- EC-1: foo\n';
-  assert.equal(ex('﻿' + t).ok, true);
-  assert.equal(ex('﻿' + t).sections, ex(t).sections);
+  assert.equal(ex('\uFEFF' + t).ok, true);
+  assert.equal(ex('\uFEFF' + t).sections, ex(t).sections);
   assert.equal(ex(t.replace(/\n/g, '\r')).ok, true);
   const t0 = Date.now();
   bad('## a' + ' \t'.repeat(40000) + 'x\n' + t, /longer than/);
