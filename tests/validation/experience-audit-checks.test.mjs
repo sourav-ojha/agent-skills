@@ -137,3 +137,39 @@ test('lighthouse: only scored, non-manual audits below 0.9 become lab-data findi
   assert.deepEqual(rules(f), ['seo.lighthouse.meta-description', 'perf.lighthouse.lcp']);
   assert.match(f[1].evidence.tool, /lab data/);
 });
+
+// --- review fixes: thresholds and boundaries ---------------------------------------------------------
+test('footer feature coverage fires at the configured missing share, not below it', () => {
+  const names = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo'];
+  const mkFooter = (covered) => ({ footer: { present: true, sel: 'footer', links: [...names.slice(0, covered).map((n) => ({ text: n, href: `/${n}` })), ...Array.from({ length: 9 - covered }, (_, i) => ({ text: `Other ${i}`, href: `/o${i}` }))], groups: [{ heading: 'A', count: 5 }, { heading: 'B', count: 4 }] }, nav: { links: [] } });
+  const caps = names.map((n) => n.toLowerCase());
+  assert.deepEqual(rules(footerChecks(mkFooter(3), cfg, caps)), ['nav.features-not-surfaced'], '2 of 5 missing = 0.4, at the limit');
+  assert.deepEqual(rules(footerChecks(mkFooter(4), cfg, caps)), [], '1 of 5 missing = 0.2, below the limit');
+});
+
+test('a section gap is only an outlier among enough sections: two gaps never yield one, three can', () => {
+  const secs = (ys) => ys.map((y, i) => ({ sel: `s${i}`, rect: { x: 0, y, w: 1000, h: 80 } }));
+  assert.deepEqual(rules(layoutChecks({ viewport: { w: 1000 }, sections: secs([0, 100, 800]) }, cfg)), [], 'with two gaps the median is the larger one, so nothing can stand out');
+  assert.deepEqual(rules(layoutChecks({ viewport: { w: 1000 }, sections: secs([0, 100, 200, 800]) }, cfg)), ['layout.section-gap']);
+});
+
+test('site: click depth fires only past the limit; mailto, hash and javascript links are not edges; "/" is never an orphan; Disallow: / blocks everything', () => {
+  const page = (route, hrefs) => ({ route, head: { title: route, description: route }, links: hrefs.map((h) => ({ href: h, hasHref: true, text: 't' })) });
+  const chain = [page('/', ['/a']), page('/a', ['/b']), page('/b', ['/c']), page('/c', ['/d']), page('/d', [])];
+  const depth = siteChecks(chain, cfg, {}).filter((x) => x.rule === 'seo.click-depth');
+  assert.deepEqual(depth.map((x) => x.route), ['/d'], 'depth 3 (/c) is at the limit, depth 4 (/d) is past it');
+  const home = [page('/', ['mailto:/a', 'tel:/a', '#a', 'javascript:/a'])];
+  const sitemap = '<urlset><url><loc>https://x.com/</loc></url><url><loc>https://x.com/a</loc></url></urlset>';
+  const f = siteChecks(home, cfg, { sitemap });
+  assert.ok(f.some((x) => x.rule === 'seo.orphan' && x.route === '/a'), 'only real links count');
+  assert.ok(!f.some((x) => x.rule === 'seo.orphan' && x.route === '/'));
+  const blocked = siteChecks([page('/x', [])], cfg, { robots: 'User-agent: *\nDisallow: /' });
+  assert.ok(blocked.some((x) => x.rule === 'seo.robots-blocks-page' && x.route === '/x'));
+});
+
+test('seo: the js-links-only rule needs at least 10 rendered links', () => {
+  const mk = (n) => ({ route: '/', url: 'https://a.com/', head: { title: 'T', description: 'd', canonical: 'https://a.com/', lang: 'en', viewportMeta: true, h1: ['H'] }, links: Array.from({ length: n }, (_, i) => ({ href: `/p${i}`, hasHref: true, text: `P${i}`, aria: false })) });
+  const raw = '<title>T</title><h1>H</h1>';
+  assert.ok(!rules(seoChecks(mk(9), cfg, raw)).includes('seo.js-links-only'));
+  assert.ok(rules(seoChecks(mk(10), cfg, raw)).includes('seo.js-links-only'));
+});

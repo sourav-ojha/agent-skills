@@ -63,10 +63,12 @@ run(() => {
     else if (kind === 'lighthouse') found = lighthouseFindings(input, { route: route || '/' });
     else die('analyze needs one of: layout, footer, seo, site, axe, lighthouse');
     extra.kind = kind; extra.found = found.length;
+    if (opt.add && !opt.run) die('--add needs --run ID (any short label, e.g. r1): reaudit relies on it to know what was re-checked');
     if (opt.add) { const r = addFindings(l, found, { dir, run: opt.run }); save(dir, l); extra.added = r.added.length; console.log(`found ${found.length}; added ${r.added.length}, merged ${r.merged.length}`); }
     else console.log(JSON.stringify(found, null, 2));
   } else if (cmd === 'add') {
     if (!opt.file) die('add needs --file');
+    if (!opt.run) die('add needs --run ID (any short label, e.g. r1): reaudit relies on it to know what was re-checked');
     const l = load(dir), d = readJson(opt.file, 'findings');
     const r = addFindings(l, Array.isArray(d) ? d : d.findings, { dir, run: opt.run });
     save(dir, l); extra.added = r.added.length;

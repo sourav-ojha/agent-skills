@@ -110,6 +110,9 @@ export function checkFinding(f, { dir, cap } = {}) {
     for (const a of f.acceptance) if (typeof a === 'string' && (UNSAFE.test(a) || a.length > 300)) e.push('an acceptance criterion contains control characters (including newlines) or is longer than 300 characters');
   }
   for (const k of ['what_to_pull', 'cite', 'tool', 'crop']) if (typeof ev[k] === 'string' && (UNSAFE.test(ev[k]) || ev[k].length > 300)) e.push(`evidence.${k} contains control characters or is longer than 300 characters`);
+  const vpOk = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 100000) || (typeof v === 'string' && /^\d{1,5}$/.test(v));
+  if (f.viewports !== undefined && (!Array.isArray(f.viewports) || f.viewports.length > 10 || !f.viewports.every(vpOk))) e.push('viewports must be a list of at most 10 pixel widths (numbers)');
+  if (ev.viewport !== undefined && !vpOk(ev.viewport)) e.push('evidence.viewport must be a pixel width (a number)');
   if (typeof f.group === 'string' && !/^[\w:.#>-]{1,80}$/.test(f.group)) e.push('group must be 1-80 characters of letters, digits and : . _ # > - (no spaces, so it can be used as group:NAME)');
   return e;
 }
@@ -117,6 +120,8 @@ export function checkFinding(f, { dir, cap } = {}) {
 // Add or merge findings. Same id => merge (viewport list grows, evidence refreshed), never a duplicate.
 export function addFindings(l, list, { dir, run } = {}) {
   const added = [], merged = [];
+  // Remember which run ids really analysed something: a reaudit can only close a run that did (see closeRun).
+  if (run) { l.started = l.started || []; if (!l.started.includes(String(run))) l.started.push(String(run)); }
   for (const raw of list) {
     const errs = checkFinding(raw, { dir });
     if (errs.length) throw new Error(`invalid finding "${flat(raw.title || raw.rule || '?').slice(0, 80)}": ${errs.join('; ')}`);
@@ -208,7 +213,7 @@ export function writeFixes(l, dir) {
       '---', `id: ${fx.id}`, 'status: ready', 'source: experience-audit', `group: ${JSON.stringify(group)}`, `findings: [${fx.findings.join(', ')}]`, '---', '',
       `# ${fx.id}: ${flat(fs_[0].title).replace(/\s*\(candidate\)$/, '')}`, '',
       '## Goal', `Resolve the approved audit findings in group \`${group}\` without changing anything else.`, '',
-      '## Findings', ...fs_.map((f) => `- **${f.id}** (${f.severity}, effort ${f.effort}, ${f.kind}) ${flat(f.title)}\n  - Route: ${flat(f.route)}; selector: \`${flat(f.selector || 'n/a').replace(/`/g, "'")}\`; viewports: ${(f.viewports || []).join(', ') || 'n/a'}\n  - Evidence: \`${JSON.stringify(f.evidence.value ?? f.evidence).slice(0, 300).replace(/`/g, "'")}\`\n  - Proposed fix: ${flat(f.proposed_fix)}`), '',
+      '## Findings', ...fs_.map((f) => `- **${f.id}** (${f.severity}, effort ${f.effort}, ${f.kind}) ${flat(f.title)}\n  - Route: ${flat(f.route)}; selector: \`${flat(f.selector || 'n/a').replace(/`/g, "'")}\`; viewports: ${(f.viewports || []).map(flat).join(', ') || 'n/a'}\n  - Evidence: \`${JSON.stringify(f.evidence.value ?? f.evidence).slice(0, 300).replace(/`/g, "'")}\`\n  - Proposed fix: ${flat(f.proposed_fix)}`), '',
       '## Acceptance criteria', ...crit.map((c, i) => `${i + 1}. ${c}`), '',
       '## Re-test', `Run the audit again for the routes above (\`reaudit\`). Rules to re-run: ${[...new Set(fs_.map((f) => flat(f.retest)))].join(', ')}. A finding is closed only when its probe no longer reports it.`, '',
       '## Non-goals', 'No redesign beyond the findings. No changes to unrelated pages or components.', '',
@@ -219,11 +224,14 @@ export function writeFixes(l, dir) {
 }
 
 // Close a re-audit run: previously known findings on covered routes/rules that did not reappear are verified fixed.
+// Only findings still waiting on a fix can be verified: a rejected or deferred decision is the user's, never overwritten.
+const VERIFIABLE = ['open', 'approved', 'needs-evidence'];
 export function closeRun(l, { run, routes, rules }) {
+  if (!(l.started || []).includes(String(run))) throw new Error(`run "${run}" has not recorded any analysis: re-run the probes with --run ${run} --add first (otherwise nothing proves the findings are gone)`);
   const verified = [], regressed = [];
   for (const f of l.findings) {
     if (f.regressed && (f.seen_in || []).includes(run)) regressed.push(f.id);
-    if (f.status === 'verified' || (f.seen_in || []).includes(run)) continue;
+    if (!VERIFIABLE.includes(f.status) || (f.seen_in || []).includes(run)) continue;
     if (routes.includes(f.route) && rules.includes(f.retest)) { f.status = 'verified'; f.verified_in = run; verified.push(f.id); }
   }
   l.runs.push({ id: run, date: new Date().toISOString().slice(0, 10), routes, rules, verified: verified.length, regressed: regressed.length });
