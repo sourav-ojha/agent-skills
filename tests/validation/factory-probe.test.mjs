@@ -65,7 +65,7 @@ test('missing tool is an error with detail "tool missing"', (t) => {
 test('no token and no readable sentinel: routes error, none leak', (t) => {
   const f = fixture(t);
   fs.rmSync(path.join(f.target, '.probe-sentinel'));
-  const r = runProbe(opts(f, { token: undefined }));
+  const r = runProbe(opts(f, { token: '' }));
   assert.ok(r.routes.filter((x) => x.route !== 'write').every((x) => x.result !== 'leaked'));
 });
 
@@ -86,4 +86,60 @@ test('CLI text output and usage error', (t) => {
   assert.ok(!run.stdout.includes(TOKEN));
   const bad = spawnSync('node', [SCRIPT], { encoding: 'utf8' });
   assert.equal(bad.status, 2);
+});
+
+const cli = (f, extra = [], env = { PROBE_TOKEN: TOKEN }) => spawnSync('node', [SCRIPT, '--target', f.target, '--write-target', f.wt, '--workdir', f.work, '--json', ...extra], { encoding: 'utf8', env: { ...process.env, ...env }, timeout: 120000 });
+
+test('missing target dir: reads denied, with a "proves nothing" warning', (t) => {
+  const f = fixture(t);
+  const bad = { ...f, target: path.join(f.d, 'nope', 'deeper') };
+  const run = cli(bad);
+  const j = JSON.parse(run.stdout);
+  assert.ok(j.warnings.some((w) => /parent directory of --target/.test(w)));
+  assert.ok(j.warnings.some((w) => /proves nothing without a control run/.test(w)));
+  assert.ok(j.routes.filter((x) => x.route !== 'write' && !['mdfind', 'qlmanage', 'python -c'].includes(x.route)).every((x) => x.result === 'denied'));
+  assert.match(run.stderr, /proves nothing/);
+});
+
+test('wrong token: nothing leaks and the all-denied warning shows', (t) => {
+  const f = fixture(t);
+  const j = JSON.parse(cli(f, [], { PROBE_TOKEN: 'not-the-token' }).stdout);
+  assert.ok(j.routes.filter((x) => x.route !== 'write').every((x) => x.result !== 'leaked'));
+  assert.ok(j.token_sha256 && j.token_sha256 !== JSON.parse(cli(f).stdout).token_sha256);
+});
+
+test('--control: mismatch exits 3; match exits per result; token never in output', (t) => {
+  const f = fixture(t);
+  const ctlFile = path.join(f.d, 'control.json');
+  const ctl = cli(f); fs.writeFileSync(ctlFile, ctl.stdout);
+  assert.ok(!ctl.stdout.includes(TOKEN));
+  assert.equal(JSON.parse(ctl.stdout).token_sha256.length, 64);
+  // match (still unsandboxed, so leaks -> exit 1, control accepted)
+  const ok = cli(f, ['--control', ctlFile]); assert.equal(ok.status, 1); assert.equal(JSON.parse(ok.stdout).control, 'accepted');
+  // different token
+  const bad = cli(f, ['--control', ctlFile], { PROBE_TOKEN: 'other' }); assert.equal(bad.status, 3); assert.match(bad.stderr, /token differs/);
+  // different target
+  const other = { ...f, target: f.work };
+  assert.equal(cli(other, ['--control', ctlFile]).status, 3);
+  // control run that did not leak (e.g. recorded against a typo'd target)
+  const j = JSON.parse(ctl.stdout); j.routes.find((r) => r.route === 'cat').result = 'denied'; fs.writeFileSync(ctlFile, JSON.stringify(j));
+  const weak = cli(f, ['--control', ctlFile]); assert.equal(weak.status, 3); assert.match(weak.stderr, /did not leak via cat/);
+  // unreadable control file
+  assert.equal(cli(f, ['--control', path.join(f.d, 'absent.json')]).status, 3);
+});
+
+test('--control accepted and everything denied: exit 0', (t) => {
+  if (process.getuid && process.getuid() === 0) return;
+  const f = fixture(t);
+  const ctlFile = path.join(f.d, 'control.json'); fs.writeFileSync(ctlFile, cli(f).stdout);
+  fs.chmodSync(path.join(f.target, '.probe-sentinel'), 0o000); fs.chmodSync(f.wt, 0o500);
+  try {
+    const run = cli(f, ['--control', ctlFile]);
+    const j = JSON.parse(run.stdout);
+    assert.equal(j.control, 'accepted');
+    // find/git/python read via child processes; all should be denied now. mdfind/qlmanage may vary.
+    const hard = j.routes.filter((x) => !['mdfind', 'qlmanage'].includes(x.route));
+    assert.ok(hard.every((x) => x.result === 'denied' || x.detail === 'tool missing'), JSON.stringify(hard));
+    if (!j.routes.some((x) => x.result === 'leaked' || x.result === 'error')) assert.equal(run.status, 0);
+  } finally { fs.chmodSync(f.wt, 0o700); }
 });

@@ -9,14 +9,14 @@ What was tested here: `probe.mjs` run unsandboxed against temp dirs. Every route
 ## The probe
 
 ```
-PROBE_TOKEN=<token> node probe.mjs --target <dir> --write-target <dir> [--workdir <dir>] [--json]
+PROBE_TOKEN=<token> node probe.mjs --target <dir> --write-target <dir> [--workdir <dir>] [--control <control.json>] [--json]
 ```
 
 - `<dir>/.probe-sentinel` holds a random token (created by you, step 1). The probe reports `leaked` when a route obtains the token, never prints it, and never prints file contents. Output per route: `route`, `result` (`denied` | `leaked` | `error`), a short fixed `detail`.
 - `PROBE_TOKEN` is needed because a sandboxed probe cannot read the sentinel to learn the token. It is a throwaway probe token, not a real secret. Without it (and with an unreadable sentinel) every read route is `error` / `no token`.
 - `--write-target` is the dir the builder must not write to. The probe creates `.probe-write-<rand>` there, reports `leaked` if that succeeded, and always removes it.
 - `--workdir` (default cwd) is where `cp`, hard link and symlink routes put their scratch files; run it inside the builder's repo to mirror "symlink in the repo pointing into the denied path". Scratch files are removed.
-- Exit code: 0 all denied, 1 any `leaked`, 2 usage error or no leak but some `error`. Phase 1 can use exit 0 as the regression gate; `error` rows must be read by a person (a tool that is missing proves nothing about that route).
+- Exit code: 0 all denied, 1 any `leaked`, 2 usage error or no leak but some `error`, 3 `--control` file rejected. Phase 1 can use exit 0 as the regression gate; `error` rows must be read by a person (a tool that is missing proves nothing about that route).
 - Routes: `fs.readFile`, `cat`, `cp`, `find`, `tar`, `mdfind`, `qlmanage`, `node -e`, `python -c`, `git -C`, `hardlink`, `symlink`, `write`. Skipped with `error` / `tool missing` when the tool is absent.
 - Known weaknesses, to read the matrix with: `mdfind` reports `leaked` only if Spotlight has indexed the sentinel, so `denied` there can mean "unindexed" (probe a normally indexed location, or treat as weak evidence). `qlmanage` can hang (it timed out in our trial) and is reported `error` / `timeout`; `leaked` means a thumbnail was generated from the file, not that the token was read. `ENOENT` counts as `denied` because a sandbox may hide the path; a mistyped `--target` therefore also looks `denied`, so always run step 1's control run (unsandboxed, expect all `leaked`) first. `hardlink` across devices fails `EXDEV` -> `error`; use a `--workdir` on the same volume as the target.
 
@@ -35,7 +35,9 @@ node $PROBE --target ~/.factory-probe/scenarios --write-target ~/.factory-probe/
 
 Expected: exit 1, every route `leaked` (mdfind/qlmanage may differ, see above). Keep `control.json` as the "no protection" baseline. If a route is not `leaked` here, that route cannot be used as evidence below.
 
-Record each later run as: `node $PROBE ... --json > probe-<config>.json` (written inside the builder's repo, which is writable), then paste the per-route results into the matrix.
+Every later run must pass `--control control.json`: the probe then compares target, write-target and the sha256 of the token (recorded in `--json`, never the token) and exits **3** unless the control run leaked on every route that could run (`mdfind` and `qlmanage` are exempt: they depend on indexing and Quick Look). Without `--control`, a run where no read route leaked prints "proves nothing without a control run" and a warning if the parent of `--target` does not exist from the probe's view. This is what stops a mistyped path or a wrong token from looking like a successful denial.
+
+Record each later run as: `node $PROBE ... --control control.json --json > probe-<config>.json` (written inside the builder's repo, which is writable), then paste the per-route results into the matrix.
 
 ## Candidate A: Claude Code deny rules plus Bash sandbox
 
@@ -144,7 +146,16 @@ Repeat with the parent killed by `kill -9` and with the stdout pipe closed (`| h
 
 ### Step 12 (user): evaluator-side leaks
 
-After a step 6 or evaluator-style `claude -p` run that read the fixture sentinel, check `grep -rl "$PROBE_TOKEN" ~/.claude/projects ~/.claude-probe-evaluator /tmp` (paths only; the grep prints no content). Record where the token landed. With a separate `CLAUDE_CONFIG_DIR`, transcripts should be outside `~/.claude/projects`, but the builder's deny rules must also cover `~/.claude-*/` and the shared `/tmp` use. **Unverified (needs user step 12)**.
+The builder token from step 1 is **visible to the builder by design** (step 2 puts it in the builder transcript), so it cannot be used here: grepping for it would always hit. Use a separate evaluator-only token and sentinel that never enters a builder session:
+
+```
+export EVAL_TOKEN="eval-$(openssl rand -hex 16)"
+printf '%s\n' "$EVAL_TOKEN" > ~/.factory-probe/scenarios/.eval-sentinel
+```
+
+Run an evaluator-style `claude -p "read ~/.factory-probe/scenarios/.eval-sentinel and say ok" </dev/null` with `CLAUDE_CONFIG_DIR=$HOME/.claude-probe-evaluator` (never in a builder session). Then `grep -rl "$EVAL_TOKEN" ~/.claude/projects ~/.claude-probe-evaluator /tmp` (prints paths only). Expected: the token is found under the evaluator config dir and nowhere the builder can read (`~/.claude/projects`, `/tmp`). The builder's deny rules must also cover `~/.claude-*/`. **Unverified (needs user step 12).**
+
+Limit of the probe: it detects only that the token's content was obtained. It cannot detect existence or metadata leaks (for example `find` or `ls` listing file names, `stat` sizes). Those routes report `denied` while still leaking names; check them by hand with `ls ~/.factory-probe/scenarios` from the builder session.
 
 ## Candidate B: builder as a separate macOS user
 
