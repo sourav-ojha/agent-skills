@@ -136,12 +136,17 @@ test('F2 a turn inside two windows of the same project marks both records ambigu
   assert.deepEqual(sep.map((r) => r.status), ['ok', 'ok']);
 });
 
-test('F3 coverage reports the share of turns that fall inside a record window', () => {
-  const turns = Array.from({ length: 20 }, (_, i) => turn(i === 19 ? 50 : 1 + (i % 5), tk(1)));
-  const c = coverage([rec('f1', 0, 10)], turns);
-  assert.equal(c.total, 20);
-  assert.equal(c.attributed, 19);
-  assert.ok(c.ratio >= 0.9);
+test('F3 coverage is per run, by tokens and turns, inside the run window only', () => {
+  // run window 0..10 (features 0..4 and 6..10); minute 5 is inside the run but in no feature window.
+  const recs = [rec('f1', 0, 4), rec('f2', 6, 10)];
+  const turns = [turn(1, tk(100)), turn(8, tk(100)), turn(5, tk(200)), turn(50, tk(9999)), turn(-30, tk(9999)), turn(2, tk(9999), 'bbbbbb')];
+  const [c] = coverage(recs, turns);
+  assert.deepEqual([c.run, c.turns_total, c.turns_attributed, c.tokens_total, c.tokens_attributed], ['r1', 3, 2, 400, 200]);
+  assert.equal(c.ratio_tokens, 0.5);
+  const full = coverage([rec('f1', 0, 10)], Array.from({ length: 20 }, (_, i) => turn(i === 19 ? 50 : 1 + (i % 5), tk(1))))[0];
+  assert.equal(full.ratio_turns, 1); // the turn at minute 50 is outside the run window
+  const ov = joinTokens([rec('f1', 0, 10), rec('f2', 5, 15)], [turn(7, tk(5, 1))]);
+  assert.deepEqual([ov[0].ambiguous_turns, ov[0].ambiguous_tokens], [1, 6]);
 });
 
 test('F4 latestPerFeature keeps the last record per (run, feature)', () => {
@@ -184,4 +189,16 @@ test('F5 CLI runs-factory: resolves symlinked --dir, counts subagent transcripts
   assert.deepEqual([f1.tokens_in, f1.tokens_out, f1.cache_create, f1.cache_read, f1.turns, f1.status], [1150, 115, 1000, 5, 3, 'ok']);
   assert.equal(rows.find((x) => x.feature === 'f2').turns, 0);
   assert.ok(!fs.readFileSync(path.join(f.real, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('tokens_in'), 'source log untouched');
+});
+
+test('F6 --out refuses to overwrite the source run log (also via a symlinked path)', () => {
+  const f = factoryFixture();
+  const src = path.join(f.real, '.skill-runs', 'factory-runs.jsonl');
+  const before = fs.readFileSync(src, 'utf8');
+  for (const out of [src, path.join(f.link, '.skill-runs', 'factory-runs.jsonl')]) {
+    const r = si('runs-factory', '--dir', f.real, '--projects-dir', f.projects, '--out', out);
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /source run log/);
+  }
+  assert.equal(fs.readFileSync(src, 'utf8'), before);
 });

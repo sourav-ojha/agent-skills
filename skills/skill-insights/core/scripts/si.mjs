@@ -85,9 +85,10 @@ function runRows(sessions) {
 }
 
 // Print, or write to --out (never through a symlink, owner-only).
-function emit(text) {
+function emit(text, protect) {
   if (!opt.out) { console.log(text); return; }
   const f = path.resolve(opt.out);
+  if (protect) { let a, b = null; try { a = fs.realpathSync(protect); } catch { a = null; } try { b = path.join(fs.realpathSync(path.dirname(f)), path.basename(f)); } catch { /* dir missing */ } if (a && b && a === b) die('--out is the source run log; refusing to overwrite it'); }
   try { if (fs.lstatSync(f).isSymbolicLink()) die('--out is a symlink; refusing to write through it'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   fs.writeFileSync(f, text + '\n', { mode: 0o600 });
   console.log(`wrote ${path.basename(f)}`);
@@ -139,12 +140,13 @@ function runsFactory() {
   }
   const rows = joinTokens(records, turns);
   const cov = coverage(records, turns);
-  if (opt.out) emit(rows.map((r) => JSON.stringify(r)).join('\n'));
+  if (opt.out) emit(rows.map((r) => JSON.stringify(r)).join('\n'), log);
   else {
     console.log('feature | tier | outcome | turns | in | out | cache-create | cache-read | status');
-    for (const r of rows) console.log(`${r.feature} | ${r.tier ?? '-'} | ${r.outcome} | ${r.turns} | ${k(r.tokens_in)} | ${k(r.tokens_out)} | ${k(r.cache_create)} | ${k(r.cache_read)} | ${r.status}`);
+    for (const r of rows) console.log(`${r.feature} | ${r.tier ?? '-'} | ${r.outcome} | ${r.turns} | ${k(r.tokens_in)} | ${k(r.tokens_out)} | ${k(r.cache_create)} | ${k(r.cache_read)} | ${r.status}${r.ambiguous_turns ? ` (${r.ambiguous_turns} shared turn(s), ${k(r.ambiguous_tokens)} tokens)` : ''}`);
   }
-  console.log(`attribution: ${(cov.ratio * 100).toFixed(0)}% of ${cov.total} turn(s) fall inside a run window${rows.some((r) => r.status === 'ambiguous') ? '; ambiguous = overlapping windows in one project' : ''}`);
+  for (const c of cov) console.log(`attribution run ${c.run}: ${(c.ratio_tokens * 100).toFixed(0)}% of tokens, ${(c.ratio_turns * 100).toFixed(0)}% of ${c.turns_total} turn(s) in the run window fall inside a feature window`);
+  if (rows.some((r) => r.status === 'ambiguous')) console.log('note: ambiguous rows share turns with another feature; their tokens are counted in each row, so do not sum ambiguous rows');
 }
 
 if (cmd === 'export') { exportBundle(); process.exit(0); }
