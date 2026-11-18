@@ -4,6 +4,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- `install-agents.mjs` in product-intelligence, experience-audit and implementer did nothing (exit 0, no files) when run through a symlinked path, such as a symlinked skills folder or macOS `/var` → `/private/var`: the entry-point check compared an unresolved path with the resolved module path. It now compares real paths, as growth-strategy does; a test runs every skill's installer through a symlink.
+
 ### Added (growth-strategy 0.1.0)
 - New skill `growth-strategy`: evidence-backed organic growth strategy for independent websites and products. Roles: product-seo-auditor, search-researcher, distribution-researcher (parallel), growth-reviewer (independent); commands `init`, `audit`, `research`, `plan`, `review`, `full`, `refresh`, `status`. Design: `docs/superpowers/specs/2026-11-18-growth-strategy-design.md` (independently reviewed; resolutions recorded there).
 - `.growth/` state: `growth.json` (baseline, phases, reviews, append-only decision log, refreshes, performance imports), `sources.json` (provenance with access dates and file hashes), `keywords.json` (+ `gs export keywords` CSV, formula-safe), `items.json` (roadmap candidates), six markdown artifacts with required sections, `roadmap.md` from approved items only, `handoff/GRO-NNN.md` implementer specs.
