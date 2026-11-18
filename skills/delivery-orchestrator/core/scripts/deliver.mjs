@@ -10,7 +10,7 @@ import { FEATURE_ID, TRANSITIONS, transition, frontmatter, discover, buildQueue,
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
-import { factoryHome, repoKey, writeJsonAtomic } from './lib/factoryhome.mjs';
+import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -150,7 +150,37 @@ C.config = () => {
   if (errors.length) process.exitCode = 1;
 };
 
-C.init = () => {
+// Merging runs in an opted-in project need a fresh readiness result for the config now on origin/<base>.
+// The cheap checks (C1, C2, C4, C5) are re-run and merged over the stored results before the level is recomputed.
+async function readinessGate(config, nameWithOwner, base) {
+  const { min_level: min, max_age_days: maxAge } = config.readiness;
+  const where = path.join(factoryHome(), 'readiness', `${repoKey(nameWithOwner)}.json`);
+  const doc = readJson(where);
+  const fixList = (r) => (r.length ? `\n${r.map((f) => `  - ${f.id}: ${flat(f.what, 160)} -> ${flat(f.help, 200)}`).join('\n')}` : '');
+  if (!doc || !Array.isArray(doc.results) || !Number.isInteger(doc.level)) return { refuse: `readiness is required to merge (readiness.min_level ${min}) but there is no usable result for ${nameWithOwner}: run "deliver readiness" first` };
+  const at = Date.parse(doc.at);
+  if (!Number.isFinite(at) || Date.now() - at > maxAge * 86400000) return { refuse: `the readiness result is older than ${maxAge} days (or undated): run "deliver readiness" again` };
+  if (!doc.config_hash || doc.config_hash !== baseConfigHash(base)) return { refuse: `config changed since readiness check (${CONFIG_PATH} on origin/${base} is not the one that was checked): run "deliver readiness" again` };
+  const ctx = makeCtx({ root, config, base, git, gh, repo: nameWithOwner });
+  const fresh = await runChecks(ctx, { only: ['C1', 'C2', 'C4', 'C5'] });
+  const freshIds = new Set(fresh.map((r) => r.id));
+  const merged = [...doc.results.filter((r) => !freshIds.has(r.id)), ...fresh];
+  const level = computeLevel(merged);
+  if (level < min) {
+    const st = new Map(merged.map((r) => [r.id, r]));
+    const fixes = CHECKS.filter((c) => c.level > 0 && st.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, st.get(c.id)));
+    return { refuse: `readiness level ${level} is below the required ${min}; fix these and run "deliver readiness" again:${fixList(fixes)}` };
+  }
+  return { level };
+}
+
+// sha256 of the raw bytes of the config file on origin/<base> (null when absent); shared by `readiness` and the init gate.
+function baseConfigHash(base) {
+  const shown = spawnSync('git', ['show', `origin/${base}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
+  return shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
+}
+
+C.init = async () => {
   if (fs.existsSync(file)) { const q = load(); if (q.features.some((f) => !['merged', 'skipped'].includes(f.state))) die('a run is in progress; use status, or reset --yes to discard its state'); }
   const top = git('rev-parse', '--show-toplevel');
   if (top.code !== 0) die('not a git repository');
@@ -202,6 +232,15 @@ C.init = () => {
   const warnings = [];
   if (protectedBase) warnings.push(`"${base}" matches protected_branches: PRs will be opened and checked but this skill will never merge into it`);
   if (!q.merge && !protectedBase) warnings.push('merging is off for this run (config merge.mode is "pr-only" and --merge was not given)');
+  if (q.merge && config.readiness) {
+    const g = await readinessGate(config, repo.nameWithOwner, base);
+    if (g.refuse) die(g.refuse);
+    q.readiness_level = g.level;
+  } else {
+    q.readiness_level = null;
+    const stored = readJson(path.join(factoryHome(), 'readiness', `${repoKey(repo.nameWithOwner)}.json`));
+    if (stored && Number.isInteger(stored.level) && stored.level < 3) warnings.push(`stored readiness level is ${stored.level} (below 3); run "deliver readiness" to see the fix list`);
+  }
   if (opt['dry-run'] || !features.length) return emit({ dry_run: !!opt['dry-run'], ...summary, warnings, queue: features.map((f) => ({ id: f.id, title: f.title, deps: f.deps })), note: features.length ? 'nothing written' : 'no feature with status: ready (and not already delivered) in the features directory' });
   save(q);
   const ex = git('rev-parse', '--git-path', 'info/exclude').out;
@@ -231,8 +270,7 @@ C.readiness = async () => {
   must(gitNet('fetch', 'origin'), 'git fetch');
   const sha = git('rev-parse', '--verify', `origin/${base}^{commit}`);
   if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
-  const shown = spawnSync('git', ['show', `origin/${base}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
-  const configHash = shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
+  const configHash = baseConfigHash(base);
   const ctx = makeCtx({ root, config, base, git, gh, repo: repo.nameWithOwner });
   let results = await runChecks(ctx);
   for (let i = 1; i < repeat; i++) {

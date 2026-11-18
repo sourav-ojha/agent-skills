@@ -387,3 +387,72 @@ test('factoryhome: writeJsonAtomic writes, refuses symlinked dir and target, and
   assert.deepEqual(fs.readdirSync(path.join(d, 'sub')).filter((n) => n.includes('.tmp-')), []);
   fs.rmSync(d, { recursive: true, force: true });
 });
+
+// ---- deliver init readiness gate (Task 5) ------------------------------------------------------------------------------
+const featureMd = '---\nid: FEATURE-001\ntitle: One\nstatus: ready\n---\nbody\n';
+async function gateRepo(config = {}, opts = {}) {
+  const r = await cliRepo({ config: { protected_branches: ['release/*'], ...config }, files: { '.product/features/FEATURE-001.md': featureMd, ...(opts.files || {}) } });
+  return r;
+}
+const initArgs = ['init', '--merge', '--note', 'ok to merge'];
+const rewriteFile = (r, fn) => { const d = JSON.parse(fs.readFileSync(r.file, 'utf8')); fn(d); fs.writeFileSync(r.file, JSON.stringify(d)); };
+const done = (r) => fs.rmSync(r.root, { recursive: true, force: true });
+
+test('init gate: opted in + merge + no readiness file is refused', async () => {
+  const r = await gateRepo();
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /deliver readiness/);
+  done(r);
+});
+test('init gate: passes and stores readiness_level', async () => {
+  const r = await gateRepo();
+  assert.equal(r.d('readiness').code, 0);
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 0, x.out + x.err);
+  const q = JSON.parse(fs.readFileSync(path.join(r.work, '.delivery', 'queue.json'), 'utf8'));
+  assert.equal(q.readiness_level, 4);
+  done(r);
+});
+test('init gate: stale readiness file (15 days) is refused', async () => {
+  const r = await gateRepo();
+  assert.equal(r.d('readiness').code, 0);
+  rewriteFile(r, (d) => { d.at = new Date(Date.now() - 15 * 86400000).toISOString(); });
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /older than|stale/i);
+  done(r);
+});
+test('init gate: config edited after the check is refused', async () => {
+  const r = await gateRepo();
+  assert.equal(r.d('readiness').code, 0);
+  rewriteFile(r, (d) => { d.config_hash = 'sha256:' + '0'.repeat(64); });
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /config changed since readiness check/);
+  done(r);
+});
+test('init gate: a tracked .env added afterwards lowers the level and refuses', async () => {
+  const r = await gateRepo();
+  assert.equal(r.d('readiness').code, 0);
+  fs.writeFileSync(path.join(r.work, '.env'), 'X=1\n');
+  sh(r.work, 'add', '-f', '.env'); sh(r.work, 'commit', '-q', '-m', 'env'); sh(r.work, 'push', '-q', 'origin', 'main');
+  const x = r.d(...initArgs);
+  assert.equal(x.code, 1, x.out + x.err);
+  assert.match(x.err, /below the required 4/);
+  assert.match(x.err, /C4/);
+  done(r);
+});
+test('init gate: merge.mode pr-only is not gated and warns when the stored level is below 3', async () => {
+  const r = await gateRepo({ merge: { mode: 'pr-only', allow_tier3: false } });
+  const nogate = r.d('init');
+  assert.equal(nogate.code, 0, nogate.out + nogate.err);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(r.work, '.delivery', 'queue.json'), 'utf8')).readiness_level, null);
+  assert.equal(r.d('reset', '--yes').code, 0);
+  fs.mkdirSync(path.dirname(r.file), { recursive: true });
+  fs.writeFileSync(r.file, JSON.stringify({ level: 2, at: new Date().toISOString(), results: [], config_hash: null }));
+  const x = r.d('init', '--dry-run');
+  assert.equal(x.code, 0, x.out + x.err);
+  assert.match(JSON.parse(x.out).warnings.join('\n'), /readiness level is 2/);
+  done(r);
+});
