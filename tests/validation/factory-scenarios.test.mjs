@@ -474,3 +474,161 @@ test('specFromBase: base validation and non-regular entries', () => {
   assert.deepEqual(cr.specFromBase(g, 'main', 'docs/link.md'), { ok: false, reason: 'not_a_file' });
   assert.equal(cr.specFromBase(g, 'main', 'docs/s.md').ok, true);
 });
+
+// ---- Task 4: scenario files (schema, lint, storage, approval) ----
+const LIB = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'lib');
+const sc = await import(path.join(LIB, 'scenarios.mjs'));
+
+const crit = () => cr.extractCriteria(SPEC);
+const CAN = 'fx-7f3a9c';
+const allIds = ['AC-1', 'AC-2', 'EC-1', 'EC-2', 'ER-1'];
+const goodDoc = () => ({
+  feature: 'FEATURE-001',
+  criteria_hash: cr.criteriaHash(crit().sections),
+  canary: CAN,
+  scenarios: [
+    { id: 'S-1', covers: ['AC-1', 'EC-2'], kind: 'api', setup: [{ method: 'POST', path: '/api/projects', body: { name: `Alpha ${CAN}` } }],
+      request: { method: 'GET', path: '/api/projects?limit=5' }, assert: [{ status: 200 }] },
+    { id: 'S-2', covers: ['AC-2', 'EC-1', 'ER-1'], kind: 'ui', setup: [`Create a project named '${CAN}'`], steps: ['Open the page'], expect: ['It is listed'] },
+  ],
+});
+const lint = (d, c = crit(), h = cr.criteriaHash(crit().sections)) => sc.lintScenarios(d, c, h);
+
+test('lintScenarios: a complete doc passes', () => {
+  assert.deepEqual(lint(goodDoc()), { ok: true, problems: [] });
+});
+
+test('lintScenarios: refuses when criteria extraction has errors (counts only)', () => {
+  const bad = cr.extractCriteria(SPEC.replace('## 11. Edge cases', '## 11. Edge cases\n\n```\nunclosed'));
+  assert.equal(bad.ok, false);
+  const r = lint(goodDoc(), bad, cr.criteriaHash(bad.sections));
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.includes(`criteria extraction has errors (${bad.errors.length})`));
+  assert.ok(!r.problems.join('\n').includes('unclosed'));
+});
+
+test('lintScenarios: uncovered criterion', () => {
+  const d = goodDoc(); d.scenarios[1].covers = ['AC-2', 'EC-1'];
+  const r = lint(d);
+  assert.equal(r.ok, false); assert.ok(r.problems.some((p) => p.includes('ER-1')));
+});
+
+test('lintScenarios: more than 3 scenarios for one criterion', () => {
+  const d = goodDoc();
+  for (let i = 3; i <= 5; i++) d.scenarios.push({ id: `S-${i}`, covers: ['AC-1'], kind: 'ui', steps: ['a'], expect: ['b'] });
+  const r = lint(d);
+  assert.equal(r.ok, false); assert.ok(r.problems.some((p) => p.includes('AC-1') && p.includes('4')));
+});
+
+test('lintScenarios: unknown covers id is reported', () => {
+  const d = goodDoc(); d.scenarios[0].covers.push('AC-99');
+  const r = lint(d); assert.equal(r.ok, false); assert.ok(r.problems.some((p) => p.includes('AC-99')));
+});
+
+test('lintScenarios: api needs request+assert, ui needs steps+expect, kind known, ids unique', () => {
+  let d = goodDoc(); delete d.scenarios[0].assert;
+  assert.equal(lint(d).ok, false);
+  d = goodDoc(); delete d.scenarios[0].request;
+  assert.equal(lint(d).ok, false);
+  d = goodDoc(); d.scenarios[1].steps = [];
+  assert.equal(lint(d).ok, false);
+  d = goodDoc(); delete d.scenarios[1].expect;
+  assert.equal(lint(d).ok, false);
+  d = goodDoc(); d.scenarios[1].kind = 'cli';
+  assert.equal(lint(d).ok, false);
+  d = goodDoc(); d.scenarios[1].id = 'S-1';
+  assert.equal(lint(d).ok, false);
+  assert.equal(lint({ feature: 'FEATURE-001', scenarios: 'x' }).ok, false);
+  assert.equal(lint(null).ok, false);
+});
+
+test('lintScenarios: api only for contract endpoints (query ignored, {id} matches one segment)', () => {
+  let d = goodDoc(); d.scenarios[0].request = { method: 'DELETE', path: '/api/projects' };
+  assert.equal(lint(d).ok, false);
+  d = goodDoc(); d.scenarios[0].request = { method: 'GET', path: '/api/other' };
+  assert.equal(lint(d).ok, false);
+  const c = { ...crit(), contract: [{ method: 'GET', path: '/api/projects/{id}' }] };
+  const h = cr.criteriaHash(c.sections);
+  d = goodDoc(); d.scenarios[0].request = { method: 'GET', path: '/api/projects/42?x=1' };
+  assert.equal(lint(d, c, h).ok, true);
+  d.scenarios[0].request = { method: 'GET', path: '/api/projects/42/extra' };
+  assert.equal(lint(d, c, h).ok, false);
+  d.scenarios[0].request = { method: 'GET', path: '/api/projects/' };
+  assert.equal(lint(d, c, h).ok, false);
+});
+
+test('lintScenarios: canary must appear in scenario data of at least one scenario, and be well formed', () => {
+  const d = goodDoc();
+  d.scenarios[0].setup[0].body.name = 'Alpha'; d.scenarios[1].setup = ['plain'];
+  assert.equal(lint(d).ok, false);
+  const e = goodDoc(); e.scenarios[1].setup = ['plain']; // still present in the api scenario only
+  assert.equal(lint(e).ok, true);
+  const f = goodDoc(); f.canary = 'fx-zz';
+  assert.equal(lint(f).ok, false);
+  const g = goodDoc(); delete g.canary;
+  assert.equal(lint(g).ok, false);
+});
+
+test('lintScenarios: stale criteria_hash', () => {
+  const d = goodDoc(); d.criteria_hash = 'sha256:old';
+  assert.equal(lint(d).ok, false);
+});
+
+test('lintScenarios: problems never echo scenario text, data, paths or canary', () => {
+  const d = goodDoc();
+  d.scenarios[0].setup[0].body.name = 'SECRET-DATA';
+  d.scenarios[0].request = { method: 'GET', path: '/secret/SECRET-DATA' };
+  d.scenarios[0].covers = ['SECRET-DATA', 'AC-1'];
+  d.scenarios[0].id = 'SECRET-DATA';
+  d.scenarios[1].kind = 'SECRET-DATA';
+  d.scenarios[1].steps = ['SECRET-DATA'];
+  d.scenarios[1].setup = ['SECRET-DATA'];
+  d.scenarios.push({ id: 'S-9 SECRET-DATA', covers: ['AC-2'], kind: 'api', request: { method: 'SECRET-DATA', path: 'SECRET-DATA' }, assert: [{ status: 200 }] });
+  const r = lint(d);
+  assert.equal(r.ok, false);
+  const out = r.problems.join('\n');
+  assert.ok(r.problems.length > 0);
+  assert.ok(!out.includes('SECRET-DATA'), out);
+  assert.ok(!out.includes(CAN), out);
+  assert.ok(!out.includes('/secret'), out);
+});
+
+test('newCanary format and scenariosHash stability', () => {
+  assert.match(sc.newCanary(), /^fx-[0-9a-f]{6}$/);
+  assert.notEqual(sc.newCanary(), sc.newCanary());
+  const a = goodDoc();
+  const b = { scenarios: goodDoc().scenarios.map((s) => Object.fromEntries(Object.entries(s).reverse())), canary: CAN, criteria_hash: a.criteria_hash, feature: a.feature };
+  assert.match(sc.scenariosHash(a), /^sha256:[0-9a-f]{64}$/);
+  assert.equal(sc.scenariosHash(a), sc.scenariosHash(b));
+  const c = goodDoc(); c.scenarios[0].id = 'S-7';
+  assert.notEqual(sc.scenariosHash(a), sc.scenariosHash(c));
+});
+
+test('approve / isCurrentApproved', () => {
+  const d = goodDoc();
+  assert.equal(sc.isCurrentApproved(d, d.criteria_hash), false);
+  const a = sc.approve(d, 'auto');
+  assert.equal(d.approved, undefined, 'approve does not mutate');
+  assert.equal(a.approved.by, 'auto');
+  assert.ok(!Number.isNaN(Date.parse(a.approved.at)));
+  assert.equal(sc.isCurrentApproved(a, d.criteria_hash), true);
+  assert.equal(sc.isCurrentApproved(a, 'sha256:other'), false);
+  assert.equal(sc.isCurrentApproved(null, 'x'), false);
+  assert.equal(sc.isCurrentApproved({ ...d, approved: { by: '', at: 'x' } }, d.criteria_hash), false);
+});
+
+test('scenarioPath and storage: under FACTORY_HOME, atomic, no traversal', () => {
+  const home = tmpDir('fx-home-');
+  const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = home;
+  try {
+    assert.equal(sc.scenarioPath('o__r', 'FEATURE-012'), path.join(home, 'scenarios', 'o__r', 'FEATURE-012.json'));
+    for (const id of ['../x', 'FEATURE-1/../../x', 'feature-1', 'FEATURE-1\n', '', 'FEATURE-', 'FEATURE-1.json']) assert.throws(() => sc.scenarioPath('o__r', id), /feature/i, id);
+    for (const k of ['a/b', '..', '.', '', 'a\\b', '../x', 'a\0b']) assert.throws(() => sc.scenarioPath(k, 'FEATURE-1'), /repo/i, JSON.stringify(k));
+    const d = sc.approve(goodDoc(), 'me');
+    sc.saveScenarios('o__r', 'FEATURE-001', d);
+    assert.deepEqual(sc.loadScenarios('o__r', 'FEATURE-001'), d);
+    assert.equal(sc.loadScenarios('o__r', 'FEATURE-002'), null);
+    assert.deepEqual(fs.readdirSync(path.dirname(sc.scenarioPath('o__r', 'FEATURE-001'))), ['FEATURE-001.json']);
+    assert.throws(() => sc.saveScenarios('o__r', '../evil', d));
+  } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; }
+});
