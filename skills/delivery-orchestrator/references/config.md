@@ -53,6 +53,21 @@ All optional. `readiness` absent (`null`) means the project has not opted in to 
 | `readiness.min_level` | Lowest acceptable readiness level, an integer 1-4 | `3` when `readiness` is present |
 | `readiness.max_age_days` | How old a readiness result may be, an integer 1-90 | `14` when `readiness` is present |
 
+## Verification keys: `verification`
+
+Optional object; absent means `required: false`. Unknown keys inside it are errors.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `verification.required` | Whether a feature must pass the verification gate | `false` |
+| `verification.scenario_approval` | `auto` or `human` | `auto` |
+| `verification.session_timeout_s.builder`, `.author` | Time limit per agent session, integers 60-7200 | 1800, 900 |
+| `verification.max_turns.builder`, `.author` | Turn limit per agent session, integers 5-1000 | 200, 40 |
+| `verification.model.builder`, `.author` | Model name, or `null` for the default | `null` |
+| `verification.test_globs` | Up to 50 path globs that identify test files | `[]` |
+
+The queue file can be moved with the `DELIVER_QUEUE` environment variable (an absolute path; the folder is created with mode 0700 and a symlinked file or folder is refused). PR body files still live in `.delivery/`.
+
 ## Safety of the file itself
 - It must be **committed and identical to the copy on `origin/<base>`** when a run starts, so the rules in force are the ones that were reviewed and merged. A local edit, or a copy that only exists on a feature branch, is refused.
 - A feature that changes it is held for a person, and the run keeps using the policy it started with.

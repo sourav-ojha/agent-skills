@@ -35,7 +35,10 @@ if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
 
 const root = path.resolve(opt.dir || '.');
 const dirState = path.join(root, '.delivery');
-const file = path.join(dirState, 'queue.json');
+// DELIVER_QUEUE (absolute path) relocates the queue file; PR body files still live under <root>/.delivery/.
+const queueOverride = process.env.DELIVER_QUEUE || '';
+if (queueOverride && !path.isAbsolute(queueOverride)) die('DELIVER_QUEUE must be an absolute path');
+const file = queueOverride ? path.normalize(queueOverride) : path.join(dirState, 'queue.json');
 const t0 = Date.now();
 const extra = {};
 process.on('exit', (code) => { if (cmd !== 'status') logEvent(root, 'delivery-orchestrator', runId('deliver', 'run'), { event: cmd, ok: code === 0, ms: Date.now() - t0, ...extra }); });
@@ -108,6 +111,7 @@ const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_
 
 // ---- state -----------------------------------------------------------------------------------------------------------
 function load() {
+  if (queueOverride) for (const p of [file, path.dirname(file)]) { try { if (fs.lstatSync(p).isSymbolicLink()) die(`refusing to use a symlinked queue path (${p})`); } catch { /* absent */ } }
   if (!fs.existsSync(file)) die('no run in progress here; use init first');
   let q;
   try { q = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { die(`queue file is invalid JSON (${e.message}); reset and re-init (merged PRs are on GitHub)`); }
@@ -128,9 +132,13 @@ function save(q) {
   fs.mkdirSync(dirState, { recursive: true });
   const ign = path.join(dirState, '.gitignore');
   if (!fs.existsSync(ign)) fs.writeFileSync(ign, '*\n');
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n');
-  fs.renameSync(tmp, file);
+  if (queueOverride) {
+    try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); writeJsonAtomic(file, q); } catch (e) { die(`cannot write the queue file: ${e.message}`); }
+  } else {
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n');
+    fs.renameSync(tmp, file);
+  }
   curQ = q;
   flushRecords();
 }
