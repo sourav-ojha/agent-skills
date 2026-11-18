@@ -72,7 +72,8 @@ const limitEvent = (e) => {
   const info = asObj(e.rate_limit_info) || (e.type === 'rate_limit_event' ? e : null) || asObj(e.rate_limit_event);
   if (!info) return null;
   const inner = asObj(info.rate_limit_info) || info;
-  return String(inner.status || '').toLowerCase() === 'allowed' ? null : inner;
+  // Only a rejected event decides a limit; allowed and allowed_warning (approaching a limit) are ignored.
+  return String(inner.status || '').toLowerCase() === 'rejected' ? inner : null;
 };
 
 export function classifyFailure(payload, { now = new Date() } = {}) {

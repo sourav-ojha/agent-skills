@@ -46,16 +46,19 @@ test('seven_day* is weekly, model names are model', () => {
   assert.equal(c('weekly-event.json').source, 'event');
   assert.equal(c('model-event.json').kind, 'model');
   // a weekly cap scoped to one model is a model limit (the model-specific wait is what matters)
-  assert.equal(classifyFailure({ is_error: true, rate_limit_event: { rateLimitType: 'seven_day_opus' } }).kind, 'model');
+  assert.equal(classifyFailure({ is_error: true, rate_limit_event: { status: 'rejected', rateLimitType: 'seven_day_opus' } }).kind, 'model');
 });
 test('epoch in milliseconds is accepted', () => {
-  const r = classifyFailure({ is_error: true, rate_limit_event: { resetsAt: 1795000000000, rateLimitType: 'five_hour' } });
+  const r = classifyFailure({ is_error: true, rate_limit_event: { status: 'rejected', resetsAt: 1795000000000, rateLimitType: 'five_hour' } });
   assert.equal(r.resetAt, new Date(1795000000000).toISOString());
 });
 test('success payloads are other, no reset', () => {
   for (const n of ['success.json', 'success-allowed-event.json', 'real-allowed-stream.json', 'not-error-with-limit-text.json']) {
     assert.deepEqual(c(n), { kind: 'other', resetAt: null, source: 'none' }, n);
   }
+});
+test('allowed_warning event plus an unrelated error is other', () => {
+  assert.deepEqual(c('allowed-warning-unrelated-error.json'), { kind: 'other', resetAt: null, source: 'none' });
 });
 test('is_error with unrelated text is other', () => {
   assert.deepEqual(c('error-unrelated.json'), { kind: 'other', resetAt: null, source: 'none' });
