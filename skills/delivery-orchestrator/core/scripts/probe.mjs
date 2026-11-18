@@ -126,6 +126,11 @@ const WEAK = new Set(['mdfind', 'qlmanage']);
 export function controlProblems(c, res) {
   if (!c || !Array.isArray(c.routes)) return ['control file is not a probe --json output'];
   const out = [];
+  const shaped = c.routes.every((r) => r && typeof r === 'object' && typeof r.route === 'string' && typeof r.result === 'string');
+  if (!shaped) return ['control file has a malformed route entry'];
+  const seen = new Set(c.routes.map((r) => r.route));
+  const missing = ROUTES.filter((r) => !seen.has(r));
+  if (missing.length) out.push(`control run lacks route(s): ${missing.join(', ')}`);
   if (c.target !== res.target) out.push('target differs from the control run');
   if (c.write_target !== res.write_target) out.push('write-target differs from the control run');
   if (!c.token_sha256 || c.token_sha256 !== res.token_sha256) out.push('token differs from the control run');

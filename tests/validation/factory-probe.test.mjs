@@ -128,6 +128,27 @@ test('--control: mismatch exits 3; match exits per result; token never in output
   assert.equal(cli(f, ['--control', path.join(f.d, 'absent.json')]).status, 3);
 });
 
+test('--control: empty, partial or malformed routes are rejected with exit 3, never a crash', (t) => {
+  const f = fixture(t);
+  const ctlFile = path.join(f.d, 'control.json');
+  const good = JSON.parse(cli(f).stdout);
+  const variants = {
+    empty: { ...good, routes: [] },
+    missing: { ...good, routes: good.routes.filter((r) => r.route !== 'cat') },
+    nullEntry: { ...good, routes: [null, ...good.routes] },
+    stringEntry: { ...good, routes: ['cat', ...good.routes.slice(1)] },
+    noResult: { ...good, routes: good.routes.map((r) => (r.route === 'cat' ? { route: 'cat' } : r)) },
+  };
+  for (const [name, c] of Object.entries(variants)) {
+    fs.writeFileSync(ctlFile, JSON.stringify(c));
+    const r = cli(f, ['--control', ctlFile]);
+    assert.equal(r.status, 3, `${name}: ${r.stderr}`);
+    assert.match(r.stderr, /control rejected/);
+  }
+  fs.writeFileSync(ctlFile, JSON.stringify(good));
+  assert.equal(cli(f, ['--control', ctlFile]).status, 1); // the genuine control is still accepted
+});
+
 test('--control accepted and everything denied: exit 0', (t) => {
   if (process.getuid && process.getuid() === 0) return;
   const f = fixture(t);
