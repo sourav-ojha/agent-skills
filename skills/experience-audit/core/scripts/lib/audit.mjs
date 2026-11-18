@@ -16,6 +16,31 @@ const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u206
 const INPUT_KEYS = ['rule', 'route', 'selector', 'category', 'kind', 'severity', 'effort', 'title', 'group', 'evidence', 'proposed_fix', 'acceptance', 'retest', 'passes', 'viewports'];
 const GWT = /given\b[\s\S]*\bwhen\b[\s\S]*\bthen\b/i;
 
+const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+// Never write through a symlink: a cloned repository could ship .experience (or its files) as links to somewhere else.
+export function ensureDir(d) {
+  if (isLink(d)) throw new Error(`refusing to use ${path.basename(d)}: it is a symbolic link`);
+  fs.mkdirSync(d, { recursive: true });
+  const st = fs.lstatSync(d);
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`refusing to use ${path.basename(d)}: not a plain directory`);
+}
+export function safeWrite(file, text) { safeFile(file, text, "replace"); }
+function safeFile(file, text, mode) { // mode: 'append' | 'create' (exclusive) | 'replace'
+  const F = fs.constants;
+  if (mode === 'replace') {
+    if (isLink(file)) throw new Error(`refusing to write ${path.basename(file)}: it is a symbolic link`);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, text, { flag: F.O_WRONLY | F.O_CREAT | F.O_EXCL | (F.O_NOFOLLOW || 0), mode: 0o644 });
+    fs.renameSync(tmp, file);
+    return;
+  }
+  const flags = F.O_WRONLY | F.O_CREAT | (mode === 'create' ? F.O_EXCL : F.O_APPEND) | (F.O_NOFOLLOW || 0);
+  let fd;
+  try { fd = fs.openSync(file, flags, 0o644); } catch (e) { if (e.code === 'ELOOP' || e.code === 'EMLINK') throw new Error(`refusing to write ${path.basename(file)}: it is a symbolic link`); throw e; }
+  try { fs.writeSync(fd, text); } finally { fs.closeSync(fd); }
+}
+export const FIX_ID = /^FIX-\d{3,6}$/;
+
 export const paths = (dir) => {
   const base = path.join(path.resolve(dir), '.experience');
   return { base, file: path.join(base, 'findings.json'), decisions: path.join(base, 'decisions.md'), fixes: path.join(base, 'fixes'), evidence: path.join(base, 'evidence'), report: path.join(base, 'report.md') };
@@ -29,14 +54,13 @@ export function load(dir) {
   let l;
   try { l = JSON.parse(fs.readFileSync(p.file, 'utf8')); } catch (e) { throw new Error(`ledger is invalid JSON (${e.message}); restore it from git or re-audit`); }
   if (!l || !Array.isArray(l.findings)) throw new Error('ledger is invalid: expected an object with a findings array');
+  for (const fx of l.fixes || []) if (!fx || !FIX_ID.test(String(fx.id))) throw new Error(`ledger has an invalid fix id ${JSON.stringify(fx && fx.id)}: ids must look like FIX-001`);
   return l;
 }
 export function save(dir, l) {
   const p = paths(dir);
-  fs.mkdirSync(p.base, { recursive: true });
-  const tmp = `${p.file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(l, null, 2) + '\n');
-  fs.renameSync(tmp, p.file);
+  ensureDir(p.base);
+  safeFile(p.file, JSON.stringify(l, null, 2) + '\n', 'replace');
 }
 
 export const findingId = (f) => `F-${shortHash(`${f.rule}|${f.route}|${f.selector || ''}`)}`;
@@ -79,6 +103,14 @@ export function checkFinding(f, { dir, cap } = {}) {
     if (!f.effort) e.push('missing effort');
     if (!Array.isArray(f.acceptance) || !f.acceptance.length || !f.acceptance.every((a) => typeof a === 'string' && GWT.test(a))) e.push('acceptance must be a list of Given/When/Then strings');
   }
+  // Everything below is copied into FIX specs and reports that an agent will read: one line, bounded, no control characters.
+  if (typeof f.proposed_fix === 'string' && f.proposed_fix.length > 500) e.push('proposed_fix is longer than 500 characters');
+  if (Array.isArray(f.acceptance)) {
+    if (f.acceptance.length > 10) e.push('at most 10 acceptance criteria per finding');
+    for (const a of f.acceptance) if (typeof a === 'string' && (UNSAFE.test(a) || a.length > 300)) e.push('an acceptance criterion contains control characters (including newlines) or is longer than 300 characters');
+  }
+  for (const k of ['what_to_pull', 'cite', 'tool', 'crop']) if (typeof ev[k] === 'string' && (UNSAFE.test(ev[k]) || ev[k].length > 300)) e.push(`evidence.${k} contains control characters or is longer than 300 characters`);
+  if (typeof f.group === 'string' && !/^[\w:.#>-]{1,80}$/.test(f.group)) e.push('group must be 1-80 characters of letters, digits and : . _ # > - (no spaces, so it can be used as group:NAME)');
   return e;
 }
 
@@ -150,36 +182,38 @@ export function decide(l, dir, targets, decision, by, note) {
     f.status = status; f.decided_by = by; f.decision_note = note; f.decided = new Date().toISOString().slice(0, 10);
   }
   const p = paths(dir);
-  fs.mkdirSync(p.base, { recursive: true });
-  if (!fs.existsSync(p.decisions)) fs.writeFileSync(p.decisions, '# Decisions (append-only)\n\n| Date | Decision | By | Findings | Note |\n|---|---|---|---|---|\n');
-  fs.appendFileSync(p.decisions, `| ${new Date().toISOString().slice(0, 10)} | ${decision} | ${by} | ${uniq.join(', ')} | ${flat(note).replace(/\|/g, '/')} |\n`);
+  ensureDir(p.base);
+  if (!fs.existsSync(p.decisions) && !isLink(p.decisions)) safeFile(p.decisions, '# Decisions (append-only)\n\n| Date | Decision | By | Findings | Note |\n|---|---|---|---|---|\n', 'create');
+  safeFile(p.decisions, `| ${new Date().toISOString().slice(0, 10)} | ${decision} | ${by} | ${uniq.join(', ')} | ${flat(note).replace(/\|/g, '/')} |\n`, 'append');
   return uniq;
 }
 
 // FIX specs for approved groups, consumable by the implementer (acceptance criteria + re-test). Never overwrites.
 export function writeFixes(l, dir) {
   const p = paths(dir);
-  fs.mkdirSync(p.fixes, { recursive: true });
+  ensureDir(p.base); ensureDir(p.fixes);
   const made = [];
   const byGroup = new Map();
   for (const f of l.findings.filter((x) => x.status === 'approved')) byGroup.set(f.group, [...(byGroup.get(f.group) || []), f]);
   for (const [group, fs_] of byGroup) {
     let fx = l.fixes.find((x) => x.group === group);
     if (!fx) { fx = { id: `FIX-${String(l.fixes.length + 1).padStart(3, '0')}`, group, findings: [] }; l.fixes.push(fx); }
+    if (!FIX_ID.test(fx.id)) throw new Error(`invalid fix id ${JSON.stringify(fx.id)}`);
     const file = path.join(p.fixes, `${fx.id}.md`);
+    if (path.dirname(path.resolve(file)) !== path.resolve(p.fixes)) throw new Error('fix path escapes the fixes folder');
     fx.findings = [...new Set([...fx.findings, ...fs_.map((f) => f.id)])];
-    if (fs.existsSync(file)) continue;
-    const crit = [...new Set(fs_.flatMap((f) => f.acceptance || []))];
+    if (fs.existsSync(file) || isLink(file)) continue;
+    const crit = [...new Set(fs_.flatMap((f) => (f.acceptance || []).map(flat)))];
     const body = [
       '---', `id: ${fx.id}`, 'status: ready', 'source: experience-audit', `group: ${JSON.stringify(group)}`, `findings: [${fx.findings.join(', ')}]`, '---', '',
-      `# ${fx.id}: ${fs_[0].title.replace(/\s*\(candidate\)$/, '')}`, '',
+      `# ${fx.id}: ${flat(fs_[0].title).replace(/\s*\(candidate\)$/, '')}`, '',
       '## Goal', `Resolve the approved audit findings in group \`${group}\` without changing anything else.`, '',
-      '## Findings', ...fs_.map((f) => `- **${f.id}** (${f.severity}, effort ${f.effort}, ${f.kind}) ${f.title}\n  - Route: ${f.route}; selector: \`${f.selector || 'n/a'}\`; viewports: ${(f.viewports || []).join(', ') || 'n/a'}\n  - Evidence: \`${JSON.stringify(f.evidence.value ?? f.evidence).slice(0, 300)}\`\n  - Proposed fix: ${f.proposed_fix}`), '',
+      '## Findings', ...fs_.map((f) => `- **${f.id}** (${f.severity}, effort ${f.effort}, ${f.kind}) ${flat(f.title)}\n  - Route: ${flat(f.route)}; selector: \`${flat(f.selector || 'n/a').replace(/`/g, "'")}\`; viewports: ${(f.viewports || []).join(', ') || 'n/a'}\n  - Evidence: \`${JSON.stringify(f.evidence.value ?? f.evidence).slice(0, 300).replace(/`/g, "'")}\`\n  - Proposed fix: ${flat(f.proposed_fix)}`), '',
       '## Acceptance criteria', ...crit.map((c, i) => `${i + 1}. ${c}`), '',
-      '## Re-test', `Run the audit again for the routes above (\`reaudit\`). Rules to re-run: ${[...new Set(fs_.map((f) => f.retest))].join(', ')}. A finding is closed only when its probe no longer reports it.`, '',
+      '## Re-test', `Run the audit again for the routes above (\`reaudit\`). Rules to re-run: ${[...new Set(fs_.map((f) => flat(f.retest)))].join(', ')}. A finding is closed only when its probe no longer reports it.`, '',
       '## Non-goals', 'No redesign beyond the findings. No changes to unrelated pages or components.', '',
     ].join('\n');
-    fs.writeFileSync(file, body); made.push(fx.id);
+    safeFile(file, body, 'create'); made.push(fx.id);
   }
   return made;
 }
@@ -209,11 +243,11 @@ export function validateLedger(l, dir) {
     for (const m of errs) e.push(`${f.id}: ${m}`);
     if (['approved', 'rejected', 'deferred', 'needs-evidence'].includes(f.status) && (!f.decided_by || !f.decision_note)) e.push(`${f.id}: status ${f.status} without decided_by/decision_note`);
   }
-  for (const fx of l.fixes || []) for (const id of fx.findings) if (!ids.has(id)) e.push(`${fx.id}: unknown finding ${id}`);
+  for (const fx of l.fixes || []) { if (!FIX_ID.test(String(fx.id))) e.push(`invalid fix id ${JSON.stringify(fx.id)}`); for (const id of fx.findings || []) if (!ids.has(id)) e.push(`${fx.id}: unknown finding ${id}`); }
   if (dir) {
     const p = paths(dir);
     for (const f of l.findings) if (f.evidence?.crop && /(^|[\\/])\.\.([\\/]|$)/.test(f.evidence.crop)) e.push(`${f.id}: crop path escapes the evidence folder`);
-    for (const fx of l.fixes || []) if (!fs.existsSync(path.join(p.fixes, `${fx.id}.md`))) e.push(`${fx.id}: fix spec file is missing`);
+    for (const fx of l.fixes || []) if (FIX_ID.test(String(fx.id)) && !fs.existsSync(path.join(p.fixes, `${fx.id}.md`))) e.push(`${fx.id}: fix spec file is missing`);
   }
   return e;
 }
@@ -225,14 +259,14 @@ export function reportMarkdown(l, top) {
   const c = l.coverage || {};
   lines.push('## Coverage', `- Routes: ${(c.routes || []).join(', ') || 'none recorded'}`, `- Viewports: ${(c.viewports || []).join(', ') || 'none recorded'}`, `- States: ${(c.states || []).join(', ') || 'none recorded'}`, `- Not covered: ${(c.not_covered || []).join('; ') || 'nothing declared'}`, '', 'Absence of a finding means "not found in this coverage", not "no problem".', '');
   lines.push(`## Top ${t.length} by severity / effort`, '', '| ID | Severity | Effort | Kind | Group | Finding | Route |', '|---|---|---|---|---|---|---|');
-  for (const f of t) lines.push(`| ${f.id} | ${f.severity} | ${f.effort} | ${f.kind === 'judgment' ? 'judgment (opinion)' : f.kind} | ${f.group} | ${f.title.replace(/\|/g, '/')} | ${f.route} |`);
+  for (const f of t) lines.push(`| ${f.id} | ${f.severity} | ${f.effort} | ${f.kind === 'judgment' ? 'judgment (opinion)' : f.kind} | ${flat(f.group)} | ${flat(f.title).replace(/\|/g, '/')} | ${flat(f.route).replace(/\|/g, '/')} |`);
   if (rest.length) lines.push('', `${rest.length} more below the cutoff: ${rest.map((f) => f.id).join(', ')}.`);
   const g = groups(l);
-  if (g.length) { lines.push('', '## Root-cause groups (one fix can clear several findings)', ''); for (const x of g) lines.push(`- **${x.group}**: ${x.findings.length} finding(s), worst ${x.severity}: ${x.findings.map((f) => f.id).join(', ')}`); }
+  if (g.length) { lines.push('', '## Root-cause groups (one fix can clear several findings)', ''); for (const x of g) lines.push(`- **${flat(x.group)}**: ${x.findings.length} finding(s), worst ${x.severity}: ${x.findings.map((f) => f.id).join(', ')}`); }
   const nd = info.filter((f) => f.kind === 'needs-data'), nh = info.filter((f) => f.kind === 'needs-human-check'), ni = info.filter((f) => !['needs-data', 'needs-human-check'].includes(f.kind));
-  if (nd.length) { lines.push('', '## Needs data (you pull this; the audit does not guess)', ''); for (const f of nd) lines.push(`- ${f.title}: ${f.evidence.what_to_pull}`); }
-  if (nh.length) { lines.push('', '## Needs a human check (automated tools could not decide)', ''); for (const f of nh) lines.push(`- ${f.title}`); }
-  if (ni.length) { lines.push('', '## Notes', ''); for (const f of ni) lines.push(`- ${f.title}`); }
+  if (nd.length) { lines.push('', '## Needs data (you pull this; the audit does not guess)', ''); for (const f of nd) lines.push(`- ${flat(f.title)}: ${flat(f.evidence.what_to_pull)}`); }
+  if (nh.length) { lines.push('', '## Needs a human check (automated tools could not decide)', ''); for (const f of nh) lines.push(`- ${flat(f.title)}`); }
+  if (ni.length) { lines.push('', '## Notes', ''); for (const f of ni) lines.push(`- ${flat(f.title)}`); }
   lines.push('', '## Decision sheet', 'Reply per finding or group: approve, reject, defer, or evidence (needs more evidence). Example: "approve group:nav:footer, reject F-1a2b3c4d".', '');
   return lines.join('\n');
 }

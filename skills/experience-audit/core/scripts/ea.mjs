@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { logEvent, runId } from './lib/runlog.mjs';
 import { layoutChecks, footerChecks, seoChecks, siteChecks, axeFindings, lighthouseFindings, extractRaw } from './lib/checks.mjs';
-import { paths, emptyLedger, load, save, addFindings, rank, groups, decide, checkBy, checkNote, writeFixes, closeRun, validateLedger, reportMarkdown, DECISIONS } from './lib/audit.mjs';
+import { paths, ensureDir, safeWrite, emptyLedger, load, save, addFindings, rank, groups, decide, checkBy, checkNote, writeFixes, closeRun, validateLedger, reportMarkdown, DECISIONS } from './lib/audit.mjs';
 import { fileURLToPath } from 'node:url';
 
 const CORE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,7 +43,7 @@ run(() => {
     if (fs.existsSync(p.file)) die('audit already initialised');
     const env = opt.environment || 'staging';
     if (!['staging', 'production'].includes(env)) die('--environment must be staging or production');
-    fs.mkdirSync(p.evidence, { recursive: true });
+    ensureDir(p.base); ensureDir(p.evidence);
     save(dir, emptyLedger(env));
     console.log(`initialised ${path.relative(process.cwd(), p.file) || p.file} (environment: ${env}). Consider ignoring .experience/evidence/ (screenshots may contain personal data).`);
   } else if (cmd === 'config') {
@@ -103,7 +103,8 @@ run(() => {
     console.log(`verified fixed: ${r.verified.join(', ') || '-'}\nregressed: ${r.regressed.join(', ') || '-'}`);
   } else if (cmd === 'report') {
     const l = load(dir), p = paths(dir);
-    fs.writeFileSync(p.report, reportMarkdown(l, Number(opt.top) || cfgFor(l).limits.top_findings));
+    ensureDir(p.base);
+    safeWrite(p.report, reportMarkdown(l, Number(opt.top) || cfgFor(l).limits.top_findings));
     console.log(`wrote ${path.relative(process.cwd(), p.report) || p.report}`);
   } else if (cmd === 'status') {
     const l = load(dir), c = (s) => l.findings.filter((f) => f.status === s).length;
