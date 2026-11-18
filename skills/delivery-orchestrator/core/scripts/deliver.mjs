@@ -304,20 +304,32 @@ C.readiness = async () => {
   let parsed = parseConfig(raw);
   if (parsed.errors.length) parsed = parseConfig(undefined); // C1 reports the errors; the other checks run on defaults
   const config = parsed.config;
-  const accountError = useAccount(config.github.account, config.github.host, { soft: true }); // C2 reports it; the run continues on gh's default login
+  // The working-copy config is untrusted: it is used only to pick credentials for the fetch below.
+  let accountError = useAccount(config.github.account, config.github.host, { soft: true }); // C2 reports it; the run continues on gh's default login
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
-  const base = opt.base || config.base || repo.defaultBranchRef?.name;
-  if (!validRef(base)) die('could not determine a valid base branch; set "base" in the config or pass --base');
   must(gitNet('fetch', 'origin'), 'git fetch');
+  const committedConfig = (ref) => {
+    const s = git('show', `origin/${ref}:${CONFIG_PATH}`);
+    if (s.code !== 0) return null;
+    try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; } // C1 reports it
+  };
+  // The base comes from the person (--base) or from the config committed on the default branch, never from the working copy:
+  // otherwise an unreviewed edit could point readiness at any branch on origin and run that branch's commands.
+  const def = repo.defaultBranchRef?.name;
+  const defConfig = validRef(def) ? committedConfig(def) : null;
+  const base = opt.base || defConfig?.base || def;
+  if (!validRef(base)) die('could not determine a valid base branch; set "base" in the config on the default branch or pass --base');
   const sha = git('rev-parse', '--verify', `origin/${base}^{commit}`);
   if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
   const configHash = baseConfigHash(base);
-  // Commands (tests, app, seed) come only from the reviewed copy on origin/<base>, never from the working copy:
-  // an unmerged edit must not get to run code. C1 still compares the two and fails when they differ.
-  const shown = git('show', `origin/${base}:${CONFIG_PATH}`);
-  let reviewed = null;
-  if (shown.code === 0) { try { const pr = parseConfig(JSON.parse(shown.out)); if (!pr.errors.length) reviewed = pr.config; } catch { /* C1 reports it */ } }
+  // Commands (tests, app, seed) and every other setting come only from the reviewed copy on origin/<base>.
+  // C1 still compares the working copy with it and fails when they differ.
+  const reviewed = committedConfig(base);
   const runConfig = reviewed || parseConfig(undefined).config;
+  if ((runConfig.github.account || null) !== (config.github.account || null) || runConfig.github.host !== config.github.host) {
+    GH_ENV = {}; GH_HOSTNAME = null; // drop the bootstrap credentials; use the reviewed account (or gh's default)
+    accountError = useAccount(runConfig.github.account, runConfig.github.host, { soft: true });
+  }
   const ctx = makeCtx({ root, config: runConfig, base, git, gh, repo: repo.nameWithOwner, accountError });
   let results = await runChecks(ctx);
   for (let i = 1; i < repeat; i++) {

@@ -335,6 +335,24 @@ test('deliver readiness runs commands from the reviewed config on origin/<base>,
   assert.equal(res.get('C3'), 'pass'); // the reviewed tests.all (exit 0) ran instead
   fs.rmSync(r.root, { recursive: true, force: true });
 });
+test('deliver readiness ignores a working-copy base that points at an unreviewed branch', async () => {
+  const r = await cliRepo();
+  const marker = path.join(r.root, 'pwned-base');
+  const p = path.join(r.work, '.product/delivery.json');
+  const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+  sh(r.work, 'checkout', '-q', '-b', 'evil');
+  cfg.tests.all = ['node', '-e', `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`];
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  sh(r.work, 'commit', '-qam', 'evil config'); sh(r.work, 'push', '-q', 'origin', 'evil');
+  cfg.base = 'evil'; // the unreviewed working copy now names that branch as the base
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  const x = r.d('readiness', '--json');
+  assert.equal(fs.existsSync(marker), false, 'a command from an unreviewed branch config ran');
+  const doc = JSON.parse(x.out);
+  assert.equal(doc.base, 'main');
+  assert.equal(new Map(doc.results.map((z) => [z.id, z.status])).get('C1'), 'fail');
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
 test('deliver readiness: --repeat 2 gives identical statuses', async () => {
   const r = await cliRepo();
   const a = r.d('readiness'); assert.equal(a.code, 0, a.out + a.err);
