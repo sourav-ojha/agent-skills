@@ -88,16 +88,17 @@ let curQ = null;
 const pending = [];
 // A feature waiting for a person is not working: its record window ends when it entered awaiting_human (f.ts_wait), so a later
 // refresh/skip/merge of it does not stretch the window over other features' runs (which would make the token join ambiguous).
-const note = (f, from) => {
+const note = (f, from, at) => {
   if (!curQ || !RECORDED.has(f.state)) return;
   const waited = from === 'awaiting_human' && Number.isFinite(Date.parse(f.ts_wait)) ? Date.parse(f.ts_wait) : null;
-  pending.push({ f: JSON.parse(JSON.stringify(f)), at: waited ?? Date.now() });
+  pending.push({ f: JSON.parse(JSON.stringify(f)), at: waited ?? at ?? Date.now() });
 };
 const transition = (f, to, reason) => {
   const from = f.state;
   transitionState(f, to, reason);
-  if (to === 'awaiting_human') f.ts_wait = new Date().toISOString();
-  note(f, from);
+  const now = new Date();
+  if (to === 'awaiting_human') f.ts_wait = now.toISOString();
+  note(f, from, now.getTime()); // one clock reading, so the record's end equals ts_wait exactly
   return f;
 };
 let stamps;
