@@ -65,7 +65,7 @@ When a feature is blocked mid-way, uncommitted work is stashed (nothing is delet
 
 ## Readiness (optional gate)
 
-`deliver readiness [--repeat N] [--json]` scores the repo from level 0 to 4 (config, tests run, CI gate, app drivable), saves the result outside the repo and lists fixes; exit `2` when below `readiness.min_level`. Repos that add a `readiness` key to the config get a gate in `deliver init` when merging is authorised: it refuses on a missing, stale, future-dated or config-mismatched result, or a level below the minimum. Every feature outcome is also recorded in `.skill-runs/factory-runs.jsonl` (join to tokens with `si.mjs runs-factory`). Details: [references/readiness.md](references/readiness.md).
+`deliver readiness [--repeat N] [--json]` scores the repo from level 0 to 4 (config, tests run, CI gate, app drivable), saves the result outside the repo and lists fixes; exit `2` when below `readiness.min_level`. Repos that add a `readiness` key to the config get a gate in `deliver init` when merging is authorised: it refuses on a missing, stale, future-dated, config-mismatched or other-base result, or a level below the minimum. Every feature outcome is also recorded in `.skill-runs/factory-runs.jsonl` (join to tokens with `si.mjs runs-factory`). Details: [references/readiness.md](references/readiness.md).
 
 ## Stop and report (do not push through)
 

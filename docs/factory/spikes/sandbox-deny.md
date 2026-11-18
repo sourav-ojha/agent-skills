@@ -29,7 +29,7 @@ mkdir -p ~/.factory-probe/scenarios ~/.factory-probe/write-target
 export PROBE_TOKEN="probe-$(openssl rand -hex 16)"
 printf '%s\n' "$PROBE_TOKEN" > ~/.factory-probe/scenarios/.probe-sentinel
 mkdir -p ~/probe-builder-repo && cd ~/probe-builder-repo && git init -q
-PROBE=/Users/sourav/workspace/personal/agent-skills/skills/delivery-orchestrator/core/scripts/probe.mjs
+PROBE=<repo>/skills/delivery-orchestrator/core/scripts/probe.mjs
 node $PROBE --target ~/.factory-probe/scenarios --write-target ~/.factory-probe/write-target --json > control.json; echo exit=$?
 ```
 
