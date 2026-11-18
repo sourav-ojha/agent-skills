@@ -353,6 +353,23 @@ test('deliver readiness ignores a working-copy base that points at an unreviewed
   assert.equal(new Map(doc.results.map((z) => [z.id, z.status])).get('C1'), 'fail');
   fs.rmSync(r.root, { recursive: true, force: true });
 });
+test('deliver readiness: a local tag or branch named origin/<base> cannot shadow the remote-tracking ref', async () => {
+  const r = await cliRepo();
+  const marker = path.join(r.root, 'pwned-ref');
+  const p = path.join(r.work, '.product/delivery.json');
+  const good = fs.readFileSync(p, 'utf8');
+  const cfg = JSON.parse(good);
+  cfg.tests.all = ['node', '-e', `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`];
+  sh(r.work, 'checkout', '-q', '-b', 'shadow');
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  sh(r.work, 'commit', '-qam', 'shadow config');
+  sh(r.work, 'tag', 'origin/main'); // refs/tags/origin/main resolves before refs/remotes/origin/main
+  sh(r.work, 'checkout', '-q', 'main');
+  const x = r.d('readiness', '--json');
+  assert.equal(fs.existsSync(marker), false, 'a command from a shadowing local ref ran');
+  assert.equal(JSON.parse(x.out).base_sha, sh(r.work, 'rev-parse', 'refs/remotes/origin/main'));
+  fs.rmSync(r.root, { recursive: true, force: true });
+});
 test('deliver readiness: --repeat 2 gives identical statuses', async () => {
   const r = await cliRepo();
   const a = r.d('readiness'); assert.equal(a.code, 0, a.out + a.err);

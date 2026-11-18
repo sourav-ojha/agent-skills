@@ -88,7 +88,7 @@ export function makeCtx({ root, config, base, git, gh, repo, worktree, accountEr
 
 const res = (status, reason = '') => ({ status, reason });
 const fileText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
-const baseRef = (ctx) => `origin/${ctx.base}`;
+const baseRef = (ctx) => `refs/remotes/origin/${ctx.base}`; // fully qualified: a local ref named origin/<base> cannot shadow it
 const baseSha = (ctx) => { const r = ctx.git('rev-parse', '--verify', `${baseRef(ctx)}^{commit}`); return r.code === 0 ? r.out : null; };
 const repoName = (ctx) => {
   if (ctx.repo) return ctx.repo;

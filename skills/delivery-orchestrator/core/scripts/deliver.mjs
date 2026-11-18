@@ -73,6 +73,8 @@ const ghJson = (args, what) => { const r = gh(...args); if (r.code !== 0) die(`$
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/; // never starts with "-": a value can not be read as a git option
 const SHA = /^[0-9a-f]{40}$/;
 const validRef = (s) => typeof s === 'string' && REF.test(s) && !s.includes('..');
+// Always the remote-tracking ref, fully qualified: a local tag or branch named "origin/<x>" must never shadow it.
+const OR = (b) => `refs/remotes/origin/${b}`;
 
 // ---- run records ------------------------------------------------------------------------------------------------------
 // A record per transition into merged, skipped, blocked or awaiting_human. Snapshots are taken at the transition and written
@@ -216,7 +218,7 @@ async function readinessGate(config, nameWithOwner, base) {
 
 // sha256 of the raw bytes of the config file on origin/<base> (null when absent); shared by `readiness` and the init gate.
 function baseConfigHash(base) {
-  const shown = spawnSync('git', ['show', `origin/${base}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
+  const shown = spawnSync('git', ['show', `${OR(base)}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
   return shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
 }
 
@@ -242,7 +244,7 @@ C.init = async () => {
   must(gitNet('fetch', 'origin'), 'git fetch');
   if (gitNet('ls-remote', '--exit-code', '--heads', 'origin', base).code !== 0) die(`the base branch "${base}" does not exist on origin`);
   // The policy in force must be the one on the base branch (reviewed and merged there), not a local edit.
-  const onBase = git('show', `origin/${base}:${CONFIG_PATH}`);
+  const onBase = git('show', `${OR(base)}:${CONFIG_PATH}`);
   if (raw === undefined && onBase.code === 0) die(`origin/${base} has ${CONFIG_PATH} but this checkout does not: update your checkout first`);
   if (raw !== undefined) {
     let theirs; try { theirs = JSON.parse(onBase.out); } catch { /* handled below */ }
@@ -309,7 +311,7 @@ C.readiness = async () => {
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
   must(gitNet('fetch', 'origin'), 'git fetch');
   const committedConfig = (ref) => {
-    const s = git('show', `origin/${ref}:${CONFIG_PATH}`);
+    const s = git('show', `${OR(ref)}:${CONFIG_PATH}`);
     if (s.code !== 0) return null;
     try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; } // C1 reports it
   };
@@ -319,7 +321,7 @@ C.readiness = async () => {
   const defConfig = validRef(def) ? committedConfig(def) : null;
   const base = opt.base || defConfig?.base || def;
   if (!validRef(base)) die('could not determine a valid base branch; set "base" in the config on the default branch or pass --base');
-  const sha = git('rev-parse', '--verify', `origin/${base}^{commit}`);
+  const sha = git('rev-parse', '--verify', `${OR(base)}^{commit}`);
   if (sha.code !== 0 || !SHA.test(sha.out)) die(`cannot resolve origin/${base}`);
   const configHash = baseConfigHash(base);
   // Commands (tests, app, seed) and every other setting come only from the reviewed copy on origin/<base>.
@@ -366,7 +368,7 @@ C.next = () => {
   if (!clean()) die('the working tree is not clean; resolve it before starting the next feature');
   must(gitNet('fetch', 'origin'), 'git fetch');
   must(git('checkout', q.base), `git checkout ${q.base}`);
-  if (git('merge', '--ff-only', `origin/${q.base}`).code !== 0) die(`local ${q.base} has diverged from origin/${q.base}; fix it by hand, then run next again`);
+  if (git('merge', '--ff-only', OR(q.base)).code !== 0) die(`local ${q.base} has diverged from origin/${q.base}; fix it by hand, then run next again`);
   const branch = `${q.policy.branch_prefix}${f.id.toLowerCase()}-${slugify(f.title)}`;
   if (git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0) {
     // A crash between creating the branch and saving state leaves a branch at the base tip: reuse it. Anything else is someone's work.
@@ -388,7 +390,7 @@ C.built = () => {
   need(f, 'building', 'built');
   if (branchNow() !== f.branch) die(`expected to be on ${f.branch}, on ${branchNow()}`);
   if (!clean()) die('uncommitted changes remain; commit them (or discard) before reporting built');
-  const ahead = Number(git('rev-list', '--count', `origin/${q.base}..HEAD`).out);
+  const ahead = Number(git('rev-list', '--count', `${OR(q.base)}..HEAD`).out);
   if (!(ahead >= 1)) { block(q, f, 'no commits on the feature branch'); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
   const delivery = (frontmatter(fs.readFileSync(f.file, 'utf8')).delivery || 'none').toLowerCase();
   if (delivery !== 'complete') { block(q, f, `spec delivery is "${delivery}", not complete`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
@@ -422,7 +424,7 @@ C.built = () => {
 };
 // -z: NUL-separated, never quoted or escaped, so a path with unusual characters cannot hide from the pattern list. A failing diff holds the merge.
 const ciFiles = (q, rev) => {
-  const r = spawnSync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', `origin/${q.base}...${rev}`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', `${OR(q.base)}...${rev}`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   if (r.status !== 0) return ['(could not list the changed files)'];
   const files = r.stdout.split('\0').filter(Boolean);
   const policy = files.filter((x) => x.toLowerCase() === CONFIG_PATH || matchesAny(x, q.policy.hold_paths)); // the config itself, and paths the project wants a person to review
@@ -541,7 +543,7 @@ C.fix = () => {
   if (branchNow() !== f.branch) must(git('checkout', f.branch), 'git checkout');
   // GitHub may have added commits (an "update branch" merge): start from the remote tip so the fix can be pushed without force.
   must(gitNet('fetch', 'origin', f.branch), 'git fetch');
-  if (git('merge', '--ff-only', `origin/${f.branch}`).code !== 0) die(`local ${f.branch} and origin/${f.branch} have diverged; resolve it by hand`);
+  if (git('merge', '--ff-only', OR(f.branch)).code !== 0) die(`local ${f.branch} and origin/${f.branch} have diverged; resolve it by hand`);
   f.fix_rounds++;
   transition(f, 'fixing');
   save(q);
@@ -606,7 +608,7 @@ function merged(q, f, sha, warn = []) {
   f.merged_sha = sha || null;
   transition(f, 'merged');
   gitNet('push', 'origin', '--delete', f.branch); // best effort: many repos delete merged branches themselves
-  if (git('checkout', q.base).code !== 0 || gitNet('fetch', 'origin').code !== 0 || git('merge', '--ff-only', `origin/${q.base}`).code !== 0) warn.push(`could not fast-forward local ${q.base}; fix it before the next feature`);
+  if (git('checkout', q.base).code !== 0 || gitNet('fetch', 'origin').code !== 0 || git('merge', '--ff-only', OR(q.base)).code !== 0) warn.push(`could not fast-forward local ${q.base}; fix it before the next feature`);
   if (git('rev-parse', '--verify', '--quiet', `refs/heads/${f.branch}`).code === 0) git('branch', '-D', f.branch);
   save(q);
   emit({ id: f.id, state: 'merged', pr: f.pr.url, merged_sha: f.merged_sha, ...(warn.length ? { warnings: warn } : {}) });
