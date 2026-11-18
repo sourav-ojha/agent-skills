@@ -1,0 +1,39 @@
+[
+  {
+    "id": "S-001",
+    "type": "repo",
+    "ref": "repo:src/pages/",
+    "title": "Marketing pages: home, pricing, 3 feature pages, blog with 4 posts",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-002",
+    "type": "serp",
+    "url": "https://serp.example/search?q=appointment+scheduling+software+for+salons&gl=us",
+    "title": "SERP check: salon scheduling software (US)",
+    "accessed": "2026-11-18",
+    "geo": "US",
+    "note": "listicles and review platforms dominate"
+  },
+  {
+    "id": "S-003",
+    "type": "competitor",
+    "url": "https://bookrival.example/alternatives",
+    "title": "Competitor alternatives hub",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-004",
+    "type": "user",
+    "ref": "user:owner estimates 40 signups a month today, from the dashboard",
+    "title": "Owner statement on current signups",
+    "accessed": "2026-11-18"
+  },
+  {
+    "id": "S-005",
+    "type": "directory",
+    "url": "https://saasreviews.example/vendors/join",
+    "title": "Review platform vendor listing (free basic profile)",
+    "accessed": "2026-11-18"
+  }
+]

@@ -16,6 +16,7 @@
     "package:implementer": "node scripts/package-skill.mjs implementer",
     "package:delivery-orchestrator": "node scripts/package-skill.mjs delivery-orchestrator",
     "package:skill-insights": "node scripts/package-skill.mjs skill-insights",
-    "package:experience-audit": "node scripts/package-skill.mjs experience-audit"
+    "package:experience-audit": "node scripts/package-skill.mjs experience-audit",
+    "package:growth-strategy": "node scripts/package-skill.mjs growth-strategy"
   }
 }

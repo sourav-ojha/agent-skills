@@ -1,0 +1,66 @@
+[
+  {
+    "id": "GRO-001",
+    "type": "internal-linking",
+    "title": "Category hub pages that link every recipe",
+    "rationale": "120 posts have no hubs, so related recipes are not linked.",
+    "keywords": [
+      "budget meal plan for a week"
+    ],
+    "sources": [
+      "S-001"
+    ],
+    "evidence": "fact",
+    "confidence": "high",
+    "impact": "M",
+    "effort": "M",
+    "window": "weeks 1-4",
+    "owner": "implementer",
+    "acceptance": [
+      "Given a reader opens a category hub, When it loads, Then it links every post in that category"
+    ],
+    "risks": []
+  },
+  {
+    "id": "GRO-002",
+    "type": "technical-seo",
+    "title": "Complete Recipe structured data on recipe posts",
+    "rationale": "Recipe rich results need documented required properties.",
+    "keywords": [
+      "lentil soup recipe"
+    ],
+    "sources": [
+      "S-004"
+    ],
+    "evidence": "fact",
+    "confidence": "high",
+    "impact": "M",
+    "effort": "S",
+    "window": "weeks 1-4",
+    "owner": "implementer",
+    "acceptance": [
+      "Given a recipe post, When its JSON-LD is validated, Then all required Recipe properties are present"
+    ],
+    "risks": []
+  },
+  {
+    "id": "GRO-003",
+    "type": "content",
+    "title": "Weekly budget meal plan series",
+    "rationale": "Fits the audience and the one-author constraint at one post a week.",
+    "keywords": [],
+    "sources": [],
+    "evidence": "hypothesis",
+    "confidence": "low",
+    "impact": "M",
+    "effort": "M",
+    "window": "weeks 5-8",
+    "owner": "human",
+    "risks": [
+      "needs consistent cadence"
+    ],
+    "acceptance": [
+      "Done when four plans are published and their Search Console impressions are compared at the next refresh"
+    ]
+  }
+]

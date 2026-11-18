@@ -101,6 +101,17 @@ node <skill-dir>/core/scripts/install-agents.mjs --agent all --scope user --remo
 
 `.product/` in your projects is your data; delete it only if you want to discard the approved context and decisions.
 
+## Other skills in this repository
+
+Every authored skill installs the same way and on its own: replace the name after `--skill`. For example, growth-strategy (Claude Code and Codex, project level):
+
+```bash
+npx skills add sourav-ojha/agent-skills --skill growth-strategy -a claude-code -a codex
+node .claude/skills/growth-strategy/core/scripts/install-agents.mjs --agent all --scope project --project-dir .   # optional native agents
+```
+
+Its helper is `core/scripts/gs.mjs` and its state is `.growth/` in your project (commit it; `.growth/performance/` is git-ignored for raw analytics exports). Host notes: [Claude Code](../skills/growth-strategy/adapters/claude-code/README.md), [Codex](../skills/growth-strategy/adapters/codex/README.md). Per-skill guides: [guides](guides/README.md).
+
 ## Verified paths
 
 | Fact | Source |

@@ -1,0 +1,69 @@
+[
+  {
+    "id": "GRO-001",
+    "type": "landing-page",
+    "title": "Vertical landing page for salons",
+    "rationale": "Commercial SERP for the salon query rewards vertical pages; no vertical page exists.",
+    "keywords": [
+      "salon appointment scheduling software"
+    ],
+    "sources": [
+      "S-001",
+      "S-002"
+    ],
+    "evidence": "inference",
+    "confidence": "medium",
+    "impact": "H",
+    "effort": "M",
+    "window": "weeks 1-4",
+    "owner": "implementer",
+    "needs_design": true,
+    "acceptance": [
+      "Given a visitor opens /salons, When the page loads, Then it shows salon-specific features, pricing link and a signup call to action",
+      "Given /salons is fetched, When the HTML is read, Then it has a unique title and H1"
+    ],
+    "risks": []
+  },
+  {
+    "id": "GRO-002",
+    "type": "distribution",
+    "title": "Claim the free vendor profile on the review platform",
+    "rationale": "Review platforms rank for the category query; a free basic profile exists.",
+    "keywords": [],
+    "sources": [
+      "S-005"
+    ],
+    "evidence": "fact",
+    "confidence": "medium",
+    "impact": "M",
+    "effort": "S",
+    "window": "weeks 1-4",
+    "owner": "human",
+    "risks": [
+      "do not incentivise reviews"
+    ],
+    "acceptance": [
+      "Done when the vendor profile is claimed and lists the free plan, without incentivised reviews"
+    ]
+  },
+  {
+    "id": "GRO-003",
+    "type": "measurement",
+    "title": "Attribute signups to landing pages",
+    "rationale": "Owner reports signups but not their source pages.",
+    "keywords": [],
+    "sources": [
+      "S-004"
+    ],
+    "evidence": "fact",
+    "confidence": "medium",
+    "impact": "M",
+    "effort": "S",
+    "window": "weeks 1-4",
+    "owner": "implementer",
+    "acceptance": [
+      "Given a visitor signs up, When the signup event fires, Then it carries the landing page path"
+    ],
+    "risks": []
+  }
+]

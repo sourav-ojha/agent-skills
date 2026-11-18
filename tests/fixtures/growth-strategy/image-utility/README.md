@@ -1,0 +1,1 @@
+Synthetic fixture: a free online image and document utility site (resize to KB, compress, convert) aiming at organic search traffic and later display-ad monetization. All domains are .example; no real search data.

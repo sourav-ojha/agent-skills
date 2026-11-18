@@ -1,0 +1,28 @@
+{
+  "name": "PixelPress",
+  "url": "https://pixelpress.example",
+  "category": "online image and document utilities",
+  "audience": [
+    "students and job applicants resizing photos and signatures for online forms",
+    "small office users compressing PDFs for email"
+  ],
+  "goals": [
+    "grow organic search traffic to tool pages",
+    "reach display-ad readiness"
+  ],
+  "geographies": [
+    "IN",
+    "US"
+  ],
+  "languages": [
+    "en"
+  ],
+  "monetization": [
+    "display-ads"
+  ],
+  "constraints": [
+    "brand-first distribution, founder stays anonymous",
+    "no paid acquisition in the first 90 days",
+    "no user accounts"
+  ]
+}

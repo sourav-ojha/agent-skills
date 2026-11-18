@@ -1,0 +1,17 @@
+{
+  "verdict": "PASS WITH CHANGES",
+  "checked_sources": [
+    "S-001",
+    "S-003",
+    "S-004"
+  ],
+  "findings": [
+    {
+      "severity": "Low",
+      "item": "GRO-003",
+      "type": "evidence",
+      "summary": "Series is a hypothesis",
+      "fix": "Measure after 4 posts"
+    }
+  ]
+}
