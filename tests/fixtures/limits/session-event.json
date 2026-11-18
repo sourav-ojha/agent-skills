@@ -1,0 +1,3 @@
+[{"type":"system","subtype":"init","session_id":"<uuid>"},
+ {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1795000000,"rateLimitType":"five_hour"}},
+ {"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You've hit your weekly limit · resets Mon 12:00am","session_id":"<uuid>"}]
