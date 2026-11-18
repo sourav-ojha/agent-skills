@@ -547,7 +547,7 @@ test('lintScenarios: api only for contract endpoints (query ignored, {id} matche
   assert.equal(lint(d).ok, false);
   d = goodDoc(); d.scenarios[0].request = { method: 'GET', path: '/api/other' };
   assert.equal(lint(d).ok, false);
-  const c = { ...crit(), contract: [{ method: 'GET', path: '/api/projects/{id}' }] };
+  const c = { ...crit(), contract: [{ method: 'GET', path: '/api/projects/{id}' }, { method: 'POST', path: '/api/projects' }] };
   const h = cr.criteriaHash(c.sections);
   d = goodDoc(); d.scenarios[0].request = { method: 'GET', path: '/api/projects/42?x=1' };
   assert.equal(lint(d, c, h).ok, true);
@@ -623,12 +623,86 @@ test('scenarioPath and storage: under FACTORY_HOME, atomic, no traversal', () =>
   try {
     assert.equal(sc.scenarioPath('o__r', 'FEATURE-012'), path.join(home, 'scenarios', 'o__r', 'FEATURE-012.json'));
     for (const id of ['../x', 'FEATURE-1/../../x', 'feature-1', 'FEATURE-1\n', '', 'FEATURE-', 'FEATURE-1.json']) assert.throws(() => sc.scenarioPath('o__r', id), /feature/i, id);
-    for (const k of ['a/b', '..', '.', '', 'a\\b', '../x', 'a\0b']) assert.throws(() => sc.scenarioPath(k, 'FEATURE-1'), /repo/i, JSON.stringify(k));
+    for (const k of ['a/b', '..', '.', '', 'a\\b', '../x', 'a\0b', 'plain', 'o__r__x', '..__r', 'o__..', 'o__r s']) assert.throws(() => sc.scenarioPath(k, 'FEATURE-1'), /repo/i, JSON.stringify(k));
     const d = sc.approve(goodDoc(), 'me');
     sc.saveScenarios('o__r', 'FEATURE-001', d);
     assert.deepEqual(sc.loadScenarios('o__r', 'FEATURE-001'), d);
     assert.equal(sc.loadScenarios('o__r', 'FEATURE-002'), null);
     assert.deepEqual(fs.readdirSync(path.dirname(sc.scenarioPath('o__r', 'FEATURE-001'))), ['FEATURE-001.json']);
     assert.throws(() => sc.saveScenarios('o__r', '../evil', d));
+  } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; }
+});
+
+const ncrit = { ok: true, ac: [{ id: 'AC-1' }], ec: [], er: [], contract: [{ method: 'GET', path: '/api/p/{id}' }, { method: 'POST', path: '/api/p' }], errors: [] };
+const nbase = () => ({ feature: 'FEATURE-001', criteria_hash: 'h', canary: 'fx-abcdef', scenarios: [{ id: 'S-1', covers: ['AC-1'], kind: 'api', setup: [{ method: 'POST', path: '/api/p', body: { n: 'fx-abcdef' } }], request: { method: 'GET', path: '/api/p/7' }, assert: [{ status: 200 }] }] });
+const nl = (d, h = 'h') => sc.lintScenarios(d, ncrit, h);
+
+test('I1: api setup must be contract requests; string setup is an error; ui setup stays free-form strings', () => {
+  assert.equal(nl(nbase()).ok, true);
+  let d = nbase(); d.scenarios[0].setup = [{ method: 'POST', path: '/api/invented' }];
+  let r = nl(d); assert.equal(r.ok, false); assert.ok(r.problems.some((p) => p.includes('S-1') && p.includes('setup request 1')));
+  d = nbase(); d.scenarios[0].setup = ['create a thing']; assert.equal(nl(d).ok, false);
+  d = nbase(); delete d.scenarios[0].setup; d.scenarios[0].request.path = '/api/p/fx-abcdef'; assert.equal(nl(d).ok, true);
+});
+
+test('I2: approval is bound to scenario content', () => {
+  const a = sc.approve(nbase(), 'auto');
+  assert.equal(a.approved.scenarios_hash, sc.scenariosHash(nbase()));
+  assert.equal(sc.isCurrentApproved(a, 'h'), true);
+  a.scenarios[0].request.path = '/api/p/8';
+  assert.equal(sc.isCurrentApproved(a, 'h'), false);
+});
+
+test('M1: assertion shapes and non-empty string steps', () => {
+  for (const bad of [{}, { status: 99 }, { status: 'x' }, { status: 200, extra: 1 }, { json_path: '$.a' }, { json_path: '$.a', equals: 1, count: 2 }, { header: 'x' }, { foo: 1 }, 'x']) {
+    const d = nbase(); d.scenarios[0].assert = [bad]; assert.equal(nl(d).ok, false, JSON.stringify(bad));
+  }
+  for (const good of [{ status: 404 }, { header: 'content-type', equals: 'x' }, { json_path: '$.a', not_contains: 'x' }, { json_path: '$.a', count: 2 }]) {
+    const d = nbase(); d.scenarios[0].assert = [good]; assert.equal(nl(d).ok, true, JSON.stringify(good));
+  }
+  const u = () => ({ id: 'S-2', covers: ['AC-1'], kind: 'ui', steps: ['a'], expect: ['b'] });
+  for (const mut of [(x) => { x.steps = ['']; }, (x) => { x.expect = [1]; }, (x) => { x.steps = ['a'.repeat(501)]; }, (x) => { x.setup = [{}]; }]) {
+    const d = nbase(); const x = u(); mut(x); d.scenarios.push(x); assert.equal(nl(d).ok, false);
+  }
+});
+
+test('M2: dot segments and encoded separators never match', () => {
+  for (const p of ['/api/p/..', '/api/p/.', '/api/p/%2e%2e', '/api/p/%2E', '/api/p/a%2Fb', '/api/p/a%5cb', '/api/p/x/../7', '/api/./p']) {
+    const d = nbase(); d.scenarios[0].request = { method: 'GET', path: p }; assert.equal(nl(d).ok, false, p);
+  }
+});
+
+test('M3: non-string hashes are refused', () => {
+  const d = nbase(); delete d.criteria_hash;
+  assert.equal(sc.lintScenarios(d, ncrit, undefined).ok, false);
+  assert.equal(sc.isCurrentApproved(sc.approve(nbase(), 'a'), undefined), false);
+});
+
+test('M4: hash survives save -> load with undefined-valued keys', () => {
+  const d = nbase(); d.extra = undefined; d.scenarios[0].note = undefined;
+  assert.equal(sc.scenariosHash(d), sc.scenariosHash(JSON.parse(JSON.stringify(d))));
+});
+
+test('M5: deep nesting is reported, not thrown', () => {
+  const d = nbase(); let deep = []; for (let i = 0; i < 200000; i++) deep = [deep];
+  d.scenarios[0].setup = [{ method: 'POST', path: '/api/p', body: deep }];
+  const r = nl(d); assert.equal(r.ok, false); assert.ok(r.problems.some((p) => p.includes('S-1') && p.includes('too deeply nested')));
+});
+
+test('M6: approve validates the approver', () => {
+  for (const by of [undefined, '', 'a b', 'x'.repeat(65), 'a/b', 5]) assert.throws(() => sc.approve(nbase(), by));
+  assert.doesNotThrow(() => sc.approve(nbase(), 'me@example.com'));
+});
+
+test('M7/M8: save requires matching feature; dirs are 0700; corrupt vs missing', () => {
+  const home = tmpDir('fx-home-');
+  const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = path.join(home, 'h');
+  try {
+    assert.throws(() => sc.saveScenarios('o__r', 'FEATURE-002', nbase()), /match/);
+    sc.saveScenarios('o__r', 'FEATURE-001', nbase());
+    assert.equal(fs.statSync(path.join(home, 'h', 'scenarios', 'o__r')).mode & 0o777, 0o700);
+    assert.equal(sc.loadScenarios('o__r', 'FEATURE-009'), null);
+    fs.writeFileSync(sc.scenarioPath('o__r', 'FEATURE-003'), 'SECRET-DATA{');
+    assert.throws(() => sc.loadScenarios('o__r', 'FEATURE-003'), (e) => /corrupt/.test(e.message) && !e.message.includes('SECRET-DATA'));
   } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; }
 });
