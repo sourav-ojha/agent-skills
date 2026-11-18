@@ -6,10 +6,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { FEATURE_ID, TRANSITIONS, transition, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
+import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
 import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
@@ -69,6 +70,24 @@ const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/; // never starts with "-": a value c
 const SHA = /^[0-9a-f]{40}$/;
 const validRef = (s) => typeof s === 'string' && REF.test(s) && !s.includes('..');
 
+// ---- run records ------------------------------------------------------------------------------------------------------
+// A record per transition into merged, skipped, blocked or awaiting_human. Snapshots are taken at the transition and written
+// by save(), so a record exists only for a state that was persisted. queue.mjs stays pure; this is the only writer.
+const RECORDED = new Set(['merged', 'skipped', 'blocked', 'awaiting_human']);
+let curQ = null;
+const pending = [];
+const note = (f) => { if (curQ && RECORDED.has(f.state)) pending.push({ f: JSON.parse(JSON.stringify(f)), at: Date.now() }); };
+const transition = (f, to, reason) => { transitionState(f, to, reason); note(f); return f; };
+let stamps;
+function flushRecords() {
+  if (!pending.length) return;
+  let project; try { project = projectHash(fs.realpathSync(root)); } catch { project = projectHash(root); }
+  stamps ??= skillStamps(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'));
+  for (const { f, at } of pending.splice(0)) appendRecord(root, buildRecord({ q: curQ, f, run: runId('deliver', 'run'), project, skills: stamps, now: at }));
+}
+let ciStart = 0;
+const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_wait_ms || 0) + (Date.now() - ciStart); };
+
 // ---- state -----------------------------------------------------------------------------------------------------------
 function load() {
   if (!fs.existsSync(file)) die('no run in progress here; use init first');
@@ -83,6 +102,7 @@ function load() {
     if (!FEATURE_ID.test(f.id) || !(f.state in TRANSITIONS) || (f.branch && !validRef(f.branch)) || (f.ci_sha && !SHA.test(f.ci_sha)) || (f.built_sha && !SHA.test(f.built_sha)) || (f.pr && !Number.isInteger(f.pr.number))) die(`queue file has an invalid entry for ${f.id}; reset and re-init`);
   }
   REPO = q.repo;
+  curQ = q;
   useAccount(q.policy.github.account, q.policy.github.host);
   return q;
 }
@@ -93,6 +113,8 @@ function save(q) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n');
   fs.renameSync(tmp, file);
+  curQ = q;
+  flushRecords();
 }
 function item(q, id = arg) {
   if (!FEATURE_ID.test(id || '')) die(`need a feature id like FEATURE-001, got ${JSON.stringify(id)}`);
@@ -113,7 +135,7 @@ function refresh(q) {
     if (f.state !== 'awaiting_human' || !f.pr) continue;
     const r = gh('pr', 'view', String(f.pr.number), '--json', 'state,mergeCommit');
     if (r.code !== 0) continue;
-    try { const v = JSON.parse(r.out); if (v.state === 'MERGED') { transition(f, 'merged', 'merged by a person'); f.merged_sha = v.mergeCommit?.oid || null; } } catch { /* ignore */ }
+    try { const v = JSON.parse(r.out); if (v.state === 'MERGED') { f.merged_sha = v.mergeCommit?.oid || null; transition(f, 'merged', 'merged by a person'); } } catch { /* ignore */ }
   }
 }
 
@@ -299,7 +321,9 @@ C.next = () => {
   const q = load();
   refresh(q);
   const stop = runStop(q);
+  const before = new Map(q.features.map((x) => [x.id, x.state]));
   const { item: f, resume } = pickNext(q);
+  for (const x of q.features) if (before.get(x.id) !== x.state) note(x); // dependency skips are made inside queue.mjs
   save(q);
   if (f && resume) { extra.feature = f.id; return emit({ resume: true, feature: pub(f), base: q.base }); }
   if (stop || !f) return emit({ done: true, reason: stop || 'queue finished', summary: counts(q) });
@@ -314,6 +338,8 @@ C.next = () => {
     must(git('checkout', branch), 'git checkout');
   } else must(git('checkout', '-b', branch), 'git checkout -b');
   f.branch = branch;
+  f.base_sha = git('rev-parse', 'HEAD').out;
+  f.ts_start ||= new Date().toISOString();
   transition(f, 'building');
   save(q);
   extra.feature = f.id;
@@ -413,6 +439,7 @@ C.ci = () => {
   const timeout = Number(opt.timeout ?? 1800) * 1000, interval = Number(opt.interval ?? 20) * 1000, grace = Number(opt.grace ?? 90) * 1000;
   if (![timeout, interval, grace].every((n) => Number.isFinite(n) && n >= 0)) die('--timeout, --interval and --grace are seconds (numbers >= 0)');
   const start = Date.now();
+  ciStart = start;
   let unstable = 0;
   for (;;) {
     // Head and checks are read around each other: checks of an older commit are never stamped onto a newer head.
@@ -426,9 +453,10 @@ C.ci = () => {
     const failed = checks.filter((c) => ['fail', 'cancel'].includes(c.bucket));
     const pending = checks.some((c) => c.bucket === 'pending');
     const elapsed = Date.now() - start;
-    const verified = (how, names) => { f.pr.head_sha = sha; f.ci_sha = sha; f.ci = how; f.ci_checks = names; transition(f, 'ci_passed'); save(q); return emit({ id: f.id, result: how === 'verified' ? 'passed' : 'unverified-allowed', checks: names, sha, ...(how === 'verified' ? {} : { note: 'no required or allowlisted check exists; proceeding because the run was started with --no-ci' }) }); };
+    const verified = (how, names) => { tallyCi(f); f.pr.head_sha = sha; f.ci_sha = sha; f.ci = how; f.ci_checks = names; transition(f, 'ci_passed'); save(q); return emit({ id: f.id, result: how === 'verified' ? 'passed' : 'unverified-allowed', checks: names, sha, ...(how === 'verified' ? {} : { note: 'no required or allowlisted check exists; proceeding because the run was started with --no-ci' }) }); };
 
     if (failed.length) {
+      tallyCi(f);
       f.pr.head_sha = sha;
       transition(f, 'ci_failed', `failed: ${failed.map((c) => flat(c.name, 60)).join(', ')}`.slice(0, 200));
       const failing = failed.map((c) => ({ name: flat(c.name, 80), link: flat(c.link, 300) }));
@@ -456,12 +484,14 @@ C.ci = () => {
   }
 };
 function waited(q, f, elapsed, more) {
+  tallyCi(f);
   f.ci_waited_s = (f.ci_waited_s || 0) + Math.round(elapsed / 1000);
   if (f.ci_waited_s >= q.ci_budget_s) { block(q, f, `CI did not finish within ${q.ci_budget_s}s`); return outcome({ id: f.id, result: 'timeout', state: f.state, reason: f.reason }); }
   save(q);
   return outcome({ id: f.id, result: 'timeout', waited_total_s: f.ci_waited_s, budget_s: q.ci_budget_s, ...more });
 }
 function stopRun(q, f, why) {
+  tallyCi(f);
   q.stop = why;
   transition(f, 'awaiting_human', flat(why, 160)); save(q);
   return outcome({ id: f.id, result: 'unconfirmed', stop: why });
