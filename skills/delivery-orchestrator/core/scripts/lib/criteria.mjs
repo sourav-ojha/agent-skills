@@ -57,7 +57,7 @@ function scanLine(line, inComment) {
   return { vis, inComment };
 }
 
-const MAX_LINE = 10000;
+export const MAX_LINE = 10000; // also the G5 pre-parse guard in antigaming.mjs (hostile head specs are refused before parsing)
 // ---- integrity anchor ---------------------------------------------------------------------------------------------------
 // Allowlisted frontmatter keys and the only values the close-out / `pi transition` write ("validated" is never written by the
 // implementer). A key that is duplicated, or has any other value, is NOT excluded (so it is hashed) and is reported.
