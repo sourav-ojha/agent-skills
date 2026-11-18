@@ -199,6 +199,33 @@ test('records are not skill events: si export ingests nothing from factory-runs.
   assert.equal(fs.readFileSync(path.join(e.work, '.skill-runs', 'factory-runs.jsonl'), 'utf8'), lines, 'export never edits the records');
 });
 
+test('two inits in one repo give different run ids, so records of separate runs never share a key', () => {
+  const e = setup();
+  e.d('init'); e.d('next'); e.d('block', 'FEATURE-001', '--reason', 'first');
+  e.d('reset', '--yes');
+  e.d('init'); e.d('next'); e.d('block', 'FEATURE-001', '--reason', 'second');
+  const recs = records(e);
+  assert.equal(recs.length, 2);
+  assert.notEqual(recs[0].run, recs[1].run);
+  assert.equal(rr.latestPerFeature(recs).length, 2);
+});
+
+test('a reason is a short category: command output and free text after the first colon never reach a record', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok');
+  ship(e, 'FEATURE-001');
+  e.setGh((s) => { s.mergeRefuse = 'ghp_SECRET0123456789abcdef token=hunter2'; });
+  const m = e.d('merge', 'FEATURE-001');
+  assert.match(m.json.reason, /hunter2/, 'the console still shows the full reason');
+  e.d('block', 'FEATURE-001', '--reason', 'gave up: password=hunter2 ' + 'x'.repeat(300));
+  const recs = records(e);
+  assert.deepEqual(recs.map((r) => r.outcome), ['awaiting_human', 'skipped']);
+  assert.equal(recs[0].reason, 'gh pr merge refused');
+  assert.equal(recs[1].reason, 'gave up');
+  assert.ok(!JSON.stringify(recs).includes('hunter2') && !JSON.stringify(recs).includes('SECRET'));
+  assert.ok(recs.every((r) => r.reason.length <= 80));
+});
+
 test('.skill-runs as a symlink: nothing is written through it', () => {
   const e = setup();
   const target = path.join(e.root, 'elsewhere'); fs.mkdirSync(target);

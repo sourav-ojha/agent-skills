@@ -83,7 +83,7 @@ function flushRecords() {
   if (!pending.length) return;
   let project; try { project = projectHash(fs.realpathSync(root)); } catch { project = projectHash(root); }
   stamps ??= skillStamps(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'));
-  for (const { f, at } of pending.splice(0)) appendRecord(root, buildRecord({ q: curQ, f, run: runId('deliver', 'run'), project, skills: stamps, now: at }));
+  for (const { f, at } of pending.splice(0)) appendRecord(root, buildRecord({ q: curQ, f, run: curQ.run_id || runId('deliver', 'run'), project, skills: stamps, now: at }));
 }
 let ciStart = 0;
 const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_wait_ms || 0) + (Date.now() - ciStart); };
@@ -250,6 +250,7 @@ C.init = async () => {
     authorised_by: wantsMerge ? (opt.merge ? flat(opt.note, 300) : `project config ${CONFIG_PATH}`) : null,
     max_fix_rounds: num(opt['max-fix-rounds'], config.limits.max_fix_rounds, 0, 5), max_failures: num(opt['max-failures'], config.limits.max_failures, 1, 10), ci_budget_s: num(opt['ci-budget'], config.limits.ci_budget_s, 1, 86400),
     policy: config, features,
+    run_id: `${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`, // one id per init: records of separate runs never share a (run, feature) key
   };
   const summary = { base, repo: q.repo, account: config.github.account || '(gh default)', merge: q.merge, protected_base: protectedBase, no_ci: q.no_ci, checks: q.checks, ignored_checks: config.checks.ignored, local_checks: config.local_checks.map((c) => c.name), hold_paths: config.hold_paths, git_auth: /^https:/i.test(url) ? 'https (uses the configured account)' : 'ssh/other (git uses your own key; the account setting applies to gh only)' };
   const warnings = [];

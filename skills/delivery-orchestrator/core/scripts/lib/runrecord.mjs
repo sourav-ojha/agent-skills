@@ -43,6 +43,8 @@ function appendNoFollow(file, text, onlyIfNew) {
   try { fs.writeSync(fd, text); } finally { fs.closeSync(fd); }
 }
 
+// Records are written even with SKILL_RUNLOG=off: they are a separate store from the runlog.
+// A crash after the queue rename but before the flush loses that record by design (no phantom records for unsaved state).
 // Never throws, never writes through a symlink.
 export function appendRecord(root, rec) {
   try {
@@ -61,8 +63,8 @@ export function latestPerFeature(lines) {
   return [...by.values()];
 }
 
-// Free text from state (a reason) keeps no URL or path.
-const scrub = (s) => (s == null ? null : String(s).replace(/https?:\/\/\S+/gi, '<url>').replace(/(?:[A-Za-z]:\\|\/)(?:[\w.@~+-]+[\\/])+[\w.@~+-]*/g, '<path>').replace(/\s+/g, ' ').trim().slice(0, 200));
+// A reason is kept as a short category: cut at the first ':' (what follows may be command output or agent free text), 80 characters, no URL or path.
+const scrub = (s) => (s == null ? null : String(s).split(':')[0].replace(/https?:\/\/\S+/gi, '<url>').replace(/(?:[A-Za-z]:\\|\/)(?:[\w.@~+-]+[\\/])+[\w.@~+-]*/g, '<path>').replace(/\s+/g, ' ').trim().slice(0, 80));
 
 export function buildRecord({ q, f, run, project, skills, now = Date.now() }) {
   const start = f.ts_start ? Date.parse(f.ts_start) : NaN;
