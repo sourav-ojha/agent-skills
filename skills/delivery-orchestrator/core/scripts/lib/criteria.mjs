@@ -56,30 +56,51 @@ function scanLine(line, inComment) {
 
 const MAX_LINE = 10000;
 // ---- integrity anchor ---------------------------------------------------------------------------------------------------
-const MUTABLE_FM_KEYS = new Set(['status', 'delivery']);
-const toLines = (text) => String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+// Allowlisted frontmatter keys and the only values the close-out / `pi transition` write ("validated" is never written by the
+// implementer). A key that is duplicated, or has any other value, is NOT excluded (so it is hashed) and is reported.
+const MUTABLE_FM = { status: new Set(['draft', 'ready', 'implemented', 'superseded']), delivery: new Set(['none', 'partial', 'complete']) };
+// Same normalisation the hash uses; region indexes refer to these lines (Task 5 G5 must diff against these too).
+export const toLines = (text) => String(text).replace(/^﻿/, '').replace(/\r\n?/g, '\n').split('\n');
 
-// Mutable line ranges of a spec: [{start, end}] 0-based, end exclusive, indexes into the LF-normalised, BOM-stripped lines.
-export function mutableRegions(specText) {
+// { lines, regions: [{start,end}] (0-based, end exclusive, indexes into `lines`), problems: string[] }.
+// Delivery log = POSITIVE grammar: the `## Delivery log` line (column 0, ASCII) plus the following lines that are blank or
+// table rows (/^\s*\|/); it ends at the first line that is anything else, so prose or any style of heading is hashed.
+export function specRegions(specText) {
   const lines = toLines(specText);
-  const out = [];
+  const regions = []; const problems = [];
   if (lines[0] !== undefined && /^---[ \t]*$/.test(lines[0])) {
-    const close = lines.findIndex((l, i) => i > 0 && /^---[ \t]*$/.test(l));
+    const close = lines.findIndex((l, i) => i > 0 && /^(---|\.\.\.)[ \t]*$/.test(l));
     if (close > 0) {
+      const seen = {};
       for (let i = 1; i < close; i++) {
-        const m = /^([A-Za-z0-9_-]+)[ \t]*:/.exec(lines[i]);
-        if (m && MUTABLE_FM_KEYS.has(m[1])) out.push({ start: i, end: i + 1 });
+        const m = /^([A-Za-z0-9_-]+)[ \t]*:[ \t]*(.*?)[ \t]*$/.exec(lines[i]);
+        if (m && MUTABLE_FM[m[1]]) (seen[m[1]] ||= []).push({ i, v: m[2].replace(/^(["'])(.*)\1$/, '$2') });
       }
+      for (const [k, occ] of Object.entries(seen)) {
+        if (occ.length > 1) { problems.push(`duplicate frontmatter key "${k}" (not excluded from the hash)`); continue; }
+        if (!MUTABLE_FM[k].has(occ[0].v)) { problems.push(`frontmatter "${k}: ${occ[0].v.slice(0, 40)}" is not a value the close-out writes (not excluded from the hash)`); continue; }
+        regions.push({ start: occ[0].i, end: occ[0].i + 1 });
+      }
+      regions.sort((x, y) => x.start - y.start);
     }
   }
-  const d = lines.findIndex((l) => /^## Delivery log[ \t\r]*$/.test(l));
-  if (d !== -1) {
-    let e = lines.length;
-    for (let i = d + 1; i < lines.length; i++) if (lines[i].startsWith('## ')) { e = i; break; }
-    out.push({ start: d, end: e });
+  const heads = [];
+  for (let i = 0; i < lines.length; i++) if (/^## Delivery log[ \t]*$/.test(lines[i])) heads.push(i);
+  if (heads.length > 1) problems.push('more than one "## Delivery log" heading (only the first is excluded from the hash)');
+  if (heads.length) {
+    const d = heads[0];
+    let e = d + 1;
+    while (e < lines.length && (lines[e].trim() === '' || /^\s*\|/.test(lines[e]))) e++;
+    regions.push({ start: d, end: e });
+    for (let i = d + 1; i < e; i++) {
+      const first = lines[i].trim().replace(/^\|/, '').split('|')[0].replace(/[*_`\s]/g, '');
+      if (/^(AC|EC|ER)[-_]?\d+$/i.test(first)) problems.push(`Delivery log row starts with a criteria id: ${lines[i].trim().slice(0, 60)}`);
+    }
   }
-  return out;
+  return { lines, regions, problems };
 }
+
+export const mutableRegions = (specText) => specRegions(specText).regions;
 
 function trimEndSpTab(t) {
   let b = t.length;
@@ -88,9 +109,9 @@ function trimEndSpTab(t) {
 }
 
 export function canonicalSpec(specText) {
-  const lines = toLines(specText);
+  const { lines, regions } = specRegions(specText);
   const skip = new Set();
-  for (const r of mutableRegions(specText)) for (let i = r.start; i < r.end; i++) skip.add(i);
+  for (const r of regions) for (let i = r.start; i < r.end; i++) skip.add(i);
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     if (skip.has(i)) continue;
@@ -241,6 +262,8 @@ function splitSections(text, errors) {
 
 export function extractCriteria(specText) {
   const errors = [];
+  if (String(specText).includes('\ufffd')) errors.push('spec contains U+FFFD (invalid UTF-8 or a replacement character); fix the file encoding');
+  errors.push(...specRegions(specText).problems);
   const { found, order } = splitSections(specText, errors);
   const vis = (k) => found[k].flatMap((s) => s.vis.filter((l) => l !== null && l.trim()));
 

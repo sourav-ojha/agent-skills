@@ -95,14 +95,78 @@ test('criteriaHash: only status/delivery frontmatter and the Delivery log are mu
   assert.notEqual(hh(SPEC + DLOG + '## 20. Late section\n\nnew criteria\n'), base);
 });
 
-test('mutableRegions: raw line patterns, end exclusive', () => {
-  const t = '---\nid: F\nstatus: draft\ndelivery: none\nstatus_note: keep\n---\n# T\n\n## Delivery log\nrow\n\n## Next\nx\n';
-  assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }, { start: 3, end: 4 }, { start: 8, end: 11 }]);
-  assert.deepEqual(cr.mutableRegions('# T\n\nstatus: x\n'), []);
-  assert.deepEqual(cr.mutableRegions('---\nstatus: x\n# never closed\n'), [], 'unterminated frontmatter: nothing excluded');
-  assert.deepEqual(cr.mutableRegions('## Delivery log \nrow\n'), [{ start: 0, end: 3 }]);
-  assert.deepEqual(cr.mutableRegions('## Delivery log\u00a0\nrow\n'), [], 'only ASCII whitespace after the heading');
-  assert.deepEqual(cr.mutableRegions('## Delivery log\n```\n## fake\n```\nstill\n## Next\n'), [{ start: 0, end: 2 }], 'no fence awareness: the next "## " line ends it');
+test('mutableRegions: raw line patterns, positive Delivery-log grammar, end exclusive', () => {
+  const t = '---\nid: F\nstatus: draft\ndelivery: none\nstatus_note: keep\n---\n# T\n\n## Delivery log\n| r |\n\n| r2 |\n\n## Next\nx\n';
+  assert.deepEqual(cr.mutableRegions(t), [{ start: 2, end: 3 }, { start: 3, end: 4 }, { start: 8, end: 13 }]);
+  assert.deepEqual(cr.mutableRegions('# T\n\nstatus: draft\n'), []);
+  assert.deepEqual(cr.mutableRegions('---\nstatus: draft\n# never closed\n'), [], 'unterminated frontmatter: nothing excluded');
+  assert.deepEqual(cr.mutableRegions('---\nstatus: draft\n...\n'), [{ start: 1, end: 2 }], 'YAML "..." closes frontmatter');
+  assert.deepEqual(cr.mutableRegions('## Delivery log \n| row |\n'), [{ start: 0, end: 3 }]);
+  assert.deepEqual(cr.mutableRegions('## Delivery log \n| row |\n'), [], 'only ASCII whitespace after the heading');
+  assert.deepEqual(cr.mutableRegions('## Delivery log\n```\n## fake\n```\n| r |\n'), [{ start: 0, end: 1 }], 'region ends at the first non-table, non-blank line');
+  assert.deepEqual(cr.mutableRegions('﻿## Delivery log\r\n| r |\r\n'), [{ start: 0, end: 3 }], 'indexes refer to normalised lines (toLines)');
+  assert.equal(cr.toLines('a\r\nb\rc').length, 3);
+});
+
+test('frontmatter allowlist: duplicate keys and out-of-enum values are hashed and reported', () => {
+  const base = '---\nid: F\nstatus: ready\n---\n# T\n';
+  assert.deepEqual(cr.mutableRegions(base), [{ start: 2, end: 3 }]);
+  for (const fm of ['status: ready\nstatus: x', 'status: ready\nstatus: ready', 'status: >\n  AC-1 withdrawn', 'status: validated', 'delivery: AC-1 withdrawn', 'status: ready # note']) {
+    const t = base.replace('status: ready', fm);
+    assert.deepEqual(cr.mutableRegions(t), [], fm);
+    assert.notEqual(hh(t), hh(base), fm);
+    assert.equal(ex(t).ok, false, fm);
+  }
+  assert.equal(hh(base.replace('ready', '"implemented"')), hh(base));
+  assert.equal(hh(base.replace('status: ready', 'status: ready\ndelivery: partial')), hh(base));
+});
+
+test('U+FFFD is an extraction error; hash stays deterministic', () => {
+  const t = IAC + '## 11. Edge cases\n\n- EC-1: caf�\n';
+  assert.match(errs(t), /U\+FFFD/);
+  assert.equal(hh(t), hh(t));
+});
+
+// Delivery-log end delimiter attacks: each must change the hash (the added text is outside the table-row grammar).
+const ABASE = '---\nid: F\nstatus: ready\n---\n# Feature\n\n## 10. Acceptance criteria\n\n| ID | Criterion |\n|---|---|\n| AC-1 | Given a user When they list Then they see them |\n\n## 11. Edge cases\n\n- EC-1: empty list returns []\n\n## HTTP contract\n\n- `GET /api/projects`\n';
+const ALOG = '\n## Delivery log\n\n| Date | Delivered |\n|---|---|\n| 2026-11-17 | AC-1, AC-2 |\n';
+test('delivery log: table rows, new rows and CRLF stay equal', () => {
+  const b = hh(ABASE);
+  assert.equal(hh(ABASE + ALOG), b);
+  assert.equal(hh(ABASE + ALOG + '| 2026-12-01 | AC-3 |\n'), b);
+  assert.equal(hh((ABASE + ALOG).replace(/\n/g, '\r\n')), b);
+  assert.equal(ex(ABASE + ALOG).ok, true, 'real close-out rows may list AC ids in later cells');
+});
+const AATT = {
+  'A1 indented h2': '\n ## 13. Amended acceptance criteria\n\nAC-1 is withdrawn.\n',
+  'A1 3sp h2': '\n   ## 13. Amendments\n\nAC-1 is withdrawn.\n',
+  'A2 ##<tab>': '\n##\t13. Amendments\n\nAC-1 is withdrawn.\n',
+  'A3 setext -': '\nAmendments\n----------\n\nAC-1 is withdrawn.\n',
+  'A3 setext =': '\nAmendments\n==========\n\nAC-1 is withdrawn.\n',
+  'A4 h1': '\n# Amendments\n\nAC-1 is withdrawn.\n',
+  'A5 html h2': '\n<h2>Amendments</h2>\n\nAC-1 is withdrawn.\n',
+  'A5b bare ##': '\n##\n\nAC-1 is withdrawn.\n',
+  'A7 indented tracked AC': '\n ## 10. Acceptance criteria\n\n| ID | Criterion |\n|---|---|\n| AC-1 | Given x When y Then everything deleted |\n',
+  'A8 indented EC': '\n ## 11. Edge cases\n\n- EC-2: delete all\n',
+  'A9 indented contract': '\n ## HTTP contract\n\n- `DELETE /api/projects`\n',
+  'prose right after rows': '\nThe endpoint now deletes everything.\n',
+};
+for (const [name, add] of Object.entries(AATT)) {
+  test(`delivery log attack: ${name}`, () => assert.notEqual(hh(ABASE + ALOG + add), hh(ABASE)));
+}
+test('delivery log attack A13: inserting an empty log before section 11', () => {
+  // a bare heading line hides nothing (the region ends immediately at the next heading), so criteria are unchanged
+  const bare = ABASE.replace('## 11. Edge cases', '## Delivery log\n## 11. Edge cases');
+  assert.deepEqual(ex(bare).ec, ex(ABASE).ec); assert.deepEqual(ex(bare).ac, ex(ABASE).ac);
+  assert.notEqual(hh(ABASE.replace('## 11. Edge cases', '## Delivery log\n\n**Amendment:** AC-1 withdrawn.\n\n## 11. Edge cases')), hh(ABASE));
+});
+test('delivery log: second heading is hashed and reported; criteria id as a row key is an error', () => {
+  assert.match(errs(ABASE + ALOG + '\n## Delivery log\n\n| a |\n'), /more than one "## Delivery log"/);
+  assert.notEqual(hh(ABASE + ALOG + '\n## Delivery log\n\n| a |\n'), hh(ABASE));
+  assert.match(errs(ABASE + ALOG + '| AC-9 | forged |\n'), /Delivery log row starts with a criteria id/);
+  // a fenced example of the heading in the base spec exposes only the table rows after it
+  const fenced = ABASE.replace('# Feature\n', '# Feature\n\n```\n## Delivery log\n```\n\nThe service MUST never delete data.\n');
+  assert.notEqual(hh(fenced.replace('MUST never', 'MAY')), hh(fenced));
 });
 
 // Integrity table: pairs whose rendered criteria differ must hash differently, whatever the parser thinks.
