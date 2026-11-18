@@ -1,0 +1,28 @@
+{
+  "verdict": "PASS WITH CHANGES",
+  "checked_sources": [
+    "S-002",
+    "S-003",
+    "S-004",
+    "S-006",
+    "S-007",
+    "S-008",
+    "S-010"
+  ],
+  "findings": [
+    {
+      "severity": "Medium",
+      "item": "GRO-002",
+      "type": "thin-content",
+      "summary": "Risk of one page per KB size",
+      "fix": "Keep one page with presets; already noted in risks"
+    },
+    {
+      "severity": "Low",
+      "item": null,
+      "type": "evidence",
+      "summary": "compress pdf keyword has no SERP check",
+      "fix": "Check SERP before planning a page"
+    }
+  ]
+}

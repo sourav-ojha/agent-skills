@@ -1,0 +1,111 @@
+[
+  {
+    "keyword": "resize image to 20kb",
+    "cluster": "resize to size",
+    "intent": "transactional",
+    "geo": "IN",
+    "language": "en",
+    "volume": {
+      "value": 12000,
+      "kind": "estimate",
+      "source": "S-005"
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "8 of top 10 are single-purpose tool pages",
+    "competitors": [
+      "imgshrink.example"
+    ],
+    "target_page": "new: /resize-image-to-20kb",
+    "priority": "P1",
+    "evidence": "fact",
+    "confidence": "medium",
+    "sources": [
+      "S-003",
+      "S-005"
+    ],
+    "researched": "2026-11-18"
+  },
+  {
+    "keyword": "resize image to 50kb",
+    "cluster": "resize to size",
+    "intent": "transactional",
+    "geo": "IN",
+    "language": "en",
+    "volume": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "same SERP pattern as 20kb",
+    "competitors": [
+      "imgshrink.example"
+    ],
+    "target_page": "new: /resize-image-to-20kb",
+    "priority": "P2",
+    "evidence": "inference",
+    "confidence": "medium",
+    "sources": [
+      "S-003"
+    ],
+    "researched": "2026-11-18"
+  },
+  {
+    "keyword": "compress pdf to 100kb",
+    "cluster": "compress pdf",
+    "intent": "transactional",
+    "geo": "IN",
+    "language": "en",
+    "volume": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "not checked yet",
+    "competitors": [],
+    "target_page": "/compress-pdf",
+    "priority": "P2",
+    "evidence": "hypothesis",
+    "confidence": "low",
+    "sources": [],
+    "researched": "2026-11-18"
+  },
+  {
+    "keyword": "passport photo size for online application",
+    "cluster": "photo requirements",
+    "intent": "informational",
+    "geo": "US",
+    "language": "en",
+    "volume": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "difficulty": {
+      "value": null,
+      "kind": "unknown",
+      "source": null
+    },
+    "serp_notes": "government pages dominate",
+    "competitors": [],
+    "target_page": "new: /guides/passport-photo-size",
+    "priority": "P3",
+    "evidence": "assumption",
+    "confidence": "low",
+    "sources": [],
+    "researched": "2026-11-18"
+  }
+]

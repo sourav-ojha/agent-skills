@@ -1,0 +1,115 @@
+[
+  {
+    "id": "GRO-001",
+    "type": "technical-seo",
+    "title": "Add an XML sitemap and reference it in robots.txt",
+    "rationale": "robots.txt has no Sitemap line and no sitemap route exists, so new tool pages depend on link discovery.",
+    "keywords": [],
+    "sources": [
+      "S-002"
+    ],
+    "evidence": "fact",
+    "confidence": "high",
+    "impact": "M",
+    "effort": "S",
+    "window": "weeks 1-4",
+    "owner": "implementer",
+    "acceptance": [
+      "Given the site is built, When /sitemap.xml is requested, Then it lists every indexable tool page with an absolute URL",
+      "Given robots.txt is requested, When it is read, Then it contains a Sitemap line with the absolute sitemap URL"
+    ],
+    "risks": []
+  },
+  {
+    "id": "GRO-002",
+    "type": "landing-page",
+    "title": "Dedicated page for resizing images to a target size in KB",
+    "rationale": "SERP for the target-size query is dominated by single-purpose tool pages; the current generic resizer has no page for it.",
+    "keywords": [
+      "resize image to 20kb",
+      "resize image to 50kb"
+    ],
+    "sources": [
+      "S-003",
+      "S-004"
+    ],
+    "evidence": "inference",
+    "confidence": "medium",
+    "impact": "H",
+    "effort": "M",
+    "window": "weeks 1-4",
+    "owner": "implementer",
+    "needs_design": true,
+    "acceptance": [
+      "Given a user opens /resize-image-to-20kb, When they upload a JPG and choose 20 KB, Then the download is at most 20 KB",
+      "Given the page is fetched without JavaScript, When the HTML is read, Then it has a unique title, H1 and how-to text"
+    ],
+    "risks": [
+      "near-duplicate pages per size would be thin content; one page with presets instead"
+    ]
+  },
+  {
+    "id": "GRO-003",
+    "type": "measurement",
+    "title": "Verify Search Console and define tool funnel events",
+    "rationale": "No Search Console verification and no tool usage events, so no landing-page or funnel data exists.",
+    "keywords": [],
+    "sources": [
+      "S-001"
+    ],
+    "evidence": "fact",
+    "confidence": "high",
+    "impact": "M",
+    "effort": "S",
+    "window": "weeks 1-4",
+    "owner": "human",
+    "risks": [],
+    "acceptance": [
+      "Done when the Search Console domain property is verified and the four funnel events appear in the analytics debug view"
+    ]
+  },
+  {
+    "id": "GRO-004",
+    "type": "distribution",
+    "title": "Answer photo-size questions in the job-applications community as the disclosed brand account",
+    "rationale": "Members ask how to meet form photo limits; rules allow self-promotion links only in the weekly thread, so answers elsewhere carry no link.",
+    "keywords": [],
+    "sources": [
+      "S-007",
+      "S-010"
+    ],
+    "evidence": "fact",
+    "confidence": "medium",
+    "impact": "L",
+    "effort": "S",
+    "window": "weeks 5-8",
+    "owner": "human",
+    "risks": [
+      "ban risk outside the weekly thread"
+    ],
+    "acceptance": [
+      "Done when three helpful answers are posted from the disclosed brand account, without links unless the thread rules allow one"
+    ]
+  },
+  {
+    "id": "GRO-005",
+    "type": "monetization",
+    "title": "Hold display ads until helpful content and consent banner are in place",
+    "rationale": "Tool pages carry little unique text; AdSense policies require valuable inventory and a consent solution for EEA and UK users.",
+    "keywords": [],
+    "sources": [
+      "S-006",
+      "S-008"
+    ],
+    "evidence": "inference",
+    "confidence": "medium",
+    "impact": "M",
+    "effort": "M",
+    "window": "weeks 9-13",
+    "owner": "human",
+    "risks": [],
+    "acceptance": [
+      "Done when the readiness table in monetization.md has no missing rows"
+    ]
+  }
+]

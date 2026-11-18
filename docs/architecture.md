@@ -63,6 +63,15 @@ The orchestrator selects agents by repository size and task, runs independent re
 
 Specs: [Agent Skills](https://agentskills.io/specification), [Claude Code skills](https://code.claude.com/docs/en/skills) and [sub-agents](https://code.claude.com/docs/en/sub-agents), [Codex skills](https://developers.openai.com/codex/skills) and subagents. No upstream text is vendored, so there are no attribution obligations beyond crediting ideas here.
 
+## Later skills on the same shape
+
+experience-audit, implementer and growth-strategy reuse this layout: agent-neutral `SKILL.md` and `core/`, a role registry with tiers, generated host agents, a zero-dependency helper that owns state and gates, and a copied (not shared) run-log module so each installs alone.
+
+growth-strategy (`skills/growth-strategy/`, design: [spec](superpowers/specs/2026-11-18-growth-strategy-design.md)) adds:
+- JSON records where data is filtered or exported (`.growth/sources.json`, `keywords.json`, `items.json`) validated by `core/schemas/records.schema.json` plus semantic rules in `core/scripts/lib/evidence.mjs`: every metric value has a provenance (`measured` only from imported Search Console or analytics exports, `estimate` only from tool exports or the user, otherwise `unknown` and null).
+- Two gates in code: an approved, hash-checked baseline before any phase can close, and decisions bound to an independent review of the current plan hash.
+- Read-only integration contracts with product-intelligence and experience-audit, handoff files for the implementer written once so its close-out is kept, and no automation of publishing, posting or submissions.
+
 ## Extending
 
 New skills go in `skills/<name>/` with the same shape (SKILL.md, references, templates, optional core/adapters). Share *conventions*, not code: copy small helpers rather than introducing a shared package that breaks single-skill installs. See [development.md](development.md).
