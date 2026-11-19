@@ -47,7 +47,7 @@ const readTemplate = (role) => JSON.parse(fs.readFileSync(S.settingsTemplate(rol
 // The lists a reviewer signed off on. Kept here, independent of the settings file, so deleting a rule fails a test.
 const CRED_DIRS = ['.ssh', '.aws', '.config/gcloud', '.kube', '.gnupg', '.config/gh'];
 const CRED_FILES = ['.npmrc', '.docker/config.json', '.claude.json', '.git-credentials', '.netrc'];
-const CLAUDE_DIRS = ['projects', 'todos', 'file-history', 'sessions', 'session-env', 'shell-snapshots', 'paste-cache', 'tasks', 'backups'];
+const CLAUDE_DIRS = ['projects', 'todos', 'file-history', 'sessions', 'session-env', 'shell-snapshots', 'paste-cache', 'tasks', 'backups', 'ide'];
 const CLAUDE_FILES = ['.credentials.json', 'history.jsonl'];
 const GIT_PARTS = ['config', 'hooks/**', 'info/**', 'modules/**', 'commondir', 'config.worktree', 'objects/info/**', 'worktrees/**'];
 const READ_PAIRS = [['/{{FACTORY_HOME}}/**', '{{FACTORY_HOME}}']];
@@ -536,19 +536,18 @@ const userSettings = (t, obj) => {
   return home;
 };
 
-test('user settings: unsafe keys refuse the session before spawning, naming keys only (never values)', async (t) => {
+test('user settings: an ALLOWLIST; anything else refuses the session before spawning, naming cleaned keys only', async (t) => {
   const f = fake(t, { mode: 'done' });
   const { cwd, settingsFile } = setup(t);
   const cases = [
     [{ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'cat SECRETVALUE' }] }] } }, ['hooks']],
-    [{ env: { GH_TOKEN: 'SECRETVALUE', DISABLE_TELEMETRY: '1' } }, ['env.GH_TOKEN']],
-    [{ apiKeyHelper: '/bin/SECRETVALUE' }, ['apiKeyHelper']],
-    [{ statusLine: { type: 'command', command: 'x' } }, ['statusLine']],
-    [{ permissions: { allow: ['Bash(gh *)'], additionalDirectories: ['/'] } }, ['permissions.allow', 'permissions.additionalDirectories']],
-    [{ permissions: { defaultMode: 'bypassPermissions' } }, ['permissions.defaultMode']],
-    [{ sandbox: { excludedCommands: ['git'], enableWeakerNestedSandbox: true, allowUnsandboxedCommands: true } }, ['sandbox.excludedCommands', 'sandbox.enableWeakerNestedSandbox', 'sandbox.allowUnsandboxedCommands']],
-    [{ sandbox: { network: { allowedDomains: ['x'], allowUnixSockets: ['/s'], allowAllUnixSockets: true }, filesystem: { allowWrite: ['/'], allowRead: ['/'] } } },
-      ['sandbox.network.allowedDomains', 'sandbox.network.allowUnixSockets', 'sandbox.network.allowAllUnixSockets', 'sandbox.filesystem.allowWrite', 'sandbox.filesystem.allowRead']],
+    [{ env: { GH_TOKEN: 'SECRETVALUE', DISABLE_TELEMETRY: '1', DISABLE_FOO: '1' } }, ['env.GH_TOKEN', 'env.DISABLE_FOO']],
+    [{ apiKeyHelper: '/bin/SECRETVALUE', statusLine: {}, fileSuggestion: {}, subagentStatusLine: {} }, ['apiKeyHelper', 'statusLine', 'fileSuggestion', 'subagentStatusLine']],
+    [{ permissions: { allow: ['Bash(gh *)'], additionalDirectories: ['/'], defaultMode: 'acceptEdits', deny: ['Bash(rm *)'] } }, ['permissions.allow', 'permissions.additionalDirectories', 'permissions.defaultMode']],
+    [{ sandbox: { excludedCommands: ['git'], network: {}, enabled: true } }, ['sandbox.excludedCommands', 'sandbox.network', 'sandbox.enabled']],
+    [{ enabledPlugins: { 'x@y': true } }, ['enabledPlugins']],
+    [{ ['evil\nkey' + 'k'.repeat(100)]: 1 }, [('evil?key' + 'k'.repeat(100)).slice(0, 64)]],
+    [{ model: 7, env: 'x', permissions: [] }, ['env', 'permissions', 'model']],
     ['{not json', ['settings.json (unparsable)']],
   ];
   for (const [obj, keys] of cases) {
@@ -559,11 +558,63 @@ test('user settings: unsafe keys refuse the session before spawning, naming keys
     assert.ok(!JSON.stringify(r).includes('SECRETVALUE'));
   }
   assert.equal(f.entries().length, 0, 'nothing may be spawned');
-  for (const ok of [undefined, { permissions: { deny: ['Bash(rm *)'] }, model: 'opus', env: { DISABLE_TELEMETRY: '1' }, enabledPlugins: { a: true }, sandbox: { network: {} } }]) {
+  const fine = { $schema: 'x', model: 'opus', env: { DISABLE_TELEMETRY: '1', BASH_MAX_TIMEOUT_MS: '1' }, permissions: { deny: ['Bash(rm *)'] }, cleanupPeriodDays: 30, includeCoAuthoredBy: false, enabledPlugins: {}, sandbox: {} };
+  for (const ok of [undefined, fine]) {
     const home = userSettings(t, ok);
     const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, baseEnv: { ...process.env, HOME: home } });
     assert.equal(r.ok, true, JSON.stringify(ok));
   }
+});
+
+test('user settings: a settings file inside the session cwd or tmpDir is refused', async (t) => {
+  const f = fake(t, { mode: 'echo-argv' });
+  const { fh, cwd, settingsFile } = setup(t, 'author');
+  const inCwd = path.join(cwd, 'cfg'); fs.mkdirSync(inCwd);
+  const r = await S.runSession({ role: 'author', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, configDir: inCwd });
+  assert.deepEqual(r.failure?.keys, ['settings.json (inside the session cwd or tmpDir)']);
+  const td = path.join(fh, 'tmp'); fs.mkdirSync(path.join(td, '.claude'), { recursive: true });
+  const r2 = await S.runSession({ role: 'author', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, tmpDir: td, baseEnv: { ...process.env, HOME: td } });
+  assert.deepEqual(r2.failure?.keys, ['settings.json (inside the session cwd or tmpDir)']);
+  const elsewhere = tmp(t, 'cfg-'); fs.symlinkSync(elsewhere, path.join(cwd, 'link'));
+  fs.symlinkSync(inCwd, path.join(elsewhere, 'viaLink'));
+  const r3 = await S.runSession({ role: 'author', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, configDir: path.join(elsewhere, 'viaLink') });
+  assert.equal(r3.failure?.kind, 'settings_unsafe', 'realpath inside cwd');
+});
+
+test('materialiseSettings: every config dir entry except skills/plugins/agents/commands/CLAUDE.md is read-denied; unsafe names fail closed', (t) => {
+  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-');
+  const cd = path.join(home, '.claude');
+  for (const d of ['skills', 'plugins', 'agents', 'commands', 'ide', 'ssh', 'brand-new-dir']) fs.mkdirSync(path.join(cd, d), { recursive: true });
+  fs.writeFileSync(path.join(cd, 'ide', 'x.lock'), 'x'); fs.writeFileSync(path.join(cd, 'newthing.json'), '{}'); fs.writeFileSync(path.join(cd, 'CLAUDE.md'), 'x');
+  const s = JSON.parse(fs.readFileSync(S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), 'utf8'));
+  for (const [n, dir] of [['ide', true], ['ssh', true], ['brand-new-dir', true], ['newthing.json', false]]) {
+    const abs = path.join(cd, n);
+    assert.ok(s.sandbox.filesystem.denyRead.includes(abs), n);
+    assert.ok(s.permissions.deny.includes(`Read(/${abs}${dir ? '/**' : ''})`), n);
+  }
+  for (const n of ['skills', 'plugins', 'agents', 'commands', 'CLAUDE.md']) {
+    const abs = path.join(cd, n);
+    assert.ok(!s.sandbox.filesystem.denyRead.some((p) => p === abs || p.startsWith(abs + '/')), n);
+    assert.ok(!s.permissions.deny.some((r) => r.startsWith(`Read(/${abs}`)), n);
+  }
+  assert.deepEqual(S.checkSettings(s), []);
+  fs.writeFileSync(path.join(cd, 'bad*name'), 'x');
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), (e) => e.code === 'settings_unsafe');
+});
+
+test('materialiseSettings: a symlinked credential dir is denied by its real path too', (t) => {
+  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-'); const keys = tmp(t, 'keys-');
+  fs.symlinkSync(keys, path.join(home, '.ssh'));
+  fs.writeFileSync(path.join(keys, 'npmrc'), 'x'); fs.symlinkSync(path.join(keys, 'npmrc'), path.join(home, '.npmrc'));
+  const s = JSON.parse(fs.readFileSync(S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), 'utf8'));
+  assert.ok(s.sandbox.filesystem.denyRead.includes(keys) && s.permissions.deny.includes(`Read(/${keys}/**)`));
+  assert.ok(s.sandbox.filesystem.denyRead.includes(path.join(keys, 'npmrc')) && s.permissions.deny.includes(`Read(/${path.join(keys, 'npmrc')})`));
+  assert.deepEqual(S.checkSettings(s), []);
+});
+
+test('runSession: unknown options (e.g. the old maxLineBytes) are refused, not silently ignored', async (t) => {
+  const { cwd, settingsFile } = setup(t);
+  await assert.rejects(S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 5, maxLineBytes: 10 }), /unknown option maxLineBytes/);
 });
 
 test('user settings: the author with a configDir is linted against that dir, not HOME', async (t) => {
@@ -615,7 +666,8 @@ test('binary and PATH: relative PATH entries dropped; a claude inside cwd is ref
   fs.symlinkSync(path.join(FAKE, 'claude'), path.join(cwd, 'claude'));
   fs.writeFileSync(path.join(cwd, 'fake.json'), JSON.stringify({ mode: 'echo-argv' }));
   const viaPath = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, baseEnv: { ...process.env, PATH: `${cwd}:${path.dirname(process.execPath)}:/usr/bin:/bin` } });
-  assert.deepEqual(viaPath.failure, { kind: 'unsafe_binary', resetAt: null });
+  assert.deepEqual(viaPath.failure, { kind: 'spawn_failed', resetAt: null }, 'a PATH entry inside cwd is dropped');
+  assert.equal(S.scrubEnv({ PATH: `${cwd}:${cwd}/bin:/usr/bin` }, { cwd }).PATH, '/usr/bin');
   const abs = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: path.join(cwd, 'claude') });
   assert.deepEqual(abs.failure, { kind: 'unsafe_binary', resetAt: null });
   const rel = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, baseEnv: { ...process.env, PATH: `.:${path.dirname(process.execPath)}` } });
@@ -635,6 +687,6 @@ test('tmpDir: TMPDIR for the session is the private dir the caller passes', asyn
 test('readBuilderResult: tag characters, Arabic letter mark, Mongolian vowel separator and variation selectors are stripped', (t) => {
   const c = clone(t);
   const cp = (...x) => String.fromCodePoint(...x);
-  put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f` }));
-  assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdef');
+  put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f${cp(0x2028)}g${cp(0x2029, 0x200b, 0xad)}h` }));
+  assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdefgh');
 });
