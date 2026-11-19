@@ -6,13 +6,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
+import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize, overrideValid } from './lib/queue.mjs';
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
 import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
-import { readVerdict } from './lib/verdict.mjs';
+import { readVerdict, verdictMatches } from './lib/verdict.mjs';
+import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
+import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios.mjs';
+import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
+import { gitSafeOpts } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -585,35 +589,106 @@ C.push = () => {
   emit({ id: f.id, state: f.state, sha: head, ci_files_touched: f.ci_files });
 };
 
+// ---- verdict gate (merge) ----------------------------------------------------------------------------------------------
+// Raw, hardened git for the gate: stdout untrimmed, real exit codes (checkDiff needs both), GIT_* scrubbed, neutralising -c flags,
+// --no-ext-diff/--no-textconv on diffs, a timeout; signals, timeouts and overflows throw. The repo config allowlist is skipped
+// (verified: true): merge runs in whatever checkout the caller uses, and this process already ran an unhardened `git fetch` there.
+// Every command here is read-only on objects and refs (rev-parse, merge-base, ls-tree, cat-file, diff between two shas).
+const rawGit = (...a) => gitSafeOpts(root, a, { verified: true });
+// The queue file is trusted only under FACTORY_HOME (by realpath, so a sibling "fhome-x" or a link out does not count).
+const queueInHome = () => { try { const h = fs.realpathSync(factoryHome()); return fs.realpathSync(file).startsWith(h + path.sep); } catch { return false; } };
+const SPEC_MAX = 256 * 1024;
+const PART_OK = (p) => p.split('/').every((x) => x !== '' && x !== '.' && x !== '..');
+const specTooBig = (t) => t.length > SPEC_MAX || t.split('\n').some((l) => l.length > MAX_LINE); // never parse a hostile size
+// The feature's spec, repo-relative: must be <...>/<ID>.md inside the repository (the queue's absolute path is only a pointer).
+function specRel(f) {
+  const rel = path.relative(root, String(f.file || '')).split(path.sep).join('/');
+  if (!rel || path.isAbsolute(rel) || !PART_OK(rel) || /[\0\n:\\]/.test(rel) || path.posix.basename(rel) !== `${f.id}.md`) throw new Error('feature spec path is not a normalised repo-relative path');
+  return rel;
+}
+// G5 covers every feature spec in the base config's features_dir on origin/<base>, plus this feature's spec.
+function specList(base, featuresDir, own) {
+  const dir = String(featuresDir).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+  if (!dir || !PART_OK(dir) || /[\0\n:\\*?[]/.test(dir)) throw new Error('features_dir is not a normalised repo-relative path');
+  const r = rawGit('ls-tree', '-z', '--name-only', '--full-tree', OR(base), '--', `${dir}/`);
+  if (r.code !== 0) throw new Error('ls-tree failed');
+  const names = r.out.split('\0').filter((n) => n.startsWith(`${dir}/`) && /^FEATURE-\d+\.md$/.test(n.slice(dir.length + 1)));
+  if (names.length > 5000) throw new Error('too many specs');
+  return [...new Set([...names, own])];
+}
+// null when the merge may go on; otherwise { why, kind } with a category reason only (never scenario text, ids or paths).
+function verdictGate(q, f, bc, headSha) {
+  const G = (why, kind = 'verification') => ({ why, kind });
+  const rk = repoKey(q.repo);
+  let crHash, rel;
+  try {
+    rel = specRel(f);
+    const s = specFromBase(rawGit, q.base, rel);
+    if (!s.ok) return G(`verification gate: the feature spec on origin/${q.base} cannot be read (${s.reason}): the criteria_hash cannot be recomputed`);
+    if (specTooBig(s.text)) return G(`verification gate: the feature spec on origin/${q.base} is too large to hash safely`);
+    crHash = criteriaHash(extractCriteria(s.text).sections);
+  } catch { return G('verification gate: the criteria_hash could not be recomputed from the base spec'); }
+  const vd = readVerdict(rk, f.id, headSha); // fail-closed: null unless a shape-valid file for exactly this feature and sha
+  if (!vd) return G(`verification gate: no valid verification verdict for commit ${headSha.slice(0, 8)}: a person reviews it, or verify again`);
+  let doc, scHash;
+  try { doc = loadScenarios(rk, f.id); if (doc) scHash = scenariosHash(doc); } catch { doc = null; }
+  if (!doc || doc.feature !== f.id || typeof scHash !== 'string') return G('verification gate: the stored scenarios are missing or unreadable, so the verdict cannot be bound to them');
+  if (!verdictMatches(vd, { sha: headSha, scenariosHash: scHash, criteriaHash: crHash })) {
+    const what = vd.verdict !== 'pass' ? 'the verdict for this commit is not a pass'
+      : vd.scenarios_hash !== scHash ? 'the scenarios changed after verification (scenarios_hash mismatch)'
+        : vd.criteria_hash !== crHash ? 'the spec criteria changed after verification (criteria_hash mismatch)' : 'the verdict does not match this commit';
+    return G(`verification gate: ${what}; verify again`);
+  }
+  if (!isCurrentApproved(doc, crHash)) return G('verification gate: the stored scenarios are not approved for the current criteria');
+  let hits;
+  try {
+    hits = checkDiff({ git: rawGit, baseRef: OR(q.base), headSha, config: bc, specPaths: specList(q.base, bc.features_dir, rel) });
+    if (classify(hits, 'merge') === 'clean') return null;
+  } catch { return G('anti-gaming checks could not run on the merge commit (fail-closed): a person reviews it', 'antigaming'); }
+  // A person's override (retry --note at a terminal) counts only for this exact head, and only from a queue the builder cannot write.
+  if (queueInHome() && overrideValid(f, headSha)) return null;
+  return G(`anti-gaming check ${holdReason(hits).ids.join(', ')} hit on the merge commit: a person reviews it (deliver retry ${f.id} --note at a terminal overrides it for this commit)`, 'antigaming');
+}
+
 C.merge = () => {
   const q = load(); const f = item(q);
   need(f, 'ci_passed', 'verified');
   must(gitNet('fetch', 'origin'), 'git fetch');
-  const hold = (why) => { transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr }); };
+  // kind: 'verification' (plain retry re-runs CI and verification) or 'antigaming' (retry needs a person at a terminal, --note).
+  const hold = (why, kind) => { if (kind || f.hold_kind) f.hold_kind = kind || null; transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr, ...(kind ? { hold_kind: kind } : {}) }); };
   const view = () => ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,isDraft,mergeStateStatus,headRefOid,headRefName,baseRefName,mergeCommit,autoMergeRequest,isCrossRepository'], 'gh pr view');
   let v = view();
   if (v.isCrossRepository || v.headRefName !== f.branch || v.baseRefName !== q.base) die(`PR #${f.pr.number} is ${v.headRefName} -> ${v.baseRefName}${v.isCrossRepository ? ' (from a fork)' : ''}, expected ${f.branch} -> ${q.base} in this repository`);
   if (v.state === 'MERGED' && v.headRefOid === f.ci_sha) return merged(q, f, v.mergeCommit?.oid, ['GitHub had already merged this PR (an earlier run was interrupted)']);
-  if (f.state === 'ci_passed') { // verification-required projects only merge what the gate verified (checked after the already-merged recovery so a hand-merged PR still resolves)
-    const bc = baseConfigNow(q.base);
-    if (!bc) die(`${CONFIG_PATH} on origin/${q.base} cannot be read (missing ref or invalid): fix it first; not assuming defaults`);
-    if (bc.verification.required) die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
-  }
-  if (q.protected_base) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
+  // Policy in force is the config on origin/<base> now, for every state (checked after the already-merged recovery so a hand-merged
+  // PR still resolves). The queue's `policy` copy is never consulted below: a forged copy has no effect.
+  const bc = baseConfigNow(q.base);
+  if (!bc) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read (missing ref or invalid): not assuming defaults; fix it, then retry`, 'verification');
+  const required = bc.verification.required;
+  if (required && f.state === 'ci_passed') die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
+  const pq = { ...q, policy: bc }; // base policy for ciFiles / isIgnored
+  // Verified mode: the queue holds the override fields and the run flags, so it must live where the builder cannot write (FACTORY_HOME).
+  if (required && !queueInHome()) return hold(`verification is required but the queue file is not under FACTORY_HOME (it may be builder-writable): run merges through the factory driver`, 'verification');
+  if (q.protected_base || isProtectedBranch(q.base, bc.protected_branches)) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
   if (!q.merge) return hold('merging was not authorised for this run (config merge.mode is "pr-only" and --merge was not given): the PR is ready for you');
   if (git('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(gitNet('fetch', 'origin', f.branch), 'git fetch');
-  const ci = [...new Set([...(f.ci_files || []), ...ciFiles(q, f.ci_sha)])]; // recomputed on the verified commit, renames included
-  if (f.tier === 'T3') { // T3 needs the opt-in AND a passing verdict for this exact commit; otherwise a person reviews it, in every mode
-    if (!q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
-    const vd = readVerdict(repoKey(q.repo), f.id, f.ci_sha); // fail-closed: null unless a shape-valid file for exactly this feature and sha (Task 10 adds the hash binding)
-    if (!(vd && vd.verdict === 'pass' && vd.sha === f.ci_sha)) return hold(`T3 work needs a passing verification verdict for commit ${String(f.ci_sha).slice(0, 8)} and there is none: a person reviews it`);
+  const ci = [...new Set([...(f.ci_files || []), ...ciFiles(pq, f.ci_sha)])]; // recomputed on the verified commit, renames included
+  // T3 needs the opt-in AND a matching passing verdict, in every mode; with verification required every feature needs the verdict.
+  if (f.tier === 'T3' && !q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
+  if (required || f.tier === 'T3') {
+    if (required && (v.state !== 'OPEN' || v.isDraft)) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
+    // Required: the verdict must be for the PR head as GitHub reports it now, and that must be the commit CI passed on.
+    const headSha = required ? v.headRefOid : f.ci_sha;
+    if (required && !(SHA.test(String(headSha)) && headSha === f.ci_sha)) return hold(`the PR head moved after verification (or cannot be resolved): ${f.id} is verified for ${String(f.ci_sha).slice(0, 8)} only; retry to run CI and verification again`, 'verification');
+    const g = verdictGate(q, f, bc, headSha);
+    if (g) return hold(`${f.tier === 'T3' && !required ? 'T3 work: ' : ''}${g.why}`, g.kind);
   }
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
   if (v.headRefOid !== f.ci_sha) { transition(f, 'pr_open'); save(q); return outcome({ id: f.id, result: 'stale', reason: 'the PR head changed after CI passed: wait for CI again', next: 'ci' }); }
   // Do not trust the state file for "CI passed": ask GitHub again about this exact commit, whatever the file says.
-  const needed = q.checks.length ? q.checks : requiredOf(f.pr.number).filter((n) => !isIgnored(q, n));
-  const now = new Map(checksOf(f.pr.number).filter((c) => !isIgnored(q, c.name)).map((c) => [lc(c.name), c.bucket]));
+  const needed = q.checks.length ? q.checks : requiredOf(f.pr.number).filter((n) => !isIgnored(pq, n));
+  const now = new Map(checksOf(f.pr.number).filter((c) => !isIgnored(pq, c.name)).map((c) => [lc(c.name), c.bucket]));
   const bad = [...now.values()].some((x) => ['fail', 'cancel', 'pending'].includes(x)) || needed.some((n) => now.get(lc(n)) !== 'pass');
   if (bad || (!needed.length && !q.no_ci)) return hold('GitHub does not show the required checks passing on this commit: a person decides');
   if (v.autoMergeRequest) return hold('auto-merge or a merge queue is already enabled on this PR: a person decides');

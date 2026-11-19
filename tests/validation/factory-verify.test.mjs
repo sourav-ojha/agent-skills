@@ -110,15 +110,20 @@ test('queue: verification transitions allowed, others refused', () => {
 });
 
 // Ship FEATURE-001 to ci_passed with the real helper, then let the test edit the queue file directly.
-function shipped(extra = {}, { tier = 'T2', config, init = ['--merge', '--note', 'ok'] } = {}) {
+function shipped(extra = {}, { tier = 'T2', config, init = ['--merge', '--note', 'ok'], files = {}, queueInHome = false, baseFiles = {}, specAppend = '' } = {}) {
   const r = repo();
+  if (queueInHome) extra = { ...extra, DELIVER_QUEUE: path.join(r.root, 'fhome', 'queues', 'o__r.json') };
+  r.env = extra;
   const sh = (...a) => { const x = spawnSync('git', a, { cwd: r.work, encoding: 'utf8' }); if (x.status !== 0) throw new Error(x.stderr); };
-  if (config) { fs.writeFileSync(path.join(r.work, '.product/delivery.json'), JSON.stringify(config)); sh('add', '-A'); sh('commit', '-q', '-m', 'cfg'); sh('push', '-q', 'origin', 'main'); }
+  for (const [p, body] of Object.entries(baseFiles)) { fs.mkdirSync(path.dirname(path.join(r.work, p)), { recursive: true }); fs.writeFileSync(path.join(r.work, p), body); }
+  if (config) fs.writeFileSync(path.join(r.work, '.product/delivery.json'), JSON.stringify(config));
+  if (config || Object.keys(baseFiles).length) { sh('add', '-A'); sh('commit', '-q', '-m', 'cfg'); sh('push', '-q', 'origin', 'main'); }
   { const i = r.d(extra, 'init', ...init); assert.equal(i.code, 0, i.out + i.err); }
   assert.equal(J(r.d(extra, 'next')).feature.id, 'FEATURE-001');
   const spc = path.join(r.work, '.product/features/FEATURE-001.md');
   fs.mkdirSync(path.join(r.work, 'src'), { recursive: true }); fs.writeFileSync(path.join(r.work, 'src/a.txt'), 'a\n');
-  fs.writeFileSync(spc, fs.readFileSync(spc, 'utf8').replace(/^status: ready/m, 'status: implemented').replace(/^---\n/, '---\ndelivery: complete\n'));
+  for (const [p, body] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(r.work, p)), { recursive: true }); fs.writeFileSync(path.join(r.work, p), body); }
+  fs.writeFileSync(spc, fs.readFileSync(spc, 'utf8').replace(/^status: ready/m, 'status: implemented').replace(/^---\n/, '---\ndelivery: complete\n') + specAppend);
   sh('add', '-A'); sh('commit', '-q', '-m', 'feat');
   assert.equal(r.d(extra, 'built', 'FEATURE-001', '--tier', tier).code, 0);
   fs.mkdirSync(path.join(r.work, '.delivery'), { recursive: true }); fs.writeFileSync(path.join(r.work, '.delivery/pr-body.md'), 'b\n');
@@ -126,8 +131,8 @@ function shipped(extra = {}, { tier = 'T2', config, init = ['--merge', '--note',
   { const g = JSON.parse(fs.readFileSync(path.join(r.root, 'gh.json'), 'utf8')); g.checkQueue = [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]]; fs.writeFileSync(path.join(r.root, 'gh.json'), JSON.stringify(g)); }
   const ci = r.d(extra, 'ci', 'FEATURE-001', '--interval', '0', '--grace', '0', '--timeout', '1');
   assert.equal(J(ci).result, 'passed', ci.out + ci.err);
-  const qf = path.join(r.work, '.delivery', 'queue.json');
-  r.edit = (fn) => { const q = JSON.parse(fs.readFileSync(qf, 'utf8')); fn(q.features[0], q); fs.writeFileSync(qf, JSON.stringify(q)); };
+  const qf = extra.DELIVER_QUEUE || path.join(r.work, '.delivery', 'queue.json');
+  r.edit =(fn) => { const q = JSON.parse(fs.readFileSync(qf, 'utf8')); fn(q.features[0], q); fs.writeFileSync(qf, JSON.stringify(q)); };
   r.feat = () => JSON.parse(fs.readFileSync(qf, 'utf8')).features[0];
   return r;
 }
@@ -159,7 +164,8 @@ test('merge accepts verified; ci_passed is accepted unless the base config requi
   req.edit((f, q) => { q.policy = { ...(q.policy || {}), verification: { required: false } }; }); // the builder-editable queue copy must not matter
   assert.match(req.d({}, 'merge', 'FEATURE-001').err, /verification/);
   req.edit((f) => { f.state = 'verified'; });
-  assert.equal(J(req.d({}, 'merge', 'FEATURE-001')).state, 'merged');
+  const held = req.d({}, 'merge', 'FEATURE-001'); // Task 10: verified alone is not enough (no trusted queue, no verdict)
+  assert.equal(held.code, 2, held.out + held.err); assert.equal(J(held).state, 'awaiting_human');
   fs.rmSync(r.root, { recursive: true, force: true }); fs.rmSync(req.root, { recursive: true, force: true });
 });
 
@@ -240,15 +246,17 @@ test('merge reads the base config fail-closed: missing ref and invalid JSON refu
   };
   const bad = shipped();
   pushCfg(bad, '{ not json');
-  const a = bad.d({}, 'merge', 'FEATURE-001');
-  assert.notEqual(a.code, 0); assert.match(a.err, /cannot be read/);
-  assert.equal(bad.feat().state, 'ci_passed');
+  const a = bad.d({}, 'merge', 'FEATURE-001'); // Task 10: an unreadable base config holds (never default-open)
+  assert.equal(a.code, 2, a.out + a.err); assert.match(J(a).reason, /cannot be read/);
+  assert.equal(bad.feat().state, 'awaiting_human');
 
   const noRef = shipped();
   const origin = path.join(noRef.root, 'origin.git');
   git(origin, 'update-ref', '-d', 'refs/heads/main'); git(noRef.work, 'update-ref', '-d', 'refs/remotes/origin/main');
   const b = noRef.d({}, 'merge', 'FEATURE-001');
-  assert.notEqual(b.code, 0); assert.match(b.err, /cannot be read/, b.err);
+  assert.equal(b.code, 2, b.out + b.err); assert.match(J(b).reason, /cannot be read/);
+  assert.equal(noRef.feat().state, 'awaiting_human');
+  assert.ok(!JSON.parse(fs.readFileSync(path.join(noRef.root, 'gh.json'), 'utf8')).calls.some((c) => c[0] === 'pr' && c[1] === 'merge'), 'never merged');
 
   const none = shipped();
   pushCfg(none, null);
@@ -658,29 +666,54 @@ test('verdictMatches: exact sha and both hashes, pass verdict, every result pass
   assert.equal(V.verdictMatches(vdoc(), null), false);
 });
 
-test('T3 with --merge-t3 merges with a real passing verdict for the exact commit; a mismatched or failing verdict still holds', () => {
-  const put = (r, doc) => { const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = path.join(r.root, 'fhome'); try { V.writeVerdict('o__r', doc); } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; } };
-  const ok = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'] });
-  put(ok, vdoc({ sha: ok.feat().ci_sha }));
+// ---- Task 10 helpers: what the driver stores after a passing verification (scenarios + verdict), with real hashes -----------
+const CR = await import(path.join(SK, 'core', 'scripts', 'lib', 'criteria.mjs'));
+const AG = await import(path.join(SK, 'core', 'scripts', 'lib', 'antigaming.mjs'));
+const inHome = (r, fn) => { const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = path.join(r.root, 'fhome'); try { return fn(); } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; } };
+const HIDDEN_PATH = '/api/hidden-route-fx-77aa11';
+const baseSpec = (r) => spawnSync('git', ['show', 'refs/remotes/origin/main:.product/features/FEATURE-001.md'], { cwd: r.work, encoding: 'utf8' }).stdout;
+function arm(r, { verdict = {}, sha = r.feat().ci_sha } = {}) {
+  const ch = CR.criteriaHash(CR.extractCriteria(baseSpec(r)).sections);
+  const doc = SC.approve({ feature: 'FEATURE-001', criteria_hash: ch, canary: 'fx-a1b2c3', scenarios: [{ id: 'S-1', covers: ['AC-1'], kind: 'api', request: { method: 'GET', path: HIDDEN_PATH }, assert: [{ status: 200 }] }] }, 'tester');
+  inHome(r, () => { SC.saveScenarios('o__r', 'FEATURE-001', doc); V.writeVerdict('o__r', vdoc({ sha, scenarios_hash: SC.scenariosHash(doc), criteria_hash: ch, ...verdict })); });
+  return { ch, sh: SC.scenariosHash(doc), doc };
+}
+const ghCalls = (r) => JSON.parse(fs.readFileSync(path.join(r.root, 'gh.json'), 'utf8')).calls;
+const mergeCalled = (r) => ghCalls(r).some((c) => c[0] === 'pr' && c[1] === 'merge');
+
+test('T3 with --merge-t3 merges with a real passing verdict bound to the recomputed hashes; a mismatched, failing or tampered verdict holds', () => {
+  const T3 = { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'] };
+  const ok = shipped({}, T3);
+  arm(ok);
   const m = ok.d({}, 'merge', 'FEATURE-001');
   assert.equal(J(m)?.state, 'merged', m.out + m.err);
 
-  const other = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'] });
-  put(other, vdoc()); // sha aaaa..., not this commit
+  const other = shipped({}, T3);
+  arm(other, { sha: SHA }); // a verdict for another commit only
   const o = other.d({}, 'merge', 'FEATURE-001');
-  assert.equal(J(o).state, 'awaiting_human'); assert.match(J(o).reason, /verdict/);
+  assert.equal(J(o).state, 'awaiting_human'); assert.match(J(o).reason, /verdict/); assert.equal(mergeCalled(other), false);
 
-  const failing = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'] });
-  put(failing, vdoc({ sha: failing.feat().ci_sha, verdict: 'fail', results: [{ id: 'S-1', covers: ['AC-1'], status: 'fail', flaky: false }] }));
+  const failing = shipped({}, T3);
+  arm(failing, { verdict: { verdict: 'fail', results: [{ id: 'S-1', covers: ['AC-1'], status: 'fail', flaky: false }] } });
   const f = failing.d({}, 'merge', 'FEATURE-001');
   assert.equal(J(f).state, 'awaiting_human'); assert.match(J(f).reason, /verdict/);
 
-  const tamper = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'] });
-  put(tamper, vdoc({ sha: tamper.feat().ci_sha }));
+  const tamper = shipped({}, T3);
+  arm(tamper);
   const tf = path.join(tamper.root, 'fhome', 'verdicts', 'o__r', `FEATURE-001.${tamper.feat().ci_sha}.json`);
   fs.writeFileSync(tf, fs.readFileSync(tf, 'utf8').replace('"flaky": false', '"flaky": true'));
   assert.equal(J(tamper.d({}, 'merge', 'FEATURE-001')).state, 'awaiting_human');
-  for (const r of [ok, other, failing, tamper]) fs.rmSync(r.root, { recursive: true, force: true });
+
+  // Task 10: the T3 path binds the hashes too (verification.required is false here). The old sha-only binding merged these.
+  const scen = shipped({}, T3);
+  arm(scen, { verdict: { scenarios_hash: `sha256:${'9'.repeat(64)}` } });
+  const s = scen.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(s).state, 'awaiting_human', s.out + s.err); assert.match(J(s).reason, /scenarios_hash/); assert.equal(mergeCalled(scen), false);
+  const crit = shipped({}, T3);
+  arm(crit, { verdict: { criteria_hash: `sha256:${'8'.repeat(64)}` } });
+  const c = crit.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(c).state, 'awaiting_human'); assert.match(J(c).reason, /criteria_hash/);
+  for (const r of [ok, other, failing, tamper, scen, crit]) fs.rmSync(r.root, { recursive: true, force: true });
 });
 
 // ---- Task 9: verification step, symptom brief, factory/verified status --------------------------------------------------------
@@ -1409,4 +1442,281 @@ test('round 3: a failed prune and an undeletable quarantined tree are both repor
   assert.ok(locked.length > 0, 'the quarantine existed when prune ran');
   assert.match(e.message, /git worktree prune failed/);
   assert.match(e.message, /quarantined verification worktree could not be deleted/);
+});
+
+// ---- Task 10: verdict-bound merge when the base config requires verification ---------------------------------------------------
+const REQ = { protected_branches: [], verification: { required: true } };
+const vship = (opts = {}) => shipped({}, { config: REQ, queueInHome: true, ...opts });
+const g = (cwd, ...a) => { const x = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (x.status !== 0) throw new Error(`git ${a.join(' ')}: ${x.stderr}`); return x.stdout.trim(); };
+const rm = (...rs) => { for (const r of rs) fs.rmSync(r.root, { recursive: true, force: true }); };
+const merge = (r) => r.d(r.env, 'merge', 'FEATURE-001');
+// A hold reason must name a category only: never the hidden scenario path, id, canary or the scenario file location.
+const noLeak = (reason) => { for (const s of [HIDDEN_PATH, 'S-1', 'fx-a1b2c3', 'o__r', 'FEATURE-001.json', 'fhome', 'hidden-route']) assert.ok(!String(reason).includes(s), `reason leaks ${s}: ${reason}`); };
+
+test('T10 happy path: verified state, trusted queue, passing verdict for the exact head with recomputed hashes, clean anti-gaming -> merged', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  const m = merge(r);
+  assert.equal(J(m)?.state, 'merged', m.out + m.err);
+  const call = ghCalls(r).find((c) => c[0] === 'pr' && c[1] === 'merge');
+  assert.equal(call[call.indexOf('--match-head-commit') + 1], r.feat().ci_sha, 'only the verified sha can be merged');
+  rm(r);
+});
+
+test('T10: a push after verification (head moved) holds; it is never merged and never silently sent back as stale', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  fs.writeFileSync(path.join(r.work, 'src/b.txt'), 'late\n'); g(r.work, 'add', '-A'); g(r.work, 'commit', '-q', '-m', 'late push'); g(r.work, 'push', '-q', 'origin', 'HEAD');
+  const m = merge(r);
+  assert.equal(m.code, 2, m.out + m.err);
+  assert.equal(J(m).state, 'awaiting_human'); assert.match(J(m).reason, /head moved after verification/);
+  assert.equal(r.feat().hold_kind, 'verification');
+  assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: scenarios changed after verification hold with a category reason (no scenario text, id or path)', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  const { doc } = arm(r);
+  const changed = SC.approve({ ...doc, approved: undefined, scenarios: [{ ...doc.scenarios[0], assert: [{ status: 201 }] }] }, 'tester');
+  inHome(r, () => SC.saveScenarios('o__r', 'FEATURE-001', changed));
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /scenarios_hash mismatch/); noLeak(J(m).reason);
+  assert.equal(mergeCalled(r), false);
+  // and with the scenario file gone, or corrupt, it also holds
+  for (const body of [null, '{ not json']) {
+    r.edit((f) => { f.state = 'verified'; });
+    const sp = path.join(r.root, 'fhome', 'scenarios', 'o__r', 'FEATURE-001.json');
+    if (body === null) fs.rmSync(sp); else fs.writeFileSync(sp, body);
+    const x = merge(r);
+    assert.equal(J(x).state, 'awaiting_human', x.out + x.err); noLeak(J(x).reason); assert.equal(mergeCalled(r), false);
+  }
+  rm(r);
+});
+
+test('T10: spec criteria changed on origin/<base> after verification hold (criteria_hash recomputed from the base spec now)', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  const br = g(r.work, 'rev-parse', '--abbrev-ref', 'HEAD');
+  g(r.work, 'checkout', '-q', 'main'); g(r.work, 'pull', '-q', 'origin', 'main');
+  fs.appendFileSync(path.join(r.work, '.product/features/FEATURE-001.md'), '\nA new acceptance criterion.\n');
+  g(r.work, 'commit', '-q', '-am', 'tighten criteria'); g(r.work, 'push', '-q', 'origin', 'main'); g(r.work, 'checkout', '-q', br);
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /criteria_hash mismatch/); noLeak(J(m).reason);
+  assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: a G4 change on the merge sha holds as anti-gaming; only an override bound to that exact head (overrideValid) lets it through', () => {
+  const r = vship({ files: { '.gitattributes': '*.txt text\n' } });
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /G4/); assert.doesNotMatch(J(m).reason, /gitattributes/);
+  assert.equal(r.feat().hold_kind, 'antigaming'); assert.equal(mergeCalled(r), false);
+  const head = r.feat().ci_sha;
+  // an override for another commit (a later push voided it) does not count
+  r.edit((f) => { f.state = 'verified'; f.hold_kind = null; f.override_note = 'reviewed'; f.override_sha = 'b'.repeat(40); });
+  assert.equal(J(merge(r)).state, 'awaiting_human'); assert.equal(mergeCalled(r), false);
+  // a note without a sha, or a sha without a note, does not count either
+  r.edit((f) => { f.state = 'verified'; f.override_note = ''; f.override_sha = head; });
+  assert.equal(J(merge(r)).state, 'awaiting_human'); assert.equal(mergeCalled(r), false);
+  // the person's override for this exact head (what retry --note records at a terminal), in the trusted queue: merges
+  r.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed the attributes change'; f.override_sha = head; });
+  const ok = merge(r);
+  assert.equal(J(ok)?.state, 'merged', ok.out + ok.err);
+  rm(r);
+});
+
+test('T10: a forged queue policy (verification.required=false) has no effect: the base config still requires a verdict', () => {
+  const r = vship();
+  r.edit((f, q) => { q.policy.verification = { ...q.policy.verification, required: false }; });
+  const a = merge(r); // ci_passed is refused outright
+  assert.equal(a.code, 1); assert.match(a.err, /verification is required/); assert.equal(r.feat().state, 'ci_passed');
+  r.edit((f) => { f.state = 'verified'; });
+  const b = merge(r); // verified but no verdict
+  assert.equal(J(b).state, 'awaiting_human', b.out + b.err); assert.match(J(b).reason, /verdict/);
+  assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: base config required:false -> ci_passed merges exactly as before (no verdict, in-repo queue)', () => {
+  const r = shipped();
+  assert.equal(r.feat().state, 'ci_passed');
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m)?.state, 'merged', m.out + m.err);
+  assert.ok(!('hold_kind' in r.feat()));
+  rm(r);
+});
+
+test('T10: in verified mode a queue file outside FACTORY_HOME holds, even with a valid verdict (its override fields are builder-writable)', () => {
+  const r = shipped({}, { config: REQ });
+  r.edit((f) => { f.state = 'verified'; f.override_note = 'forged'; f.override_sha = f.ci_sha; });
+  arm(r);
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /FACTORY_HOME/);
+  assert.equal(mergeCalled(r), false);
+  // a queue reached through a symlink into FACTORY_HOME is refused by load(); a queue under a sibling dir named like FACTORY_HOME is not inside it
+  const r2 = shipped({}, { config: REQ });
+  const twin = path.join(r2.root, 'fhome-evil', 'q.json');
+  fs.mkdirSync(path.dirname(twin), { recursive: true });
+  fs.copyFileSync(path.join(r2.work, '.delivery', 'queue.json'), twin);
+  const q = JSON.parse(fs.readFileSync(twin, 'utf8')); q.features[0].state = 'verified'; fs.writeFileSync(twin, JSON.stringify(q));
+  arm(r2);
+  const x = r2.d({ DELIVER_QUEUE: twin }, 'merge', 'FEATURE-001');
+  assert.equal(J(x).state, 'awaiting_human', x.out + x.err); assert.match(J(x).reason, /FACTORY_HOME/);
+  rm(r, r2);
+});
+
+test('T10: an anti-gaming check that cannot run (checkDiff throws: no merge base) holds, never merges', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  const orphan = g(r.work, 'commit-tree', 'refs/remotes/origin/main^{tree}', '-m', 'unrelated history'); // same tree: config and spec unchanged
+  g(r.work, 'push', '-q', '-f', 'origin', `${orphan}:refs/heads/main`);
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /anti-gaming checks could not run/);
+  assert.equal(r.feat().hold_kind, 'antigaming'); assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: base ref missing holds in verified mode too', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  g(path.join(r.root, 'origin.git'), 'update-ref', '-d', 'refs/heads/main'); g(r.work, 'update-ref', '-d', 'refs/remotes/origin/main');
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /cannot be read/); assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: an override in a builder-writable (in-repo) queue is ignored on the T3 path', () => {
+  const r = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'], files: { '.gitattributes': '*.txt text\n' } });
+  arm(r);
+  r.edit((f) => { f.override_note = 'forged'; f.override_sha = f.ci_sha; });
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /G4/); assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: merge takes protected_branches, hold_paths and checks.ignored from the base config, not the queue copy', () => {
+  const a = shipped({}, { config: { protected_branches: [], hold_paths: ['src/**'] } });
+  a.edit((f, q) => { q.policy.hold_paths = []; f.ci_files = []; }); // forged
+  const x = a.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(x).state, 'awaiting_human', x.out + x.err); assert.match(J(x).reason, /src\/a\.txt/);
+
+  const b = shipped();
+  const br = g(b.work, 'rev-parse', '--abbrev-ref', 'HEAD');
+  g(b.work, 'checkout', '-q', 'main'); fs.writeFileSync(path.join(b.work, '.product/delivery.json'), JSON.stringify({ protected_branches: ['main'] }));
+  g(b.work, 'commit', '-q', '-am', 'protect main'); g(b.work, 'push', '-q', 'origin', 'main'); g(b.work, 'checkout', '-q', br);
+  const y = b.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(y).state, 'awaiting_human', y.out + y.err); assert.match(J(y).reason, /protected/);
+
+  const c = shipped(); // the queue says "ignore lint", the base config does not: a failing lint check is not ignored
+  c.edit((f, q) => { q.policy.checks.ignored = ['lint']; });
+  const gp = path.join(c.root, 'gh.json'); const st = JSON.parse(fs.readFileSync(gp, 'utf8')); st.checkQueue = [[{ name: 'ci', bucket: 'pass', link: 'x', state: 'SUCCESS' }, { name: 'lint', bucket: 'fail', link: 'x', state: 'FAILURE' }]]; fs.writeFileSync(gp, JSON.stringify(st));
+  const z = c.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(z).state, 'awaiting_human', z.out + z.err); assert.match(J(z).reason, /required checks/);
+  for (const r of [a, b, c]) assert.equal(mergeCalled(r), false);
+  rm(a, b, c);
+});
+
+test('T10: gitSafe accepts exactly the two display -c pairs checkDiff passes, so checkDiff runs on the hardened runner', () => {
+  const r = shipped();
+  const run = (...a) => GS.gitSafeOpts(r.work, a, { verified: true });
+  const hits = AG.checkDiff({ git: run, baseRef: 'refs/remotes/origin/main', headSha: r.feat().ci_sha, specPaths: ['.product/features/FEATURE-001.md'] });
+  assert.deepEqual(hits, []);
+  for (const kv of ['core.quotePath=true', 'diff.suppressBlankEmpty=true', 'core.pager=less', 'diff.external=x']) assert.throws(() => run('-c', kv, 'rev-parse', 'HEAD'), /not allowed/, kv);
+  rm(r);
+});
+
+test('T10: G5 at merge covers the feature spec and every other spec in features_dir on origin/<base>', () => {
+  const own = vship({ specAppend: '\nA weaker criterion slipped in by the builder.\n' });
+  own.edit((f) => { f.state = 'verified'; });
+  arm(own); // criteria_hash is from the BASE spec, so only G5 can catch the head edit
+  const a = merge(own);
+  assert.equal(J(a).state, 'awaiting_human', a.out + a.err); assert.match(J(a).reason, /G5/); assert.equal(mergeCalled(own), false);
+  const other = vship({ baseFiles: { '.product/features/FEATURE-002.md': '---\nid: FEATURE-002\nstatus: draft\n---\n# Two\n\nAC text\n' }, files: { '.product/features/FEATURE-002.md': '---\nid: FEATURE-002\nstatus: draft\n---\n# Two\n\nweaker\n' } });
+  other.edit((f) => { f.state = 'verified'; });
+  arm(other);
+  const b = merge(other);
+  assert.equal(J(b).state, 'awaiting_human', b.out + b.err); assert.match(J(b).reason, /G5/); assert.equal(mergeCalled(other), false);
+  rm(own, other);
+});
+
+test('T10: scenarios that are not approved for the current criteria hold even when the hashes match (approval is not hashed)', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  const { doc } = arm(r);
+  const { approved: _drop, ...unapproved } = doc;
+  inHome(r, () => SC.saveScenarios('o__r', 'FEATURE-001', unapproved));
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /not approved/); noLeak(J(m).reason);
+  assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10: a base spec over the parse guard (a line longer than MAX_LINE) holds without parsing, even with a matching verdict', () => {
+  const r = vship({ baseFiles: { '.product/features/FEATURE-001.md': `---\ntype: feature-spec\nid: FEATURE-001\nopportunity: OPP-001\nstatus: ready\n---\n# One\n\n${'x'.repeat(CR.MAX_LINE + 1)}\n` } });
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /too large/); assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10 self-attack probes: no merge through a broken pipe, a forged spec path, a hostile scenario doc or a symlinked queue folder', () => {
+  // (a) a valid override never waives an anti-gaming check that could not run
+  const a = vship();
+  a.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed'; f.override_sha = f.ci_sha; });
+  arm(a);
+  g(a.work, 'push', '-q', '-f', 'origin', `${g(a.work, 'commit-tree', 'refs/remotes/origin/main^{tree}', '-m', 'x')}:refs/heads/main`);
+  assert.match(J(merge(a)).reason, /could not run/); assert.equal(mergeCalled(a), false);
+  // (b) a queue entry whose spec path leaves the repository (or names another feature's spec) holds, it does not crash or merge
+  for (const file of ['/etc/FEATURE-001.md', path.join(a.work, '..', 'FEATURE-001.md'), path.join(a.work, '.product/features/FEATURE-002.md')]) {
+    const b = vship();
+    b.edit((f) => { f.state = 'verified'; });
+    arm(b);
+    b.edit((f) => { f.file = file; });
+    const x = merge(b);
+    assert.equal(J(x)?.state, 'awaiting_human', `${file}: ${x.out}${x.err}`); assert.equal(mergeCalled(b), false);
+    rm(b);
+  }
+  // (c) a scenario doc nested past the hash depth limit holds (scenariosHash throws), never crashes into a merge
+  const c = vship();
+  c.edit((f) => { f.state = 'verified'; });
+  const { doc } = arm(c);
+  let deep = {}; const top = deep; for (let i = 0; i < 60; i++) { deep.x = {}; deep = deep.x; }
+  fs.writeFileSync(path.join(c.root, 'fhome', 'scenarios', 'o__r', 'FEATURE-001.json'), JSON.stringify({ ...doc, extra: top }));
+  const y = merge(c);
+  assert.equal(J(y).state, 'awaiting_human', y.out + y.err); assert.match(J(y).reason, /scenarios/); assert.equal(mergeCalled(c), false);
+  // (d) a queue folder inside FACTORY_HOME that is a symlink to a builder-writable folder is refused outright
+  const d = vship();
+  d.edit((f) => { f.state = 'verified'; });
+  arm(d);
+  const qf = d.env.DELIVER_QUEUE; const out = path.join(d.work, 'qdir');
+  fs.mkdirSync(out); fs.renameSync(qf, path.join(out, 'o__r.json')); fs.rmSync(path.dirname(qf), { recursive: true }); fs.symlinkSync(out, path.dirname(qf));
+  const z = merge(d);
+  assert.notEqual(z.code, 0); assert.match(z.err, /symlink/); assert.equal(mergeCalled(d), false);
+  // (e) ... and a deeper symlinked ancestor resolves outside FACTORY_HOME: held as untrusted
+  const e = vship();
+  e.edit((f) => { f.state = 'verified'; });
+  arm(e);
+  const eq = e.env.DELIVER_QUEUE; const outside = path.join(e.work, 'deep'); const link = path.join(e.root, 'fhome', 'lnk');
+  fs.mkdirSync(path.join(outside, 'queues'), { recursive: true }); fs.renameSync(eq, path.join(outside, 'queues', 'o__r.json')); fs.symlinkSync(outside, link);
+  const w = e.d({ DELIVER_QUEUE: path.join(link, 'queues', 'o__r.json') }, 'merge', 'FEATURE-001');
+  assert.equal(J(w)?.state, 'awaiting_human', w.out + w.err); assert.match(J(w).reason, /FACTORY_HOME/); assert.equal(mergeCalled(e), false);
+  rm(a, c, d, e);
+});
+
+test('T10: T3 without the opt-in holds even with a matching passing verdict', () => {
+  const r = shipped({}, { tier: 'T3' });
+  arm(r);
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /T3 work/); assert.equal(mergeCalled(r), false);
+  rm(r);
 });

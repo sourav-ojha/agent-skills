@@ -103,6 +103,10 @@ export function gitEnv(base = process.env) {
 // Splits args into git global options and the rest. Only these global options are accepted; `-c k=v` keys must pass the allowlist.
 const GLOBAL_WITH_VALUE = new Set(['-C', '--git-dir', '--work-tree']);
 const GLOBAL_FLAGS = new Set(['--no-pager', '-P', '--no-replace-objects', '--literal-pathspecs', '--no-optional-locks']);
+// Command-line only (never accepted in a repo's own config): the exact display pairs antigaming.mjs checkDiff passes on every call,
+// so checkDiff can run on gitSafe. Key case-insensitive, value exact.
+const CLI_ONLY = new Set(['core.quotepath=false', 'diff.suppressblankempty=false']);
+const cliOnly = (kv) => { const eq = kv.indexOf('='); return eq > 0 && CLI_ONLY.has(`${kv.slice(0, eq).toLowerCase()}=${kv.slice(eq + 1)}`); };
 export function splitGlobal(args) {
   const global = [];
   let i = 0;
@@ -114,7 +118,7 @@ export function splitGlobal(args) {
       if (typeof kv !== 'string') throw new Error('gitSafe: -c needs key=value');
       const eq = kv.indexOf('=');
       const key = eq < 0 ? kv : kv.slice(0, eq);
-      if (!configAllowed(key, eq < 0 ? undefined : kv.slice(eq + 1))) throw new Error(`git config not allowed: ${key}`);
+      if (!cliOnly(kv) && !configAllowed(key, eq < 0 ? undefined : kv.slice(eq + 1))) throw new Error(`git config not allowed: ${key}`);
       global.push(a, kv); i++;
     } else if (GLOBAL_WITH_VALUE.has(a)) {
       if (typeof args[i + 1] !== 'string') throw new Error(`gitSafe: ${a} needs a value`);
