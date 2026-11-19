@@ -1,0 +1,77 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "disableBypassPermissionsMode": "disable",
+    "blockWritesOutsideWorkingDirectories": true,
+    "allow": [],
+    "deny": [
+      "Read(/{{FACTORY_HOME}}/**)",
+      "Edit(/{{FACTORY_HOME}}/**)",
+      "Write(/{{FACTORY_HOME}}/**)",
+      "Read(~/.claude*/projects/**)",
+      "Read(/{{HOME}}/.claude*/projects/**)",
+      "Read(~/.claude*/todos/**)",
+      "Read(~/.claude*/file-history/**)",
+      "Read(~/.claude*/history.jsonl)",
+      "Edit(~/.claude*/**)",
+      "Edit(/{{HOME}}/.claude*/**)",
+      "Edit(~/.claude.json)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.git-credentials)",
+      "Read(~/.netrc)",
+      "Edit(**/.git/config)",
+      "Edit(**/.git/hooks/**)",
+      "Edit(**/.git/info/**)",
+      "Edit(**/.git/modules/**)",
+      "Edit(/{{REPO}}/.git/config)",
+      "Edit(/{{REPO}}/.git/hooks/**)",
+      "Edit(/{{REPO}}/.git/info/**)",
+      "Edit(/{{REPO}}/.git/modules/**)",
+      "Edit(/{{REPO}}/*/**/.git)",
+      "Edit(/{{REPO}}/*/**/.git/**)",
+      "Write(**/.git/**)",
+      "Write(**/.git)",
+      "NotebookEdit(**/.git/**)",
+      "Bash(gh)",
+      "Bash(gh *)",
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(git * push *)",
+      "Bash(node *factory.mjs*)",
+      "Bash(node *deliver.mjs*)",
+      "Bash(*factory.mjs*)",
+      "Bash(*deliver.mjs*)",
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "disableAllHooks": true,
+  "enableAllProjectMcpServers": false,
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": true,
+    "excludedCommands": [],
+    "filesystem": {
+      "denyRead": [
+        "{{FACTORY_HOME}}",
+        "{{CLAUDE_PROJECTS}}",
+        "{{HOME}}/.config/gh"
+      ],
+      "denyWrite": [
+        "{{FACTORY_HOME}}",
+        "{{HOME}}/.claude",
+        "{{HOME}}/.claude.json",
+        "{{REPO}}/.git/config",
+        "{{REPO}}/.git/hooks",
+        "{{REPO}}/.git/info",
+        "{{REPO}}/.git/modules"
+      ]
+    },
+    "network": {
+      "allowedDomains": [],
+      "allowLocalBinding": true
+    }
+  }
+}

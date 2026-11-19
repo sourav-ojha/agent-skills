@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable",
+    "allow": [],
+    "deny": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "Task",
+      "Read(/{{FACTORY_HOME}}/**)",
+      "Edit(/{{FACTORY_HOME}}/**)",
+      "Read(~/.claude*/projects/**)",
+      "Read(/{{HOME}}/.claude*/projects/**)"
+    ]
+  },
+  "disableAllHooks": true,
+  "enableAllProjectMcpServers": false,
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [],
+    "network": {
+      "allowedDomains": []
+    }
+  }
+}
