@@ -6,6 +6,9 @@
 //
 // git is injected: (...argv) => { code, out, err }, run without a shell (the driver passes gitSafe; tests a spawnSync wrapper).
 // Any git failure or unparseable output THROWS (fail closed): the caller must treat an exception as a hold, never as clean.
+// WIRING: the runner must return RAW { code, out, err }: no trimming of stdout and no defaulted exit code (the small runner at
+// deliver.mjs:50 trims, so it must not be passed here). Task 6's gitSafe and the driver pass raw results; a trimming runner
+// makes the full-context package.json diff look truncated (a throw, i.e. a safe hold, but never a correct answer).
 // baseRef is `refs/remotes/origin/<branch>` or a raw 40-hex commit sha (e.g. the base sha recorded at merge time).
 //
 // OUT OF SCOPE for this mechanical check (the hidden verification scenarios are the backstop): semantic stubs and hard-coded
@@ -54,11 +57,15 @@ const PROTECTED_BASENAMES = new Set(['.mcp.json', 'claude.md', 'claude.local.md'
   '.pre-commit-config.yaml', 'lefthook.yml', 'lefthook.yaml', '.lefthook.yml',
   '.travis.yml', 'bitbucket-pipelines.yml', '.drone.yml', // CI systems not in queue.mjs CI_PATHS
   'pnpm-workspace.yaml', '.pnpmfile.cjs', '.pnp.cjs', '.pnp.loader.mjs', // install-time resolution / hooks
-  'sitecustomize.py', 'usercustomize.py']); // imported by every Python process that has the directory on sys.path
+  'sitecustomize.py', 'usercustomize.py', // imported by every Python process that has the directory on sys.path
+  'pytest.py', '_pytest.py', 'unittest.py', 'hypothesis.py', // test-framework module shadowing (any depth)
+  'go.work', 'go.work.sum', 'turbo.json', 'nx.json', 'project.json', 'lerna.json']); // workspace / task-runner config
 const PROTECTED_BASE_RE = [/^jest\.(config|setup)\./i, /^vitest\.(config|workspace|setup)\./i, /^vite\.config\./i, /^karma\.conf\./i,
   /^playwright\.config\./i, /^cypress\.config\./i, /^ava\.config\./i, /^\.mocharc/i, /^\.nycrc/i, /^\.c8rc/i, /^setuptests\./i,
   /^babel\.config\./i, /^\.babelrc/i, /\.pth$/i];
-const PROTECTED_DIRS = new Set(['.claude', '.husky', '.githooks', '__mocks__', '.gitea', '.forgejo', 'patches', 'node_modules']); // patches/: patch-package; node_modules/: committed bin/package shadowing
+const PROTECTED_DIRS = new Set(['.claude', '.husky', '.githooks', '__mocks__', '.gitea', '.forgejo', 'patches', 'node_modules', 'vendor',
+  'pytest', '_pytest', 'unittest', 'hypothesis']); // patches/: patch-package; node_modules/, vendor/: committed dependency
+// shadowing; pytest/ _pytest/ unittest/ hypothesis/: test-framework package shadowing (any depth)
 // Case-insensitive: on a case-insensitive file system a lower-case agent file is read under its upper-case name.
 export function isProtectedPath(p) {
   if (p.toLowerCase() === '.product/delivery.json') return true;
@@ -82,7 +89,8 @@ const SKIP_IN_TESTS = [
   /\[\s*(['"`])(?:skip|only|skipIf|todo)\1\s*\]/,
   /(?<![\w$])(['"`]?)(?:skip|todo|only)\1\s*:(?!\s*false\s*[,}])/,
   /[{,]\s*(?:skip|todo|only)\s*[,}]/,
-  /(['"`])[^'"`\n]{0,40}\\(?:u|x)[^'"`\n]{0,40}\1\s*:/, // escaped option key, e.g. { "\u0073kip": true }
+  /(['"`])[^'"`\n]{0,40}\\[^'"`\n]{0,40}\1[ \t]*:/, // any backslash in a quoted key, e.g. { "\u0073kip": true }, { "sk\ip": 1 }
+  /\\(?:u\{?[0-9a-fA-F]|x[0-9a-fA-F])[\w${}\\]{0,40}[ \t]*:/, // escaped identifier key, e.g. { sk\u0069p: 1 }, { \u{73}kip: 1 }
   /(?<![\w$.])pending\s*\(/,
   /(?<![\w$.])(?:describe|it|test|context|suite|specify|bench)\s*\[/,
   /\{[^{}]{0,200}(?<![\w$])(?:skip|only|skipIf|todo)(?![\w$])[^{}]{0,200}\}\s*=/, // bounded: no quadratic scan on hostile input
@@ -108,7 +116,10 @@ const SKIP_ANYWHERE = [
   /\bt\s*\.\s*(?:skip|todo)\s*\(/, // node:test context
   // any `<identifier>.skip()` / `.skip("reason")` (a node:test context under another name: ctx, t2, ...). Costs a fix round
   // for a non-test API with that exact shape (e.g. `iter.skip()` without a count); `rows.skip(2)` is not matched.
-  /(?<![\w$])[A-Za-z_$][\w$]*\s*\.\s*skip\s*\(\s*(?:(['"`])[^'"`\n]{0,200}\1\s*)?\)/,
+  // also optional chaining (`ctx?.skip()`, `ctx.skip?.()`), bracket access (`t["skip"]()`) and `.todo(`; any first argument
+  // that does not start with a digit (`rows.skip(2)` is not matched, `rows.skip(n)` is: one fix round, by decision).
+  /(?<![\w$])[A-Za-z_$][\w$]*[ \t]*\??\.[ \t]*(?:skip|todo)[ \t]*(?:\?\.[ \t]*)?\([ \t]*(?:\)|[^\d\s)])/,
+  /(?<![\w$])[A-Za-z_$][\w$]*[ \t]*(?:\?\.[ \t]*)?\[[ \t]*(['"`])(?:skip|todo)\1[ \t]*\][ \t]*(?:\?\.[ \t]*)?\(/,
   /\bunittest\s*\.\s*(?:skip|expectedFailure)/,
 ];
 // G3 in non-test, non-doc files (joined added text, so `throw new Error(\n  "not implemented")` is seen).
@@ -116,7 +127,7 @@ const STUBS = [
   /\bNotImplemented(?:Error|Exception)\b/,
   /\bunimplemented!\s*\(/,
   /\btodo!\s*\(/,
-  /\b(?:throw|raise|panic)\b[^;]{0,60}?(['"`])\s*not\s+(?:yet\s+)?implemented/i,
+  /\b(?:throw|raise|panic)\b[^;]{0,60}?(['"`])[ \t]*not[ \t]+(?:yet[ \t]+)?implemented/i, // [ \t] only: no newline runs to backtrack
 ];
 
 // Linear (a lazy /\/\*[\s\S]*?\*\//g rescans to the end for every unclosed "/*": quadratic on hostile input).
@@ -214,34 +225,62 @@ function blob(git, sha, max) {
 }
 
 // ---- G4 content checks (package.json) --------------------------------------------------------------------------------------
-// Script names an argv runs through npm/pnpm/yarn/bun: every non-flag token after the tool, minus run/run-script (an
-// over-approximation: a flag value such as `--prefix web` is also protected, which only protects more); `node --run <name>`.
-// A shell as the tool, or a delegation flag in the argv, makes every scripts change in every package.json protected.
+// Configured commands (tests.all, local_checks) are unwrapped from env/VAR=val/time/nice/npx/bunx/corepack/cross-env/dotenv/
+// `npm|pnpm|yarn exec|x|dlx` and then classified: npm/pnpm/yarn/bun -> script names (every non-flag token after the tool, minus
+// run/run-script: an over-approximation); `node --run <name>`; node otherwise -> no scripts; anything else (a shell, turbo,
+// nx, lerna, rush, moon, bazel, make, just, jest, ...) or a delegation flag -> GLOBAL (every scripts change in every
+// package.json is G4).
 const PM = new Set(['npm', 'pnpm', 'yarn', 'bun']);
-const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'cmd', 'powershell', 'pwsh']);
+const WRAPPERS = new Set(['env', 'time', 'nice', 'npx', 'bunx', 'corepack', 'cross-env']);
 const NPM_ALIASES = { t: 'test', tst: 'test' };
 const DELEGATE_ARGS = /^(?:--prefix|-C|--dir|--cwd|-w|--workspace|--workspaces|-ws|--filter|-F|-r|--recursive|workspace|workspaces)(?:=.*)?$/;
 const tool = (a) => String(a).split(/[/\\]/).at(-1).replace(/\.(cmd|exe)$/i, '').toLowerCase();
-function scriptNames(config) {
-  const cmds = [config?.tests?.all, ...(Array.isArray(config?.local_checks) ? config.local_checks.map((c) => c?.command) : [])];
-  const names = new Set(); let global = false;
-  for (const argv of cmds) {
-    if (!Array.isArray(argv) || !argv.length) continue;
-    const t = tool(argv[0]); const rest = argv.slice(1).map(String);
-    if (SHELLS.has(t)) { global = true; continue; }
-    if (t === 'node') {
-      rest.forEach((a, i) => { if (a === '--run' && rest[i + 1]) names.add(rest[i + 1]); else if (a.startsWith('--run=')) names.add(a.slice(6)); });
+// Strip wrappers; returns the remaining argv, or null when it cannot be read with confidence (=> global).
+function unwrap(argv) {
+  let a = argv.map(String);
+  for (let guard = 0; guard < 20; guard++) {
+    while (a.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(a[0])) a.shift();
+    if (!a.length) return null;
+    const t = tool(a[0]);
+    if (WRAPPERS.has(t)) {
+      a = a.slice(1);
+      while (a.length && (a[0].startsWith('-') || /^\d+$/.test(a[0]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(a[0]))) a.shift(); // flags, `nice -n 10`, VAR=val
       continue;
     }
-    if (!PM.has(t)) continue;
-    if (rest.some((a) => DELEGATE_ARGS.test(a))) global = true;
-    for (const a of rest) {
-      if (!a || a.startsWith('-') || ['run', 'run-script', 'rum', 'urn'].includes(a)) continue;
-      names.add(NPM_ALIASES[a] ?? a);
+    if (t === 'dotenv') { const i = a.indexOf('--'); if (i === -1) return null; a = a.slice(i + 1); continue; }
+    if (PM.has(t) && ['exec', 'x', 'dlx'].includes(a[1])) {
+      const i = a.indexOf('--'); a = i === -1 ? a.slice(2).filter((x) => !x.startsWith('-')) : a.slice(i + 1); continue;
+    }
+    return a;
+  }
+  return null;
+}
+const CONFIG_CMDS = (config) => [config?.tests?.all, ...(Array.isArray(config?.local_checks) ? config.local_checks.map((c) => c?.command) : [])]
+  .filter((x) => Array.isArray(x) && x.length);
+function scriptNames(config) {
+  const names = new Set(); let global = false;
+  for (const argv of CONFIG_CMDS(config)) {
+    const a = unwrap(argv);
+    if (!a) { global = true; continue; }
+    const t = tool(a[0]); const rest = a.slice(1);
+    if (t === 'node') {
+      rest.forEach((x, i) => { if (x === '--run' && rest[i + 1]) names.add(rest[i + 1]); else if (x.startsWith('--run=')) names.add(x.slice(6)); });
+      continue;
+    }
+    if (!PM.has(t)) { global = true; continue; }
+    if (rest.some((x) => DELEGATE_ARGS.test(x))) global = true;
+    for (const x of rest) {
+      if (!x || x.startsWith('-') || ['run', 'run-script', 'rum', 'urn'].includes(x)) continue;
+      names.add(NPM_ALIASES[x] ?? x);
+      for (const part of x.split(':')) if (part) names.add(part); // project:target (nx/moon style)
     }
   }
   return { names, global };
 }
+// Make/just files are protected only when a configured command runs make/gmake/just (otherwise they are ordinary files).
+const MAKE_TOOLS = new Set(['make', 'gmake', 'just']);
+const usesMake = (config) => CONFIG_CMDS(config).some((argv) => { const a = unwrap(argv); return MAKE_TOOLS.has(tool((a ?? argv)[0])); });
+const isMakeFile = (p) => /^(?:gnumakefile|makefile|\.?justfile)$/i.test(base(p)) || /\.mk$/i.test(p);
 // npm lifecycle scripts run by an install (the driver's test setup) or pack: always protected in every package.json.
 const LIFECYCLE = ['prepare', 'preinstall', 'install', 'postinstall', 'prepublish', 'prepublishOnly', 'prepack', 'postpack'];
 // A protected script value that selects scripts by pattern, runs through a multi-script runner, delegates to another package
@@ -251,7 +290,7 @@ const WILDCARD = /[*?{}[\]/$`]|(?<![\w-])(?:npm-run-all2?|run-s|run-p|concurrent
 const DELEGATE = /(?<![\w-])(?:--prefix|-C|--dir|--cwd|-w|--workspace|--workspaces|-ws|--filter|-F|-r|--recursive)(?![\w-])|(?<![\w-])(?:workspaces?|cd|pushd)\s/;
 const PKG_TEST_KEYS = ['jest', 'mocha', 'ava', 'c8', 'nyc', 'vitest'];
 // Compared whole: any change is G4 (workspace layout, resolution rewrites, patches, bins can all swap a test runner).
-const PKG_WHOLE_KEYS = ['workspaces', 'pnpm', 'resolutions', 'overrides', 'bin', 'dependenciesMeta', 'bundledDependencies', 'bundleDependencies'];
+const PKG_WHOLE_KEYS = ['workspaces', 'pnpm', 'resolutions', 'overrides', 'bin', 'directories', 'wireit', 'dependenciesMeta', 'bundledDependencies', 'bundleDependencies'];
 // Any new or changed non-registry specifier in a dependency section (file:, link:, git, URL, workspace:, portal:, patch:,
 // npm: alias, a path, owner/repo shorthand). A registry version/range change is not a hit. Lockfiles are out of scope.
 const DEP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
@@ -259,6 +298,8 @@ const nonRegistry = (v) => typeof v !== 'string' || /[:/\\]/.test(v) || /^\s*[.~
 const own = (o, k) => (o && typeof o === 'object' && !Array.isArray(o) && Object.hasOwn(o, k) ? o[k] : undefined);
 const same = (x, y) => JSON.stringify(x) === JSON.stringify(y);
 const PKG_MAX_FILES = 50;
+const PKG_TREE_MAX = 500; // package.json files in the head tree read by name (over the cap = G4)
+const isPlainObject = (o) => o !== null && typeof o === 'object' && !Array.isArray(o);
 
 // Per-file checks that need no script closure. true = G4.
 function pkgFileHit(b, h) {
@@ -278,7 +319,9 @@ const scriptsOf = (o) => { const sc = own(o, 'scripts'); return sc && typeof sc 
 
 // pkgs: [{ path, b, h }] (parsed base/head objects of every package.json in the diff). Returns the set of paths that are G4.
 // The protected-name closure is computed across ALL of them (a root script may call a workspace script) and applied to each.
-function pkgScriptHits(pkgs, config) {
+// treePaths: package.json paths in the head tree. A scripts change in a non-root manifest is G4 whenever another manifest
+// exists (a root or sibling script can reach it by a route the closure cannot see).
+function pkgScriptHits(pkgs, config, treePaths) {
   const hits = new Set();
   const { names, global: argvGlobal } = scriptNames(config);
   const keys = new Set(); for (const x of pkgs) for (const k of [...Object.keys(scriptsOf(x.b)), ...Object.keys(scriptsOf(x.h))]) keys.add(k);
@@ -292,7 +335,7 @@ function pkgScriptHits(pkgs, config) {
     const vals = pkgs.flatMap((x) => [own(scriptsOf(x.b), n), own(scriptsOf(x.h), n)]).filter((v) => v !== undefined).map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join('\n');
     if (!vals) continue;
     if (WILDCARD.test(vals) || DELEGATE.test(vals)) { global = true; break; }
-    const tokens = new Set(vals.split(/[^\w:.-]+/));
+    const tokens = new Set(vals.split(/[^\w:.-]+/).flatMap((t) => [t, ...t.split(':')])); // project:target parts too
     for (const k of keys) {
       if (prot.has(k)) continue;
       // A key with other characters falls back to a substring test (over-protects, never under-protects).
@@ -300,8 +343,10 @@ function pkgScriptHits(pkgs, config) {
     }
   }
   for (const x of pkgs) {
+    if (x.context) continue;
     const ch = changedKeys(x);
-    if (global ? ch.length > 0 : ch.some((k) => prot.has(k))) hits.add(x.path);
+    const sibling = x.path !== 'package.json' && treePaths.some((q) => q !== x.path);
+    if ((global || sibling) ? ch.length > 0 : ch.some((k) => prot.has(k))) hits.add(x.path);
   }
   return hits;
 }
@@ -358,6 +403,7 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
 
   const globs = testGlobs(config);
   const pkgEntries = [];
+  const makeFiles = usesMake(config);
   const specs = new Set(specPaths);
   const found = { G1: new Set(), G2: new Set(), G3: new Set(), G4: new Set(), G5: new Set() };
   for (const e of entries) {
@@ -370,40 +416,55 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
     if (any(test ? SKIP_IN_TESTS : SKIP_ANYWHERE)) found.G2.add(p);
     if (!test && !isDoc(p) && any(STUBS)) found.G3.add(p);
     if (isProtectedPath(p)) found.G4.add(p);
-    else if (base(p).toLowerCase() === 'go.mod' && any([/(^|\n)\s*replace\b/, /=>/])) found.G4.add(p); // module replace (e.g. a fake testify)
+    else if (base(p).toLowerCase() === 'go.mod' && any([/^[ \t]*replace\b/m, /=>/])) found.G4.add(p); // module replace (e.g. a fake testify)
+    else if (makeFiles && isMakeFile(p)) found.G4.add(p);
     else if (base(p).toLowerCase() === 'package.json') pkgEntries.push(e);
     if (specs.has(p) && specChanged(git, e, parser)) found.G5.add(p);
   }
   // package.json: all base/head texts from ONE full-context diff limited by a fixed pathspec (no names in argv, no per-file
-  // process). More than PKG_MAX_FILES changed manifests is a hit without reading them.
+  // process). More than PKG_MAX_FILES changed manifests is a hit without reading them. A manifest whose mode changes, or that
+  // is not a regular file on either side, is a hit; one with no hunk (mode-only) is read by blob id, never taken as {}.
   if (pkgEntries.length > PKG_MAX_FILES) for (const e of pkgEntries) found.G4.add(e.path);
   else if (pkgEntries.length) {
-    const full = patchLines(runGit(git, 'diff', '--no-color', '--text', '--unified=100000000', '--src-prefix=a/', '--dst-prefix=b/', ...common, ':(glob,icase)**/package.json'), pkgEntries);
+    const full = patchLines(runGit(git, 'diff', '--no-color', '--text', '--unified=100000000', '--src-prefix=a/', '--dst-prefix=b/', ...common, ':(top,glob,icase)**/package.json'), pkgEntries);
+    const REG = /^100(?:644|755)$/; const ABSENT = '000000';
     const pkgs = [];
     for (const e of pkgEntries) {
+      if (!(REG.test(e.oldMode) || e.oldMode === ABSENT) || !(REG.test(e.newMode) || e.newMode === ABSENT)
+        || (e.oldMode !== ABSENT && e.newMode !== ABSENT && e.oldMode !== e.newMode)) { found.G4.add(e.path); continue; }
       const { base: bl, head: hl } = full.get(e.path);
-      const bt = bl.join('\n'); const ht = hl.join('\n');
       let b; let h;
       try {
-        if (bt.length > BLOB_MAX || ht.length > BLOB_MAX) throw new Error('too big');
-        b = bt === '' ? {} : JSON.parse(bt); h = ht === '' ? {} : JSON.parse(ht);
+        const side = (lines, sha) => {
+          if (NULL_SHA.test(sha)) return {};
+          let t = lines.join('\n');
+          if (!lines.length) { const r = blob(git, sha, BLOB_MAX); if (r.tooBig) throw new Error('too big'); t = r.text; }
+          if (t.length > BLOB_MAX) throw new Error('too big');
+          const o = JSON.parse(t);
+          if (!isPlainObject(o)) throw new Error('not an object');
+          return o;
+        };
+        b = side(bl, e.oldSha); h = side(hl, e.newSha);
       } catch { found.G4.add(e.path); continue; }
       if (pkgFileHit(b, h)) found.G4.add(e.path);
       pkgs.push({ path: e.path, b, h });
     }
+    // Every package.json in the head tree (ls-tree has no pathspec magic: list the tree, filter here; capped).
+    const tree = runGit(git, 'ls-tree', '-r', '--full-tree', '--name-only', '-z', head).split('\0').filter((q) => q && base(q).toLowerCase() === 'package.json');
+    if (tree.length > PKG_TREE_MAX) for (const e of pkgEntries) found.G4.add(e.path);
     // The configured commands run at the repo root: an unchanged root manifest still feeds the closure (read by fixed path).
     if (!pkgEntries.some((e) => e.path === 'package.json')) {
-      const t = runGit(git, 'ls-tree', '-z', head, '--', 'package.json');
+      const t = runGit(git, 'ls-tree', '--full-tree', '-z', head, '--', 'package.json');
       const m = /^100(?:644|755) blob ([0-9a-f]{40,64})\tpackage\.json\0?$/.exec(t);
-      if (t && !m) found.G4.add('package.json'); // root manifest is not a regular file: hold
+      if (t && !m) for (const x of pkgEntries) found.G4.add(x.path); // root manifest is not a regular file: cannot prove the closure
       else if (m) {
         const r = blob(git, m[1], BLOB_MAX); let o;
-        try { if (r.tooBig) throw new Error('too big'); o = JSON.parse(r.text); } catch { o = undefined; }
-        if (o === undefined) for (const x of pkgs) found.G4.add(x.path); // unreadable root: cannot prove the closure
-        else pkgs.push({ path: 'package.json', b: o, h: o });
+        try { if (r.tooBig) throw new Error('too big'); o = JSON.parse(r.text); if (!isPlainObject(o)) throw new Error('not an object'); } catch { o = undefined; }
+        if (o === undefined) for (const x of pkgEntries) found.G4.add(x.path); // unreadable root: cannot prove the closure
+        else pkgs.push({ path: 'package.json', b: o, h: o, context: true });
       }
     }
-    for (const p of pkgScriptHits(pkgs, config)) found.G4.add(p);
+    for (const p of pkgScriptHits(pkgs, config, tree)) found.G4.add(p);
   }
   return Object.entries(found).filter(([, s]) => s.size).map(([id, s]) => ({ id, files: [...s].sort() }));
 }

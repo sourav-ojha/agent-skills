@@ -329,10 +329,11 @@ test('G4: a root script delegating to a workspace makes any scripts change in an
     assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ ...w2, other: 'tsc -b' }) }), { tests: { all } }), 'G4')?.files, ['web/package.json'], all.join(' '));
   }
 });
-test('G4: the protected-name closure spans every package.json in the diff; unrelated scripts stay clean', () => {
+test('G4: any scripts change in a non-root manifest is a hit when another manifest exists; non-script edits stay clean', () => {
   const fx = fixture({ 'package.json': pkgJ({ test: 'turbo run unit' }), 'web/package.json': pkgJ({ unit: 'jest', build: 'tsc' }) });
   assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'true', build: 'tsc' }) }, { fresh: true }), { tests: { all: ['npm', 'test'] } }), 'G4')?.files, ['web/package.json']);
-  assert.deepEqual(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'jest', build: 'tsc -b' }) }, { fresh: true }), { tests: { all: ['npm', 'test'] } }), []);
+  assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'jest', build: 'tsc -b' }) }, { fresh: true }), { tests: { all: ['npm', 'test'] } }), 'G4')?.files, ['web/package.json']);
+  assert.deepEqual(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'jest', build: 'tsc' }, { description: 'web app' }) }, { fresh: true }), { tests: { all: ['npm', 'test'] } }), []);
 });
 test('G2: quoted, shorthand and non-literal-false option keys fire; literal false does not; ctx.skip() under any name', () => {
   const fx = fixture({});
@@ -347,7 +348,7 @@ test('G2: quoted, shorthand and non-literal-false option keys fire; literal fals
   for (const c of ['ctx.skip("not ready")', '(t2) => t2.skip()', 'function f(t){ t . skip() }', 'unittest . skip("x")']) {
     assert.deepEqual(hit(run(fx, fx.change({ 'src/h.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['src/h.js'], c);
   }
-  assert.equal(hit(run(fx, fx.change({ 'src/h.js': 'rows.skip(2); q.skip(n)\n' }, { fresh: true })), 'G2'), undefined, 'skip with a count');
+  assert.equal(hit(run(fx, fx.change({ 'src/h.js': 'rows.skip(2); q.skip(10)\n' }, { fresh: true })), 'G2'), undefined, 'skip with a numeric count');
 });
 test('G4: bin shadowing, workspaces, pnpm patches, patch-package and yarn releases fire', () => {
   const fx = fixture({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29' } }) });
@@ -367,10 +368,10 @@ test('package.json contents are read in one git call; more than 50 changed manif
   const fx = fixture({});
   let calls = 0;
   const git = (...a) => { calls++; return fx.git(...a); };
-  const forty = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`p${i}/package.json`, pkgJ({ build: 'tsc' })]));
+  const forty = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`p${i}/package.json`, `${JSON.stringify({ name: `p${i}`, version: '1.0.0' })}\n`]));
   const head = fx.change(forty, { fresh: true });
   assert.deepEqual(ag.checkDiff({ git, baseRef: BASE, headSha: head, config: {}, specPaths: [] }), []);
-  assert.ok(calls <= 8, `${calls} git calls`);
+  assert.ok(calls <= 9, `${calls} git calls`);
   const many = Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`p${i}/package.json`, pkgJ({ build: 'tsc' })]));
   calls = 0;
   const h2 = ag.checkDiff({ git, baseRef: BASE, headSha: fx.change(many, { fresh: true }), config: {}, specPaths: [] });
@@ -385,4 +386,119 @@ test('self-attack round 2: escaped option keys, committed node_modules, Python s
   }
   assert.deepEqual(hit(run(fx, fx.change({ 'go.mod': 'module x\n\ngo 1.22\n\nreplace github.com/stretchr/testify => ./fake\n' }, { fresh: true })), 'G4')?.files, ['go.mod']);
   assert.deepEqual(run(fx, fx.change({ 'go.mod': 'module x\n\ngo 1.23\n' }, { fresh: true })), [], 'go version bump');
+});
+
+// ---- fix round 3 regressions -----------------------------------------------------------------------------------------------
+const TALL = { tests: { all: ['npm', 'test'] } };
+test('Bug 1: a mode-only change of package.json is G4 and never read as {}; a delegating root still reaches the closure', () => {
+  for (const v of ['npm --prefix web run unit', 'cd web && npm run unit', 'npm run unit -w web']) {
+    const fx = fixture({ 'package.json': pkgJ({ test: v }), 'web/package.json': pkgJ({ unit: 'jest', b: 'tsc' }) });
+    fs.chmodSync(path.join(fx.work, 'package.json'), 0o755);
+    const h = run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'exit 0', b: 'tsc' }) }), TALL);
+    assert.deepEqual(hit(h, 'G4')?.files, ['package.json', 'web/package.json'], v);
+  }
+  const fx = fixture({ 'package.json': pkgJ({ test: 'jest' }) });
+  fs.chmodSync(path.join(fx.work, 'package.json'), 0o755);
+  assert.deepEqual(hit(run(fx, fx.change({}), TALL), 'G4')?.files, ['package.json'], 'mode-only, no hunk');
+});
+test('D1: package.json that is a symlink, or parses to a non-object, is G4', () => {
+  const fx = fixture({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29' } }) });
+  for (const [files, why] of [[{ 'web/package.json': { link: 'null' }, 'web/null': '{}' }, 'symlink to "null"'], [{ 'web/package.json': { link: '1' }, 'web/1': '{}' }, 'symlink to "1"'],
+    [{ 'web/package.json': 'null\n' }, 'null'], [{ 'web/package.json': '[1]\n' }, 'array'], [{ 'web/package.json': '7\n' }, 'number']]) {
+    assert.ok(hit(run(fx, fx.change(files, { fresh: true })), 'G4')?.files.includes('web/package.json'), why);
+  }
+});
+test('Bug 2: 200k blank lines in go.mod, package.json, test and source files are scanned in bounded time', () => {
+  const blank = '\n'.repeat(200000);
+  const fx = fixture({ 'go.mod': 'module x\n', 'package.json': '{"name":"x"}\n' });
+  for (const [files, expect] of [[{ 'go.mod': `module x\n${blank}` }, []], [{ 'go.mod': `module x\n${blank}replace a => ./b\n` }, ['G4']],
+    [{ 'package.json': `{${blank}"name":"x"}\n` }, []], [{ 'tests/t.test.js': `${blank}it.only("x")\n` }, ['G2']],
+    [{ 'src/s.js': `throw new Error("${blank}not implemented")\n` }, []], [{ 'src/s.js': `${blank}x = ctx.${blank}skip${blank}\n` }, []]]) {
+    const t0 = Date.now();
+    const h = run(fx, fx.change(files, { fresh: true }));
+    const ms = Date.now() - t0;
+    assert.deepEqual(ids(h), expect, Object.keys(files)[0]);
+    assert.ok(ms < 3000, `${Object.keys(files)[0]} took ${ms} ms`);
+  }
+});
+test('D2: project:target script references protect the target script name', () => {
+  const fx = fixture({ 'package.json': pkgJ({ test: 'nx run app:unit', unit: 'jest', build: 'tsc' }) });
+  assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkgJ({ test: 'nx run app:unit', unit: 'exit 0', build: 'tsc' }) }, { fresh: true }), TALL), 'G4')?.files, ['package.json']);
+  assert.deepEqual(run(fx, fx.change({ 'package.json': pkgJ({ test: 'nx run app:unit', unit: 'jest', build: 'tsc -b' }) }, { fresh: true }), TALL), []);
+});
+test('D3: wrappers are unwrapped; an unrecognised tool protects every script', () => {
+  const s0 = { test: 'jest', build: 'tsc' };
+  const fx = fixture({ 'package.json': pkgJ(s0) });
+  for (const all of [['env', 'CI=1', 'npm', 'test'], ['cross-env', 'CI=1', 'npm', 'test'], ['npx', 'npm', 'test'], ['corepack', 'pnpm', 'test'], ['time', 'npm', 'test'],
+    ['nice', '-n', '10', 'npm', 'test'], ['dotenv', '-e', '.env', '--', 'npm', 'test'], ['npm', 'exec', '--', 'npm', 'test'], ['CI=1', 'npm', 'test']]) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkgJ({ ...s0, test: 'exit 0' }) }, { fresh: true }), { tests: { all } }), 'G4')?.files, ['package.json'], all.join(' '));
+    assert.deepEqual(run(fx, fx.change({ 'package.json': pkgJ({ ...s0, build: 'tsc -b' }) }, { fresh: true }), { tests: { all } }), [], `${all.join(' ')}: build is not protected`);
+  }
+  for (const all of [['turbo', 'run', 'test'], ['npx', 'turbo', 'run', 'test'], ['nx', 'run-many', '-t', 'test'], ['lerna', 'run', 'test'], ['make', 'test'], ['npx', 'jest'], ['dotenv', 'npm', 'test']]) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkgJ({ ...s0, build: 'tsc -b' }) }, { fresh: true }), { tests: { all } }), 'G4')?.files, ['package.json'], all.join(' '));
+  }
+});
+test('D4: any escape in an option key in a test file is G2', () => {
+  const fx = fixture({});
+  for (const c of ['test("x", { sk\\u0069p: true }, f)', 'test("x", { "sk\\ip": true }, f)', 'test("x", { \\u{73}kip: true }, f)', "test('x', { 'sk\\x69p': 1 }, f)"]) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'tests/n.test.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['tests/n.test.js'], c);
+  }
+});
+test('D5: optional-chaining, bracket and todo skip forms in non-test files are G2; a numeric count is not', () => {
+  const fx = fixture({});
+  for (const c of ['ctx?.skip()', 't?.skip("r")', 'ctx.skip?.()', 't["skip"]()', 'ctx?.["todo"]("x")', 'list.todo(item)', 'rows.skip(n)']) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'src/h.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['src/h.js'], c);
+  }
+  assert.equal(hit(run(fx, fx.change({ 'src/h.js': 'rows.skip(25)\n' }, { fresh: true })), 'G2'), undefined);
+});
+test('D6: directories.bin, wireit, workspace/task-runner configs, vendor/ and Python framework shadowing are G4', () => {
+  const fx = fixture({ 'web/package.json': JSON.stringify({ name: 'w' }) });
+  const g4 = (files, config = {}) => hit(run(fx, fx.change(files, { fresh: true }), config), 'G4')?.files;
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ name: 'w', directories: { bin: 'b' } }) }), ['web/package.json']);
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ name: 'w', wireit: { test: { command: 'true' } } }) }), ['web/package.json']);
+  for (const p of ['go.work', 'go.work.sum', 'vendor/github.com/x/assert/a.go', 'pytest/__init__.py', 'src/_pytest/x.py', 'unittest.py', 'hypothesis/__init__.py',
+    'turbo.json', 'nx.json', 'apps/web/project.json', 'lerna.json']) assert.deepEqual(g4({ [p]: 'x\n' }), [p], p);
+});
+test('D6: Makefile / justfile are protected only when a configured command runs make or just', () => {
+  const fx = fixture({ Makefile: 'test:\n\tgo test ./...\n', justfile: 'test:\n  go test ./...\n' });
+  assert.deepEqual(run(fx, fx.change({ Makefile: 'test:\n\ttrue\n' }, { fresh: true })), [], 'no make in config');
+  assert.deepEqual(hit(run(fx, fx.change({ Makefile: 'test:\n\ttrue\n' }, { fresh: true }), { tests: { all: ['make', 'test'] } }), 'G4')?.files, ['Makefile']);
+  assert.deepEqual(hit(run(fx, fx.change({ justfile: 'test:\n  true\n', 'mk/t.mk': 'x\n' }, { fresh: true }), { local_checks: [{ name: 'j', command: ['just', 'test'], timeout_s: 60 }] }), 'G4')?.files, ['justfile', 'mk/t.mk']);
+});
+test('test gaps: suppressBlankEmpty repo config, unreadable root manifest, backtick and delegation in a root-only repo', () => {
+  const dj = (o) => JSON.stringify(o, null, 2).replace('{\n', '{\n\n');
+  let fx = fixture({ 'package.json': dj({ name: 'x', devDependencies: { jest: '^29' } }) });
+  fx.sh(fx.work, 'config', 'diff.suppressBlankEmpty', 'true');
+  assert.deepEqual(run(fx, fx.change({ 'package.json': dj({ name: 'x', devDependencies: { jest: '^30' } }) }, { fresh: true })), [], 'blank context line read correctly');
+  assert.deepEqual(hit(run(fx, fx.change({ 'package.json': dj({ name: 'x', devDependencies: { jest: 'file:./j' } }) }, { fresh: true })), 'G4')?.files, ['package.json']);
+  fx = fixture({ 'package.json': '{ not json', 'web/package.json': pkgJ({ unit: 'jest' }) });
+  assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'jest' }, { description: 'd' }) }), TALL), 'G4')?.files, ['web/package.json'], 'unreadable root');
+  for (const v of ['`echo jest`', 'npm run $T', 'npm --prefix web run unit', 'cd web && npm run unit', 'pnpm -r unit', 'yarn workspace web unit']) {
+    fx = fixture({ 'package.json': pkgJ({ test: v, build: 'tsc' }) });
+    assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkgJ({ test: v, build: 'tsc -b' }) }), TALL), 'G4')?.files, ['package.json'], v);
+  }
+  fx = fixture({ 'package.json': pkgJ({ unit: 'jest', other: 'tsc' }) });
+  for (const all of [['npm', '--prefix', 'web', 'run', 'unit'], ['npm', 'run', 'unit', '--workspace=web'], ['sh', '-c', 'npm run unit']]) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkgJ({ unit: 'jest', other: 'tsc -b' }) }, { fresh: true }), { tests: { all } }), 'G4')?.files, ['package.json'], all.join(' '));
+  }
+});
+test('a non-string dependency value is G4; more than 500 manifests in the head tree is G4', () => {
+  let fx = fixture({ 'package.json': JSON.stringify({ devDependencies: { jest: '^29' } }) });
+  assert.deepEqual(hit(run(fx, fx.change({ 'package.json': JSON.stringify({ devDependencies: { jest: ['file:./j'] } }) })), 'G4')?.files, ['package.json']);
+  const many = Object.fromEntries(Array.from({ length: 501 }, (_, i) => [`p${i}/package.json`, '{"name":"p"}\n']));
+  fx = fixture(many);
+  assert.deepEqual(hit(run(fx, fx.change({ 'p0/package.json': '{"name":"p","description":"d"}\n' })), 'G4')?.files, ['p0/package.json']);
+  assert.deepEqual(run(fx, fx.change({ 'p0/package.json': null, 'p1/package.json': null, 'p2/package.json': '{"name":"p","description":"d"}\n' }, { fresh: true })), [], '499 manifests: under the cap');
+});
+test('mutation survivors: added symlink manifest, project:target in argv, driver running from a subdirectory', () => {
+  let fx = fixture({ 'web/{}': 'x\n' });
+  assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': { link: '{}' } })), 'G4')?.files, ['web/package.json'], 'new symlink whose target text parses as {}');
+  fx = fixture({ 'package.json': pkgJ({ 'app:unit': 'jest', unit: 'jest', build: 'tsc' }) });
+  const cfg = { tests: { all: ['npm', 'run', 'app:unit'] } };
+  assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkgJ({ 'app:unit': 'jest', unit: 'exit 0', build: 'tsc' }) }, { fresh: true }), cfg), 'G4')?.files, ['package.json']);
+  assert.deepEqual(run(fx, fx.change({ 'package.json': pkgJ({ 'app:unit': 'jest', unit: 'jest', build: 'tsc -b' }) }, { fresh: true }), cfg), []);
+  fx = fixture({ 'web/package.json': pkgJ({ unit: 'jest' }), 'lib/package.json': pkgJ({ x: 'jest' }), 'docs/readme.txt': 'x\n' });
+  const head = fx.change({ 'web/package.json': pkgJ({ unit: 'exit 0' }) });
+  const sub = (...a) => { const r = spawnSync('git', a, { cwd: path.join(fx.work, 'docs'), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); return { code: r.status, out: r.stdout, err: r.stderr }; };
+  assert.deepEqual(ag.checkDiff({ git: sub, baseRef: BASE, headSha: head, config: {}, specPaths: [] }), [{ id: 'G4', files: ['web/package.json'] }]);
 });
