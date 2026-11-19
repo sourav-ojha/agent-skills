@@ -697,6 +697,9 @@ if (SBX_SKIP) console.log(`# factory-verify: SKIPPING real-sandbox verification 
 
 const CANARY = 'fx-c0ffee';
 const VCH = `sha256:${'3'.repeat(64)}`;
+// postVerified args for a doc, with that doc stored as the verdict file (docs writeVerdict rejects are simply not stored).
+const withStored = (doc) => { try { V.writeVerdict('o__r', doc); } catch { /* invalid on purpose */ } return { doc, repoKey: 'o__r', id: 'FEATURE-001' }; };
+
 const NOTE_PATH = `/api/notes/secret-${CANARY}`;
 const NOTE_DATA = `Secret note ${CANARY}`;
 const vscenarios = (over = {}) => ({
@@ -1014,6 +1017,8 @@ function ghWorld(t, body = 'Adds notes.\n\nCloses FEATURE-001.') {
   const g = (...a) => rawGit(origin, ...a).stdout.trim();
   g('init', '-q', '-b', 'main'); g('config', 'user.email', 't@x'); g('config', 'user.name', 't'); g('commit', '-q', '--allow-empty', '-m', 'base');
   g('checkout', '-q', '-b', 'feat/notes'); g('commit', '-q', '--allow-empty', '-m', 'feat'); const sha = g('rev-parse', 'HEAD'); g('checkout', '-q', 'main');
+  const prevFh = process.env.FACTORY_HOME; process.env.FACTORY_HOME = path.join(root, 'fh');
+  t.after(() => { if (prevFh === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prevFh; });
   const sp = path.join(root, 'state.json');
   fs.writeFileSync(sp, JSON.stringify({ calls: [], origin, prs: [{ number: 7, head: 'feat/notes', base: 'main', state: 'OPEN', draft: false, mergeState: 'CLEAN', url: 'https://github.com/o/r/pull/7', body }] }));
   const gh = (...a) => { const r = spawnSync(process.execPath, [FAKE_GH, ...a], { encoding: 'utf8', env: { ...process.env, FAKE_GH_STATE: sp } }); return { code: r.status, out: (r.stdout || '').trim(), err: r.stderr || '' }; };
@@ -1023,7 +1028,7 @@ function ghWorld(t, body = 'Adds notes.\n\nCloses FEATURE-001.') {
 
 test('postVerified: factory/verified success on the exact sha, PR body line with the count only, idempotent', (t) => {
   const w = ghWorld(t);
-  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2) });
+  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...withStored(pdoc(w.sha, 2)) });
   assert.equal(r.line, `Verified: 2/2 scenarios at ${w.sha.slice(0, 7)}`);
   const st = w.state();
   assert.deepEqual(st.statuses[w.sha], [{ state: 'success', context: 'factory/verified', description: VF.VERIFIED_DESCRIPTION }]);
@@ -1036,25 +1041,25 @@ test('postVerified: factory/verified success on the exact sha, PR body line with
   const all = JSON.stringify(st);
   for (const s of LEAK_STRINGS) assert.ok(!all.includes(s), `gh traffic leaks ${s}`);
   // again with a new count: the Verified line is replaced, never duplicated; the rest of the body is kept
-  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, doc: pdoc(w.sha, 3) });
+  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, ...withStored(pdoc(w.sha, 3)) });
   assert.equal(w.state().prs[0].body, `Adds notes.\n\nCloses FEATURE-001.\n\nVerified: 3/3 scenarios at ${w.sha.slice(0, 7)}`);
   const edits = w.state().calls.filter((c) => c[0] === 'pr' && c[1] === 'edit').length;
-  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, doc: pdoc(w.sha, 3) });
+  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, ...withStored(pdoc(w.sha, 3)) });
   assert.equal(w.state().calls.filter((c) => c[0] === 'pr' && c[1] === 'edit').length, edits, 'unchanged body is not re-edited');
 });
 
 test('postVerified: validates inputs before any gh call; refuses a moved PR head; gh failures throw', (t) => {
   const w = ghWorld(t, '');
   for (const bad of [{ sha: 'A'.repeat(40) }, { sha: w.sha.slice(0, 39) }, { n: 0 }, { n: 1.5 }, { n: '2' }, { repo: 'o' }, { repo: 'o/r/x' }, { repo: '-o/r' }, { pr: 0 }, { pr: '7' }, { gh: null }]) {
-    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2), ...bad }), /invalid/, JSON.stringify(bad));
+    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...withStored(pdoc(w.sha, 2)), ...bad }), /invalid/, JSON.stringify(bad));
   }
   assert.equal(w.state().calls.length, 0);
-  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: 'c'.repeat(40), n: 2, pr: 7, doc: pdoc('c'.repeat(40), 2) }), /PR head/);
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: 'c'.repeat(40), n: 2, pr: 7, ...withStored(pdoc('c'.repeat(40), 2)) }), /PR head/);
   assert.ok(!w.state().calls.some((c) => c[1] === 'edit'));
-  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 1, pr: 7, doc: pdoc(w.sha, 1) });
+  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 1, pr: 7, ...withStored(pdoc(w.sha, 1)) });
   assert.equal(w.state().prs[0].body, r.line, 'empty body gets just the line');
   const failing = (...a) => (a[0] === 'api' ? { code: 1, out: '', err: 'HTTP 403' } : w.gh(...a));
-  assert.throws(() => VF.postVerified({ gh: failing, repo: 'o/r', sha: w.sha, n: 1, pr: 7, doc: pdoc(w.sha, 1) }), /factory\/verified/);
+  assert.throws(() => VF.postVerified({ gh: failing, repo: 'o/r', sha: w.sha, n: 1, pr: 7, ...withStored(pdoc(w.sha, 1)) }), /factory\/verified/);
 });
 
 test('withVerifiedLine replaces every existing Verified line in place and keeps the rest', () => {
@@ -1089,14 +1094,14 @@ test('symptomBrief: object keys inside request bodies are data too; schema keys 
 test('postVerified: a status that does not show up after posting throws before the body edit', (t) => {
   const w = ghWorld(t);
   const gh = (...a) => (a[0] === 'api' && a[1].endsWith('/status') ? { code: 0, out: JSON.stringify({ statuses: [{ context: 'factory/verified', state: 'pending' }] }), err: '' } : w.gh(...a));
-  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2) }), /not visible/);
+  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...withStored(pdoc(w.sha, 2)) }), /not visible/);
   assert.ok(!w.state().calls.some((c) => c[1] === 'edit'));
 });
 
 test('postVerified: a failing pr edit throws', (t) => {
   const w = ghWorld(t);
   const gh = (...a) => (a[0] === 'pr' && a[1] === 'edit' ? { code: 1, out: '', err: 'HTTP 422' } : w.gh(...a));
-  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2) }), /pr edit #7 failed/);
+  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...withStored(pdoc(w.sha, 2)) }), /pr edit #7 failed/);
 });
 
 // ---- Task 9 fix round 1 ------------------------------------------------------------------------------------------------------
@@ -1144,7 +1149,7 @@ test('I-1: a surviving non-listening process after setup / seed / app stop, or a
   const w2 = await vworld(t);
   let k = 0; const total = 1 + 2 * 2 * 2; // setup + (seed + app) x 2 runs x 2 scenarios
   const e2 = await VF.verifyFeature(w2.args(), vseams(w2.log, { survivors: async () => (++k > total ? 1 : 0) })).catch((x) => x);
-  assert.match(e2?.message ?? '', /still running or listening after verification/); assert.ok(noGitAfterAdd(w2.log));
+  assert.match(e2?.message ?? '', /still running or listening/); assert.ok(noGitAfterAdd(w2.log));
 });
 
 test('M-3: without a seed, the port is checked immediately before every start', async (t) => {
@@ -1218,7 +1223,7 @@ test('M-5: postVerified needs a consistent pass verdict for this sha with exactl
     { ...pdoc(w.sha, 2), results: [{ id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: true }, { id: 'S-2', covers: ['AC-1'], status: 'pass', flaky: false }] }, { ...pdoc(w.sha, 2), extra: 1 }]) {
     assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc }), /invalid verdict/);
   }
-  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, doc: pdoc(w.sha, 2) }), /invalid scenario count/);
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, ...withStored(pdoc(w.sha, 2)) }), /invalid scenario count/);
   assert.equal(w.state().calls.length, 0);
 });
 
@@ -1266,4 +1271,94 @@ test('scanSurvivors finds a process by its environment (ps -E) and by its cwd (l
 
 test('M-1: an error other than refused (unresolvable host) also counts as in use', async () => {
   assert.equal(await PR.portInUse(80, 'nonexistent.invalid'), true);
+});
+
+// ---- Task 9 fix round 2 ------------------------------------------------------------------------------------------------------
+test('I-A: a closed port stays free even when the event loop stalls past the probe timeout', async () => {
+  const port = await vfreePort();
+  for (const host of ['127.0.0.1', 'localhost']) {
+    const p = PR.portInUse(port, host);
+    const t0 = Date.now(); while (Date.now() - t0 < 1300) { /* deliberate event-loop stall */ }
+    assert.equal(await p, false, host);
+  }
+  const s = net.createServer(); await new Promise((r) => s.listen(port, '127.0.0.1', r));
+  const p = PR.portInUse(port, '127.0.0.1');
+  const t0 = Date.now(); while (Date.now() - t0 < 1300) { /* stall */ }
+  assert.equal(await p, true, 'a real listener is still found after a stall');
+  await new Promise((r) => s.close(r));
+});
+
+test('I-B: an escape or an app that will not exit keeps the run temp AND drops its on-exit delete; a clean run removes both', async (t) => {
+  for (const [name, over] of [
+    ['escape', () => { let busy = false; return { stopApp: async (app) => { app.up = false; busy = true; }, portInUse: async () => busy }; }],
+    ['app will not exit', () => ({ stopApp: async () => {}, alive: () => true })],
+  ]) {
+    const w = await vworld(t);
+    const n0 = PR.pendingCleanups();
+    const e = await VF.verifyFeature(w.args(), vseams(w.log, over())).catch((x) => x);
+    assert.ok(e instanceof Error, name);
+    assert.equal(PR.pendingCleanups(), n0, `${name}: no on-exit delete left registered`);
+    const tmps = fs.readdirSync(path.join(w.fh, 'tmp'));
+    assert.equal(tmps.length, 1, `${name}: run temp kept`);
+    PR.runCleanups(); // what the driver's exit would run
+    assert.ok(fs.existsSync(path.join(w.fh, 'tmp', tmps[0])), `${name}: still there after the exit hooks`);
+  }
+  const w = await vworld(t);
+  const n0 = PR.pendingCleanups();
+  await VF.verifyFeature(w.args(), vseams(w.log));
+  assert.equal(PR.pendingCleanups(), n0); assert.deepEqual(fs.readdirSync(path.join(w.fh, 'tmp')), []);
+});
+
+test('I-C: the escape sweep runs before the verdict is written; a later escape deletes the written verdict; neither is reused', async (t) => {
+  const phases = 1 + 2 * 2 * 2; // setup + (seed + app) x 2 runs x 2 scenarios
+  for (const [name, at] of [['before writing', phases + 1], ['after writing', phases + 2]]) {
+    const w = await vworld(t);
+    let n = 0; let wrote = null;
+    const e = await VF.verifyFeature(w.args(), vseams(w.log, { survivors: async () => { if (n === phases + 1) wrote = V.readVerdict('o__r', 'FEATURE-001', w.bad); return ++n === at ? 1 : 0; } })).catch((x) => x);
+    assert.match(e?.message ?? '', /still running or listening/, name);
+    if (name === 'after writing') assert.ok(wrote, 'the verdict had been written before the last sweep');
+    else assert.equal(wrote, null, 'nothing written before the in-run sweep');
+    assert.equal(V.readVerdict('o__r', 'FEATURE-001', w.bad), null, `${name}: no stored verdict`);
+  }
+  // and a clean second call over the same FACTORY_HOME runs instead of reusing
+  const w = await vworld(t);
+  let n = 0;
+  await VF.verifyFeature(w.args(), vseams(w.log, { survivors: async () => (++n === phases + 2 ? 1 : 0) })).catch(() => {});
+  // the escape left the worktree; clear it the way a person would before re-verifying
+  fs.rmSync(w.wtOf(w.bad), { recursive: true, force: true }); rawGit(w.clone, 'worktree', 'prune');
+  w.log.length = 0;
+  const r = await VF.verifyFeature(w.args(), vseams(w.log));
+  assert.equal(r.reused, false); assert.ok(w.log.some((e) => e[0] === 'api'));
+});
+
+test('M-f: a failing git worktree prune is surfaced as its own error (the result is attached); it never masks an earlier error', async (t) => {
+  const w = await vworld(t);
+  const git = (...a) => (a[0] === 'worktree' && a[1] === 'prune' ? (w.log.push(['git', 'prune']), { code: 1, out: '', err: 'locked' }) : w.git(...a));
+  const e = await VF.verifyFeature(w.args({ git }), vseams(w.log)).catch((x) => x);
+  assert.match(e.message, /git worktree prune failed/); assert.equal(e.result?.verdict, 'pass');
+  assert.ok(!fs.existsSync(w.wtOf(w.bad)), 'the tree itself was quarantined and deleted');
+  const w2 = await vworld(t);
+  const git2 = (...a) => (a[0] === 'worktree' && a[1] === 'prune' ? { code: 1, out: '', err: 'locked' } : w2.git(...a));
+  const e2 = await VF.verifyFeature(w2.args({ git: git2 }), vseams(w2.log, { runApiScenario: async () => { throw new Error('boom-first'); } })).catch((x) => x);
+  assert.match(e2.message, /boom-first/); assert.match(e2.cleanupError, /prune failed/);
+});
+
+test('M-c: postVerified requires the stored verdict file for (repoKey, id, sha) to match the doc', (t) => {
+  const w = ghWorld(t);
+  const doc = pdoc(w.sha, 2);
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc, repoKey: 'o__r', id: 'FEATURE-001' }), /stored verdict|verdict file/, 'nothing stored');
+  V.writeVerdict('o__r', { ...doc, results: [{ id: 'S-1', covers: ['AC-2'], status: 'pass', flaky: false }, doc.results[1]] });
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc, repoKey: 'o__r', id: 'FEATURE-001' }), /verdict file/, 'different results');
+  V.writeVerdict('o__r', { ...doc, criteria_hash: `sha256:${'7'.repeat(64)}` });
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc, repoKey: 'o__r', id: 'FEATURE-001' }), /verdict file/, 'different hash');
+  V.writeVerdict('o__r', doc);
+  for (const bad of [{ repoKey: 'o/r' }, { id: 'FEATURE-002' }, { id: undefined }]) assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc, repoKey: 'o__r', id: 'FEATURE-001', ...bad }), /invalid/);
+  assert.equal(w.state().calls.length, 0);
+  assert.equal(VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc, repoKey: 'o__r', id: 'FEATURE-001' }).edited, true);
+});
+
+test('I-A: only refused / no-such-address errors mean free; unreachable means free on ::1 only', () => {
+  for (const c of ['ECONNREFUSED', 'EADDRNOTAVAIL', 'EAFNOSUPPORT']) { assert.equal(PR.freeError(c, '127.0.0.1'), true, c); assert.equal(PR.freeError(c, '::1'), true, c); }
+  for (const c of ['ENETUNREACH', 'EHOSTUNREACH']) { assert.equal(PR.freeError(c, '::1'), true, c); assert.equal(PR.freeError(c, '127.0.0.1'), false, c); }
+  for (const c of ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', undefined]) assert.equal(PR.freeError(c, '127.0.0.1'), false, String(c));
 });

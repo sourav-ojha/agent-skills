@@ -322,6 +322,13 @@ export function makeRunTemp(fh = factoryHome()) {
   return dir;
 }
 
+// Keeps the dir (an escaped sandboxed process may still use it) and drops its on-exit delete, so the driver's exit cannot rm it
+// out from under that process (a symlink-swap race). Someone must remove it later (Task 11's restart sweep or a person).
+export function keepRunTemp(dir) {
+  const un = runTemps.get(dir);
+  if (un) { un(); runTemps.delete(dir); }
+}
+
 export function removeRunTemp(dir) {
   fs.rmSync(dir, { recursive: true, force: true });
   const un = runTemps.get(dir);

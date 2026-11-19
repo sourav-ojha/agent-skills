@@ -23,7 +23,7 @@ import { spawnSync } from 'node:child_process';
 import * as sbx from './sandbox.mjs';
 import * as proc from './proc.mjs';
 import { runApiScenario } from './apicheck.mjs';
-import { readVerdict, writeVerdict, verdictMatches, validVerdict } from './verdict.mjs';
+import { readVerdict, writeVerdict, verdictMatches, validVerdict, verdictPath } from './verdict.mjs';
 import { checkRepoKey, scenariosHash, CRIT_ID, SCEN_ID } from './scenarios.mjs';
 import { isLocalUrl } from './config.mjs';
 import { FEATURE_ID } from './queue.mjs';
@@ -58,7 +58,7 @@ const within = (p, root) => p === root || p.startsWith(`${root}/`);
 // phase (a setsid daemon included) normally shows one of them. Fails closed: a ps or lsof failure counts as a survivor.
 // Residual: a process that clears its environment, rewrites its argv AND leaves the worktree cwd is not found.
 export function scanSurvivors(markers) {
-  const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 15000 });
+  const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
   if (ps.status !== 0 || ps.error) return 1;
   const hits = new Set();
   for (const line of ps.stdout.split('\n')) {
@@ -66,7 +66,7 @@ export function scanSurvivors(markers) {
     if (!m || m[2].startsWith('Z') || Number(m[1]) === process.pid) continue;
     if (markers.some((k) => m[3].includes(k))) hits.add(m[1]);
   }
-  const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 15000 });
+  const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 5000 });
   if (lsof.error || !lsof.stdout) return 1;
   let pid = null;
   for (const line of lsof.stdout.split('\n')) {
@@ -91,6 +91,7 @@ const DEFAULT_SEAMS = {
   sandboxProfile: sbx.sandboxProfile,
   makeRunTemp: sbx.makeRunTemp,
   removeRunTemp: sbx.removeRunTemp,
+  keepRunTemp: sbx.keepRunTemp,
   runSandboxed: sbx.runSandboxed,
   startSandboxed: sbx.startSandboxed,
   stopApp: proc.stopApp,
@@ -163,7 +164,7 @@ function workDir(repoKey, id, sha) {
   return path.join(work, repoKey, `${id}-${sha}`);
 }
 
-// Quarantine-then-delete. Only call once nothing sandboxed from the run can be alive. Returns null, or a message (no paths).
+// Quarantine-then-delete. Only call once nothing sandboxed from the run can be alive. Returns null, or { message, pruneFailed } (no paths).
 //   1. rename(2) the worktree to FACTORY_HOME/trash/<random> (same volume, 0700); on failure it stays where it is (never rm in place);
 //   2. `git worktree prune` from the clone (the only git call; it checks the registered path, now gone, and never reads the moved tree);
 //   3. delete the quarantined tree (fs.rmSync unlinks symlinks, it does not follow them).
@@ -178,14 +179,16 @@ function removeWorktree(git, dir, trashRoot) {
       if (t.isSymbolicLink() || !t.isDirectory()) throw new Error('trash is not a plain directory');
       q = path.join(trashRoot.dir, crypto.randomBytes(12).toString('hex'));
       fs.renameSync(dir, q);
-    } catch { return 'the verification worktree could not be moved to the trash: it was left in place'; }
-    try { git('worktree', 'prune'); } catch { /* a stale registration only; the tree itself is gone */ }
+    } catch { return { message: 'the verification worktree could not be moved to the trash: it was left in place', pruneFailed: false }; }
+    const pruned = prune(git);
     try { fs.rmSync(q, { recursive: true, force: true }); } catch { /* reported below */ }
-    return exists(q) ? 'the quarantined verification worktree could not be deleted' : null;
+    if (!pruned) return { message: PRUNE_FAILED, pruneFailed: true };
+    return exists(q) ? { message: 'the quarantined verification worktree could not be deleted', pruneFailed: false } : null;
   }
-  try { git('worktree', 'prune'); } catch { /* nothing to remove */ }
-  return null;
+  return prune(git) ? null : { message: PRUNE_FAILED, pruneFailed: true };
 }
+const PRUNE_FAILED = 'git worktree prune failed in the factory clone: a stale verification worktree registration remains';
+const prune = (git) => { try { return git('worktree', 'prune')?.code === 0; } catch { return false; } };
 
 const combine = (runs) => {
   const flaky = runs.some((r) => r !== runs[0]);
@@ -231,7 +234,7 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   if (exists(wt)) { // a crashed or escaped earlier run: only cleared when nothing from it is still alive
     if ((await s.survivors([wt])) > 0) throw new Error('leftover worktree: a process from an earlier run is still running there; refusing to verify');
     const left = removeWorktree(git, wt, trash);
-    if (left) throw new Error(`leftover worktree: ${left}`);
+    if (left) throw new Error(`leftover worktree: ${left.message}`);
   }
 
   let tmp = null, running = null, escaped = false, failure = null, outcome = null;
@@ -292,6 +295,7 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
       results.push({ id: sc.id, covers: [...sc.covers], ...combine(runs) });
     }
     checkBudget();
+    await afterPhase('the run'); // before the verdict is written: an escape must never leave a stored (reusable) verdict
     const verdict = results.length > 0 && results.every((r) => r.status === 'pass' && !r.flaky) ? 'pass' : 'fail';
     const doc = { feature: id, sha, scenarios_hash: scHash, criteria_hash: criteriaHash, results, verdict, at: new Date().toISOString() };
     writeVerdict(repoKey, doc);
@@ -307,11 +311,20 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   if (tmp && !running && !escaped) {
     try { if (await listening() || (await s.survivors([wt, tmp])) > 0) escaped = true; } catch { escaped = true; }
   }
-  const cleanupError = running ? 'the app did not exit: the verification worktree was left in place'
-    : escaped ? 'a process from the run is still running or listening: the verification worktree was left in place'
+  const removal = running ? { message: 'the app did not exit: the verification worktree was left in place' }
+    : escaped ? { message: 'a process from the run is still running or listening: the verification worktree was left in place' }
       : removeWorktree(git, wt, trash);
-  if (tmp && !running && !escaped) { try { s.removeRunTemp(tmp); } catch { /* removed on process exit */ } }
+  const cleanupError = removal?.message ?? null;
+  if (tmp) {
+    // Kept on an escape: also drop proc's on-exit delete, or it would rm the dir on driver exit while the escaped process lives.
+    if (running || escaped) { try { s.keepRunTemp(tmp); } catch { /* nothing registered */ } } else { try { s.removeRunTemp(tmp); } catch { /* removed on process exit */ } }
+  }
+  if (escaped && outcome) { // found only by the last sweep, after the verdict was written: that verdict must not be reused
+    try { fs.rmSync(verdictPath(repoKey, id, sha), { force: true }); } catch { /* readVerdict is fail-closed on what remains */ }
+    outcome = null;
+  }
   if (escaped && !failure) failure = new Error('a process from the run is still running or listening after verification');
+  if (removal?.pruneFailed && !failure) { failure = new Error(PRUNE_FAILED); failure.result = outcome; }
   if (failure) {
     if (cleanupError && failure && typeof failure === 'object') failure.cleanupError = cleanupError;
     throw failure;
@@ -394,11 +407,12 @@ export function withVerifiedLine(body, line) {
 
 const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
-// postVerified({ gh, repo, sha, n, pr, doc }): commit status factory/verified=success on `sha`, then the PR body line
+// postVerified({ gh, repo, sha, n, pr, doc, repoKey, id }): commit status factory/verified=success on `sha`, then the PR body line
 // `Verified: N/N scenarios at <short sha>` (a count only). gh: (...args) => { code, out, err }, argv only.
 // `pr` (the PR number) is required: the body edit needs it, and the PR head must still be `sha`. `doc` is the verdict: it must be a
-// consistent pass for exactly `sha` (verdictMatches against its own hashes) with exactly `n` results.
-export function postVerified({ gh, repo, sha, n, pr, doc } = {}) {
+// consistent pass for exactly `sha` (verdictMatches against its own hashes) with exactly `n` results, and equal to the verdict file
+// stored for (repoKey, id, sha) (same feature, sha, hashes and results).
+export function postVerified({ gh, repo, sha, n, pr, doc, repoKey, id } = {}) {
   if (typeof gh !== 'function') throw new Error('invalid gh runner');
   if (typeof repo !== 'string' || !REPO.test(repo) || repo.split('/').some((p) => p === '.' || p === '..')) throw new Error('invalid repo (expected owner/name)');
   if (typeof sha !== 'string' || !SHA.test(sha)) throw new Error('invalid sha (expected 40 lowercase hex characters)');
@@ -406,6 +420,13 @@ export function postVerified({ gh, repo, sha, n, pr, doc } = {}) {
   if (!Number.isInteger(pr) || pr < 1) throw new Error('invalid PR number');
   if (!validVerdict(doc) || !verdictMatches(doc, { sha, scenariosHash: doc.scenarios_hash, criteriaHash: doc.criteria_hash })) throw new Error('invalid verdict: a passing verdict for this exact commit is required');
   if (doc.results.length !== n) throw new Error('invalid scenario count: it must equal the number of verdict results');
+  checkRepoKey(repoKey);
+  if (typeof id !== 'string' || !FEATURE_ID.test(id) || doc.feature !== id) throw new Error('invalid feature id: it must match the verdict');
+  const stored = readVerdict(repoKey, id, sha);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!stored || stored.verdict !== 'pass' || !same([stored.feature, stored.sha, stored.scenarios_hash, stored.criteria_hash, stored.results], [doc.feature, doc.sha, doc.scenarios_hash, doc.criteria_hash, doc.results])) {
+    throw new Error('invalid verdict: it does not match the verdict file stored for this commit');
+  }
 
   const view = gh('pr', 'view', String(pr), '--json', 'body,headRefOid');
   const v = view.code === 0 ? parse(view.out) : null;
