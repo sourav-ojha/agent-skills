@@ -1362,3 +1362,51 @@ test('I-A: only refused / no-such-address errors mean free; unreachable means fr
   for (const c of ['ENETUNREACH', 'EHOSTUNREACH']) { assert.equal(PR.freeError(c, '::1'), true, c); assert.equal(PR.freeError(c, '127.0.0.1'), false, c); }
   for (const c of ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', undefined]) assert.equal(PR.freeError(c, '127.0.0.1'), false, String(c));
 });
+
+// ---- Task 9 fix round 3 ------------------------------------------------------------------------------------------------------
+test('round 3: a pass verdict that cannot be deleted after a late escape is overwritten with fail; if that fails too it is reported and never reusable', async (t) => {
+  const phases = 1 + 2 * 2 * 2 + 1; // setup + (seed + app) x 2 x 2 + the in-run sweep; the next call is the final sweep
+  const late = () => { let n = 0; return async () => (++n === phases + 1 ? 1 : 0); };
+  const w = await vworld(t);
+  const e = await VF.verifyFeature(w.args(), vseams(w.log, { survivors: late(), rmVerdict: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); } })).catch((x) => x);
+  assert.match(e.message, /still running or listening/);
+  const left = V.readVerdict('o__r', 'FEATURE-001', w.bad);
+  assert.equal(left?.verdict, 'fail', 'overwritten with a fail verdict');
+  assert.ok(left.results.every((r) => r.status !== 'pass'));
+  assert.doesNotMatch(e.cleanupError, /stored verdict/);
+
+  const w2 = await vworld(t);
+  const e2 = await VF.verifyFeature(w2.args(), vseams(w2.log, { survivors: late(), rmVerdict: (file) => { fs.rmSync(file); fs.mkdirSync(file); fs.writeFileSync(path.join(file, 'x'), 'x'); } })).catch((x) => x);
+  assert.match(e2.cleanupError, /stored verdict could not be removed/);
+  assert.equal(V.readVerdict('o__r', 'FEATURE-001', w2.bad), null, 'what remains reads as no verdict');
+  assert.throws(() => VF.postVerified({ gh: () => { throw new Error('gh must not run'); }, repo: 'o/r', sha: w2.bad, n: 2, pr: 7, doc: { feature: 'FEATURE-001', sha: w2.bad, scenarios_hash: SC.scenariosHash(vscenarios()), criteria_hash: VCH, results: [{ id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: false }, { id: 'S-2', covers: ['AC-2', 'EC-1'], status: 'pass', flaky: false }], verdict: 'pass', at: new Date().toISOString() }, repoKey: 'o__r', id: 'FEATURE-001' }), /verdict file/);
+});
+
+test('round 3: postVerified requires repoKey to be derived from repo', (t) => {
+  const w = ghWorld(t);
+  const a = withStored(pdoc(w.sha, 2));
+  for (const repoKey of ['x__r', 'o__x', 'O__r']) {
+    V.writeVerdict(repoKey, a.doc);
+    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...a, repoKey }), /invalid repo key/, repoKey);
+  }
+  assert.equal(w.state().calls.length, 0);
+});
+
+test('round 3: a failed prune and an undeletable quarantined tree are both reported', async (t) => {
+  if (process.getuid?.() === 0) return;
+  const w = await vworld(t);
+  const trash = path.join(fs.realpathSync(w.fh), 'trash');
+  const locked = [];
+  const git = (...a) => {
+    if (a[0] === 'worktree' && a[1] === 'prune') {
+      for (const q of fs.existsSync(trash) ? fs.readdirSync(trash) : []) { const d = path.join(trash, q); fs.chmodSync(d, 0o500); locked.push(d); }
+      return { code: 1, out: '', err: 'locked' };
+    }
+    return w.git(...a);
+  };
+  const e = await VF.verifyFeature(w.args({ git }), vseams(w.log)).catch((x) => x);
+  for (const d of locked) fs.chmodSync(d, 0o700); // before vworld's cleanup removes the root
+  assert.ok(locked.length > 0, 'the quarantine existed when prune ran');
+  assert.match(e.message, /git worktree prune failed/);
+  assert.match(e.message, /quarantined verification worktree could not be deleted/);
+});

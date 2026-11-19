@@ -27,7 +27,7 @@ import { readVerdict, writeVerdict, verdictMatches, validVerdict, verdictPath } 
 import { checkRepoKey, scenariosHash, CRIT_ID, SCEN_ID } from './scenarios.mjs';
 import { isLocalUrl } from './config.mjs';
 import { FEATURE_ID } from './queue.mjs';
-import { factoryHome } from './factoryhome.mjs';
+import { factoryHome, repoKey as repoKeyOf } from './factoryhome.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
 const HASH = /^sha256:[0-9a-f]{64}$/;
@@ -100,6 +100,7 @@ const DEFAULT_SEAMS = {
   runApiScenario,
   alive: groupAlive,
   survivors: (markers) => sweepSurvivors(markers),
+  rmVerdict: (file) => fs.rmSync(file, { force: true }),
   now: () => Date.now(),
 };
 
@@ -182,8 +183,9 @@ function removeWorktree(git, dir, trashRoot) {
     } catch { return { message: 'the verification worktree could not be moved to the trash: it was left in place', pruneFailed: false }; }
     const pruned = prune(git);
     try { fs.rmSync(q, { recursive: true, force: true }); } catch { /* reported below */ }
-    if (!pruned) return { message: PRUNE_FAILED, pruneFailed: true };
-    return exists(q) ? { message: 'the quarantined verification worktree could not be deleted', pruneFailed: false } : null;
+    const undeleted = exists(q) ? 'the quarantined verification worktree could not be deleted' : null;
+    if (!pruned) return { message: undeleted ? `${PRUNE_FAILED}; ${undeleted}` : PRUNE_FAILED, pruneFailed: true };
+    return undeleted ? { message: undeleted, pruneFailed: false } : null;
   }
   return prune(git) ? null : { message: PRUNE_FAILED, pruneFailed: true };
 }
@@ -314,17 +316,24 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   const removal = running ? { message: 'the app did not exit: the verification worktree was left in place' }
     : escaped ? { message: 'a process from the run is still running or listening: the verification worktree was left in place' }
       : removeWorktree(git, wt, trash);
-  const cleanupError = removal?.message ?? null;
+  let cleanupError = removal?.message ?? null;
   if (tmp) {
     // Kept on an escape: also drop proc's on-exit delete, or it would rm the dir on driver exit while the escaped process lives.
     if (running || escaped) { try { s.keepRunTemp(tmp); } catch { /* nothing registered */ } } else { try { s.removeRunTemp(tmp); } catch { /* removed on process exit */ } }
   }
   if (escaped && outcome) { // found only by the last sweep, after the verdict was written: that verdict must not be reused
-    try { fs.rmSync(verdictPath(repoKey, id, sha), { force: true }); } catch { /* readVerdict is fail-closed on what remains */ }
+    const file = verdictPath(repoKey, id, sha);
+    try { s.rmVerdict(file); } catch { /* checked below */ }
+    if (exists(file)) { // could not be deleted: overwrite it with a fail verdict (never reused, never posted)
+      const d = outcome.doc;
+      try { writeVerdict(repoKey, { ...d, verdict: 'fail', results: d.results.map((r) => ({ ...r, status: r.status === 'pass' ? 'fail' : r.status })) }); } catch {
+        cleanupError = [cleanupError, 'stored verdict could not be removed'].filter(Boolean).join('; ');
+      }
+    }
     outcome = null;
   }
   if (escaped && !failure) failure = new Error('a process from the run is still running or listening after verification');
-  if (removal?.pruneFailed && !failure) { failure = new Error(PRUNE_FAILED); failure.result = outcome; }
+  if (removal?.pruneFailed && !failure) { failure = new Error(removal.message); failure.result = outcome; }
   if (failure) {
     if (cleanupError && failure && typeof failure === 'object') failure.cleanupError = cleanupError;
     throw failure;
@@ -421,6 +430,7 @@ export function postVerified({ gh, repo, sha, n, pr, doc, repoKey, id } = {}) {
   if (!validVerdict(doc) || !verdictMatches(doc, { sha, scenariosHash: doc.scenarios_hash, criteriaHash: doc.criteria_hash })) throw new Error('invalid verdict: a passing verdict for this exact commit is required');
   if (doc.results.length !== n) throw new Error('invalid scenario count: it must equal the number of verdict results');
   checkRepoKey(repoKey);
+  if (repoKeyOf(repo) !== repoKey) throw new Error('invalid repo key: it must be derived from repo (owner/name -> owner__name)');
   if (typeof id !== 'string' || !FEATURE_ID.test(id) || doc.feature !== id) throw new Error('invalid feature id: it must match the verdict');
   const stored = readVerdict(repoKey, id, sha);
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
