@@ -32,6 +32,21 @@ const accounts = st.accounts || { work: 'tok-work', personal: 'tok-personal' };
 if (a === 'auth' && b === 'token') { const u = flag('--user'); if (!accounts[u]) fail(`no token found for ${u}`); out(accounts[u]); }
 if (a === 'api' && /^repos\/[^/]+\/[^/]+\/branches\/[^/]+\/protection$/.test(b || '')) { if (st.protection) out(st.protection); fail('gh: Not Found (HTTP 404)'); }
 if (a === 'api' && /^repos\/[^/]+\/[^/]+\/rules\/branches\/[^/]+$/.test(b || '')) { if (st.rules) out(st.rules); fail('gh: Not Found (HTTP 404)'); }
+// Commit statuses: `api -X POST repos/o/r/statuses/<sha> -f k=v ...` records one status; `api repos/o/r/commits/<sha>/status` lists them.
+const apiPath = a === 'api' ? args.slice(1).find((x) => /^repos\//.test(x)) : undefined;
+const fields = () => { const o = {}; args.forEach((x, i) => { if (['-f', '-F', '--field', '--raw-field'].includes(x) && typeof args[i + 1] === 'string') { const s = args[i + 1]; const k = s.indexOf('='); o[s.slice(0, k)] = s.slice(k + 1); } }); return o; };
+if (apiPath && /^repos\/[^/]+\/[^/]+\/statuses\/[0-9a-f]{40}$/.test(apiPath) && flag('-X') === 'POST') {
+  if (st.statusRefuse) fail(st.statusRefuse);
+  const sha = apiPath.split('/').pop(); const f = fields();
+  ((st.statuses ||= {})[sha] ||= []).push(f);
+  out({ state: f.state, context: f.context, description: f.description });
+}
+if (apiPath && /^repos\/[^/]+\/[^/]+\/commits\/[0-9a-f]{40}\/status$/.test(apiPath)) {
+  const sha = apiPath.split('/')[4];
+  const latest = new Map(); for (const s of (st.statuses?.[sha] || [])) latest.set(s.context, s);
+  const list = [...latest.values()];
+  out({ sha, state: list.length && list.every((s) => s.state === 'success') ? 'success' : 'pending', statuses: list });
+}
 if (a === 'api' && b === 'user') { const t = process.env.GH_TOKEN; const who = Object.keys(accounts).find((k) => accounts[k] === t); out(st.loginOverride || who || 'default-user'); }
 if (a === 'repo' && b === 'view') out({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'main' }, viewerPermission: st.permission || 'WRITE' });
 if (a === 'pr' && b === 'list') { const h = flag('--head'); out([...(st.cross || []).filter((p) => p.head === h), ...st.prs.filter((p) => p.head === h && p.state === 'OPEN').map((p) => ({ number: p.number, url: p.url, isCrossRepository: false }))]); }
@@ -43,7 +58,12 @@ if (a === 'pr' && b === 'create') {
 if (a === 'pr' && b === 'view') {
   const p = find(args[2]); if (!p) fail('no pull request found');
   if (p.mergeStates?.length) p.mergeState = p.mergeStates.length > 1 ? p.mergeStates.shift() : p.mergeStates[0];
-  out({ number: p.number, url: p.url, state: p.state, isDraft: p.draft, isCrossRepository: false, autoMergeRequest: p.autoMerge ? { enabledBy: 'x' } : null, mergeStateStatus: p.mergeState, headRefOid: p.state === 'OPEN' ? headSha(p) : p.headSha, headRefName: p.head, baseRefName: p.base, mergeCommit: p.mergeSha ? { oid: p.mergeSha } : null });
+  out({ number: p.number, url: p.url, state: p.state, isDraft: p.draft, isCrossRepository: false, autoMergeRequest: p.autoMerge ? { enabledBy: 'x' } : null, mergeStateStatus: p.mergeState, headRefOid: p.state === 'OPEN' ? headSha(p) : p.headSha, headRefName: p.head, baseRefName: p.base, mergeCommit: p.mergeSha ? { oid: p.mergeSha } : null, body: p.body ?? '' });
+}
+if (a === 'pr' && b === 'edit') {
+  const p = find(args[2]); if (!p) fail('no pull request found');
+  const bf = flag('--body-file'); if (bf !== undefined) p.body = fs.readFileSync(bf, 'utf8');
+  out(p.url);
 }
 if (a === 'pr' && b === 'checks') {
   const p = find(args[2]);

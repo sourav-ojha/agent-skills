@@ -682,3 +682,420 @@ test('T3 with --merge-t3 merges with a real passing verdict for the exact commit
   assert.equal(J(tamper.d({}, 'merge', 'FEATURE-001')).state, 'awaiting_human');
   for (const r of [ok, other, failing, tamper]) fs.rmSync(r.root, { recursive: true, force: true });
 });
+
+// ---- Task 9: verification step, symptom brief, factory/verified status --------------------------------------------------------
+import os from 'node:os';
+import net from 'node:net';
+const VF = await import(path.join(SK, 'core', 'scripts', 'lib', 'verify.mjs'));
+const GS = await import(path.join(SK, 'core', 'scripts', 'lib', 'gitsafe.mjs'));
+const SBX = await import(path.join(SK, 'core', 'scripts', 'lib', 'sandbox.mjs'));
+const PR = await import(path.join(SK, 'core', 'scripts', 'lib', 'proc.mjs'));
+
+const SBX_AVAIL = SBX.sandboxAvailable();
+const SBX_SKIP = SBX_AVAIL.ok ? false : `real sandbox unavailable here (${SBX_AVAIL.reason}); only the seam-based verification tests ran`;
+if (SBX_SKIP) console.log(`# factory-verify: SKIPPING real-sandbox verification tests: ${SBX_SKIP}`);
+
+const CANARY = 'fx-c0ffee';
+const VCH = `sha256:${'3'.repeat(64)}`;
+const NOTE_PATH = `/api/notes/secret-${CANARY}`;
+const NOTE_DATA = `Secret note ${CANARY}`;
+const vscenarios = (over = {}) => ({
+  feature: 'FEATURE-001', criteria_hash: VCH, canary: CANARY,
+  scenarios: [
+    { id: 'S-1', covers: ['AC-1'], kind: 'api', request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }, { json_path: '$.items', count: 0 }] },
+    { id: 'S-2', covers: ['AC-2', 'EC-1'], kind: 'api', setup: [{ method: 'POST', path: '/api/notes', body: { name: NOTE_DATA } }],
+      request: { method: 'GET', path: NOTE_PATH }, assert: [{ status: 200 }, { json_path: '$.name', equals: `secret-${CANARY}` }] },
+  ],
+  ...over,
+});
+const LEAK_STRINGS = [CANARY, NOTE_PATH, NOTE_DATA, '/api/notes', '/api/items', 'secret-', 'S-1', 'S-2', '$.name', '$.items'];
+
+// The fixture app: /api/items is right; /api/notes/<x> is right only in the good build (the bad build answers 500).
+const appSource = (good) => `import http from 'node:http';
+const json = (s, c, o) => { s.writeHead(c, { 'content-type': 'application/json' }); s.end(JSON.stringify(o)); };
+http.createServer((q, s) => {
+  if (q.url === '/health') return json(s, 200, { ok: true });
+  if (q.url === '/api/items') return json(s, 200, { items: [] });
+  if (q.method === 'POST' && q.url === '/api/notes') return json(s, 201, { ok: true });
+  if (q.url.startsWith('/api/notes/')) return ${good ? "json(s, 200, { name: decodeURIComponent(q.url.split('/').pop()) })" : "json(s, 500, { name: 'oops' })"};
+  json(s, 404, {});
+}).listen(Number(process.env.PORT), process.env.HOST);
+`;
+const vfreePort = () => new Promise((res, rej) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => res(port)); }); s.on('error', rej); });
+const rawGit = (cwd, ...a) => spawnSync('git', a, { cwd, encoding: 'utf8', env: GS.gitEnv() });
+
+// FACTORY_HOME + a factory clone with a base commit (refs/remotes/origin/main) and a bad and a good feature commit on top.
+async function vworld(t) {
+  const root = fs.realpathSync(tmpDir('factory-verify-'));
+  t.after(() => { try { fs.chmodSync(path.join(root, 'fh', 'work', 'o__r'), 0o700); } catch { /* absent */ } fs.rmSync(root, { recursive: true, force: true }); });
+  const fh = path.join(root, 'fh'); fs.mkdirSync(fh);
+  const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = fh;
+  t.after(() => { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; });
+  const clone = path.join(root, 'clone'); fs.mkdirSync(clone);
+  const g = (...a) => { const r = rawGit(clone, ...a); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 't@x'); g('config', 'user.name', 't');
+  fs.writeFileSync(path.join(clone, 'server.mjs'), appSource(false));
+  fs.writeFileSync(path.join(clone, '.env.example'), 'FOO=base\n');
+  g('add', '-A'); g('commit', '-q', '-m', 'base'); g('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  fs.writeFileSync(path.join(clone, '.env.example'), 'FOO=feature\n');
+  fs.mkdirSync(path.join(clone, '.product'));
+  fs.writeFileSync(path.join(clone, '.product', 'delivery.json'), JSON.stringify({ app: { start: ['node', '-e', 'evil()'] } }));
+  g('add', '-A'); g('commit', '-q', '-m', 'bad feature'); const bad = g('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(clone, 'server.mjs'), appSource(true));
+  g('add', '-A'); g('commit', '-q', '-m', 'good feature'); const good = g('rev-parse', 'HEAD');
+  g('checkout', '-q', 'main');
+  const port = await vfreePort();
+  const { config, errors } = c.parseConfig({ base: 'main', app: {
+    setup: ['node', '-e', "require('fs').writeFileSync('setup-ran.txt','1')"], seed: ['node', '-e', 'process.exit(0)'], start: ['node', 'server.mjs'],
+    base_url: `http://127.0.0.1:${port}`, ready: { url: `http://localhost:${port}/health`, timeout_s: 20 }, env_example: '.env.example' } });
+  assert.deepEqual(errors, []);
+  const log = [];
+  const git = (...a) => { if (a[0] === 'worktree') log.push(['git', a[1]]); return GS.gitSafeOpts(clone, a); };
+  const wtOf = (sha) => path.join(fs.realpathSync(fh), 'work', 'o__r', `FEATURE-001-${sha}`);
+  const worktrees = () => rawGit(clone, 'worktree', 'list', '--porcelain').stdout.split('\n').filter((l) => l.startsWith('worktree ')).length;
+  const args = (over = {}) => ({ repoKey: 'o__r', id: 'FEATURE-001', sha: bad, baseRef: 'refs/remotes/origin/main', config, scenarios: vscenarios(), criteriaHash: VCH, git, ...over });
+  return { root, fh, clone, bad, good, port, config, log, git, wtOf, worktrees, args };
+}
+
+// Seams standing in for the sandbox and the app (no real processes): every call is logged so order can be asserted.
+function vseams(log, over = {}) {
+  return {
+    sandboxAvailable: () => ({ ok: true }),
+    sandboxProfile: ({ network, writable, tmpDir: tmp }) => { log.push(['profile', network, writable, tmp]); return `(version 1)\n; net ${JSON.stringify(network)}\n`; },
+    runSandboxed: async (argv, o) => { log.push(['run', argv, o.profile, o.env, o.cwd]); return { code: 0, timedOut: false }; },
+    startSandboxed: (argv, o) => { log.push(['start', argv, o.profile, o.env, o.cwd]); return { pid: 0, pgid: 0, up: true, output: () => '' }; },
+    stopApp: async (app, o) => { log.push(['stop', o?.stopArgv]); app.up = false; },
+    alive: (app) => app.up,
+    waitReady: async (ready) => { log.push(['ready', ready]); return true; },
+    portInUse: async () => false,
+    runApiScenario: async (sc, base) => { log.push(['api', sc.id, base]); return { status: 'pass' }; },
+    ...over,
+  };
+}
+const kinds = (log) => log.map((e) => e[0] === 'git' ? `git ${e[1]}` : e[0]);
+const throwing = () => new Proxy({}, { get: (_, k) => () => { throw new Error(`seam ${String(k)} must not be called`); } });
+
+test('verifyFeature (real sandbox): a wrong endpoint fails with only its covers in the brief; the app is stopped and the worktree removed', { skip: SBX_SKIP }, async (t) => {
+  const w = await vworld(t);
+  const r = await VF.verifyFeature(w.args());
+  assert.equal(r.verdict, 'fail');
+  assert.equal(r.reused, false);
+  assert.deepEqual(r.doc.results, [{ id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: false }, { id: 'S-2', covers: ['AC-2', 'EC-1'], status: 'fail', flaky: false }]);
+  assert.deepEqual(r.brief, ['AC-2, EC-1: an endpoint returned an unexpected status or body']);
+  const text = JSON.stringify(r.brief);
+  for (const s of LEAK_STRINGS) assert.ok(!text.includes(s), `brief leaks ${s}`);
+  assert.deepEqual(V.readVerdict('o__r', 'FEATURE-001', w.bad), r.doc);
+  assert.equal(r.doc.scenarios_hash, SC.scenariosHash(vscenarios())); assert.equal(r.doc.criteria_hash, VCH);
+  assert.ok(!fs.existsSync(w.wtOf(w.bad)), 'worktree removed');
+  assert.equal(w.worktrees(), 1, 'only the clone itself is registered');
+  assert.equal(await PR.portInUse(w.port), false, 'nothing listens after verification');
+  assert.deepEqual(fs.readdirSync(path.join(w.fh, 'tmp')), [], 'run temp removed');
+  assert.deepEqual(kinds(w.log), ['git add', 'git remove', 'git prune']);
+
+  const ok = await VF.verifyFeature(w.args({ sha: w.good }));
+  assert.equal(ok.verdict, 'pass', JSON.stringify(ok.doc.results));
+  assert.deepEqual(ok.brief, []);
+  assert.ok(V.verdictMatches(V.readVerdict('o__r', 'FEATURE-001', w.good), { sha: w.good, scenariosHash: SC.scenariosHash(vscenarios()), criteriaHash: VCH }));
+  const again = await VF.verifyFeature(w.args({ sha: w.good }), throwing());
+  assert.equal(again.reused, true); assert.equal(again.verdict, 'pass'); assert.deepEqual(again.doc, ok.doc);
+  assert.equal(await PR.portInUse(w.port), false);
+});
+
+test('verifyFeature: commands come from the base config, env from the base env example, networks per phase, app on 127.0.0.1', async (t) => {
+  const w = await vworld(t);
+  const r = await VF.verifyFeature(w.args(), vseams(w.log));
+  assert.equal(r.verdict, 'pass');
+  const wt = w.wtOf(w.bad);
+  const profiles = w.log.filter((e) => e[0] === 'profile');
+  assert.deepEqual(profiles.map((e) => e[1]), ['registries', { localhostPort: w.port }]);
+  for (const p of profiles) { assert.deepEqual(p[2], [wt]); assert.ok(p[3].startsWith(path.join(fs.realpathSync(w.fh), 'tmp') + path.sep)); }
+  const runs = w.log.filter((e) => e[0] === 'run');
+  assert.deepEqual(runs[0][1], w.config.app.setup); assert.match(runs[0][2], /"registries"/);
+  const seeds = runs.slice(1);
+  assert.equal(seeds.length, 4, 'seed before each of 2 runs x 2 scenarios');
+  for (const s of seeds) { assert.deepEqual(s[1], w.config.app.seed); assert.match(s[2], /localhostPort/); }
+  const starts = w.log.filter((e) => e[0] === 'start');
+  assert.equal(starts.length, 4);
+  for (const s of starts) {
+    assert.deepEqual(s[1], ['node', 'server.mjs']); assert.match(s[2], /localhostPort/); assert.equal(s[4], wt);
+    assert.equal(s[3].HOST, '127.0.0.1'); assert.equal(s[3].PORT, String(w.port)); assert.equal(s[3].FOO, 'base', 'env example read from the base, not the feature branch');
+  }
+  for (const e of w.log.filter((x) => x[0] === 'ready')) assert.equal(e[1].url, `http://127.0.0.1:${w.port}/health`, 'localhost ready URL pinned to 127.0.0.1');
+  for (const e of w.log.filter((x) => x[0] === 'stop')) assert.equal(e[1], undefined, 'app.stop is never run unsandboxed');
+  assert.deepEqual(kinds(w.log).filter((k) => ['start', 'stop', 'api'].includes(k)), ['start', 'api', 'stop', 'start', 'api', 'stop', 'start', 'api', 'stop', 'start', 'api', 'stop']);
+  assert.ok(kinds(w.log).lastIndexOf('stop') < kinds(w.log).indexOf('git remove'), 'app stopped before the worktree is touched');
+});
+
+test('verifyFeature: a configured app.stop runs sandboxed on the app port, before the process-group stop', async (t) => {
+  const w = await vworld(t);
+  const config = { ...w.config, app: { ...w.config.app, stop: ['node', '-e', 'stop()'] } };
+  await VF.verifyFeature(w.args({ config }), vseams(w.log));
+  const i = w.log.findIndex((e) => e[0] === 'run' && e[1][2] === 'stop()');
+  assert.ok(i > 0); assert.match(w.log[i][2], /localhostPort/); assert.equal(w.log[i + 1][0], 'stop');
+});
+
+test('verifyFeature: both runs must pass; disagreement is fail + flaky; blocked never passes', async (t) => {
+  const w = await vworld(t);
+  const seq = { 'S-1': ['pass', 'fail'], 'S-2': ['blocked', 'blocked'] };
+  const r = await VF.verifyFeature(w.args(), vseams(w.log, { runApiScenario: async (sc) => ({ status: seq[sc.id].shift() }) }));
+  assert.equal(r.verdict, 'fail');
+  assert.deepEqual(r.doc.results, [{ id: 'S-1', covers: ['AC-1'], status: 'fail', flaky: true }, { id: 'S-2', covers: ['AC-2', 'EC-1'], status: 'blocked', flaky: false }]);
+  assert.deepEqual(r.brief, ['AC-1: an endpoint returned an unexpected status or body', 'AC-2, EC-1: an endpoint returned an unexpected status or body']);
+
+  const w2 = await vworld(t);
+  const r2 = await VF.verifyFeature(w2.args(), vseams(w2.log, { waitReady: async () => false }));
+  assert.equal(r2.verdict, 'fail'); assert.ok(r2.doc.results.every((x) => x.status === 'blocked'));
+  assert.ok(!w2.log.some((e) => e[0] === 'api'), 'no request when the app never became ready');
+
+  const w3 = await vworld(t);
+  const r3 = await VF.verifyFeature(w3.args(), vseams(w3.log, { runSandboxed: async (argv) => ({ code: argv === w3.config.app.setup ? 1 : 0, timedOut: false }) }));
+  assert.equal(r3.verdict, 'fail'); assert.ok(r3.doc.results.every((x) => x.status === 'blocked' && !x.flaky));
+  assert.ok(!w3.log.some((e) => e[0] === 'start'), 'app not started after a failed setup');
+
+  const w4 = await vworld(t); // the app dies during the request (an impostor may have answered): a pass is not trusted
+  let n = 0;
+  const r4 = await VF.verifyFeature(w4.args(), vseams(w4.log, { alive: (app) => app.up && !(app.checked = (app.checked ?? 0) + 1, n++, app.checked > 1) }));
+  assert.equal(r4.verdict, 'fail'); assert.ok(n > 0); assert.ok(r4.doc.results.every((x) => x.status === 'blocked'));
+
+  const w5 = await vworld(t);
+  const r5 = await VF.verifyFeature(w5.args(), vseams(w5.log, { runSandboxed: async (argv) => ({ code: argv === w5.config.app.seed ? 3 : 0, timedOut: false }) }));
+  assert.ok(r5.doc.results.every((x) => x.status === 'blocked')); assert.ok(!w5.log.some((e) => e[0] === 'start'));
+});
+
+test('verifyFeature: the app is always stopped and the worktree removed on thrown errors (stop before removal)', async (t) => {
+  for (const [name, over] of [
+    ['request', { runApiScenario: async () => { throw new Error('boom-request'); } }],
+    ['ready', { waitReady: async () => { throw new Error('boom-ready'); } }],
+    ['setup', { runSandboxed: async () => { throw new Error('boom-setup'); } }],
+    ['start', { startSandboxed: () => { throw new Error('boom-start'); } }],
+  ]) {
+    const w = await vworld(t);
+    await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, over)), new RegExp(`boom-${name}`));
+    const k = kinds(w.log);
+    if (k.includes('start')) assert.ok(k.indexOf('stop') > k.indexOf('start') && k.indexOf('stop') < k.indexOf('git remove'), `${name}: ${k}`);
+    assert.ok(k.includes('git remove'), name);
+    assert.ok(!fs.existsSync(w.wtOf(w.bad)), name); assert.equal(w.worktrees(), 1, name);
+    assert.deepEqual(fs.readdirSync(path.join(w.fh, 'tmp')), [], `${name}: run temp removed`);
+    assert.equal(V.readVerdict('o__r', 'FEATURE-001', w.bad), null, `${name}: no verdict on a crash`);
+  }
+});
+
+test('verifyFeature: an app that will not exit leaves the worktree in place (no git call while it may run); removal failure never masks the error', async (t) => {
+  const w = await vworld(t);
+  const e = await VF.verifyFeature(w.args(), vseams(w.log, { stopApp: async () => {}, alive: () => true })).catch((x) => x);
+  assert.match(e.message, /did not exit/);
+  assert.ok(!kinds(w.log).includes('git remove'), 'no worktree git command while the app may still run');
+  assert.match(e.cleanupError, /left in place/);
+
+  if (process.getuid?.() === 0) return;
+  const w2 = await vworld(t);
+  const parent = path.dirname(w2.wtOf(w2.bad));
+  const git = (...a) => (a[0] === 'worktree' && a[1] === 'remove' ? { code: 1, out: '', err: 'nope' } : w2.git(...a));
+  const e2 = await VF.verifyFeature(w2.args({ git }), vseams(w2.log, { runApiScenario: async () => { fs.chmodSync(parent, 0o500); throw new Error('boom-original'); } })).catch((x) => x);
+  fs.chmodSync(parent, 0o700);
+  assert.match(e2.message, /boom-original/);
+  assert.match(e2.cleanupError, /could not be removed/);
+});
+
+test('verifyFeature: refuses when something already listens on the port (127.0.0.1 or ::1), and when it is still listening after stop', async (t) => {
+  const w = await vworld(t);
+  const s4 = net.createServer(); await new Promise((r) => s4.listen(w.port, '127.0.0.1', r));
+  await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, { portInUse: PR.portInUse })), /port \d+ is already in use/);
+  await new Promise((r) => s4.close(r));
+  assert.deepEqual(w.log, [], 'nothing created or run'); assert.ok(!fs.existsSync(path.join(w.fh, 'work')));
+
+  const s6 = net.createServer();
+  const v6 = await new Promise((r) => { s6.once('error', () => r(false)); s6.listen(w.port, '::1', () => r(true)); });
+  if (v6) {
+    await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, { portInUse: PR.portInUse })), /port \d+ is already in use/);
+    await new Promise((r) => s6.close(r));
+    assert.deepEqual(w.log, []);
+  } else t.diagnostic('::1 unavailable: IPv6 impostor check skipped');
+
+  const w2 = await vworld(t);
+  let calls = 0;
+  const e = await VF.verifyFeature(w2.args(), vseams(w2.log, { portInUse: async () => ++calls > 2 })).catch((x) => x);
+  assert.match(e.message, /still listening/);
+  // an escaped listener is a sandboxed process that may still touch the worktree: no git command runs there, the dir stays
+  assert.match(e.cleanupError, /left in place/);
+  assert.ok(!kinds(w2.log).includes('git remove')); assert.ok(fs.existsSync(w2.wtOf(w2.bad)));
+});
+
+test('verifyFeature: refuses without the sandbox, before creating anything', async (t) => {
+  const w = await vworld(t);
+  await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, { sandboxAvailable: () => ({ ok: false, reason: 'sandbox-exec is macOS only' }) })), /sandbox unavailable \(sandbox-exec is macOS only\)/);
+  assert.deepEqual(w.log, []); assert.ok(!fs.existsSync(path.join(w.fh, 'work')));
+});
+
+test('verifyFeature: a matching pass verdict is reused without running; a stale or failing one is not', async (t) => {
+  const w = await vworld(t);
+  const doc = { feature: 'FEATURE-001', sha: w.bad, scenarios_hash: SC.scenariosHash(vscenarios()), criteria_hash: VCH, results: [{ id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: false }, { id: 'S-2', covers: ['AC-2', 'EC-1'], status: 'pass', flaky: false }], verdict: 'pass', at: new Date().toISOString() };
+  V.writeVerdict('o__r', doc);
+  const r = await VF.verifyFeature(w.args(), throwing());
+  assert.deepEqual(r, { verdict: 'pass', doc, brief: [], reused: true });
+  // scenario content changed -> hash differs -> runs again
+  const changed = vscenarios(); changed.scenarios[0].assert.push({ json_path: '$.items', not_contains: 'x' });
+  const r2 = await VF.verifyFeature(w.args({ scenarios: changed }), vseams(w.log));
+  assert.equal(r2.reused, false); assert.ok(w.log.some((e) => e[0] === 'api'));
+  // a fail verdict for the same hashes is never reused
+  V.writeVerdict('o__r', { ...doc, scenarios_hash: SC.scenariosHash(changed), verdict: 'fail', results: [{ id: 'S-1', covers: ['AC-1'], status: 'fail', flaky: false }] });
+  w.log.length = 0;
+  const r3 = await VF.verifyFeature(w.args({ scenarios: changed }), vseams(w.log));
+  assert.equal(r3.reused, false); assert.ok(w.log.some((e) => e[0] === 'api'));
+});
+
+test('verifyFeature: input validation (ids, sha, base ref, config, UI scenarios, stale criteria hash)', async (t) => {
+  const w = await vworld(t);
+  const app = w.config.app;
+  for (const [over, re] of [
+    [{ repoKey: 'o/r' }, /repo key/], [{ id: '../x' }, /feature id/], [{ sha: 'A'.repeat(40) }, /sha/], [{ baseRef: 'origin/main' }, /base ref/],
+    [{ baseRef: 'refs/remotes/origin/../x' }, /base ref/], [{ git: null }, /git/], [{ criteriaHash: 'x' }, /criteria hash/],
+    [{ scenarios: vscenarios({ criteria_hash: `sha256:${'9'.repeat(64)}` }) }, /criteria_hash is not current/],
+    [{ scenarios: vscenarios({ scenarios: [] }) }, /no api scenarios/],
+    [{ scenarios: vscenarios({ scenarios: [...vscenarios().scenarios, { id: 'S-3', covers: ['AC-3'], kind: 'ui', steps: ['a'], expect: ['b'] }] }) }, /UI scenarios/],
+    [{ scenarios: vscenarios({ scenarios: [{ ...vscenarios().scenarios[0], covers: ['nope'] }] }) }, /covers/],
+    [{ config: { ...w.config, app: { ...app, base_url: null } } }, /base_url/],
+    [{ config: { ...w.config, app: { ...app, base_url: 'http://example.com:80' } } }, /base_url/],
+    [{ config: { ...w.config, app: { ...app, start: null } } }, /app.start/],
+    [{ config: { ...w.config, app: { ...app, ready: null } } }, /app.ready/],
+    [{ config: { ...w.config, app: { ...app, ready: { url: `http://127.0.0.1:${w.port + 1}/health`, timeout_s: 5 } } } }, /same port/],
+    [{ sha: 'b'.repeat(40) }, /not a commit/],
+  ]) await assert.rejects(VF.verifyFeature(w.args(over), vseams(w.log)), re, JSON.stringify(over).slice(0, 80));
+  assert.ok(!w.log.some((e) => ['run', 'start'].includes(e[0])));
+});
+
+test('symptomBrief: criterion IDs and the fixed sentence only; never ids, paths, data, the canary, quotes or URLs (Review Focus 2)', () => {
+  const sc = vscenarios();
+  const failures = [
+    { id: 'S-2', covers: ['AC-2', 'EC-1'], status: 'fail', flaky: false },
+    { id: 'S-9', covers: ['AC-2', 'EC-1', 'AC-2'], status: 'blocked', flaky: false },
+    { id: NOTE_PATH, covers: ['AC-3', NOTE_PATH, `AC-4 ${CANARY}`, 'S-1', 'ac-5', 'AC-0', 'AC-12345', '"AC-6"', 'AC-7\n', ' ER-1', 'http://x/AC-8', { toString: () => 'AC-9' }, 'ER-2'], status: 'fail', flaky: false },
+    { id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: false },
+    { id: 'S-5', covers: ['EC-3'], status: 'pass', flaky: true },
+    { covers: [NOTE_DATA], status: 'fail' }, null, 'AC-1', { status: 'fail' },
+  ];
+  const brief = VF.symptomBrief(failures, sc, CANARY);
+  assert.deepEqual(brief, [
+    'AC-2, EC-1: an endpoint returned an unexpected status or body',
+    'AC-3, ER-2: an endpoint returned an unexpected status or body',
+    'EC-3: an endpoint returned an unexpected status or body',
+  ]);
+  const text = brief.join('\n');
+  for (const s of [...LEAK_STRINGS, 'S-5', 'S-9', 'http', '"', "'", '`', '/']) assert.ok(!text.includes(s), `brief leaks ${s}`);
+  for (const l of brief) assert.match(l, /^(?:(?:AC|EC|ER)-[1-9]\d{0,3})(?:, (?:AC|EC|ER)-[1-9]\d{0,3})*: an endpoint returned an unexpected status or body$/);
+  assert.deepEqual(VF.symptomBrief(failures, sc.scenarios, CANARY), brief, 'scenarios as a doc or an array');
+  for (const junk of [undefined, null, 'x', {}, [null]]) assert.deepEqual(VF.symptomBrief(junk, sc, CANARY), []);
+});
+
+test('symptomBrief: a scenario string that overlaps the fixed sentence falls back, then drops; caps hold', () => {
+  const sc = vscenarios(); sc.scenarios[0].request.body = { note: 'an unexpected status' };
+  assert.deepEqual(VF.symptomBrief([{ covers: ['AC-1'], status: 'fail' }], sc, CANARY), ['behaviour does not satisfy AC-1']);
+  sc.scenarios[0].request.body.other = 'does not satisfy';
+  assert.deepEqual(VF.symptomBrief([{ covers: ['AC-1'], status: 'fail' }], sc, CANARY), []);
+  const many = Array.from({ length: 300 }, (_, i) => ({ covers: [`AC-${i + 1}`], status: 'fail' }));
+  const b = VF.symptomBrief(many, vscenarios(), CANARY);
+  assert.equal(b.length, 50);
+  const wide = VF.symptomBrief([{ covers: Array.from({ length: 60 }, (_, i) => `EC-${i + 1}`), status: 'fail' }], vscenarios(), CANARY);
+  assert.equal(wide.length, 1); assert.equal(wide[0].split(', ').length, 20); assert.ok(wide[0].length <= 300);
+  // a canary that is not a string, or scenarios that are junk, do not crash and do not loosen the ID filter
+  assert.deepEqual(VF.symptomBrief([{ covers: ['AC-1', 'zz'], status: 'fail' }], 'junk', 42), ['AC-1: an endpoint returned an unexpected status or body']);
+});
+
+// Fake gh as a function (argv only), state in a JSON file; the PR's head comes from a real repo.
+function ghWorld(t, body = 'Adds notes.\n\nCloses FEATURE-001.') {
+  const root = fs.realpathSync(tmpDir('factory-ghv-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const origin = path.join(root, 'origin'); fs.mkdirSync(origin);
+  const g = (...a) => rawGit(origin, ...a).stdout.trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 't@x'); g('config', 'user.name', 't'); g('commit', '-q', '--allow-empty', '-m', 'base');
+  g('checkout', '-q', '-b', 'feat/notes'); g('commit', '-q', '--allow-empty', '-m', 'feat'); const sha = g('rev-parse', 'HEAD'); g('checkout', '-q', 'main');
+  const sp = path.join(root, 'state.json');
+  fs.writeFileSync(sp, JSON.stringify({ calls: [], origin, prs: [{ number: 7, head: 'feat/notes', base: 'main', state: 'OPEN', draft: false, mergeState: 'CLEAN', url: 'https://github.com/o/r/pull/7', body }] }));
+  const gh = (...a) => { const r = spawnSync(process.execPath, [FAKE_GH, ...a], { encoding: 'utf8', env: { ...process.env, FAKE_GH_STATE: sp } }); return { code: r.status, out: (r.stdout || '').trim(), err: r.stderr || '' }; };
+  const state = () => JSON.parse(fs.readFileSync(sp, 'utf8'));
+  return { gh, sha, state, sp };
+}
+
+test('postVerified: factory/verified success on the exact sha, PR body line with the count only, idempotent', (t) => {
+  const w = ghWorld(t);
+  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7 });
+  assert.equal(r.line, `Verified: 2/2 scenarios at ${w.sha.slice(0, 7)}`);
+  const st = w.state();
+  assert.deepEqual(st.statuses[w.sha], [{ state: 'success', context: 'factory/verified', description: VF.VERIFIED_DESCRIPTION }]);
+  const post = st.calls.find((c) => c.includes('POST'));
+  assert.deepEqual(post.slice(0, 4), ['api', '-X', 'POST', `repos/o/r/statuses/${w.sha}`]);
+  assert.equal(st.prs[0].body, `Adds notes.\n\nCloses FEATURE-001.\n\nVerified: 2/2 scenarios at ${w.sha.slice(0, 7)}`);
+  const edit = st.calls.find((c) => c[0] === 'pr' && c[1] === 'edit');
+  assert.equal(edit[2], '7'); assert.ok(edit.includes('--body-file'));
+  assert.ok(!fs.existsSync(edit[edit.indexOf('--body-file') + 1]), 'body file removed');
+  const all = JSON.stringify(st);
+  for (const s of LEAK_STRINGS) assert.ok(!all.includes(s), `gh traffic leaks ${s}`);
+  // again with a new count: the Verified line is replaced, never duplicated; the rest of the body is kept
+  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7 });
+  assert.equal(w.state().prs[0].body, `Adds notes.\n\nCloses FEATURE-001.\n\nVerified: 3/3 scenarios at ${w.sha.slice(0, 7)}`);
+  const edits = w.state().calls.filter((c) => c[0] === 'pr' && c[1] === 'edit').length;
+  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7 });
+  assert.equal(w.state().calls.filter((c) => c[0] === 'pr' && c[1] === 'edit').length, edits, 'unchanged body is not re-edited');
+});
+
+test('postVerified: validates inputs before any gh call; refuses a moved PR head; gh failures throw', (t) => {
+  const w = ghWorld(t, '');
+  for (const bad of [{ sha: 'A'.repeat(40) }, { sha: w.sha.slice(0, 39) }, { n: 0 }, { n: 1.5 }, { n: '2' }, { repo: 'o' }, { repo: 'o/r/x' }, { repo: '-o/r' }, { pr: 0 }, { pr: '7' }, { gh: null }]) {
+    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...bad }), /invalid/, JSON.stringify(bad));
+  }
+  assert.equal(w.state().calls.length, 0);
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: 'c'.repeat(40), n: 2, pr: 7 }), /PR head/);
+  assert.ok(!w.state().calls.some((c) => c[1] === 'edit'));
+  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 1, pr: 7 });
+  assert.equal(w.state().prs[0].body, r.line, 'empty body gets just the line');
+  const failing = (...a) => (a[0] === 'api' ? { code: 1, out: '', err: 'HTTP 403' } : w.gh(...a));
+  assert.throws(() => VF.postVerified({ gh: failing, repo: 'o/r', sha: w.sha, n: 1, pr: 7 }), /factory\/verified/);
+});
+
+test('withVerifiedLine replaces every existing Verified line in place and keeps the rest', () => {
+  const L = 'Verified: 4/4 scenarios at abcdef1';
+  assert.equal(VF.withVerifiedLine('A\nVerified: 1/1 scenarios at 1234567\nB\nVerified: 2/2 scenarios at 7654321', L), `A\n${L}\nB`);
+  assert.equal(VF.withVerifiedLine('A\r\nB', L), `A\r\nB\n\n${L}`);
+  assert.equal(VF.withVerifiedLine('', L), L);
+  assert.equal(VF.withVerifiedLine('Not Verified: 1/1 scenarios at 1234567', L), `Not Verified: 1/1 scenarios at 1234567\n\n${L}`);
+});
+
+test('verifyFeature: a leftover worktree dir is cleared first; a symlinked work dir is refused; an unknown status never passes', async (t) => {
+  const w = await vworld(t);
+  fs.mkdirSync(w.wtOf(w.bad), { recursive: true }); fs.writeFileSync(path.join(w.wtOf(w.bad), 'planted.txt'), 'x');
+  const r = await VF.verifyFeature(w.args(), vseams(w.log, { runApiScenario: async () => ({ status: 'PASS' }) }));
+  assert.equal(r.verdict, 'fail'); assert.ok(r.doc.results.every((x) => x.status === 'blocked'));
+  assert.ok(!fs.existsSync(w.wtOf(w.bad))); assert.equal(w.worktrees(), 1);
+
+  const w2 = await vworld(t);
+  const elsewhere = path.join(w2.root, 'elsewhere'); fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(w2.fh, 'work'));
+  await assert.rejects(VF.verifyFeature(w2.args(), vseams(w2.log)), /symlink/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
+test('symptomBrief: object keys inside request bodies are data too; schema keys are not', () => {
+  const sc = vscenarios(); sc.scenarios[1].setup[0].body = { 'an unexpected status': 1 };
+  assert.deepEqual(VF.symptomBrief([{ covers: ['AC-2'], status: 'fail' }], sc, CANARY), ['behaviour does not satisfy AC-2']);
+  const hdr = vscenarios(); hdr.scenarios[0].request.headers = { 'status or body': 'v' }; // a header NAME that is a substring of the fixed sentence
+  assert.deepEqual(VF.symptomBrief([{ covers: ['AC-2'], status: 'fail' }], hdr, CANARY), ['behaviour does not satisfy AC-2']);
+});
+
+test('postVerified: a status that does not show up after posting throws before the body edit', (t) => {
+  const w = ghWorld(t);
+  const gh = (...a) => (a[0] === 'api' && a[1].endsWith('/status') ? { code: 0, out: JSON.stringify({ statuses: [{ context: 'factory/verified', state: 'pending' }] }), err: '' } : w.gh(...a));
+  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7 }), /not visible/);
+  assert.ok(!w.state().calls.some((c) => c[1] === 'edit'));
+});
+
+test('verifyFeature: an impostor that appears between the pre-check and an app start is refused', async (t) => {
+  const w = await vworld(t);
+  let n = 0; // call 1: the up-front check; call 2: the check right before the first start
+  await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, { portInUse: async () => ++n === 2 })), /in use before the app start/);
+  assert.ok(!w.log.some((e) => e[0] === 'start')); assert.ok(!fs.existsSync(w.wtOf(w.bad)));
+});
+
+test('postVerified: a failing pr edit throws', (t) => {
+  const w = ghWorld(t);
+  const gh = (...a) => (a[0] === 'pr' && a[1] === 'edit' ? { code: 1, out: '', err: 'HTTP 422' } : w.gh(...a));
+  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7 }), /pr edit #7 failed/);
+});
