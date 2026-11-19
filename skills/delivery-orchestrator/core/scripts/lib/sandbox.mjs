@@ -1,6 +1,10 @@
 // Untrusted-code sandbox (macOS sandbox-exec). Builder-controlled code (tests, local checks, the app, build scripts) runs under a
-// profile that denies writes outside the worktree and a per-run temp dir, denies reads of FACTORY_HOME and the user's credentials,
-// and limits the network. If the sandbox cannot be applied, callers must refuse to verify: there is no unsandboxed fallback.
+// profile that denies writes outside the worktree and a per-run temp dir, denies reads of every home dir, /Users, the user's temp dirs
+// and FACTORY_HOME (allowing back only the worktree, the run temp, node and toolchains, then re-denying credential stores), cannot signal
+// or inspect processes outside itself, and has a limited network. If the sandbox cannot be applied, callers must refuse to verify:
+// there is no unsandboxed fallback.
+// Downstream (Task 11): the DRIVER reads worktree files such as `.delivery/pr-<ID>.md` OUTSIDE the sandbox; those reads must refuse
+// symlinks (lstat / O_NOFOLLOW), or builder code can point them at the driver's own secrets.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -76,9 +80,49 @@ export const sbplString = (s) => {
 const subpath = (p) => `(subpath ${sbplString(p)})`;
 const literal = (p) => `(literal ${sbplString(p)})`;
 
-// Secrets and scenarios the sandboxed code must never read. FACTORY_HOME is always included; `readDeny` adds to this list.
-export function defaultReadDeny(home = os.homedir(), fh = factoryHome()) {
-  return [fh, ...['.ssh', '.aws', '.config/gh', '.netrc', 'Library/Keychains', '.claude', '.claude.json', '.gnupg'].map((r) => path.join(home, r))];
+// ---- read policy -----------------------------------------------------------------------------------------------------------------
+// Reads are INVERTED for the places a user keeps secrets: every home dir, /Users, the user's temp dirs and FACTORY_HOME are denied
+// wholesale; the worktree, the run temp dir, node's own install and the toolchain dirs are allowed back; then credential stores are
+// denied again LAST so no allow can re-expose them.
+
+// Relative to each home. Denied after every allow.
+export const CREDENTIAL_PATHS = Object.freeze([
+  '.ssh', '.aws', '.config/gh', '.netrc', '.git-credentials', '.npmrc', '.yarnrc', '.yarnrc.yml', '.docker', '.kube', '.config/gcloud',
+  '.config/git', '.gitconfig', '.azure', '.pypirc', '.cargo/credentials', '.cargo/credentials.toml', '.gem/credentials', '.gnupg',
+  'Library/Keychains', 'Library/Application Support', 'Library/Cookies', 'Library/Mail', 'Library/Messages', '.claude', '.claude.json',
+  '.codex', '.mcp-auth', '.fly', '.zsh_history', '.bash_history', '.zsh_sessions', '.zshenv', '.viminfo',
+]);
+// Relative to each home: toolchains that node/npm/python/rust builds may need to READ. Missing ones are skipped. Override with `readAllow`.
+export const TOOLCHAIN_PATHS = Object.freeze([
+  '.nvm', '.volta', '.fnm', '.asdf', '.pyenv', '.rustup', '.bun', '.cargo/bin', '.cargo/registry', '.local/bin', '.local/share/pnpm',
+]);
+
+// Basenames denied anywhere under an allowed toolchain dir (SBPL regex).
+const TOOLCHAIN_CRED_NAMES = '(\\.npmrc|\\.yarnrc|\\.yarnrc\\.yml|\\.netrc|\\.git-credentials|\\.pypirc|\\.env|credentials|credentials\\.(toml|json)|auth\\.json|[^/]*\\.pem|id_[a-z0-9]+)';
+
+// os.userInfo().homedir AND $HOME when they differ (a planted HOME must not move the deny away from the real home).
+export function homeDirs(env = process.env) {
+  const homes = [os.userInfo().homedir];
+  if (env.HOME && path.isAbsolute(env.HOME)) homes.push(env.HOME);
+  return [...new Set(homes.map(canonical))];
+}
+
+let userDirsCache = null;
+// /private/tmp/claude-<uid> and the per-user /var/folders/<xx>/<id> dir (holds T = DARWIN_USER_TEMP_DIR, C = caches, 0 = user dir).
+export function userTempDirs() {
+  if (userDirsCache) return userDirsCache;
+  const dirs = [canonical(`/private/tmp/claude-${process.getuid()}`)];
+  const g = spawnSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8', env: PROBE_ENV, timeout: 5000 });
+  const t = (g.status === 0 && g.stdout.trim()) || (os.tmpdir().includes('/var/folders/') ? os.tmpdir() : '');
+  if (t) dirs.push(path.dirname(canonical(t))); // /private/var/folders/<xx>/<id>
+  userDirsCache = dirs;
+  return dirs;
+}
+
+// Secrets and scenarios the sandboxed code must never read: FACTORY_HOME plus each home's credential stores.
+export function defaultReadDeny(home = os.userInfo().homedir, fh = factoryHome()) {
+  const homes = Array.isArray(home) ? home : [home];
+  return [fh, ...homes.flatMap((h) => CREDENTIAL_PATHS.map((r) => path.join(h, r)))];
 }
 
 // libinfo/membership: getpwuid (os.userInfo, ~ expansion); notification_center + loggers: libSystem; trustd: TLS certificate checks for
@@ -89,13 +133,20 @@ export const MACH_ALLOW = Object.freeze([
 ]);
 
 const within = (child, parent) => child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
+const regexEscape = (s) => {
+  if (s.includes('"')) throw new Error(`path cannot be used in an SBPL regex: ${s}`);
+  return s.replace(/[.*+?^${}()|[\]\\/]/g, (c) => (c === '/' ? '/' : `\\${c}`));
+};
+const sameFile = (a, b) => { try { const x = fs.statSync(a), y = fs.statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
 
 function networkRules(network) {
   if (network === 'none') return ['(deny network*)'];
   if (network === 'registries') {
-    // Outbound TCP 443/80 to any host, plus the mDNSResponder socket so name resolution works (found empirically: without it every lookup is ENOTFOUND;
-    // UDP 53 is not needed on macOS). Nothing listens; no other ports, no other local sockets (ssh-agent, docker.sock stay denied).
-    return ['(deny network*)', '(allow network-outbound (remote tcp "*:443") (remote tcp "*:80") (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'];
+    // Outbound TCP 443/80 to any PUBLIC host, plus the mDNSResponder socket so name resolution works (found empirically: without it every
+    // lookup is ENOTFOUND; UDP 53 is not needed on macOS). Loopback is denied last. SBPL hosts can only be `*` or `localhost`, so LAN,
+    // link-local and cloud-metadata addresses (192.168/16, 10/8, 169.254.169.254) on 80/443 CANNOT be expressed and stay reachable (known gap).
+    return ['(deny network*)', '(allow network-outbound (remote tcp "*:443") (remote tcp "*:80") (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
+      '(deny network-outbound (remote ip "localhost:*"))'];
   }
   if (network && typeof network === 'object' && Object.keys(network).length === 1 && 'localhostPort' in network) {
     const port = network.localhostPort;
@@ -106,42 +157,100 @@ function networkRules(network) {
   throw new Error(`network must be 'registries', 'none' or { localhostPort }: ${JSON.stringify(network)}`);
 }
 
-// SBPL for untrusted code. Later rules win in SBPL, so the order is: allow everything, deny all writes, deny reads of secrets,
-// re-allow read+write of the writable dirs, deny writes to any .git inside them, re-allow a few device files, then network.
-export function sandboxProfile({ writable = [], network, readDeny = [], tmpDir, home = os.homedir(), factoryHome: fh = factoryHome() } = {}) {
+// node's install prefix (<prefix>/bin/node -> <prefix>), for process.execPath and for `node` on PATH. Falls back to the bin dir, and to
+// nothing, if the prefix would contain a denied root (e.g. ~/bin/node would otherwise allow all of ~).
+function nodeReadAllow(denyRoots) {
+  const out = [];
+  const bins = [process.execPath];
+  for (const d of String(process.env.PATH || '').split(':')) if (d && path.isAbsolute(d)) { const f = path.join(d, 'node'); if (fs.existsSync(f)) { bins.push(f); break; } }
+  for (const b of bins) {
+    let real; try { real = fs.realpathSync.native(b); } catch { continue; }
+    for (const cand of [path.dirname(path.dirname(real)), path.dirname(real)]) {
+      if (cand === '/' || denyRoots.some((r) => within(r, cand))) continue;
+      out.push(cand); break;
+    }
+  }
+  return out;
+}
+
+const READ_ROOTS_EXTRA = ['/Users'];
+
+// SBPL for untrusted code. Later rules win, so the order is:
+//   allow default; deny all writes; deny reads of homes, /Users, user temp dirs, FACTORY_HOME; stat-only on ancestors of allowed paths;
+//   allow reads of node/toolchains; allow read+write of writable dirs; deny writes to .git in them; deny credential reads (LAST of the
+//   file rules); /dev writes; deny signals and process-info outside this sandbox; mach allowlist; network.
+// Writable dirs must be under realpath(FACTORY_HOME)/work or /tmp unless `unsafeAllowOutsideFactoryHome` (TESTS ONLY).
+export function sandboxProfile({
+  writable = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false,
+} = {}) {
   if (!Array.isArray(writable) || !Array.isArray(readDeny)) throw new Error('writable and readDeny must be arrays');
-  const wr = [...writable, ...(tmpDir ? [tmpDir] : [])].map((p) => {
-    checkPath(p);
-    let real;
-    try { real = fs.realpathSync.native(p); } catch { throw new Error(`writable path does not exist: ${p}`); }
-    if (!fs.statSync(real).isDirectory()) throw new Error(`writable path is not a directory: ${p}`);
-    if (real === '/') throw new Error('writable path must not be /');
-    return real;
-  });
-  const denied = [...new Set([...defaultReadDeny(home, fh), ...readDeny].map(canonical))];
-  for (const w of wr) for (const d of denied) if (within(d, w)) throw new Error(`writable path ${w} contains protected path ${d}`);
+  const homes = home === undefined ? homeDirs() : (Array.isArray(home) ? home : [home]).map(canonical);
+  const fh = canonical(fhIn);
+  const tmp = tmpDir ? realDir(tmpDir) : null;
+  const wr = [...new Set([...writable.map(realDir), ...(tmp ? [tmp] : [])])];
+  // FACTORY_HOME is a deny ROOT (first deny), not a credential: re-denying it last would hide the worktree under FACTORY_HOME/work.
+  const credentials = [...new Set([...defaultReadDeny(homes, fh).slice(1), ...readDeny].map(canonical))];
+  const denyRoots = [...new Set([...homes, ...READ_ROOTS_EXTRA.map(canonical), ...userTempDirs(), fh])];
+  for (const w of wr) {
+    if (w === '/') throw new Error('writable path must not be /');
+    for (const d of [...credentials, ...homes, fh]) if (within(d, w)) throw new Error(`writable path ${w} contains protected path ${d}`);
+    if (!unsafeAllowOutsideFactoryHome) {
+      const okRoots = [path.join(fh, 'work'), path.join(fh, 'tmp')];
+      if (!okRoots.some((r) => within(w, r) && w !== r)) throw new Error(`writable path ${w} must be inside ${okRoots.join(' or ')}`);
+      if (!okRoots.some((r) => [w, ...ancestorsOf(w)].some((a) => a !== w && sameFile(a, r)))) throw new Error(`writable path ${w} is not under FACTORY_HOME by inode`);
+    }
+  }
+  const toolchains = (readAllow ?? homes.flatMap((h) => TOOLCHAIN_PATHS.map((r) => path.join(h, r))))
+    .map((p) => { checkPath(p); return p; }).filter((p) => fs.existsSync(p)).map(canonical);
+  for (const a of toolchains) for (const r of denyRoots) if (within(r, a)) throw new Error(`readAllow path ${a} contains denied root ${r}`);
+  const readAllowAll = [...new Set([...nodeReadAllow(denyRoots), ...toolchains])];
   const ancestors = new Set();
-  for (const w of wr) for (let a = path.dirname(w); a !== path.dirname(a); a = path.dirname(a)) ancestors.add(a);
+  for (const p of [...wr, ...readAllowAll]) for (const a of ancestorsOf(p)) ancestors.add(a);
+  const historyRegex = homes.map((h) => `(regex #"^${regexEscape(h)}/\\.[^/]*_history$")`);
+  // Credential-named files INSIDE an allowed toolchain dir (found by probe: ~/.nvm/.npmrc, a pnpm auth.json) stay denied too.
+  const toolchainCreds = toolchains.map((d) => `(regex #"^${regexEscape(d)}/(.*/)?${TOOLCHAIN_CRED_NAMES}$")`);
   const lines = [
     '(version 1)',
+    `; factory-tmpdir: ${tmp ?? ''}`,
     '(allow default)',
     '(deny file-write*)',
-    `(deny file-read* ${denied.map(subpath).join(' ')})`,
+    `(deny file-read* ${denyRoots.map(subpath).join(' ')})`,
   ];
   // Node's realpath lstats every ancestor of the cwd/script; stat only (no listing, no content) of the ancestors keeps that working.
   if (ancestors.size) lines.push(`(allow file-read-metadata ${[...ancestors].sort().map(literal).join(' ')})`);
+  if (readAllowAll.length) lines.push(`(allow file-read* ${readAllowAll.map(subpath).join(' ')})`);
   if (wr.length) {
     lines.push(`(allow file-read* file-write* ${wr.map(subpath).join(' ')})`);
     // A full clone's .git (config, hooks, attributes) stays read-only: driver git must not pick up planted config or hooks.
     lines.push(`(deny file-write* ${wr.map((w) => subpath(path.join(w, '.git'))).join(' ')})`);
   }
+  lines.push(`(deny file-read* ${[...credentials.map(subpath), ...historyRegex, ...toolchainCreds].join(' ')})`);
   lines.push('(allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (literal "/dev/stdout") (literal "/dev/stderr") (regex #"^/dev/fd/[0-9]+$"))');
+  // Same-user processes outside the sandbox (the driver, the evaluator) cannot be signalled (kill -9, SIGSTOP, SIGUSR1 = node inspector)
+  // or inspected (ps eww env, KERN_PROCARGS2, lsof -p). Its own children are in the same sandbox and stay reachable.
+  lines.push('(deny signal)', '(allow signal (target same-sandbox))');
+  lines.push('(deny process-info*)', '(allow process-info* (target self) (target same-sandbox))');
   // Mach services run OUTSIDE the sandbox and act for the caller: found empirically that LaunchServices (`open -n X.app`) starts an
   // unsandboxed app, cfprefsd (`defaults write`) writes ~/Library/Preferences, securityd (`security dump-keychain`) reads the keychain,
   // and the pasteboard leaks. So mach-lookup is deny-by-default with a short allowlist that node, npm, git, curl and python need.
   lines.push('(deny mach-lookup)', `(allow mach-lookup ${MACH_ALLOW.map((n) => `(global-name ${sbplString(n)})`).join(' ')})`);
   lines.push(...networkRules(network));
   return `${lines.join('\n')}\n`;
+}
+
+function realDir(p) {
+  checkPath(p);
+  let real;
+  try { real = fs.realpathSync.native(p); } catch { throw new Error(`writable path does not exist: ${p}`); }
+  if (!fs.statSync(real).isDirectory()) throw new Error(`writable path is not a directory: ${p}`);
+  return real;
+}
+function ancestorsOf(p) { const out = []; for (let a = path.dirname(p); a !== path.dirname(a); a = path.dirname(a)) out.push(a); out.push('/'); return out.filter((a) => a !== '/'); }
+
+// The run temp dir a profile was built with (recorded in its `; factory-tmpdir:` comment), so TMPDIR is derived once.
+export function profileTmpDir(profile) {
+  const m = /^; factory-tmpdir: (.*)$/m.exec(String(profile));
+  return m && m[1] ? m[1] : null;
 }
 
 // ---- per-run temp dir ----------------------------------------------------------------------------------------------------------
@@ -172,12 +281,25 @@ function sandboxArgv(argv, profile, sandbox) {
   if (!Array.isArray(argv) || !argv.length || argv.some((a) => typeof a !== 'string')) throw new Error('argv must be a non-empty string array');
   return [SANDBOX_EXEC, '-p', profile, ...argv];
 }
-const withTmp = (env, tmpDir) => (tmpDir ? { ...(env ?? allowEnv(null)), TMPDIR: tmpDir } : env);
+// TMPDIR (and HOME) come from the profile (one source of truth); a different explicit tmpDir is refused.
+function withTmp(env, tmpDir, profile) {
+  const fromProfile = profileTmpDir(profile);
+  if (tmpDir && fromProfile && fs.realpathSync.native(tmpDir) !== fromProfile) throw new Error('tmpDir does not match the profile\'s run temp dir');
+  const t = fromProfile ?? (tmpDir ? fs.realpathSync.native(tmpDir) : null);
+  if (!t) return env;
+  // HOME is a fresh dir inside the run temp: the real home is unreadable, and tools that treat an unreadable ~/.gitconfig as fatal
+  // (git: "unable to access ... Operation not permitted") or write ~/.npm/_logs then just see an empty, writable home.
+  const home = path.join(t, 'home');
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  return { ...(env ?? allowEnv(null)), TMPDIR: t, HOME: home };
+}
 
 export async function runSandboxed(argv, { cwd, env, timeoutS, profile, tmpDir, sandbox } = {}) {
-  return runCmd(sandboxArgv(argv, profile, sandbox), { cwd, env: withTmp(env, tmpDir), timeoutS });
+  const full = sandboxArgv(argv, profile, sandbox);
+  return runCmd(full, { cwd, env: withTmp(env, tmpDir, profile), timeoutS });
 }
 
 export function startSandboxed(argv, { cwd, env, profile, tmpDir, sandbox } = {}) {
-  return startApp(sandboxArgv(argv, profile, sandbox), { cwd, env: withTmp(env, tmpDir) });
+  const full = sandboxArgv(argv, profile, sandbox);
+  return startApp(full, { cwd, env: withTmp(env, tmpDir, profile) });
 }

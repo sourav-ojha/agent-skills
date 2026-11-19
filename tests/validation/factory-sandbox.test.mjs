@@ -8,7 +8,7 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { REPO } from './helpers.mjs';
 
 const LIB = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'lib');
@@ -45,9 +45,9 @@ function world(t, { workUnderHome = true } = {}) {
   fs.writeFileSync(path.join(outside, 'normal.txt'), 'NORMAL\n');
   const tmpDir = S.makeRunTemp(fh);
   t.after(() => S.removeRunTemp(tmpDir));
-  return { root, fh, work, outside, tmpDir };
+  return { root, fh, work, outside, tmpDir, unsafe: !workUnderHome };
 }
-const profileOf = (w, network = 'none', extra = {}) => S.sandboxProfile({ writable: [w.work], tmpDir: w.tmpDir, network, factoryHome: w.fh, ...extra });
+const profileOf = (w, network = 'none', extra = {}) => S.sandboxProfile({ writable: [w.work], tmpDir: w.tmpDir, network, factoryHome: w.fh, unsafeAllowOutsideFactoryHome: w.unsafe, ...extra });
 
 // Runs `node -e <code> ...args` sandboxed; the code writes its findings as JSON to $PROBE_OUT inside the run temp dir
 // (runCmd's tail is redacted, so stdout cannot carry paths or long tokens).
@@ -87,7 +87,7 @@ test('gitSafe: a planted post-checkout hook does not run (plain git runs it)', (
   assert.equal(fs.existsSync(marker), true, 'control: plain git should run the planted hook');
 });
 
-test('gitSafe: repo-configured fsmonitor, external diff and ext:: transport never run', (t) => {
+test('gitSafe second layer (allowlist bypassed with verified:true): repo-configured fsmonitor, external diff, textconv and ext:: never run', (t) => {
   const repo = repoWithCommit(t); const mk = (n) => path.join(repo, `${n}-RAN`);
   const script = (n) => { const f = path.join(repo, `${n}.sh`); fs.writeFileSync(f, `#!/bin/sh\ntouch "${mk(n)}"\n`, { mode: 0o755 }); return f; };
   git(repo, 'config', 'core.fsmonitor', script('fsmon'));
@@ -96,10 +96,15 @@ test('gitSafe: repo-configured fsmonitor, external diff and ext:: transport neve
   git(repo, 'config', 'diff.conv.textconv', script('textconv'));
   fs.writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.txt diff=conv\n');
   fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
-  assert.equal(G.gitSafe(repo, 'status', '--porcelain').code, 0);
-  const d = G.gitSafe(repo, 'diff');
+  assert.throws(() => G.gitSafe(repo, 'status'), /^Error: git config not allowed: core\.fsmonitor$/);
+  const v = { verified: true };
+  assert.equal(G.gitSafeOpts(repo, ['status', '--porcelain'], v).code, 0);
+  const d = G.gitSafeOpts(repo, ['diff'], v);
   assert.equal(d.code, 0); assert.match(d.out, /^-one\n\+two\n/m);
-  G.gitSafe(repo, 'ls-remote', `ext::${script('ext')}`);
+  G.gitSafeOpts(repo, ['-C', repo, 'diff'], v); // the guard finds the subcommand after global options
+  G.gitSafeOpts(repo, ['--no-pager', 'blame', 'a.txt'], v);
+  G.gitSafeOpts(repo, ['log', '-p', '-1'], v);
+  G.gitSafeOpts(repo, ['ls-remote', `ext::${script('ext')}`], v);
   for (const n of ['fsmon', 'extdiff', 'ext', 'textconv']) assert.equal(fs.existsSync(mk(n)), false, `${n} ran under gitSafe`);
   git(repo, 'diff'); // control: plain git honours the planted diff.external
   assert.equal(fs.existsSync(mk('extdiff')), true, 'control: plain git should run diff.external');
@@ -109,8 +114,10 @@ test('gitSafe: repo-configured core.sshCommand is replaced by plain ssh', (t) =>
   const repo = repoWithCommit(t); const marker = path.join(repo, 'SSH-RAN');
   const f = path.join(repo, 'ssh.sh'); fs.writeFileSync(f, `#!/bin/sh\ntouch "${marker}"\nexit 1\n`, { mode: 0o755 });
   git(repo, 'config', 'core.sshCommand', f);
+  assert.throws(() => G.gitSafe(repo, 'status'), /git config not allowed: core\.sshcommand/);
   // Port 1 on loopback: ssh fails immediately with connection refused; nothing leaves the machine.
-  G.gitSafe(repo, 'ls-remote', 'ssh://git@127.0.0.1:1/x.git');
+  const r = G.gitSafeOpts(repo, ['ls-remote', 'ssh://git@127.0.0.1:1/x.git'], { verified: true });
+  assert.notEqual(r.code, 0);
   assert.equal(fs.existsSync(marker), false, 'gitSafe ran the repo-configured ssh command');
 });
 
@@ -140,8 +147,9 @@ test('gitSafe: GIT_* environment is scrubbed (GIT_DIR, GIT_EXTERNAL_DIFF, GIT_CO
   assert.match(d.out, /\+changed/, `${d.code} ${d.err}: GIT_DIR must not redirect gitSafe to another repo`);
   assert.equal(fs.existsSync(marker), false, 'GIT_EXTERNAL_DIFF ran');
   assert.equal(G.gitSafe(repo, 'config', 'user.name').out.trim(), '', 'env or global config leaked into gitSafe');
-  const e = G.gitEnv({ PATH: '/bin', HOME: '/h', GIT_SSH_COMMAND: 'x', GIT_ASKPASS: 'x', GIT_PAGER: 'x', git_dir: 'x', GIT_CONFIG_PARAMETERS: 'x' });
-  assert.deepEqual(e, { PATH: '/bin', HOME: '/h', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' });
+  const e = G.gitEnv({ PATH: '/bin', HOME: '/h', GIT_SSH_COMMAND: 'x', GIT_ASKPASS: 'x', GIT_PAGER: 'x', git_dir: 'x', GIT_CONFIG_PARAMETERS: 'x', SSH_ASKPASS: 'x' });
+  assert.deepEqual(e, { PATH: '/bin', HOME: '/h', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', SSH_ASKPASS_REQUIRE: 'never' });
+  assert.ok(G.GIT_SAFE_FLAGS.includes('core.sshCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'));
 });
 
 // ---- availability and refusal (pure) ------------------------------------------------------------------------------------------
@@ -170,7 +178,7 @@ test('sandboxProfile: realpaths, deny-before-allow order, default secrets, .git 
   const root = tmp(t); // already realpath'd (/private/var/...)
   const raw = fs.mkdtempSync(path.join(os.tmpdir(), 'factory-raw-')); gone(t, raw);
   const fh = path.join(root, 'fh'); fs.mkdirSync(path.join(fh, 'tmp'), { recursive: true });
-  const prof = S.sandboxProfile({ writable: [raw], tmpDir: path.join(fh, 'tmp'), network: 'none', factoryHome: fh, home: '/Users/someone' });
+  const prof = S.sandboxProfile({ writable: [raw], tmpDir: path.join(fh, 'tmp'), network: 'none', factoryHome: fh, home: '/Users/someone', readAllow: [], unsafeAllowOutsideFactoryHome: true });
   const realRaw = fs.realpathSync(raw);
   if (realRaw !== raw) assert.ok(!prof.includes(`"${raw}"`), 'non-realpath writable leaked into the profile');
   assert.ok(prof.includes(`(subpath "${realRaw}")`));
@@ -180,9 +188,20 @@ test('sandboxProfile: realpaths, deny-before-allow order, default secrets, .git 
   assert.ok(idx('(deny file-read*') < idx('(allow file-read* file-write*'));
   assert.ok(idx('(allow file-read* file-write*') < idx(`(deny file-write* (subpath "${realRaw}/.git")`));
   assert.ok(idx('(deny mach-lookup)') < idx('(allow mach-lookup'));
-  const denyRead = prof.split('\n').find((l) => l.startsWith('(deny file-read*'));
-  for (const s of ['.ssh', '.aws', '.config/gh', '.netrc', 'Library/Keychains', '.claude', '.claude.json', '.gnupg']) assert.ok(denyRead.includes(`(subpath "/Users/someone/${s}")`), s);
-  assert.ok(denyRead.includes(`(subpath "${fh}")`), 'FACTORY_HOME must be read-denied');
+  const lines = prof.split('\n');
+  const denyReads = lines.map((l, i) => [l, i]).filter(([l]) => l.startsWith('(deny file-read*'));
+  assert.equal(denyReads.length, 2, 'one deny of whole roots first, one credential deny last');
+  const [roots, creds] = denyReads;
+  for (const r of ['/Users/someone', '/Users', fh, `/private/tmp/claude-${process.getuid()}`]) assert.ok(roots[0].includes(`(subpath "${r}")`), r);
+  const lastAllow = Math.max(...lines.map((l, i) => (l.startsWith('(allow file-read') ? i : -1)));
+  assert.ok(roots[1] < lines.findIndex((l) => l.startsWith('(allow file-read*')) && creds[1] > lastAllow, 'roots denied before every read allow; credentials after');
+  for (const s of ['.ssh', '.aws', '.config/gh', '.netrc', '.git-credentials', '.npmrc', '.docker', '.kube', '.config/gcloud', '.codex', 'Library/Keychains',
+    'Library/Application Support', 'Library/Cookies', '.claude', '.claude.json', '.gnupg', '.zsh_history', '.mcp-auth']) assert.ok(creds[0].includes(`(subpath "/Users/someone/${s}")`), s);
+  assert.ok(creds[0].includes('(regex #"^/Users/someone/\\.[^/]*_history$")'), creds[0]);
+  assert.ok(!creds[0].includes(`(subpath "${fh}")`), 'FACTORY_HOME must not be re-denied last (it would hide the worktree)');
+  assert.ok(idx('(deny signal)') < idx('(allow signal (target same-sandbox))'));
+  assert.ok(idx('(deny process-info*)') < idx('(allow process-info* (target self) (target same-sandbox))'));
+  assert.equal(S.profileTmpDir(prof), path.join(fh, 'tmp'));
   assert.ok(prof.includes(`(literal "${path.dirname(realRaw)}")`), 'ancestors get stat-only access');
   for (const n of ['com.apple.coreservices.launchservicesd', 'com.apple.cfprefsd', 'com.apple.SecurityServer', 'pasteboard']) assert.ok(!prof.includes(n), n);
 });
@@ -190,29 +209,32 @@ test('sandboxProfile: realpaths, deny-before-allow order, default secrets, .git 
 test('sandboxProfile: escaping, control characters, relative/missing/protected paths and bad network specs', (t) => {
   const root = tmp(t);
   const weird = path.join(root, 'we"ird\\dir'); fs.mkdirSync(weird);
-  const prof = S.sandboxProfile({ writable: [weird], network: 'none', factoryHome: path.join(root, 'fh') });
+  const U = { unsafeAllowOutsideFactoryHome: true };
+  const prof = S.sandboxProfile({ writable: [weird], network: 'none', factoryHome: path.join(root, 'fh'), ...U });
   assert.ok(prof.includes(`(subpath "${root}/we\\"ird\\\\dir")`), prof);
   assert.throws(() => S.sandboxProfile({ writable: [path.join(root, 'a\nb')], network: 'none' }), /control character/);
   assert.throws(() => S.sandboxProfile({ writable: [root], readDeny: [`${root}/x\u0000`], network: 'none' }), /control character/);
   assert.throws(() => S.sandboxProfile({ writable: ['rel/dir'], network: 'none' }), /absolute/);
   assert.throws(() => S.sandboxProfile({ writable: [path.join(root, 'missing')], network: 'none' }), /does not exist/);
-  assert.throws(() => S.sandboxProfile({ writable: [root], network: 'none', factoryHome: path.join(root, 'fh') }), /contains protected path/);
-  assert.throws(() => S.sandboxProfile({ writable: [os.homedir()], network: 'none' }), /contains protected path/);
-  assert.throws(() => S.sandboxProfile({ writable: ['/'], network: 'none' }), /must not be \/|protected/);
+  assert.throws(() => S.sandboxProfile({ writable: [root], network: 'none', factoryHome: path.join(root, 'fh'), ...U }), /contains protected path/);
+  assert.throws(() => S.sandboxProfile({ writable: [os.homedir()], network: 'none', ...U }), /contains protected path/);
+  assert.throws(() => S.sandboxProfile({ writable: ['/'], network: 'none', ...U }), /must not be \/|protected/);
+  assert.throws(() => S.sandboxProfile({ writable: [], readAllow: [path.dirname(root)], network: 'none', factoryHome: path.join(root, 'fh') }), /contains denied root/);
   for (const bad of [undefined, 'all', { localhostPort: 0 }, { localhostPort: 70000 }, { localhostPort: '80' }, { localhostPort: 80, extra: 1 }]) {
-    assert.throws(() => S.sandboxProfile({ writable: [weird], network: bad, factoryHome: path.join(root, 'fh') }), /network|localhostPort/);
+    assert.throws(() => S.sandboxProfile({ writable: [weird], network: bad, factoryHome: path.join(root, 'fh'), ...U }), /network|localhostPort/);
   }
 });
 
 test('sandboxProfile: network rules per mode', (t) => {
-  const root = tmp(t); const base = { writable: [root], factoryHome: '/nonexistent/fh' };
+  const root = tmp(t); const base = { writable: [root], factoryHome: '/nonexistent/fh', unsafeAllowOutsideFactoryHome: true };
   const none = S.sandboxProfile({ ...base, network: 'none' });
   assert.match(none, /\(deny network\*\)\n?$/); assert.ok(!/allow network/.test(none));
   const reg = S.sandboxProfile({ ...base, network: 'registries' });
   assert.ok(reg.indexOf('(deny network*)') < reg.indexOf('(allow network-outbound (remote tcp "*:443") (remote tcp "*:80") (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'));
+  assert.ok(reg.indexOf('(allow network-outbound (remote tcp') < reg.indexOf('(deny network-outbound (remote ip "localhost:*"))'), 'loopback denied after the 80/443 allow');
   const lp = S.sandboxProfile({ ...base, network: { localhostPort: 4321 } });
   assert.ok(lp.includes('(allow network-outbound (remote ip "localhost:4321"))') && lp.includes('(allow network-bind network-inbound (local ip "localhost:4321"))'));
-  assert.ok(!lp.includes('mDNSResponder') && !lp.includes('*:443'));
+  assert.ok(!lp.includes('mDNSResponder') && !lp.includes('*:443') && !lp.includes('(deny network-outbound (remote ip "localhost:*"))'));
 });
 
 test('makeRunTemp: FACTORY_HOME/tmp/<random>, mode 0700, realpath; removeRunTemp deletes it', (t) => {
@@ -246,19 +268,24 @@ test('sandbox fs: writes inside the worktree and run temp work; writes outside a
   assert.equal(fs.readFileSync(path.join(w.fh, 'scenarios', 'secret.txt'), 'utf8'), 'SENTINEL-SECRET\n');
 });
 
-test('sandbox fs: FACTORY_HOME and credential dirs are unreadable; normal files, modules and npm still work', { skip: SKIP }, async (t) => {
+test('sandbox fs: FACTORY_HOME (except this worktree and run temp), the user temp dir and credentials are unreadable; node/npm still work', { skip: SKIP }, async (t) => {
   const w = world(t);
+  fs.mkdirSync(path.join(w.fh, 'work', 'other-wt')); fs.writeFileSync(path.join(w.fh, 'work', 'other-wt', 'f'), 'OTHER\n');
+  const otherRun = S.makeRunTemp(w.fh); t.after(() => S.removeRunTemp(otherRun));
   const r = await sb(w, `out({
     secret: t(()=>fs.readFileSync(path.join(A[1],'scenarios','secret.txt'),'utf8')), list: t(()=>fs.readdirSync(A[1]).join()),
-    listScen: t(()=>fs.readdirSync(path.join(A[1],'scenarios')).join()), ssh: t(()=>fs.readdirSync(path.join(os.homedir(),'.ssh')).length>=0),
-    normal: t(()=>fs.readFileSync(path.join(A[2],'normal.txt'),'utf8')), mod: t(()=>require(path.join(A[0],'mod.js'))),
-    npm: t(()=>cp.execFileSync('npm',['--version'],{encoding:'utf8'}).trim().length>0),
+    listScen: t(()=>fs.readdirSync(path.join(A[1],'scenarios')).join()), ssh: t(()=>fs.readdirSync(path.join(A[3],'.ssh')).length>=0),
+    otherWt: t(()=>fs.readFileSync(path.join(A[1],'work','other-wt','f'),'utf8')), listWork: t(()=>fs.readdirSync(path.join(A[1],'work')).join()),
+    otherRun: t(()=>fs.readdirSync(A[4]).join()), listTmp: t(()=>fs.readdirSync(path.join(A[1],'tmp')).join()),
+    userTmp: t(()=>fs.readFileSync(path.join(A[2],'normal.txt'),'utf8')), etcHosts: t(()=>fs.readFileSync('/etc/hosts','utf8').length>0),
+    mod: t(()=>require(path.join(A[0],'mod.js'))), ownTmp: t(()=>{fs.writeFileSync(path.join(os.tmpdir(),'r'),'R');return fs.readFileSync(path.join(os.tmpdir(),'r'),'utf8')}),
+    fakeHome: os.homedir()===path.join(A[5],'home'), npm: t(()=>cp.execFileSync('npm',['--version'],{encoding:'utf8'}).trim().length>0),
     cat: t(()=>cp.execFileSync('/bin/cat',[path.join(A[1],'scenarios','secret.txt')],{encoding:'utf8',stdio:['ignore','pipe','pipe']})),
-  })`, { args: [w.work, w.fh, w.outside] });
-  assert.equal(r.secret, 'EPERM'); assert.equal(r.list, 'EPERM'); assert.equal(r.listScen, 'EPERM');
-  if (fs.existsSync(path.join(os.homedir(), '.ssh'))) assert.equal(r.ssh, 'EPERM');
+  })`, { args: [w.work, w.fh, w.outside, os.userInfo().homedir, otherRun, w.tmpDir] });
+  assert.deepEqual({ ...r, cat: undefined, ssh: undefined }, { secret: 'EPERM', list: 'EPERM', listScen: 'EPERM', otherWt: 'EPERM', listWork: 'EPERM', otherRun: 'EPERM',
+    listTmp: 'EPERM', userTmp: 'EPERM', etcHosts: true, mod: 42, ownTmp: 'R', fakeHome: true, npm: true, cat: undefined, ssh: undefined });
+  assert.equal(r.ssh, 'EPERM', 'the real ~/.ssh (or the real home itself) must be unreadable');
   assert.notEqual(r.cat, 'SENTINEL-SECRET\n'); assert.match(String(r.cat), /Command failed/);
-  assert.equal(r.normal, 'NORMAL\n'); assert.equal(r.mod, 42); assert.equal(r.npm, true);
 });
 
 test('sandbox fs: symlink, .., chdir, hard link, /dev/fd and rename-out escapes are denied', { skip: SKIP }, async (t) => {
@@ -342,16 +369,17 @@ test('sandbox net: localhostPort allows exactly that port (connect + listen); ot
   assert.equal(l.listen, 'OK'); assert.notEqual(l.dns, 'RESOLVED');
 });
 
-test('sandbox net: registries allows only tcp 80/443 (an ephemeral localhost port is denied); none denies everything', { skip: SKIP }, async (t) => {
+test('sandbox net: registries allows only tcp 80/443 to non-loopback hosts (loopback 443/80 and ephemeral ports denied); none denies everything', { skip: SKIP }, async (t) => {
   const w = world(t);
   const eph = await serve(t, 0);
   let p443 = null; try { p443 = await serve(t, 443); } catch { t.diagnostic('could not listen on 127.0.0.1:443; positive 443 check skipped'); }
-  const code = `(async()=>out({ eph: await conn('127.0.0.1',+A[0]), p443: A[1]?await conn('127.0.0.1',443):'skip', listen: await listen('127.0.0.1',0),
+  const code = `(async()=>out({ eph: await conn('127.0.0.1',+A[0]), p443: A[1]?await conn('127.0.0.1',443):'skip', lo80: await conn('127.0.0.1',80), v6_443: await conn('::1',443), listen: await listen('127.0.0.1',0),
     ssh: await conn('127.0.0.1',22), unix: await new Promise(r=>{const s=net.connect('/private/var/run/mDNSResponder');s.on('connect',()=>{s.destroy();r('OK')});s.on('error',e=>r(e.code))}),
     agent: await new Promise(r=>{if(!process.env.SSH_AUTH_SOCK)return r('none');const s=net.connect(process.env.SSH_AUTH_SOCK);s.on('connect',()=>{s.destroy();r('OK')});s.on('error',e=>r(e.code))}) }))()`;
   const reg = await sb(w, code, { network: 'registries', args: [String(eph), p443 ? '1' : ''] });
   assert.equal(reg.eph, 'EPERM'); assert.equal(reg.listen, 'EPERM'); assert.equal(reg.ssh, 'EPERM'); assert.equal(reg.unix, 'OK');
-  if (p443) assert.equal(reg.p443, 'OK');
+  if (p443) assert.equal(reg.p443, 'EPERM', 'I2: loopback :443 must be denied in registries mode');
+  assert.equal(reg.lo80, 'EPERM', 'I2: loopback :80 (EPERM, not ECONNREFUSED) must be denied'); assert.equal(reg.v6_443, 'EPERM');
   const none = await sb(w, code, { network: 'none', args: [String(eph), p443 ? '1' : ''] });
   assert.equal(none.eph, 'EPERM'); assert.equal(none.unix, 'EPERM'); assert.ok(['EPERM', 'skip'].includes(none.p443));
   assert.ok(['EPERM', 'none', 'ENOENT'].includes(none.agent) && reg.agent !== 'OK', 'ssh-agent socket reachable');
@@ -368,4 +396,262 @@ test('startSandboxed: the app listens on its port inside the sandbox, cannot wri
   assert.equal(await (await fetch(`http://127.0.0.1:${port}/`)).text(), 'write=EPERM');
   await P.stopApp(app, { graceMs: 500 });
   assert.equal(await P.portInUse(port), false);
+});
+
+// ---- fix round 1 regressions ----------------------------------------------------------------------------------------------------
+// A FAKE home outside every other deny root (/private/tmp, not /private/tmp/claude-<uid> nor the user temp dir), so a hit proves the
+// home rules themselves. Nothing is ever planted in the real home.
+function fakeHome(t) {
+  const h = fs.realpathSync(fs.mkdtempSync('/private/tmp/factory-fakehome-')); gone(t, h);
+  const put = (rel, body = 'CRED\n') => { fs.mkdirSync(path.dirname(path.join(h, rel)), { recursive: true }); fs.writeFileSync(path.join(h, rel), body); };
+  for (const f of ['.npmrc', '.codex/auth.json', '.docker/config.json', '.config/gcloud/credentials.db', '.zsh_history', '.python_history',
+    'Library/Application Support/Google/Chrome/Default/Cookies', '.cargo/credentials.toml', '.kube/config', 'project/notes.txt', '.git-credentials']) put(f);
+  put('.nvm/versions/node/v1/bin/tool.txt', 'TOOL\n');
+  put('.nvm/.npmrc'); put('.local/share/pnpm/auth.json'); put('.nvm/versions/node/v1/etc/npmrc-not-a-cred.txt', 'OK\n');
+  return h;
+}
+
+test('C1 sandbox fs: the whole home is unreadable except toolchains; credentials stay denied even inside an allowed toolchain dir', { skip: SKIP }, async (t) => {
+  const w = world(t); const H = fakeHome(t);
+  const prof = profileOf(w, 'none', { home: H, readAllow: [path.join(H, '.nvm'), path.join(H, '.cargo'), path.join(H, '.local/share/pnpm')] });
+  const creds = ['.npmrc', '.codex/auth.json', '.docker/config.json', '.config/gcloud/credentials.db', '.zsh_history', '.python_history',
+    'Library/Application Support/Google/Chrome/Default/Cookies', '.cargo/credentials.toml', '.kube/config', '.git-credentials', 'project/notes.txt',
+    '.nvm/.npmrc', '.local/share/pnpm/auth.json'];
+  const r = await sb(w, `const H=A[0],W=A[1];out({
+    creds: JSON.parse(A[2]).map(c=>t(()=>fs.readFileSync(path.join(H,c),'utf8'))),
+    listHome: t(()=>fs.readdirSync(H).join()), tool: t(()=>fs.readFileSync(path.join(H,'.nvm/versions/node/v1/bin/tool.txt'),'utf8')),
+    listTool: t(()=>fs.readdirSync(path.join(H,'.nvm','versions')).join()), toolOther: t(()=>fs.readFileSync(path.join(H,'.nvm/versions/node/v1/etc/npmrc-not-a-cred.txt'),'utf8')),
+    dotdot: t(()=>fs.readFileSync(path.join(H,'.nvm')+'/../.npmrc','utf8')),
+    dotdotCargo: t(()=>fs.readFileSync(path.join(H,'.cargo')+'/../.npmrc','utf8')),
+    symlink: t(()=>{fs.symlinkSync(path.join(H,'.npmrc'),path.join(W,'npmrc-link'));return fs.readFileSync(path.join(W,'npmrc-link'),'utf8')}),
+    hardlink: t(()=>fs.linkSync(path.join(H,'project','notes.txt'),path.join(W,'hl'))),
+    copy: t(()=>fs.copyFileSync(path.join(H,'.npmrc'),path.join(W,'cp'))),
+    upper: t(()=>fs.readFileSync(path.join(H,'.NPMRC'),'utf8')), upperHome: t(()=>fs.readFileSync(H.toUpperCase()+'/.npmrc','utf8')),
+    sysvol: t(()=>fs.readFileSync('/System/Volumes/Data'+H+'/.npmrc','utf8')),
+    shell: t(()=>cp.execFileSync('/bin/sh',['-c','cat "$0"/.npmrc "$0"/.codex/auth.json 2>/dev/null; echo END',H],{encoding:'utf8'})),
+  })`, { args: [H, w.work, JSON.stringify(creds)], profile: prof });
+  assert.deepEqual(Object.fromEntries(creds.map((c, i) => [c, r.creds[i]])), Object.fromEntries(creds.map((c) => [c, 'EPERM'])));
+  assert.deepEqual({ ...r, creds: undefined }, { creds: undefined, listHome: 'EPERM', tool: 'TOOL\n', listTool: 'node', toolOther: 'OK\n', dotdot: 'EPERM', dotdotCargo: 'EPERM',
+    symlink: 'EPERM', hardlink: 'EPERM', copy: 'EPERM', upper: 'EPERM', upperHome: 'EPERM', sysvol: 'EPERM', shell: 'END\n' });
+});
+
+test('C1 sandbox fs: the real home, /Users (incl. /Users/Shared), the claude temp dir and the user temp dir are unreadable (no files planted)', { skip: SKIP }, async (t) => {
+  const w = world(t);
+  const claudeTmp = `/private/tmp/claude-${process.getuid()}`;
+  const r = await sb(w, `out({ home: t(()=>fs.readdirSync(A[0]).length), users: t(()=>fs.readdirSync('/Users').length),
+    shared: t(()=>fs.readdirSync('/Users/Shared').length), claude: t(()=>fs.readdirSync(A[1]).length), userTmp: t(()=>fs.readdirSync(A[2]).length),
+    gitconfig: t(()=>fs.readFileSync(path.join(A[0],'.gitconfig'),'utf8').length) })`, { args: [os.userInfo().homedir, claudeTmp, os.tmpdir()] });
+  assert.equal(r.home, 'EPERM'); assert.equal(r.users, 'EPERM'); assert.equal(r.userTmp, 'EPERM');
+  assert.ok(['EPERM', 'ENOENT'].includes(r.shared)); assert.ok(['EPERM', 'ENOENT'].includes(r.gitconfig));
+  assert.equal(r.claude, fs.existsSync(claudeTmp) ? 'EPERM' : 'ENOENT');
+});
+
+test('C1 homeDirs: os.userInfo().homedir AND $HOME when they differ; defaultReadDeny takes a home param', () => {
+  const real = fs.realpathSync(os.userInfo().homedir);
+  assert.deepEqual(S.homeDirs({ HOME: '/private/tmp' }), [real, '/private/tmp']);
+  assert.deepEqual(S.homeDirs({ HOME: os.userInfo().homedir }), [real]);
+  assert.deepEqual(S.homeDirs({}), [real]);
+  const d = S.defaultReadDeny('/h/x', '/fh');
+  assert.equal(d[0], '/fh'); assert.ok(d.includes('/h/x/.npmrc') && d.includes('/h/x/.codex') && d.includes('/h/x/Library/Application Support'));
+});
+
+test('I1 sandbox: processes outside the sandbox (the driver, a victim) cannot be signalled or inspected; own children can', { skip: SKIP }, async (t) => {
+  const w = world(t);
+  const victim = spawn('/bin/sleep', ['120'], { env: { PATH: '/usr/bin:/bin', SBX_SENTINEL: 'tok_SENTINEL_ENV_42' }, detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(victim.pid, 'SIGKILL'); } catch { /* gone */ } });
+  await new Promise((res) => setTimeout(res, 200));
+  const py = 'import ctypes,sys\nlibc=ctypes.CDLL(None)\nmib=(ctypes.c_int*3)(1,49,int(sys.argv[1]))\nn=ctypes.c_size_t(1<<20);b=ctypes.create_string_buffer(1<<20)\nlibc.sysctl(mib,3,b,ctypes.byref(n),None,0)\nprint("FOUND" if b"tok_SENTINEL_ENV_42" in b.raw[:n.value] else "no")';
+  fs.writeFileSync(path.join(w.tmpDir, 'procargs.py'), py);
+  const r = await sb(w, `const V=+A[0];const sh=(c)=>{try{return cp.execFileSync('/bin/sh',['-c',c],{encoding:'utf8',stdio:['ignore','pipe','ignore']})}catch(e){return String(e.stdout||'')}};
+    const child=cp.spawn('/bin/sleep',['30']);
+    out({ kill9: t(()=>process.kill(V,'SIGKILL')), stop: t(()=>process.kill(V,'SIGSTOP')), usr1: t(()=>process.kill(V,'SIGUSR1')),
+      parent: t(()=>process.kill(process.ppid,'SIGCONT')), pkill: sh('pkill -9 -f "sleep 120"; echo rc=$?').trim()!=='rc=0',
+      psEnv: /tok_SENTINEL/.test(sh('ps eww -p '+V+' -o command=')), psAll: sh('ps -axww -o pid=').trim().split(/\\s+/).includes(String(V)),
+      lsof: sh('lsof -p '+V+' 2>/dev/null | wc -l').trim(), procargs: sh('/usr/bin/python3 -I "$TMPDIR/procargs.py" '+V).trim(),
+      ownChild: t(()=>{process.kill(child.pid,'SIGKILL')}) })`, { args: [String(victim.pid), py] });
+  assert.deepEqual(r, { kill9: 'EPERM', stop: 'EPERM', usr1: 'EPERM', parent: 'EPERM', pkill: true, psEnv: false, psAll: false, lsof: '0', procargs: 'no', ownChild: 'OK' });
+  assert.doesNotThrow(() => process.kill(victim.pid, 0), 'the victim must still be alive');
+});
+
+test('I5 sandboxProfile: writable dirs must be under FACTORY_HOME/work or FACTORY_HOME/tmp (by realpath and inode)', (t) => {
+  const root = tmp(t); const fh = path.join(root, 'fh');
+  for (const d of ['work/wt', 'tmp/run', 'scenarios']) fs.mkdirSync(path.join(fh, d), { recursive: true });
+  fs.symlinkSync(root, path.join(fh, 'work', 'escape'));
+  const P0 = (writable) => S.sandboxProfile({ writable, network: 'none', factoryHome: fh, readAllow: [] });
+  assert.ok(P0([path.join(fh, 'work', 'wt'), path.join(fh, 'tmp', 'run')]).includes(`(subpath "${fh}/work/wt")`));
+  for (const bad of [fh, path.join(fh, 'work'), path.join(fh, 'tmp'), path.join(fh, 'scenarios'), path.join(fh, 'work', 'escape'), root, '/private/tmp']) {
+    assert.throws(() => P0([bad]), /must be inside|contains protected path/, bad);
+  }
+  for (const real of [path.join(os.homedir(), 'workspace'), path.join(os.homedir(), 'Library', 'LaunchAgents')]) {
+    if (fs.existsSync(real)) assert.throws(() => S.sandboxProfile({ writable: [real], network: 'none', factoryHome: fh, readAllow: [] }), /must be inside/, real);
+  }
+  assert.doesNotThrow(() => S.sandboxProfile({ writable: [root + '/fh/scenarios'], network: 'none', factoryHome: path.join(root, 'other'), readAllow: [], unsafeAllowOutsideFactoryHome: true }));
+});
+
+test('tmpDir is derived once from the profile: a different tmpDir is refused; TMPDIR and HOME point into the run temp', { skip: SKIP }, async (t) => {
+  const w = world(t); const other = S.makeRunTemp(w.fh); t.after(() => S.removeRunTemp(other));
+  await assert.rejects(S.runSandboxed(['/usr/bin/true'], { profile: profileOf(w), tmpDir: other }), /does not match/);
+  const r = await sb(w, `out({ tmp: os.tmpdir(), home: os.homedir() })`, { profile: profileOf(w) });
+  assert.deepEqual(r, { tmp: w.tmpDir, home: path.join(w.tmpDir, 'home') });
+});
+
+// ---- C2: gitSafe config allowlist ---------------------------------------------------------------------------------------------
+function hostileRepo(t) {
+  const repo = repoWithCommit(t); const mk = (n) => path.join(repo, `${n}-RAN`);
+  const script = (n) => { const f = path.join(repo, `${n}.sh`); fs.writeFileSync(f, `#!/bin/sh\ntouch "${mk(n)}"\ncat\n`, { mode: 0o755 }); return f; };
+  return { repo, mk, script };
+}
+
+test('C2 gitSafe: a planted filter.*.smudge selected by .gitattributes makes checkout THROW and never runs', (t) => {
+  const { repo, mk, script } = hostileRepo(t);
+  fs.writeFileSync(path.join(repo, '.gitattributes'), '*.txt filter=x\n');
+  git(repo, 'add', '.gitattributes'); git(repo, '-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-qm', 'attrs');
+  git(repo, 'config', 'filter.x.smudge', script('smudge')); git(repo, 'config', 'filter.x.clean', script('clean'));
+  fs.rmSync(path.join(repo, 'a.txt'));
+  assert.throws(() => G.gitSafe(repo, 'checkout', '--', 'a.txt'), (e) => e.message === 'git config not allowed: filter.x.smudge');
+  assert.throws(() => G.gitSafe(repo, 'status'), /git config not allowed: filter\.x\./);
+  assert.equal(fs.existsSync(mk('smudge')) || fs.existsSync(mk('clean')), false);
+  git(repo, 'checkout', '--', 'a.txt'); // control: plain git runs the smudge filter
+  assert.equal(fs.existsSync(mk('smudge')), true, 'control: plain git should run the planted smudge filter');
+});
+
+test('C2 gitSafe: textconv (via blame), merge drivers, uploadpack, includes, url rewrites and unsafe remote URLs all throw before running', (t) => {
+  const cases = [
+    ['diff.conv.textconv', (s) => s('textconv'), ['blame', 'a.txt'], (repo) => fs.writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.txt diff=conv\n')],
+    ['merge.evil.driver', (s) => `${s('merge')} %O %A %B`, ['merge', '--ff-only', 'other']],
+    ['remote.up.uploadpack', (s) => s('uploadpack'), ['fetch', 'up']],
+    ['include.path', () => '/dev/null', ['status']],
+    ['url.ext::sh.insteadof', () => 'https://', ['status']],
+    ['core.editor', (s) => s('editor'), ['commit', '--allow-empty']],
+    ['gpg.program', (s) => s('gpg'), ['status']],
+    ['credential.helper', (s) => `!${s('cred')}`, ['status']],
+    ['alias.st', () => '!touch PWN', ['st']],
+    ['core.hookspath', () => '.githooks', ['status']],
+    ['remote.origin.url', () => 'ext::sh -c touch% PWN', ['status']],
+    ['remote.origin.url', () => '/tmp/some/local.git', ['status']],
+  ];
+  for (const [key, val, cmd, extra] of cases) {
+    const { repo, mk, script } = hostileRepo(t);
+    git(repo, 'config', key, val(script));
+    if (key === 'remote.up.uploadpack') git(repo, 'config', 'remote.up.url', 'https://example.invalid/x.git');
+    extra?.(repo);
+    assert.throws(() => G.gitSafe(repo, ...cmd), (e) => e.message.toLowerCase() === `git config not allowed: ${key}`.toLowerCase(), key);
+    assert.deepEqual(fs.readdirSync(repo).filter((f) => f.endsWith('-RAN') || f === 'PWN'), [], `${key} ran`);
+    assert.ok(!/touch|sh -c|\.sh/.test(String((() => { try { G.gitSafe(repo, ...cmd); } catch (e) { return e.message; } })())), 'the error names the key only, never the value');
+  }
+});
+
+test('C2 gitSafe: a clean repo with an https remote and branch tracking is allowed; caller -c and global options are checked', (t) => {
+  const repo = repoWithCommit(t); const other = repoWithCommit(t);
+  git(repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git'); git(repo, 'config', 'branch.main.remote', 'origin'); git(repo, 'config', 'branch.main.merge', 'refs/heads/main');
+  git(repo, 'config', 'user.name', 'Driver'); git(repo, 'config', 'gc.auto', '0'); git(repo, 'config', 'remote.ssh.url', 'git@github.com:example/repo.git');
+  assert.equal(G.gitSafe(repo, 'status', '--porcelain').code, 0);
+  assert.equal(G.gitSafe(repo, '-c', 'user.name=x', '-c', 'user.email=x@y', 'commit', '-q', '--allow-empty', '-m', 'ok').code, 0);
+  assert.throws(() => G.gitSafe(repo, '-c', 'filter.x.smudge=touch PWN', 'status'), /^Error: git config not allowed: filter\.x\.smudge$/);
+  assert.throws(() => G.gitSafe(repo, '--exec-path=/tmp', 'status'), /global option not allowed: --exec-path/);
+  assert.throws(() => G.gitSafe(repo, '--config-env', 'core.pager=X', 'status'), /global option not allowed/);
+  git(other, 'config', 'core.fsmonitor', '/bin/echo');
+  assert.throws(() => G.gitSafe(repo, '-C', other, 'status'), /git config not allowed: core\.fsmonitor/, '-C must verify the repository it points at');
+  assert.throws(() => G.gitSafe(repo, '--git-dir', path.join(other, '.git'), 'status'), /core\.fsmonitor/);
+  for (const [k, v, ok] of [['remote.o.url', 'https://h.example/x', true], ['remote.o.url', 'git@h.example:a/b', true], ['remote.o.url', 'file:///x', false],
+    ['remote.o.url', '-oProxyCommand=x@h:p', false], ['remote.o.pushurl', 'ext::x', false], ['branch.m.remote', 'https://h/x', false], ['remote.o.fetch', '-x', false],
+    ['Core.FileMode', 'true', true], ['core.worktree', '/x', false], ['core.sparsecheckout', 'true', false], ['extensions.worktreeconfig', 'true', true],
+    ['gc.auto', '0', true], ['gc.somehook', 'x', false], ['pack.island', 'x', false], ['advice.detachedhead', 'false', false], ['foo.hook', 'x', false],
+    ['remote.o.hooks', 'x', false], ['extensions.partialclone', 'o', false], ['remote.o.vcs', 'x', false], ['remote.o.promisor', 'true', false], ['remote.o.receivepack', 'x', false],
+    ['safe.directory', '*', false], ['http.proxy', 'x', false], ['protocol.allow', 'always', false], ['commit.gpgsign', 'true', false]]) {
+    assert.equal(G.configAllowed(k, v), ok, `${k}=${v}`);
+  }
+});
+
+test('I3/I4 gitSafe: timeout and signal deaths THROW without output; a timeout option is separate from git args', (t) => {
+  const repo = repoWithCommit(t);
+  assert.throws(() => G.gitSafeOpts(repo, ['log'], { timeout: 1 }), /timed out after 1 ms|killed by SIGKILL/);
+  assert.equal(G.gitSafeOpts(repo, ['rev-parse', 'HEAD'], { timeout: 20000 }).code, 0);
+  assert.throws(() => G.gitSafeOpts(repo, 'log'), /args must be an array/);
+});
+
+// ---- addendum: exact allowlist, core.worktree, and the second-layer -c flags (each proven with verified:true) ------------------
+test('C2 addendum: a planted core.worktree makes gitSafe throw and nothing is written to the redirected tree', (t) => {
+  const repo = repoWithCommit(t); const elsewhere = tmp(t, 'factory-elsewhere-');
+  git(repo, 'config', 'core.worktree', elsewhere);
+  assert.throws(() => G.gitSafe(repo, 'checkout', '-f', 'other'), /^Error: git config not allowed: core\.worktree$/);
+  assert.throws(() => G.gitSafe(repo, 'reset', '--hard'), /core\.worktree/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
+test('C2 addendum: the allowlist accepts exactly what a driver-created clone and worktree contain', (t) => {
+  const src = repoWithCommit(t); const d = tmp(t, 'factory-clone-');
+  const clone = path.join(d, 'clone'); spawnSync('git', ['clone', '-q', src, clone], { env: G.gitEnv() });
+  git(clone, 'config', 'remote.origin.url', 'https://github.com/example/repo.git'); // the driver's clone has an https origin
+  git(clone, 'config', 'extensions.worktreeConfig', 'true');
+  assert.equal(G.gitSafe(clone, 'worktree', 'add', '-q', path.join(d, 'wt'), '-b', 'feat').code, 0);
+  for (const r of [clone, path.join(d, 'wt')]) assert.equal(G.gitSafe(r, 'status', '--porcelain').code, 0);
+  git(clone, 'config', 'gc.auto', '0'); assert.equal(G.gitSafe(clone, 'status').code, 0);
+  git(clone, 'config', 'pack.threads', '1'); assert.throws(() => G.gitSafe(clone, 'status'), /not allowed: pack\.threads/);
+});
+
+function planted(t) {
+  const repo = repoWithCommit(t); const mk = (n) => path.join(repo, `${n}-RAN`);
+  const script = (n, tail = '') => { const f = path.join(repo, `${n}.sh`); fs.writeFileSync(f, `#!/bin/sh\ntouch "${mk(n)}"\n${tail}`, { mode: 0o755 }); return f; };
+  git(repo, 'config', 'user.name', 't'); git(repo, 'config', 'user.email', 't@e');
+  return { repo, mk, script, v: { verified: true } };
+}
+const ran = (mk, n) => fs.existsSync(mk(n));
+
+test('second layer: core.editor / sequence.editor never run (commit without -m, rebase -i)', (t) => {
+  const { repo, mk, script, v } = planted(t);
+  git(repo, 'config', 'core.editor', script('editor')); git(repo, 'config', 'sequence.editor', script('seq'));
+  G.gitSafeOpts(repo, ['commit', '--allow-empty'], v);
+  G.gitSafeOpts(repo, ['rebase', '-i', 'HEAD'], v);
+  assert.equal(ran(mk, 'editor') || ran(mk, 'seq'), false);
+  spawnSync('git', ['commit', '--allow-empty'], { cwd: repo, env: G.gitEnv(), stdio: 'ignore' });
+  assert.equal(ran(mk, 'editor'), true, 'control: plain git runs core.editor');
+});
+
+test('second layer: gpg.program never runs even with commit.gpgSign=true', (t) => {
+  const { repo, mk, script, v } = planted(t);
+  git(repo, 'config', 'gpg.program', script('gpg', 'exit 1\n')); git(repo, 'config', 'commit.gpgSign', 'true');
+  assert.equal(G.gitSafeOpts(repo, ['commit', '-q', '--allow-empty', '-m', 'x'], v).code, 0);
+  assert.equal(ran(mk, 'gpg'), false);
+  git(repo, 'commit', '-q', '--allow-empty', '-m', 'y');
+  assert.equal(ran(mk, 'gpg'), true, 'control: plain git runs gpg.program');
+});
+
+test('second layer: credential.helper and core.askPass never run on an HTTP 401', async (t) => {
+  const { repo, mk, script, v } = planted(t);
+  git(repo, 'config', 'credential.helper', `!${script('cred')}`); git(repo, 'config', 'core.askPass', script('askpass'));
+  const srv = spawn(process.execPath, ['-e', "require('http').createServer((q,s)=>{s.writeHead(401,{'WWW-Authenticate':'Basic realm=x'});s.end()}).listen(0,'127.0.0.1',function(){console.log(this.address().port)})"], { stdio: ['ignore', 'pipe', 'ignore'] });
+  t.after(() => srv.kill('SIGKILL'));
+  const port = await new Promise((res) => srv.stdout.once('data', (d) => res(String(d).trim())));
+  const r = G.gitSafeOpts(repo, ['ls-remote', `http://127.0.0.1:${port}/x.git`], { ...v, timeout: 20000 });
+  assert.notEqual(r.code, 0);
+  assert.equal(ran(mk, 'cred') || ran(mk, 'askpass'), false);
+  spawnSync('git', ['ls-remote', `http://127.0.0.1:${port}/x.git`], { cwd: repo, env: G.gitEnv(), stdio: 'ignore', timeout: 20000 });
+  assert.equal(ran(mk, 'cred') || ran(mk, 'askpass'), true, 'control: plain git runs the credential helper / askpass');
+});
+
+test('second layer: core.attributesFile cannot select a clean filter; core.excludesFile cannot hide files', (t) => {
+  const { repo, mk, script, v } = planted(t);
+  const attrs = path.join(repo, 'attrs'); fs.writeFileSync(attrs, '*.txt filter=x\n');
+  git(repo, 'config', 'core.attributesFile', attrs); git(repo, 'config', 'filter.x.clean', script('clean', 'cat\n'));
+  const excl = path.join(repo, 'excl'); fs.writeFileSync(excl, 'hidden.txt\n'); git(repo, 'config', 'core.excludesFile', excl);
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'changed\n'); fs.writeFileSync(path.join(repo, 'hidden.txt'), 'h\n');
+  G.gitSafeOpts(repo, ['add', 'a.txt'], v);
+  assert.equal(ran(mk, 'clean'), false);
+  assert.match(G.gitSafeOpts(repo, ['status', '--porcelain'], v).out, /\?\? hidden\.txt/);
+  git(repo, 'add', 'a.txt');
+  assert.equal(ran(mk, 'clean'), true, 'control: plain git runs the clean filter selected by core.attributesFile');
+});
+
+test('second layer: gc.auto=0 keeps auto-gc from running inside a driver call', (t) => {
+  const { repo, v } = planted(t);
+  git(repo, 'config', 'gc.auto', '1'); git(repo, 'config', 'gc.autoDetach', 'false');
+  // auto-gc samples objects/17: ~1500 loose blobs put several there, so plain git reliably decides to gc.
+  for (let i = 0; i < 1500; i++) fs.writeFileSync(path.join(repo, `f${i}`), `${i}\n`);
+  git(repo, 'add', '.');
+  const packs = () => fs.readdirSync(path.join(repo, '.git', 'objects', 'pack')).filter((f) => f.endsWith('.pack')).length;
+  G.gitSafeOpts(repo, ['commit', '-q', '-m', 'many'], v);
+  assert.equal(packs(), 0, 'auto-gc packed objects inside a gitSafe call');
+  git(repo, 'commit', '-q', '--allow-empty', '-m', 'ctl');
+  assert.ok(packs() > 0, 'control: plain git auto-gc packs with gc.auto=1');
 });
