@@ -94,11 +94,18 @@ export const CREDENTIAL_PATHS = Object.freeze([
 ]);
 // Relative to each home: toolchains that node/npm/python/rust builds may need to READ. Missing ones are skipped. Override with `readAllow`.
 export const TOOLCHAIN_PATHS = Object.freeze([
-  '.nvm', '.volta', '.fnm', '.asdf', '.pyenv', '.rustup', '.bun', '.cargo/bin', '.cargo/registry', '.local/bin', '.local/share/pnpm',
+  '.nvm', '.volta', '.fnm', '.asdf', '.pyenv', '.rustup', '.bun', '.cargo/bin', '.cargo/registry', '.local/share/pnpm',
 ]);
+// `.local/bin` is NOT a default: it is a general scripts dir (a token in a script would be readable). Add it via readAllow if needed.
+// Toolchain layouts a node prefix under a home may live in (then the whole prefix is allowed, minus credential names).
+const NODE_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.asdf', '.pyenv', '.bun', '.cargo', '.rustup'];
 
-// Basenames denied anywhere under an allowed toolchain dir (SBPL regex).
-const TOOLCHAIN_CRED_NAMES = '(\\.npmrc|\\.yarnrc|\\.yarnrc\\.yml|\\.netrc|\\.git-credentials|\\.pypirc|\\.env|credentials|credentials\\.(toml|json)|auth\\.json|[^/]*\\.pem|id_[a-z0-9]+)';
+// Basenames denied anywhere under an allowed read dir (toolchains, node prefix, npm, corepack). SBPL regex has no (?i), so every letter
+// becomes a [xX] class: APFS is case-insensitive and a file named NPMRC is the same credential.
+// Suffixed copies (npmrc.bak, .env.local, credentials.toml, tokens.json) count as the same credential.
+const CRED_BASENAMES = String.raw`(\.?npmrc[^/]*|\.yarnrc[^/]*|[._]?netrc[^/]*|\.git-credentials[^/]*|\.pypirc[^/]*|pip\.(conf|ini)[^/]*|rc|auth\.(ini|json)[^/]*|bunfig\.toml[^/]*|[^/]*\.(key|pem|p12|pfx)|tokens?([._-][^/]*)?|\.env([._-][^/]*)?|credentials[^/]*|id_[a-z0-9_]+[^/]*)`;
+const caseFold = (re) => re.replace(/\\.|\[[^\]]*\]|[a-zA-Z]/g, (m) => (m.length === 1 ? `[${m.toLowerCase()}${m.toUpperCase()}]` : m));
+const credNameRegex = (dir) => `(regex #"^${regexEscape(dir)}/(.*/)?${caseFold(CRED_BASENAMES)}$")`;
 
 // os.userInfo().homedir AND $HOME when they differ (a planted HOME must not move the deny away from the real home).
 export function homeDirs(env = process.env) {
@@ -157,19 +164,31 @@ function networkRules(network) {
   throw new Error(`network must be 'registries', 'none' or { localhostPort }: ${JSON.stringify(network)}`);
 }
 
-// node's install prefix (<prefix>/bin/node -> <prefix>), for process.execPath and for `node` on PATH. Falls back to the bin dir, and to
-// nothing, if the prefix would contain a denied root (e.g. ~/bin/node would otherwise allow all of ~).
-function nodeReadAllow(denyRoots) {
-  const out = [];
-  const bins = [process.execPath];
-  for (const d of String(process.env.PATH || '').split(':')) if (d && path.isAbsolute(d)) { const f = path.join(d, 'node'); if (fs.existsSync(f)) { bins.push(f); break; } }
-  for (const b of bins) {
+// Read access for node itself. For each node binary (process.execPath and `node` on PATH by default) with prefix P = dirname(dirname(realpath)):
+//  - P outside every deny root (e.g. /opt/homebrew/Cellar/node/X, /usr/local)      -> allow P
+//  - P inside a home's toolchain layout (~/.nvm, ~/.volta, ~/.fnm, ~/.asdf, ...)      -> allow P
+//  - anything else (e.g. ~/opt/node, ~/bin)  -> allow only P/bin/{node,npm,npx,corepack} (literal) and P/lib/node_modules/{npm,corepack}
+// Credential names under every allowed subpath stay denied (credNameRegex).
+export function nodeReadPaths({ nodePaths = defaultNodePaths(), homes = homeDirs(), denyRoots = [] } = {}) {
+  const subpaths = [], literals = [];
+  for (const b of nodePaths) {
     let real; try { real = fs.realpathSync.native(b); } catch { continue; }
-    for (const cand of [path.dirname(path.dirname(real)), path.dirname(real)]) {
-      if (cand === '/' || denyRoots.some((r) => within(r, cand))) continue;
-      out.push(cand); break;
-    }
+    const prefix = path.dirname(path.dirname(real));
+    const containsRoot = prefix === '/' || denyRoots.some((r) => within(r, prefix)); // e.g. ~/bin/node -> prefix ~
+    const underRoot = denyRoots.some((r) => within(prefix, r));
+    const inToolchain = homes.some((h) => NODE_TOOLCHAIN_DIRS.some((d) => within(prefix, path.join(h, d)) && prefix !== path.join(h, d)));
+    if (!containsRoot && (!underRoot || inToolchain)) { subpaths.push(prefix); continue; }
+    literals.push(...['node', 'npm', 'npx', 'corepack'].map((n) => path.join(prefix, 'bin', n)));
+    if (real !== path.join(prefix, 'bin', 'node')) literals.push(real);
+    // A dynamically linked node (e.g. Homebrew's @rpath/libnode.<n>.dylib) needs its own dylibs from <prefix>/lib.
+    try { for (const f of fs.readdirSync(path.join(prefix, 'lib'))) if (/\.dylib$/.test(f)) literals.push(path.join(prefix, 'lib', f)); } catch { /* no lib dir */ }
+    subpaths.push(...['npm', 'corepack'].map((n) => path.join(prefix, 'lib', 'node_modules', n)));
   }
+  return { subpaths: [...new Set(subpaths)], literals: [...new Set(literals)] };
+}
+function defaultNodePaths() {
+  const out = [process.execPath];
+  for (const d of String(process.env.PATH || '').split(':')) if (d && path.isAbsolute(d)) { const f = path.join(d, 'node'); if (fs.existsSync(f)) { out.push(f); break; } }
   return out;
 }
 
@@ -181,7 +200,7 @@ const READ_ROOTS_EXTRA = ['/Users'];
 //   file rules); /dev writes; deny signals and process-info outside this sandbox; mach allowlist; network.
 // Writable dirs must be under realpath(FACTORY_HOME)/work or /tmp unless `unsafeAllowOutsideFactoryHome` (TESTS ONLY).
 export function sandboxProfile({
-  writable = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false,
+  writable = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false, nodePaths,
 } = {}) {
   if (!Array.isArray(writable) || !Array.isArray(readDeny)) throw new Error('writable and readDeny must be arrays');
   const homes = home === undefined ? homeDirs() : (Array.isArray(home) ? home : [home]).map(canonical);
@@ -203,12 +222,13 @@ export function sandboxProfile({
   const toolchains = (readAllow ?? homes.flatMap((h) => TOOLCHAIN_PATHS.map((r) => path.join(h, r))))
     .map((p) => { checkPath(p); return p; }).filter((p) => fs.existsSync(p)).map(canonical);
   for (const a of toolchains) for (const r of denyRoots) if (within(r, a)) throw new Error(`readAllow path ${a} contains denied root ${r}`);
-  const readAllowAll = [...new Set([...nodeReadAllow(denyRoots), ...toolchains])];
+  const node = nodeReadPaths({ nodePaths: nodePaths ?? defaultNodePaths(), homes, denyRoots });
+  const readAllowAll = [...new Set([...node.subpaths, ...toolchains])];
   const ancestors = new Set();
-  for (const p of [...wr, ...readAllowAll]) for (const a of ancestorsOf(p)) ancestors.add(a);
+  for (const p of [...wr, ...readAllowAll, ...node.literals]) for (const a of ancestorsOf(p)) ancestors.add(a);
   const historyRegex = homes.map((h) => `(regex #"^${regexEscape(h)}/\\.[^/]*_history$")`);
   // Credential-named files INSIDE an allowed toolchain dir (found by probe: ~/.nvm/.npmrc, a pnpm auth.json) stay denied too.
-  const toolchainCreds = toolchains.map((d) => `(regex #"^${regexEscape(d)}/(.*/)?${TOOLCHAIN_CRED_NAMES}$")`);
+  const toolchainCreds = readAllowAll.map(credNameRegex);
   const lines = [
     '(version 1)',
     `; factory-tmpdir: ${tmp ?? ''}`,
@@ -218,7 +238,7 @@ export function sandboxProfile({
   ];
   // Node's realpath lstats every ancestor of the cwd/script; stat only (no listing, no content) of the ancestors keeps that working.
   if (ancestors.size) lines.push(`(allow file-read-metadata ${[...ancestors].sort().map(literal).join(' ')})`);
-  if (readAllowAll.length) lines.push(`(allow file-read* ${readAllowAll.map(subpath).join(' ')})`);
+  if (readAllowAll.length || node.literals.length) lines.push(`(allow file-read* ${[...readAllowAll.map(subpath), ...node.literals.map(literal)].join(' ')})`);
   if (wr.length) {
     lines.push(`(allow file-read* file-write* ${wr.map(subpath).join(' ')})`);
     // A full clone's .git (config, hooks, attributes) stays read-only: driver git must not pick up planted config or hooks.
@@ -230,6 +250,10 @@ export function sandboxProfile({
   // or inspected (ps eww env, KERN_PROCARGS2, lsof -p). Its own children are in the same sandbox and stay reachable.
   lines.push('(deny signal)', '(allow signal (target same-sandbox))');
   lines.push('(deny process-info*)', '(allow process-info* (target self) (target same-sandbox))');
+  // process-info does NOT cover sysctl: kern.procargs2 returned the argv AND environment of every same-user process (the driver's
+  // tokens included). The exact name "kern.procargs2" does not match; the prefix does. kern.proc.* (kern.proc.all/pid/pgrp listings)
+  // is denied too; node, npm, git and node --test still work, and a process can still read its own procargs.
+  lines.push('(deny sysctl-read (sysctl-name-prefix "kern.procargs") (sysctl-name-prefix "kern.proc."))');
   // Mach services run OUTSIDE the sandbox and act for the caller: found empirically that LaunchServices (`open -n X.app`) starts an
   // unsandboxed app, cfprefsd (`defaults write`) writes ~/Library/Preferences, securityd (`security dump-keychain`) reads the keychain,
   // and the pasteboard leaks. So mach-lookup is deny-by-default with a short allowlist that node, npm, git, curl and python need.

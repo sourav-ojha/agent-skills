@@ -42,6 +42,17 @@ const DANGEROUS_NAME = /^hooks?$|cmd|command|program|helper|driver|process|smudg
 const HOST = '[A-Za-z0-9][A-Za-z0-9.-]*', USER = '[A-Za-z0-9][A-Za-z0-9._-]*';
 const SAFE_URL = new RegExp(`^(?:https://${HOST}(?::\\d+)?/\\S*|ssh://(?:${USER}@)?${HOST}(?::\\d+)?/\\S*|${USER}@${HOST}:[^\\s/-]\\S*)$`);
 const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// Host of an https://, ssh:// or scp-style URL (already shape-checked by SAFE_URL).
+const urlHost = (u) => (/^(?:https|ssh):\/\/(?:[^@/]+@)?([^/:]+)/.exec(u) ?? /^[^@]+@([^:]+):/.exec(u) ?? [])[1] ?? '';
+// Driver-side SSRF guard: no loopback/localhost, mDNS .local, and no numeric IP literal of any spelling (dotted, decimal, hex, octal,
+// short forms like 127.1). Private ranges are numeric too, so every 10.*, 172.16-31.*, 192.168.*, 169.254.*, 0.0.0.0 is covered;
+// IPv6 literals ([::1], [fe80::], [fd00::]) cannot pass SAFE_URL's host pattern. A NAME that resolves privately (DNS rebinding) is not caught.
+export function publicHost(host) {
+  const h = String(host).toLowerCase().replace(/\.$/, '');
+  if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) return false;
+  if (/^[0-9.]+$/.test(h) || /^0x[0-9a-f]+$/.test(h) || h.split('.').some((l) => /^0x[0-9a-f]*$/.test(l)) || /^[0-9a-fx.]+$/.test(h) && /\d$/.test(h)) return false;
+  return true;
+}
 
 // Lower-cases section and variable name; the subsection (between them) is case-sensitive in git and is kept as is.
 const normKey = (k) => { const a = k.indexOf('.'), b = k.lastIndexOf('.'); return a === b ? k.toLowerCase() : `${k.slice(0, a).toLowerCase()}${k.slice(a, b)}${k.slice(b).toLowerCase()}`; };
@@ -51,7 +62,7 @@ export function configAllowed(key, value) {
   if (DANGEROUS_NAME.test(lk.slice(lk.lastIndexOf('.') + 1))) return false;
   if (ALLOWED_EXACT.has(lk)) return true;
   if (!ALLOWED_PATTERNS.some((re) => re.test(lk))) return false;
-  if (/^remote\..+\.(url|pushurl)$/.test(lk)) return typeof value === 'string' && SAFE_URL.test(value);
+  if (/^remote\..+\.(url|pushurl)$/.test(lk)) return typeof value === 'string' && SAFE_URL.test(value) && publicHost(urlHost(value));
   if (/^(remote\..+\.fetch|branch\..+\.merge)$/.test(lk)) return typeof value === 'string' && !value.startsWith('-');
   if (/^branch\..+\.remote$/.test(lk)) return typeof value === 'string' && REMOTE_NAME.test(value); // a name, never a URL
   return true;
@@ -65,6 +76,7 @@ export function gitEnv(base = process.env) {
   env.GIT_CONFIG_NOSYSTEM = '1';
   env.GIT_CONFIG_GLOBAL = '/dev/null';
   env.SSH_ASKPASS_REQUIRE = 'never';
+  env.GIT_NO_REPLACE_OBJECTS = '1'; // refs/replace/* cannot swap the commits or blobs the driver inspects
   return env;
 }
 

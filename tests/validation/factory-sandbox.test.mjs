@@ -148,7 +148,7 @@ test('gitSafe: GIT_* environment is scrubbed (GIT_DIR, GIT_EXTERNAL_DIFF, GIT_CO
   assert.equal(fs.existsSync(marker), false, 'GIT_EXTERNAL_DIFF ran');
   assert.equal(G.gitSafe(repo, 'config', 'user.name').out.trim(), '', 'env or global config leaked into gitSafe');
   const e = G.gitEnv({ PATH: '/bin', HOME: '/h', GIT_SSH_COMMAND: 'x', GIT_ASKPASS: 'x', GIT_PAGER: 'x', git_dir: 'x', GIT_CONFIG_PARAMETERS: 'x', SSH_ASKPASS: 'x' });
-  assert.deepEqual(e, { PATH: '/bin', HOME: '/h', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', SSH_ASKPASS_REQUIRE: 'never' });
+  assert.deepEqual(e, { PATH: '/bin', HOME: '/h', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', SSH_ASKPASS_REQUIRE: 'never', GIT_NO_REPLACE_OBJECTS: '1' });
   assert.ok(G.GIT_SAFE_FLAGS.includes('core.sshCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'));
 });
 
@@ -407,7 +407,7 @@ function fakeHome(t) {
   for (const f of ['.npmrc', '.codex/auth.json', '.docker/config.json', '.config/gcloud/credentials.db', '.zsh_history', '.python_history',
     'Library/Application Support/Google/Chrome/Default/Cookies', '.cargo/credentials.toml', '.kube/config', 'project/notes.txt', '.git-credentials']) put(f);
   put('.nvm/versions/node/v1/bin/tool.txt', 'TOOL\n');
-  put('.nvm/.npmrc'); put('.local/share/pnpm/auth.json'); put('.nvm/versions/node/v1/etc/npmrc-not-a-cred.txt', 'OK\n');
+  put('.nvm/.npmrc'); put('.local/share/pnpm/auth.json'); put('.nvm/versions/node/v1/etc/readme-not-a-cred.txt', 'OK\n');
   return h;
 }
 
@@ -420,7 +420,7 @@ test('C1 sandbox fs: the whole home is unreadable except toolchains; credentials
   const r = await sb(w, `const H=A[0],W=A[1];out({
     creds: JSON.parse(A[2]).map(c=>t(()=>fs.readFileSync(path.join(H,c),'utf8'))),
     listHome: t(()=>fs.readdirSync(H).join()), tool: t(()=>fs.readFileSync(path.join(H,'.nvm/versions/node/v1/bin/tool.txt'),'utf8')),
-    listTool: t(()=>fs.readdirSync(path.join(H,'.nvm','versions')).join()), toolOther: t(()=>fs.readFileSync(path.join(H,'.nvm/versions/node/v1/etc/npmrc-not-a-cred.txt'),'utf8')),
+    listTool: t(()=>fs.readdirSync(path.join(H,'.nvm','versions')).join()), toolOther: t(()=>fs.readFileSync(path.join(H,'.nvm/versions/node/v1/etc/readme-not-a-cred.txt'),'utf8')),
     dotdot: t(()=>fs.readFileSync(path.join(H,'.nvm')+'/../.npmrc','utf8')),
     dotdotCargo: t(()=>fs.readFileSync(path.join(H,'.cargo')+'/../.npmrc','utf8')),
     symlink: t(()=>{fs.symlinkSync(path.join(H,'.npmrc'),path.join(W,'npmrc-link'));return fs.readFileSync(path.join(W,'npmrc-link'),'utf8')}),
@@ -654,4 +654,117 @@ test('second layer: gc.auto=0 keeps auto-gc from running inside a driver call', 
   assert.equal(packs(), 0, 'auto-gc packed objects inside a gitSafe call');
   git(repo, 'commit', '-q', '--allow-empty', '-m', 'ctl');
   assert.ok(packs() > 0, 'control: plain git auto-gc packs with gc.auto=1');
+});
+
+// ---- fix round 2 ------------------------------------------------------------------------------------------------------------------
+// N1: kern.procargs2 is a sysctl, not process-info: it returned the argv AND environment of every same-user process (the driver too).
+const PROCARGS_PY = `import ctypes,sys,os
+libc=ctypes.CDLL(None)
+def pa(pid):
+  mib=(ctypes.c_int*3)(1,49,pid); n=ctypes.c_size_t(1<<17); b=ctypes.create_string_buffer(1<<17)
+  rc=libc.sysctl(mib,3,b,ctypes.byref(n),None,0)
+  return rc, (b.raw[:n.value] if rc==0 else b'')
+mode=sys.argv[1]
+if mode=='one':
+  rc,d=pa(int(sys.argv[2])); print(rc, sys.argv[3].encode() in d)
+elif mode=='scan':
+  # processes in THIS sandbox (the sh and its subshells) carry SELF_SENTINEL and are allowed; count every other readable one
+  seen=0
+  for pid in range(1,100000):
+    rc,d=pa(pid)
+    if rc==0 and len(d)>4 and b'SELF_SENTINEL=tok_SELF' not in d:
+      seen+=1
+  print(seen)
+elif mode=='all':
+  m=(ctypes.c_int*4)(1,14,0,0); n=ctypes.c_size_t(0); print(libc.sysctl(m,3,None,ctypes.byref(n),None,0))`;
+
+test('N1 sandbox: no other process\'s argv/environment via kern.procargs2 (the driver, a node victim, a scan); its own stays readable', { skip: SKIP }, async (t) => {
+  const w = world(t);
+  const victim = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { env: { ...process.env, DRIVER_SECRET_SENTINEL: 'tok_N1_SENTINEL' }, stdio: 'ignore' });
+  t.after(() => victim.kill('SIGKILL'));
+  await new Promise((res) => setTimeout(res, 300));
+  // Control: outside the sandbox the victim's environment IS readable this way, so the probe is not a false negative.
+  fs.writeFileSync(path.join(w.tmpDir, 'pa.py'), PROCARGS_PY);
+  assert.match(spawnSync('/usr/bin/python3', ['-I', path.join(w.tmpDir, 'pa.py'), 'one', String(victim.pid), 'tok_N1_SENTINEL'], { encoding: 'utf8' }).stdout, /^0 True/);
+  const file = path.join(w.tmpDir, 'n1.json');
+  const env = { ...P.allowEnv(null), SELF_SENTINEL: 'tok_SELF', OUT: file };
+  const r = await S.runSandboxed(['/bin/sh', '-c', `py() { /usr/bin/python3 -I "$TMPDIR/pa.py" "$@" 2>/dev/null; }
+    printf '{"victim":"%s","parent":"%s","self":"%s","scan":"%s","all":"%s"}' "$(py one ${victim.pid} tok_N1_SENTINEL)" "$(py one $PPID PATH=)" "$(py one $$ SELF_SENTINEL=tok_SELF)" "$(py scan)" "$(py all)" > "$OUT"`],
+  { cwd: w.work, env, profile: profileOf(w), timeoutS: 120 });
+  const o = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(o, { victim: '-1 False', parent: '-1 False', self: '0 True', scan: '0', all: '-1' }, r.tail);
+});
+
+test('N2 sandbox fs: credential-named files inside default toolchain dirs (incl. case variants) are unreadable; .local/bin is no longer allowed', { skip: SKIP }, async (t) => {
+  const w = world(t); const H = fakeHome(t);
+  const put = (rel, body = 'CRED\n') => { fs.mkdirSync(path.dirname(path.join(H, rel)), { recursive: true }); fs.writeFileSync(path.join(H, rel), body); return rel; };
+  const creds = ['.nvm/versions/node/v1/etc/npmrc', '.nvm/versions/node/v1/lib/node_modules/x/.npmrc', '.cargo/registry/index/x/credentials.toml',
+    '.volta/tools/image/x/auth.json', '.local/share/pnpm/rc', '.local/share/pnpm/auth.ini', '.pyenv/pip.conf', '.pyenv/pip.ini', '.bun/bunfig.toml',
+    '.bun/install/global/.npmrc', '.asdf/.env', '.asdf/.env.local', '.rustup/tls/server.key', '.rustup/tls/cert.pem', '.rustup/tls/id.p12', '.fnm/token',
+    '.fnm/tokens', '.volta/credentials', '.volta/credentials.json', '.nvm/_netrc', '.nvm/.netrc', '.nvm/versions/node/v1/etc/NPMRC', '.pyenv/Pip.Conf',
+    '.nvm/versions/node/v1/lib/node_modules/x/npmrc.bak', '.asdf/x/.env-prod', '.bun/tokens.json', '.rustup/id_ed25519.pub',
+    '.local/bin/deploy.sh'].map((c) => put(c));
+  put('.nvm/versions/node/v1/lib/node_modules/x/index.js', 'module.exports=1\n');
+  const r = await sb(w, `out({ creds: JSON.parse(A[1]).map(c=>t(()=>fs.readFileSync(path.join(A[0],c),'utf8'))),
+    ok: t(()=>fs.readFileSync(path.join(A[0],'.nvm/versions/node/v1/lib/node_modules/x/index.js'),'utf8')) })`,
+  { args: [H, JSON.stringify(creds)], profile: profileOf(w, 'none', { home: H }) });
+  assert.deepEqual(Object.fromEntries(creds.map((c, i) => [c, r.creds[i]])), Object.fromEntries(creds.map((c) => [c, 'EPERM'])));
+  assert.equal(r.ok, 'module.exports=1\n');
+  assert.ok(!S.TOOLCHAIN_PATHS.includes('.local/bin'));
+});
+
+test('N2 node read paths: a toolchain or system prefix is allowed whole; a prefix elsewhere under a home allows only node, npm and corepack', (t) => {
+  const H = fs.realpathSync(fs.mkdtempSync('/private/tmp/factory-nodehome-')); gone(t, H);
+  const mk = (prefix) => { for (const d of ['bin', 'lib/node_modules/npm', 'lib/node_modules/corepack', 'etc']) fs.mkdirSync(path.join(prefix, d), { recursive: true }); fs.writeFileSync(path.join(prefix, 'bin', 'node'), ''); return path.join(prefix, 'bin', 'node'); };
+  const odd = mk(path.join(H, 'opt', 'node')); fs.writeFileSync(path.join(H, 'opt/node/lib/libnode.147.dylib'), ''); fs.writeFileSync(path.join(H, 'opt/node/lib/other.txt'), ''); const nvm = mk(path.join(H, '.nvm', 'versions', 'node', 'v1'));
+  const sys = mk(fs.realpathSync(fs.mkdtempSync('/private/tmp/factory-sysnode-'))); gone(t, path.dirname(path.dirname(sys)));
+  const roots = [H];
+  const a = S.nodeReadPaths({ nodePaths: [odd], homes: [H], denyRoots: roots });
+  assert.deepEqual(a, { subpaths: [path.join(H, 'opt/node/lib/node_modules/npm'), path.join(H, 'opt/node/lib/node_modules/corepack')],
+    literals: [...['node', 'npm', 'npx', 'corepack'].map((b) => path.join(H, 'opt/node/bin', b)), path.join(H, 'opt/node/lib/libnode.147.dylib')] });
+  assert.deepEqual(S.nodeReadPaths({ nodePaths: [nvm], homes: [H], denyRoots: roots }), { subpaths: [path.join(H, '.nvm/versions/node/v1')], literals: [] });
+  assert.deepEqual(S.nodeReadPaths({ nodePaths: [sys], homes: [H], denyRoots: roots }), { subpaths: [path.dirname(path.dirname(sys))], literals: [] });
+});
+
+test('N2 sandbox fs: an odd node prefix under home exposes only node/npm/corepack, and never credential names', { skip: SKIP }, async (t) => {
+  const w = world(t); const H = fakeHome(t);
+  const pre = path.join(H, 'opt', 'node');
+  for (const d of ['bin', 'lib/node_modules/npm', 'lib/node_modules/corepack', 'lib/node_modules/other', 'etc']) fs.mkdirSync(path.join(pre, d), { recursive: true });
+  for (const [f, b] of [['bin/node', 'BIN'], ['lib/node_modules/npm/package.json', 'NPM'], ['lib/node_modules/npm/.npmrc', 'CRED'], ['lib/node_modules/other/x', 'OTHER'], ['etc/npmrc', 'CRED'], ['secret.txt', 'S']]) fs.writeFileSync(path.join(pre, f), b);
+  const prof = profileOf(w, 'none', { home: H, nodePaths: [path.join(pre, 'bin', 'node')] });
+  const r = await sb(w, `out(JSON.parse(A[1]).map(f=>t(()=>fs.readFileSync(path.join(A[0],f),'utf8'))))`,
+    { args: [pre, JSON.stringify(['bin/node', 'lib/node_modules/npm/package.json', 'lib/node_modules/npm/.npmrc', 'lib/node_modules/other/x', 'etc/npmrc', 'secret.txt'])], profile: prof });
+  assert.deepEqual(r, ['BIN', 'NPM', 'EPERM', 'EPERM', 'EPERM', 'EPERM']);
+});
+
+test('minor gitSafe: remote URLs to loopback, private, link-local or numeric-IP hosts are refused (driver-side SSRF)', () => {
+  for (const u of ['https://127.0.0.1/x', 'https://localhost/x', 'https://a.localhost/x', 'https://10.0.0.1/x', 'https://172.16.5.4/x', 'https://172.31.0.1/x',
+    'https://192.168.1.1/x', 'https://169.254.169.254/x', 'https://0.0.0.0/x', 'https://[::1]/x', 'https://[fe80::1]/x', 'https://[fd00::1]/x', 'https://2130706433/x',
+    'https://0x7f000001/x', 'https://0177.0.0.1/x', 'https://8.8.8.8/x', 'ssh://git@127.0.0.1/x', 'git@10.1.2.3:a/b', 'git@localhost:a/b', 'https://LOCALHOST/x', 'https://127.1/x']) {
+    assert.equal(G.configAllowed('remote.origin.url', u), false, u);
+  }
+  for (const u of ['https://github.com/a/b.git', 'git@github.com:a/b.git', 'ssh://git@gitlab.example.com/a/b', 'https://172.example.com/x']) assert.equal(G.configAllowed('remote.origin.url', u), true, u);
+});
+
+test('minor gitSafe: replace refs are ignored (GIT_NO_REPLACE_OBJECTS)', (t) => {
+  const repo = repoWithCommit(t);
+  git(repo, '-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-q', '--allow-empty', '-m', 'REAL');
+  git(repo, '-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-q', '--allow-empty', '-m', 'FAKE');
+  const real = git(repo, 'rev-parse', 'HEAD~1').stdout.trim(); const fake = git(repo, 'rev-parse', 'HEAD').stdout.trim();
+  git(repo, 'reset', '-q', '--hard', 'HEAD~1'); git(repo, 'replace', real, fake);
+  const plainEnv = G.gitEnv(); delete plainEnv.GIT_NO_REPLACE_OBJECTS;
+  assert.match(spawnSync('git', ['log', '-1', '--format=%s'], { cwd: repo, env: plainEnv, encoding: 'utf8' }).stdout, /FAKE/, 'control: plain git honours the replace ref');
+  assert.equal(G.gitSafe(repo, 'log', '-1', '--format=%s').out, 'REAL\n');
+});
+
+test('minor gitSafe: git killed by an outside signal (no timeout, no error) throws without output', async (t) => {
+  const repo = repoWithCommit(t);
+  const srv = spawn(process.execPath, ['-e', "require('net').createServer(()=>{}).listen(0,'127.0.0.1',function(){console.log(this.address().port)})"], { stdio: ['ignore', 'pipe', 'ignore'] });
+  t.after(() => srv.kill('SIGKILL'));
+  const port = await new Promise((res) => srv.stdout.once('data', (d) => res(String(d).trim())));
+  // Kill git AND its git-remote-http children (they hold the pipes); the sh's own command line does not contain the full pattern.
+  const tag = `sigprobe${rnd()}`;
+  const killer = spawn('/bin/sh', ['-c', `p=127.0.0.1:${port}; sleep 1; pkill -KILL -f "$p/${tag}"`], { stdio: 'ignore', detached: true });
+  t.after(() => { try { process.kill(-killer.pid, 'SIGKILL'); } catch { /* done */ } });
+  assert.throws(() => G.gitSafeOpts(repo, ['ls-remote', `http://127.0.0.1:${port}/${tag}`], { timeout: 30000 }), /^Error: git ls-remote was killed by SIGKILL$/);
 });
