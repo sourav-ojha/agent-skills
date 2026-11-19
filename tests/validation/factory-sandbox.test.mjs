@@ -149,7 +149,7 @@ test('gitSafe: GIT_* environment is scrubbed (GIT_DIR, GIT_EXTERNAL_DIFF, GIT_CO
   assert.equal(fs.existsSync(marker), false, 'GIT_EXTERNAL_DIFF ran');
   assert.equal(G.gitSafe(repo, 'config', 'user.name').out.trim(), '', 'env or global config leaked into gitSafe');
   const e = G.gitEnv({ PATH: '/bin', HOME: '/h', GIT_SSH_COMMAND: 'x', GIT_ASKPASS: 'x', GIT_PAGER: 'x', git_dir: 'x', GIT_CONFIG_PARAMETERS: 'x', SSH_ASKPASS: 'x' });
-  assert.deepEqual(e, { PATH: '/bin', HOME: '/h', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', SSH_ASKPASS_REQUIRE: 'never', GIT_NO_REPLACE_OBJECTS: '1' });
+  assert.deepEqual(e, { PATH: '/bin', HOME: '/h', GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', SSH_ASKPASS_REQUIRE: 'never', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1' });
   assert.ok(G.GIT_SAFE_FLAGS.includes('core.sshCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'));
 });
 

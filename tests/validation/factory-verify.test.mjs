@@ -1875,8 +1875,8 @@ const forgeConfig = (r, cfg) => {
 test('T10 r2: a refs/replace-forged base config (required:false) is ignored by the policy read; the preflight refuses refs/replace', () => {
   const a = vship();
   forgeConfig(a, { protected_branches: [], verification: { required: false } });
-  const x = merge(a); // ci_passed: still refused because the REAL base config requires verification
-  assert.equal(x.code, 1, x.out + x.err); assert.match(x.err, /verification is required/);
+  const x = merge(a); // ci_passed: the policy read ignores the replace ref, so this is driver mode, and the pre-fetch preflight refuses
+  assert.equal(J(x)?.state, 'awaiting_human', x.out + x.err); assert.match(J(x).reason, /not a trusted clone/); assert.equal(mergeCalled(a), false);
   a.edit((f) => { f.state = 'verified'; });
   arm(a);
   const y = merge(a);
@@ -1907,5 +1907,65 @@ test('T10 r2: commit-graphs are never read or written by gitSafe, and a planted 
   fs.rmSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graph'));
   fs.mkdirSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graphs'));
   assert.throws(() => GS.checkRepoMetadata(r.work), /commit-graphs present/);
+  rm(r);
+});
+
+// ---- Task 10 fix round 3 ------------------------------------------------------------------------------------------------------------
+test('T10 r3: a planted origin/<base> (required:false) that `git fetch origin` would never refresh does not decide the policy', () => {
+  const r = vship();
+  const br = g(r.work, 'rev-parse', '--abbrev-ref', 'HEAD');
+  g(r.work, 'checkout', '-q', '-b', 'evil', 'refs/remotes/origin/main');
+  fs.writeFileSync(path.join(r.work, '.product/delivery.json'), JSON.stringify({ protected_branches: [], verification: { required: false } }));
+  g(r.work, 'commit', '-q', '-am', 'forged policy'); const evil = g(r.work, 'rev-parse', 'HEAD');
+  g(r.work, 'checkout', '-q', br);
+  g(r.work, 'update-ref', 'refs/remotes/origin/main', evil);
+  g(r.work, 'config', 'remote.origin.fetch', '+refs/heads/main:refs/remotes/origin/elsewhere');
+  g(r.work, 'fetch', '-q', 'origin');
+  assert.equal(g(r.work, 'rev-parse', 'refs/remotes/origin/main'), evil, 'control: a plain fetch leaves the planted ref');
+  const x = merge(r); // ci_passed: refused, because the REAL base requires verification
+  assert.equal(x.code, 1, x.out + x.err); assert.match(x.err, /verification is required/);
+  assert.notEqual(g(r.work, 'rev-parse', 'refs/remotes/origin/main'), evil, 'the explicit refspec refreshed the tracking ref');
+  rm(r);
+});
+
+test('T10 r3: origin must be exactly the pinned repository, in every mode', () => {
+  for (const url of ['git@github.com:evil/o/r.git', 'https://github.com/evil/o/r', 'git@example.com:o/r.git']) {
+    const r = shipped(); // required:false, interactive (in-repo queue)
+    g(r.work, 'remote', 'set-url', 'origin', url);
+    const m = r.d({}, 'merge', 'FEATURE-001');
+    assert.equal(J(m)?.state, 'awaiting_human', `${url}: ${m.out}${m.err}`); assert.match(J(m).reason, /origin's URL is not o\/r/); assert.equal(mergeCalled(r), false);
+    rm(r);
+  }
+});
+
+test('T10 r3: driver mode refuses an installed hook before the fetch runs it', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; }); arm(r);
+  const marker = path.join(r.root, 'HOOK-RAN');
+  fs.writeFileSync(path.join(gitDirOf(r), 'hooks', 'reference-transaction'), `#!/bin/sh\ntouch "${marker}"\n`, { mode: 0o755 });
+  const m = merge(r);
+  assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /not a trusted clone/);
+  assert.equal(fs.existsSync(marker), false, 'the planted hook never ran'); assert.equal(mergeCalled(r), false);
+  assert.throws(() => GS.checkNoHooks(r.work), /a hook is installed/);
+  fs.rmSync(path.join(gitDirOf(r), 'hooks', 'reference-transaction'));
+  assert.doesNotThrow(() => GS.checkNoHooks(r.work), 'git\'s own *.sample files are fine');
+  // ... and a stale local base config that requires verification also selects driver mode (in-repo queue)
+  const s = shipped({}, { config: REQ });
+  s.edit((f) => { f.state = 'verified'; });
+  const mk2 = path.join(s.root, 'HOOK2'); fs.writeFileSync(path.join(gitDirOf(s), 'hooks', 'reference-transaction'), `#!/bin/sh\ntouch "${mk2}"\n`, { mode: 0o755 });
+  const y = s.d({}, 'merge', 'FEATURE-001');
+  assert.match(J(y).reason, /not a trusted clone/, y.out + y.err); assert.equal(fs.existsSync(mk2), false);
+  rm(r, s);
+});
+
+test('T10 r3: gitEnv blocks lazy fetches', () => {
+  assert.equal(GS.gitEnv({}).GIT_NO_LAZY_FETCH, '1');
+});
+
+test('T10 r3: when the changed files cannot be listed (no merge base) a non-gated merge holds instead of treating the list as empty', () => {
+  const r = shipped(); // required:false, T2: no verdict gate runs
+  g(r.work, 'push', '-q', '-f', 'origin', `${g(r.work, 'commit-tree', 'refs/remotes/origin/main^{tree}', '-m', 'unrelated')}:refs/heads/main`);
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /changed files could not be listed/); assert.equal(mergeCalled(r), false);
   rm(r);
 });

@@ -16,7 +16,7 @@ import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
 import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios.mjs';
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
-import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs } from './lib/gitsafe.mjs';
+import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs, checkNoHooks, GIT_SAFE_FLAGS } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -240,12 +240,13 @@ function baseConfigHash(base) {
 // Read through gitSafe (GIT_* scrubbed, GIT_NO_REPLACE_OBJECTS, neutralising -c flags, raw exit codes): a planted refs/replace/* or
 // repo config in this checkout cannot swap the blob that decides verification.required. Only rev-parse / ls-tree / cat-file run here,
 // none of which runs a config-defined program, so the per-call config listing is skipped (verified: true) for interactive checkouts.
-function baseConfigNow(base) {
-  const og = (...a) => { try { return gitSafeOpts(root, a, { verified: true }); } catch { return { code: 1, out: '', err: '' }; } };
+// `at`: read from this commit (merge passes the sha it just fetched) instead of the local tracking ref.
+const og = (...a) => { try { return gitSafeOpts(root, a, { verified: true }); } catch { return { code: 1, out: '', err: '' }; } };
+function baseConfigNow(base, at = OR(base)) {
   // Fail closed: a ref that does not resolve is not "no config". Defaults apply only when the ref resolves and the file is genuinely absent.
-  if (og('rev-parse', '--verify', '--quiet', `${OR(base)}^{commit}`).code !== 0) return null;
+  if (og('rev-parse', '--verify', '--quiet', `${at}^{commit}`).code !== 0) return null;
   // "Absent" only when ls-tree succeeds and lists nothing; any other failure, or anything but a regular file, is unreadable (null).
-  const t = og('ls-tree', '--full-tree', '-z', OR(base), '--', CONFIG_PATH);
+  const t = og('ls-tree', '--full-tree', '-z', at, '--', CONFIG_PATH);
   if (t.code !== 0) return null;
   if (t.out === '') return parseConfig(undefined).config;
   const m = /^100(?:644|755) blob ([0-9a-f]{40,64})\t/.exec(t.out);
@@ -675,20 +676,55 @@ function verdictGate(q, f, bc, headSha) {
   return { ...G(`anti-gaming check ${ids.join(', ')} hit on the merge commit: a person reviews it (deliver retry ${f.id} --note at a terminal overrides it for this commit)`, 'antigaming'), ids };
 }
 
+// Fetch for merge: an EXPLICIT refspec (a planted remote.origin.fetch cannot leave a stale or forged tracking ref in place) from an
+// origin whose configured URL is exactly the repository gh is pinned to. hardened (driver mode, after the preflight): the gitSafe
+// neutralising flags on top of gitNet (hooks off, ext:: off, plain ssh, no redirects, no submodules, no gc/maintenance, no
+// commit-graph). protocol.file and the credential flags are left to gitNet: the URL check pins origin, and gitNet supplies the
+// configured account's token. Interactive mode keeps the plain gitNet fetch (the user's own checkout and config).
+const HARD = (() => { const out = []; for (let i = 0; i < GIT_SAFE_FLAGS.length; i += 2) if (!/^(protocol\.file\.allow|credential\.helper|core\.askPass)=/.test(GIT_SAFE_FLAGS[i + 1])) out.push(GIT_SAFE_FLAGS[i], GIT_SAFE_FLAGS[i + 1]); return out; })();
+const urlPath = (u) => { const m = /^(?:(?:https|ssh):\/\/[^/]+\/|[A-Za-z0-9._-]+@[^:/]+:)(.+?)(?:\.git)?\/?$/i.exec(String(u)); return m ? m[1].toLowerCase() : null; };
+function originOk(q) {
+  const u = og('config', '--get', 'remote.origin.url');
+  const url = u.code === 0 ? u.out.trim() : '';
+  const host = (GH_HOSTNAME || q.policy?.github?.host || 'github.com').toLowerCase();
+  return !!url && !url.includes('\n') && remoteHost(url) === host && urlPath(url) === String(q.repo).toLowerCase();
+}
+const fetchRef = (branch, hardened) => (hardened ? gitNet(...HARD, 'fetch', 'origin', `+refs/heads/${branch}:${OR(branch)}`) : gitNet('fetch', 'origin', `+refs/heads/${branch}:${OR(branch)}`));
+// The files of the change that need a person, computed with gitSafe (no replace objects, raw output); throws on any git failure.
+function ciFilesAt(pq, rev) {
+  const mb = rawGit('merge-base', OR(pq.base), rev);
+  const base = mb.code === 0 ? mb.out.trim() : '';
+  if (!SHA.test(base) || !SHA.test(rev)) throw new Error('merge-base failed');
+  const r = rawGit('-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', base, rev);
+  if (r.code !== 0) throw new Error('diff failed');
+  const files = r.out.split('\0').filter(Boolean);
+  const policy = files.filter((x) => x.toLowerCase() === CONFIG_PATH || matchesAny(x, pq.policy.hold_paths));
+  return [...new Set([...touchesCi(files), ...policy])];
+}
+
 C.merge = () => {
   const q = load(); const f = item(q);
   need(f, 'ci_passed', 'verified');
-  must(gitNet('fetch', 'origin'), 'git fetch');
   // kind: 'verification' (plain retry re-runs CI and verification) or 'antigaming' (retry needs a person at a terminal, --note).
   // An anti-gaming hold records the held commit and G-ids: retry --note can only override exactly those (see C.retry).
   const hold = (why, kind, at) => { if (kind || f.hold_kind) f.hold_kind = kind || null; if (at) { f.hold_sha = at.sha; f.hold_ids = at.ids; } transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr, ...(kind ? { hold_kind: kind } : {}) }); };
+  // Driver mode (a trusted queue, or the local copy of the base config already asks for verification): the checkout must pass the
+  // preflight and have no hooks BEFORE the fetch, which then runs hardened. The stale local config only picks the mode; never policy.
+  const driver = queueInHome() || !!baseConfigNow(q.base)?.verification.required;
+  if (driver) { try { gatePreflight(); checkNoHooks(root); } catch { return hold('verification gate: this checkout is not a trusted clone (git config outside the allowlist, a hook, or planted grafts, shallow, alternates, commit-graph, config.worktree or replace refs): run merge from the driver-owned clone', 'verification'); } }
+  if (!originOk(q)) return hold(`origin's URL is not ${q.repo} on ${GH_HOSTNAME || q.policy?.github?.host || 'github.com'}: the base branch and its policy cannot be fetched from a trusted remote`, 'verification');
+  if (fetchRef(q.base, driver).code !== 0) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read: fetching refs/heads/${q.base} from origin failed`, 'verification');
+  // The policy is read from exactly the commit just fetched, and the tracking ref every later check uses must point at it.
+  const fh = og('rev-parse', '--verify', '--quiet', 'FETCH_HEAD^{commit}'), tr = og('rev-parse', '--verify', '--quiet', `${OR(q.base)}^{commit}`);
+  const baseSha = fh.code === 0 ? fh.out.trim() : '';
+  if (!SHA.test(baseSha) || tr.code !== 0 || tr.out.trim() !== baseSha) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read: the tracking ref does not match the commit just fetched`, 'verification');
   const view = () => ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,isDraft,mergeStateStatus,headRefOid,headRefName,baseRefName,mergeCommit,autoMergeRequest,isCrossRepository'], 'gh pr view');
   let v = view();
   if (v.isCrossRepository || v.headRefName !== f.branch || v.baseRefName !== q.base) die(`PR #${f.pr.number} is ${v.headRefName} -> ${v.baseRefName}${v.isCrossRepository ? ' (from a fork)' : ''}, expected ${f.branch} -> ${q.base} in this repository`);
   if (v.state === 'MERGED' && v.headRefOid === f.ci_sha) return merged(q, f, v.mergeCommit?.oid, ['GitHub had already merged this PR (an earlier run was interrupted)']);
   // Policy in force is the config on origin/<base> now, for every state (checked after the already-merged recovery so a hand-merged
   // PR still resolves). The queue's `policy` copy is never consulted below: a forged copy has no effect.
-  const bc = baseConfigNow(q.base);
+  const bc = baseConfigNow(q.base, baseSha);
   if (!bc) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read (missing ref or invalid): not assuming defaults; fix it, then retry`, 'verification');
   const required = bc.verification.required;
   if (required && f.state === 'ci_passed') die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
@@ -697,8 +733,9 @@ C.merge = () => {
   if (required && !queueInHome()) return hold(`verification is required but the queue file is not under FACTORY_HOME (it may be builder-writable): run merges through the factory driver`, 'verification');
   if (q.protected_base || isProtectedBranch(q.base, bc.protected_branches)) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
   if (!q.merge) return hold('merging was not authorised for this run (config merge.mode is "pr-only" and --merge was not given): the PR is ready for you');
-  if (git('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(gitNet('fetch', 'origin', f.branch), 'git fetch');
-  const ci = [...new Set([...(f.ci_files || []), ...ciFiles(pq, f.ci_sha)])]; // recomputed on the verified commit, renames included
+  if (og('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(fetchRef(f.branch, driver), 'git fetch');
+  let ci = null; // recomputed on the verified commit with gitSafe, renames included; a git failure holds (after the gate, below)
+  try { ci = [...new Set([...(f.ci_files || []), ...ciFilesAt(pq, f.ci_sha)])]; } catch { /* ci stays null */ }
   // T3 needs the opt-in AND a matching passing verdict, in every mode; with verification required every feature needs the verdict.
   if (f.tier === 'T3' && !q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
   if (required || f.tier === 'T3') {
@@ -711,6 +748,7 @@ C.merge = () => {
     try { g = verdictGate(q, f, bc, headSha); } catch { g = { why: 'verification gate: the verdict could not be checked (fail-closed)', kind: 'verification' }; }
     if (g) return hold(`${f.tier === 'T3' && !required ? 'T3 work: ' : ''}${g.why}`, g.kind, g.kind === 'antigaming' ? { sha: headSha, ids: g.ids || [] } : null);
   }
+  if (!ci) return hold('the changed files could not be listed on the verified commit (fail-closed): a person reviews it', 'verification');
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
   if (v.headRefOid !== f.ci_sha) { transition(f, 'pr_open'); save(q); return outcome({ id: f.id, result: 'stale', reason: 'the PR head changed after CI passed: wait for CI again', next: 'ci' }); }

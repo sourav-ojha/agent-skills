@@ -100,6 +100,7 @@ export function gitEnv(base = process.env) {
   env.GIT_CONFIG_GLOBAL = '/dev/null';
   env.SSH_ASKPASS_REQUIRE = 'never';
   env.GIT_NO_REPLACE_OBJECTS = '1'; // refs/replace/* cannot swap the commits or blobs the driver inspects
+  env.GIT_NO_LAZY_FETCH = '1'; // a (promisor) repo never fetches missing objects behind a read
   return env;
 }
 
@@ -212,6 +213,17 @@ export function checkRepoMetadata(cwd, { global = [], timeout = DEFAULT_TIMEOUT_
   if (!gitDir || !commonDir) throw new Error('git worktree not safe: git dir unreadable');
   const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
   for (const rel of PLANTED) for (const d of new Set([commonDir, gitDir])) if (exists(path.join(d, ...rel))) throw new Error(`git worktree not safe: ${rel.join('/')} present`);
+}
+// Throws when <git dir>/hooks or <common dir>/hooks holds anything but git's own *.sample files (core.hooksPath itself is refused by
+// the config allowlist). For plain-git commands that must run in a checkout before it is otherwise trusted (deliver merge's fetch).
+export function checkNoHooks(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS } = {}) {
+  const dirs = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...locationOf(global), 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], timeout);
+  if (dirs.status !== 0) throw new Error('git repository not safe: git dir unreadable');
+  for (const d of new Set(dirs.stdout.split('\n').filter(Boolean))) {
+    let ents = [];
+    try { ents = fs.readdirSync(path.join(d, 'hooks')); } catch (e) { if (e.code !== 'ENOENT') throw new Error(`git repository not safe: hooks unreadable (${e.code})`); }
+    if (ents.some((n) => !n.endsWith('.sample'))) throw new Error('git repository not safe: a hook is installed');
+  }
 }
 // Throws when any refs/replace/* ref exists (loose, packed or reftable: listed by for-each-ref; a failing listing throws). gitSafe
 // itself ignores replace refs (GIT_NO_REPLACE_OBJECTS), so ordinary gitSafe calls do not need this; a checkout whose PLAIN git
