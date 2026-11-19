@@ -923,7 +923,10 @@ test('R4 gitSafe: an embedded repo (nested .git with a filter) makes worktree co
     assert.equal(G.gitSafe(repo, ...cmd).code, 0, cmd.join(' '));
   }
   assert.throws(() => G.gitSafe(repo, 'diff', '--submodule=diff', head, other), /worktree not safe/);
-  assert.throws(() => G.gitSafe(repo, 'diff', head, other, '--', 'a.txt'), /worktree not safe/);
+  assert.throws(() => G.gitSafe(repo, 'diff', head, '--', 'a.txt'), /worktree not safe/); // one revision: worktree diff
+  assert.throws(() => G.gitSafe(repo, 'diff', head, other, '--', ':(attr:x)a.txt'), /worktree not safe/); // attr magic reads .gitattributes
+  assert.throws(() => G.gitSafe(repo, 'diff', '--cached', head, other, '--', 'a.txt'), /worktree not safe/);
+  assert.equal(G.gitSafe(repo, 'diff', head, other, '--', 'a.txt').code, 0, 'Task 10: two full commit ids + pathspec is an object-database read');
   assert.throws(() => G.gitSafe(repo, 'diff', '--ext-diff', head, other), /option not allowed/);
   assert.equal(fs.existsSync(marker), false);
   git(repo, 'add', '-A'); git(repo, 'diff'); // control: once staged as a gitlink, plain `git diff` runs the embedded repo's filter

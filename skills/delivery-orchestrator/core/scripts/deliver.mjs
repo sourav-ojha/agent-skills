@@ -16,7 +16,7 @@ import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
 import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios.mjs';
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
-import { gitSafeOpts } from './lib/gitsafe.mjs';
+import { gitSafeOpts, verifyGitConfig, checkRepoMetadata } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -240,7 +240,11 @@ function baseConfigHash(base) {
 function baseConfigNow(base) {
   // Fail closed: a ref that does not resolve is not "no config". Defaults apply only when the ref resolves and the file is genuinely absent.
   if (git('rev-parse', '--verify', '--quiet', OR(base)).code !== 0) return null;
-  if (git('cat-file', '-e', `${OR(base)}:${CONFIG_PATH}`).code !== 0) return parseConfig(undefined).config;
+  // "Absent" only when ls-tree succeeds and lists nothing; any other failure, or anything but a regular file, is unreadable (null).
+  const t = git('ls-tree', '--full-tree', OR(base), '--', CONFIG_PATH);
+  if (t.code !== 0) return null;
+  if (t.out === '') return parseConfig(undefined).config;
+  if (!/^100(644|755) blob [0-9a-f]{40,64}\t/.test(t.out)) return null;
   const s = git('show', `${OR(base)}:${CONFIG_PATH}`);
   if (s.code !== 0) return null;
   try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; }
@@ -591,12 +595,25 @@ C.push = () => {
 
 // ---- verdict gate (merge) ----------------------------------------------------------------------------------------------
 // Raw, hardened git for the gate: stdout untrimmed, real exit codes (checkDiff needs both), GIT_* scrubbed, neutralising -c flags,
-// --no-ext-diff/--no-textconv on diffs, a timeout; signals, timeouts and overflows throw. The repo config allowlist is skipped
-// (verified: true): merge runs in whatever checkout the caller uses, and this process already ran an unhardened `git fetch` there.
-// Every command here is read-only on objects and refs (rev-parse, merge-base, ls-tree, cat-file, diff between two shas).
+// --no-ext-diff/--no-textconv on diffs, a timeout; signals, timeouts and overflows throw. Every command is read-only on objects and
+// refs (rev-parse, merge-base, ls-tree, cat-file, diff between two shas). `verified: true` skips the per-call config listing: the gate
+// runs gatePreflight() once first on the same cwd (config allowlist + planted repository metadata), as gitsafe requires.
 const rawGit = (...a) => gitSafeOpts(root, a, { verified: true });
-// The queue file is trusted only under FACTORY_HOME (by realpath, so a sibling "fhome-x" or a link out does not count).
-const queueInHome = () => { try { const h = fs.realpathSync(factoryHome()); return fs.realpathSync(file).startsWith(h + path.sep); } catch { return false; } };
+// Throws unless the checkout's config passes the gitsafe allowlist and no grafts / shallow / alternates / config.worktree exist.
+// PRECONDITION (safety.md): merge with a verdict gate runs in a driver-owned clone the builder cannot write to.
+const gatePreflight = () => { verifyGitConfig(root); checkRepoMetadata(root); };
+// The queue file is trusted only as a private regular file under FACTORY_HOME (by realpath: a sibling "fhome-x" or a link out does
+// not count), outside the repository, with FACTORY_HOME neither the repository nor an ancestor of it; one link, ours, not
+// group/other writable.
+const within = (p, d) => p === d || p.startsWith(d + path.sep);
+const queueInHome = () => {
+  try {
+    const h = fs.realpathSync(factoryHome()), r = fs.realpathSync(root), q = fs.realpathSync(file);
+    if (!q.startsWith(h + path.sep) || within(q, r) || within(r, h)) return false;
+    const st = fs.lstatSync(q);
+    return st.isFile() && st.nlink === 1 && st.uid === process.getuid() && (st.mode & 0o022) === 0;
+  } catch { return false; }
+};
 const SPEC_MAX = 256 * 1024;
 const PART_OK = (p) => p.split('/').every((x) => x !== '' && x !== '.' && x !== '..');
 const specTooBig = (t) => t.length > SPEC_MAX || t.split('\n').some((l) => l.length > MAX_LINE); // never parse a hostile size
@@ -644,10 +661,12 @@ function verdictGate(q, f, bc, headSha) {
   try {
     hits = checkDiff({ git: rawGit, baseRef: OR(q.base), headSha, config: bc, specPaths: specList(q.base, bc.features_dir, rel) });
     if (classify(hits, 'merge') === 'clean') return null;
-  } catch { return G('anti-gaming checks could not run on the merge commit (fail-closed): a person reviews it', 'antigaming'); }
-  // A person's override (retry --note at a terminal) counts only for this exact head, and only from a queue the builder cannot write.
-  if (queueInHome() && overrideValid(f, headSha)) return null;
-  return G(`anti-gaming check ${holdReason(hits).ids.join(', ')} hit on the merge commit: a person reviews it (deliver retry ${f.id} --note at a terminal overrides it for this commit)`, 'antigaming');
+  } catch { return { ...G('anti-gaming checks could not run on the merge commit (fail-closed): a person reviews it', 'antigaming'), ids: [] }; }
+  // A person's override (retry --note at a terminal) counts only for this exact head and only for the G-ids it was given for,
+  // and only from a queue the builder cannot write.
+  const ids = holdReason(hits).ids;
+  if (queueInHome() && overrideValid(f, headSha, ids)) return null;
+  return { ...G(`anti-gaming check ${ids.join(', ')} hit on the merge commit: a person reviews it (deliver retry ${f.id} --note at a terminal overrides it for this commit)`, 'antigaming'), ids };
 }
 
 C.merge = () => {
@@ -655,7 +674,8 @@ C.merge = () => {
   need(f, 'ci_passed', 'verified');
   must(gitNet('fetch', 'origin'), 'git fetch');
   // kind: 'verification' (plain retry re-runs CI and verification) or 'antigaming' (retry needs a person at a terminal, --note).
-  const hold = (why, kind) => { if (kind || f.hold_kind) f.hold_kind = kind || null; transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr, ...(kind ? { hold_kind: kind } : {}) }); };
+  // An anti-gaming hold records the held commit and G-ids: retry --note can only override exactly those (see C.retry).
+  const hold = (why, kind, at) => { if (kind || f.hold_kind) f.hold_kind = kind || null; if (at) { f.hold_sha = at.sha; f.hold_ids = at.ids; } transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr, ...(kind ? { hold_kind: kind } : {}) }); };
   const view = () => ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,isDraft,mergeStateStatus,headRefOid,headRefName,baseRefName,mergeCommit,autoMergeRequest,isCrossRepository'], 'gh pr view');
   let v = view();
   if (v.isCrossRepository || v.headRefName !== f.branch || v.baseRefName !== q.base) die(`PR #${f.pr.number} is ${v.headRefName} -> ${v.baseRefName}${v.isCrossRepository ? ' (from a fork)' : ''}, expected ${f.branch} -> ${q.base} in this repository`);
@@ -680,8 +700,10 @@ C.merge = () => {
     // Required: the verdict must be for the PR head as GitHub reports it now, and that must be the commit CI passed on.
     const headSha = required ? v.headRefOid : f.ci_sha;
     if (required && !(SHA.test(String(headSha)) && headSha === f.ci_sha)) return hold(`the PR head moved after verification (or cannot be resolved): ${f.id} is verified for ${String(f.ci_sha).slice(0, 8)} only; retry to run CI and verification again`, 'verification');
-    const g = verdictGate(q, f, bc, headSha);
-    if (g) return hold(`${f.tier === 'T3' && !required ? 'T3 work: ' : ''}${g.why}`, g.kind);
+    try { gatePreflight(); } catch { return hold('verification gate: this checkout is not a trusted clone (git config outside the allowlist, or planted grafts, shallow, alternates or config.worktree), so no verdict can be checked here: run merge from the driver-owned clone', 'verification'); }
+    let g;
+    try { g = verdictGate(q, f, bc, headSha); } catch { g = { why: 'verification gate: the verdict could not be checked (fail-closed)', kind: 'verification' }; }
+    if (g) return hold(`${f.tier === 'T3' && !required ? 'T3 work: ' : ''}${g.why}`, g.kind, g.kind === 'antigaming' ? { sha: headSha, ids: g.ids || [] } : null);
   }
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
@@ -731,7 +753,14 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   }
   const v = ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,headRefOid'], 'gh pr view');
   if (v.state !== 'OPEN') die(`PR #${f.pr.number} is ${v.state}`);
-  if (anti) { f.override_note = note; f.override_sha = v.headRefOid; f.hold_kind = null; } // valid for this exact head only: see overrideValid
+  if (anti) { // valid only for the commit that was held and only for the G-ids it was held for: see overrideValid
+    const held = f.hold_sha || f.ci_sha;
+    if (!SHA.test(String(held))) die(`${f.id} has no held commit recorded; an override cannot be bound to one`);
+    if (v.headRefOid !== held) die(`${f.id}: the PR head moved since the hold (held ${held.slice(0, 8)}, now ${flat(v.headRefOid, 40).slice(0, 8)}): an override covers only the held commit; the new commits need CI, verification and the anti-gaming checks again`);
+    const ids = Array.isArray(f.hold_ids) ? f.hold_ids.filter((x) => /^G[1-5]$/.test(x)) : [];
+    console.error(`override for ${f.id}: commit ${held}, anti-gaming checks ${ids.length ? ids.join(', ') : '(none recorded: nothing will be waived)'}`);
+    f.override_note = note; f.override_sha = held; f.override_ids = ids; f.hold_kind = null;
+  }
   if (opt['no-ci']) q.no_ci = true;
   if (opt.checks) q.checks = parseList(opt.checks);
   q.stop = null;

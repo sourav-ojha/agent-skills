@@ -40,17 +40,22 @@ test('verification stays absent from the shipped template', () => {
   assert.equal('verification' in JSON.parse(fs.readFileSync(path.join(SK, 'templates', 'delivery.json'), 'utf8')), false);
 });
 
+// The test origin is a local bare repo reached through url.<path>.insteadOf. That rewrite is passed per process (GIT_CONFIG_COUNT),
+// never written to the repo config: the merge gate requires a config that passes the gitsafe allowlist (as a driver clone would).
+const GENV = new Map();
+const genv = (cwd) => ({ ...process.env, ...(GENV.get(cwd) || {}) });
 function repo() {
   const root = tmpDir('verify-');
   const origin = path.join(root, 'origin.git'), work = path.join(root, 'work'), bin = path.join(root, 'bin');
-  const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
+  const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8', env: genv(cwd) }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
   fs.mkdirSync(bin);
   fs.copyFileSync(FAKE_GH, path.join(bin, 'gh.mjs'));
   fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nexec node "${path.join(bin, 'gh.mjs')}" "$@"\n`, { mode: 0o755 });
   sh(root, 'init', '-q', '--bare', '-b', 'main', origin);
   sh(root, 'clone', '-q', origin, work);
   sh(work, 'config', 'user.email', 't@x'); sh(work, 'config', 'user.name', 't');
-  sh(work, 'config', `url.${origin}.insteadOf`, 'git@github.com:o/r.git');
+  const rw = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_0: 'git@github.com:o/r.git' };
+  GENV.set(work, rw);
   sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
   fs.mkdirSync(path.join(work, '.product/features'), { recursive: true });
   fs.writeFileSync(path.join(work, '.product/features/FEATURE-001.md'), '---\ntype: feature-spec\nid: FEATURE-001\nopportunity: OPP-001\nstatus: ready\n---\n# One\n\nbody\n');
@@ -59,7 +64,7 @@ function repo() {
   sh(work, 'checkout', '-q', '-b', 'main'); sh(work, 'add', '-A'); sh(work, 'commit', '-q', '-m', 'init'); sh(work, 'push', '-q', '-u', 'origin', 'main');
   const state = path.join(root, 'gh.json');
   fs.writeFileSync(state, JSON.stringify({ origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [] }));
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
+  const env = { ...process.env, ...rw, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
   const d = (extra, ...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env: { ...env, ...extra } }); return { code: r.status, out: r.stdout, err: r.stderr }; };
   return { root, work, d };
 }
@@ -114,7 +119,7 @@ function shipped(extra = {}, { tier = 'T2', config, init = ['--merge', '--note',
   const r = repo();
   if (queueInHome) extra = { ...extra, DELIVER_QUEUE: path.join(r.root, 'fhome', 'queues', 'o__r.json') };
   r.env = extra;
-  const sh = (...a) => { const x = spawnSync('git', a, { cwd: r.work, encoding: 'utf8' }); if (x.status !== 0) throw new Error(x.stderr); };
+  const sh = (...a) => { const x = spawnSync('git', a, { cwd: r.work, encoding: 'utf8', env: genv(r.work) }); if (x.status !== 0) throw new Error(x.stderr); };
   for (const [p, body] of Object.entries(baseFiles)) { fs.mkdirSync(path.dirname(path.join(r.work, p)), { recursive: true }); fs.writeFileSync(path.join(r.work, p), body); }
   if (config) fs.writeFileSync(path.join(r.work, '.product/delivery.json'), JSON.stringify(config));
   if (config || Object.keys(baseFiles).length) { sh('add', '-A'); sh('commit', '-q', '-m', 'cfg'); sh('push', '-q', 'origin', 'main'); }
@@ -199,7 +204,7 @@ function underTty(r, ...args) {
   const has = spawnSync('script', process.platform === 'darwin' ? ['-q', '/dev/null', 'true'] : ['-qec', 'true', '/dev/null'], { encoding: 'utf8', stdio: devnull() });
   if (has.error || has.status !== 0) return null;
   const argv = [DELIVER, ...args, '--dir', r.work];
-  const env = { ...process.env, PATH: `${path.join(r.root, 'bin')}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: path.join(r.root, 'gh.json'), SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(r.root, 'fhome') };
+  const env = { ...genv(r.work), PATH: `${path.join(r.root, 'bin')}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: path.join(r.root, 'gh.json'), SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(r.root, 'fhome') };
   const x = process.platform === 'darwin'
     ? spawnSync('script', ['-q', '/dev/null', 'node', ...argv], { encoding: 'utf8', env, stdio: devnull() })
     : spawnSync('script', ['-qec', ['node', ...argv].map((a) => `'${a}'`).join(' '), '/dev/null'], { encoding: 'utf8', env, stdio: devnull() });
@@ -208,7 +213,7 @@ function underTty(r, ...args) {
 
 test('retry --note under a real terminal: needs a note, records it bound to the head sha, returns to pr_open', (t) => {
   const r = shipped();
-  r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = 'antigaming'; f.reason = 'G1'; });
+  r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = 'antigaming'; f.reason = 'G1'; f.hold_sha = f.ci_sha; f.hold_ids = ['G1', 'bogus']; });
   const a = underTty(r, 'retry', 'FEATURE-001');
   if (!a) { t.skip('script(1) is not available: cannot allocate a pseudo-terminal'); fs.rmSync(r.root, { recursive: true, force: true }); return; }
   assert.notEqual(a.code, 0, a.out); assert.match(a.out + a.err, /--note/);
@@ -218,26 +223,33 @@ test('retry --note under a real terminal: needs a note, records it bound to the 
   const b = underTty(r, 'retry', 'FEATURE-001', '--note', 'reviewed the diff, the test change is intended');
   assert.equal(b.code, 0, b.out + b.err);
   const f = r.feat();
+  assert.match(b.out + b.err, new RegExp(`override for FEATURE-001: commit ${f.ci_sha}, anti-gaming checks G1`), 'the held sha and ids are shown at the terminal');
   assert.equal(f.state, 'pr_open');
   assert.equal(f.override_note, 'reviewed the diff, the test change is intended');
-  assert.equal(f.override_sha, f.pr.head_sha);
-  assert.ok(Q.overrideValid(f, f.pr.head_sha));
+  assert.equal(f.override_sha, f.ci_sha, 'bound to the held commit');
+  assert.deepEqual(f.override_ids, ['G1'], 'only the held G-ids (junk dropped)');
+  assert.ok(Q.overrideValid(f, f.ci_sha, ['G1']));
+  assert.equal(Q.overrideValid(f, f.ci_sha, ['G1', 'G4']), false, 'a new G-id is not covered');
   assert.ok(!f.hold_kind);
   fs.rmSync(r.root, { recursive: true, force: true });
 });
 
-test('overrideValid: only for the exact head sha the override was given on', () => {
-  const f = { override_note: 'ok', override_sha: 'abc' };
-  assert.equal(Q.overrideValid(f, 'abc'), true);
-  assert.equal(Q.overrideValid(f, 'abd'), false, 'a later push voids it');
-  assert.equal(Q.overrideValid(f, undefined), false);
-  assert.equal(Q.overrideValid({ override_sha: 'abc' }, 'abc'), false, 'no note');
-  assert.equal(Q.overrideValid({ override_note: 'ok' }, 'abc'), false, 'no sha');
-  assert.equal(Q.overrideValid(null, 'abc'), false);
+test('overrideValid: only for the exact head sha the override was given on, and only for its G-ids', () => {
+  const f = { override_note: 'ok', override_sha: 'abc', override_ids: ['G1', 'G4'] };
+  assert.equal(Q.overrideValid(f, 'abc', ['G1']), true);
+  assert.equal(Q.overrideValid(f, 'abc', ['G4', 'G1']), true);
+  assert.equal(Q.overrideValid(f, 'abc', ['G1', 'G5']), false, 'G5 was not reviewed');
+  assert.equal(Q.overrideValid(f, 'abc'), false, 'hit ids are required');
+  assert.equal(Q.overrideValid({ override_note: 'ok', override_sha: 'abc' }, 'abc', ['G1']), false, 'no recorded ids');
+  assert.equal(Q.overrideValid(f, 'abd', ['G1']), false, 'a later push voids it');
+  assert.equal(Q.overrideValid(f, undefined, ['G1']), false);
+  assert.equal(Q.overrideValid({ override_sha: 'abc', override_ids: ['G1'] }, 'abc', ['G1']), false, 'no note');
+  assert.equal(Q.overrideValid({ override_note: 'ok', override_ids: ['G1'] }, 'abc', ['G1']), false, 'no sha');
+  assert.equal(Q.overrideValid(null, 'abc', ['G1']), false);
 });
 
 test('merge reads the base config fail-closed: missing ref and invalid JSON refuse; a genuinely absent file means defaults', () => {
-  const git = (cwd, ...a) => { const x = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (x.status !== 0) throw new Error(x.stderr); return x.stdout.trim(); };
+  const git = (cwd, ...a) => { const x = spawnSync('git', a, { cwd, encoding: 'utf8', env: genv(cwd) }); if (x.status !== 0) throw new Error(x.stderr); return x.stdout.trim(); };
   const pushCfg = (r, content) => {
     const br = git(r.work, 'rev-parse', '--abbrev-ref', 'HEAD');
     git(r.work, 'checkout', '-q', 'main');
@@ -1447,7 +1459,7 @@ test('round 3: a failed prune and an undeletable quarantined tree are both repor
 // ---- Task 10: verdict-bound merge when the base config requires verification ---------------------------------------------------
 const REQ = { protected_branches: [], verification: { required: true } };
 const vship = (opts = {}) => shipped({}, { config: REQ, queueInHome: true, ...opts });
-const g = (cwd, ...a) => { const x = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (x.status !== 0) throw new Error(`git ${a.join(' ')}: ${x.stderr}`); return x.stdout.trim(); };
+const g = (cwd, ...a) => { const x = spawnSync('git', a, { cwd, encoding: 'utf8', env: genv(cwd) }); if (x.status !== 0) throw new Error(`git ${a.join(' ')}: ${x.stderr}`); return x.stdout.trim(); };
 const rm = (...rs) => { for (const r of rs) fs.rmSync(r.root, { recursive: true, force: true }); };
 const merge = (r) => r.d(r.env, 'merge', 'FEATURE-001');
 // A hold reason must name a category only: never the hidden scenario path, id, canary or the scenario file location.
@@ -1519,14 +1531,18 @@ test('T10: a G4 change on the merge sha holds as anti-gaming; only an override b
   assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /G4/); assert.doesNotMatch(J(m).reason, /gitattributes/);
   assert.equal(r.feat().hold_kind, 'antigaming'); assert.equal(mergeCalled(r), false);
   const head = r.feat().ci_sha;
+  assert.equal(r.feat().hold_sha, head); assert.deepEqual(r.feat().hold_ids, ['G4']);
   // an override for another commit (a later push voided it) does not count
-  r.edit((f) => { f.state = 'verified'; f.hold_kind = null; f.override_note = 'reviewed'; f.override_sha = 'b'.repeat(40); });
+  r.edit((f) => { f.state = 'verified'; f.hold_kind = null; f.override_note = 'reviewed'; f.override_sha = 'b'.repeat(40); f.override_ids = ['G4']; });
   assert.equal(J(merge(r)).state, 'awaiting_human'); assert.equal(mergeCalled(r), false);
   // a note without a sha, or a sha without a note, does not count either
   r.edit((f) => { f.state = 'verified'; f.override_note = ''; f.override_sha = head; });
   assert.equal(J(merge(r)).state, 'awaiting_human'); assert.equal(mergeCalled(r), false);
-  // the person's override for this exact head (what retry --note records at a terminal), in the trusted queue: merges
-  r.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed the attributes change'; f.override_sha = head; });
+  // an override for this head but for other G-ids does not cover G4
+  r.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed'; f.override_sha = head; f.override_ids = ['G1']; });
+  assert.equal(J(merge(r)).state, 'awaiting_human'); assert.equal(mergeCalled(r), false);
+  // the person's override for this exact head and G4 (what retry --note records at a terminal), in the trusted queue: merges
+  r.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed the attributes change'; f.override_sha = head; f.override_ids = ['G4']; });
   const ok = merge(r);
   assert.equal(J(ok)?.state, 'merged', ok.out + ok.err);
   rm(r);
@@ -1555,7 +1571,7 @@ test('T10: base config required:false -> ci_passed merges exactly as before (no 
 
 test('T10: in verified mode a queue file outside FACTORY_HOME holds, even with a valid verdict (its override fields are builder-writable)', () => {
   const r = shipped({}, { config: REQ });
-  r.edit((f) => { f.state = 'verified'; f.override_note = 'forged'; f.override_sha = f.ci_sha; });
+  r.edit((f) => { f.state = 'verified'; f.override_note = 'forged'; f.override_sha = f.ci_sha; f.override_ids = ['G1', 'G2', 'G3', 'G4', 'G5']; });
   arm(r);
   const m = r.d({}, 'merge', 'FEATURE-001');
   assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /FACTORY_HOME/);
@@ -1597,7 +1613,7 @@ test('T10: base ref missing holds in verified mode too', () => {
 test('T10: an override in a builder-writable (in-repo) queue is ignored on the T3 path', () => {
   const r = shipped({}, { tier: 'T3', init: ['--merge', '--note', 'ok', '--merge-t3'], files: { '.gitattributes': '*.txt text\n' } });
   arm(r);
-  r.edit((f) => { f.override_note = 'forged'; f.override_sha = f.ci_sha; });
+  r.edit((f) => { f.override_note = 'forged'; f.override_sha = f.ci_sha; f.override_ids = ['G1', 'G2', 'G3', 'G4', 'G5']; });
   const m = r.d({}, 'merge', 'FEATURE-001');
   assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /G4/); assert.equal(mergeCalled(r), false);
   rm(r);
@@ -1672,7 +1688,7 @@ test('T10: a base spec over the parse guard (a line longer than MAX_LINE) holds 
 test('T10 self-attack probes: no merge through a broken pipe, a forged spec path, a hostile scenario doc or a symlinked queue folder', () => {
   // (a) a valid override never waives an anti-gaming check that could not run
   const a = vship();
-  a.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed'; f.override_sha = f.ci_sha; });
+  a.edit((f) => { f.state = 'verified'; f.override_note = 'reviewed'; f.override_sha = f.ci_sha; f.override_ids = ['G1', 'G2', 'G3', 'G4', 'G5']; });
   arm(a);
   g(a.work, 'push', '-q', '-f', 'origin', `${g(a.work, 'commit-tree', 'refs/remotes/origin/main^{tree}', '-m', 'x')}:refs/heads/main`);
   assert.match(J(merge(a)).reason, /could not run/); assert.equal(mergeCalled(a), false);
@@ -1718,5 +1734,130 @@ test('T10: T3 without the opt-in holds even with a matching passing verdict', ()
   arm(r);
   const m = r.d({}, 'merge', 'FEATURE-001');
   assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /T3 work/); assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+// ---- Task 10 fix round 1 ------------------------------------------------------------------------------------------------------------
+const gitDirOf = (r) => path.join(r.work, '.git');
+
+test('T10 r1 I-1: planted grafts, shallow or alternates, or a config key outside the gitsafe allowlist, hold before any gate git call', () => {
+  const plants = {
+    grafts: (r) => { const base = g(r.work, 'rev-parse', 'refs/remotes/origin/main'); fs.writeFileSync(path.join(gitDirOf(r), 'info', 'grafts'), `${base} ${r.feat().ci_sha}\n`); },
+    shallow: (r) => fs.writeFileSync(path.join(gitDirOf(r), 'shallow'), `${g(r.work, 'rev-parse', 'refs/remotes/origin/main')}\n`),
+    alternates: (r) => { fs.mkdirSync(path.join(gitDirOf(r), 'objects', 'info'), { recursive: true }); fs.writeFileSync(path.join(gitDirOf(r), 'objects', 'info', 'alternates'), `${path.join(r.root, 'origin.git', 'objects')}\n`); },
+    config: (r) => g(r.work, 'config', 'core.pager', 'cat'),
+  };
+  for (const [name, plant] of Object.entries(plants)) {
+    const r = vship({ files: { '.gitattributes': '*.txt text\n' } }); // a G4 hit the graft would otherwise hide (merge-base = head, empty diff)
+    r.edit((f) => { f.state = 'verified'; });
+    arm(r);
+    plant(r);
+    const m = merge(r);
+    assert.equal(J(m)?.state, 'awaiting_human', `${name}: ${m.out}${m.err}`); assert.match(J(m).reason, /not a trusted clone/, name);
+    assert.equal(mergeCalled(r), false, name);
+    rm(r);
+  }
+});
+
+test('T10 r1 I-1: checkWorktreeSafe (and so every worktree-touching gitSafe call) refuses grafts and shallow', () => {
+  const r = shipped();
+  fs.writeFileSync(path.join(gitDirOf(r), 'info', 'grafts'), '');
+  assert.throws(() => GS.gitSafe(r.work, 'status'), /^Error: git worktree not safe: info\/grafts present$/);
+  assert.throws(() => GS.checkRepoMetadata(r.work), /info\/grafts/);
+  fs.rmSync(path.join(gitDirOf(r), 'info', 'grafts'));
+  fs.writeFileSync(path.join(gitDirOf(r), 'shallow'), '');
+  assert.throws(() => GS.gitSafe(r.work, 'status'), /^Error: git worktree not safe: shallow present$/);
+  fs.rmSync(path.join(gitDirOf(r), 'shallow'));
+  assert.doesNotThrow(() => GS.checkRepoMetadata(r.work));
+  assert.equal(GS.touchesWorktree(['diff', '--raw', 'a'.repeat(40), 'b'.repeat(40), '--']), false, 'two full ids + -- is an object read');
+  assert.equal(GS.touchesWorktree(['diff', 'a'.repeat(40), '--', 'x']), true);
+  assert.equal(GS.touchesWorktree(['diff', 'HEAD~1', 'HEAD', '--', 'x']), true, 'only full ids or refs/... names');
+  rm(r);
+});
+
+test('T10 r1 I-2: retry --note refuses when the head moved since the hold, and binds to the held sha', (t) => {
+  const r = shipped();
+  r.edit((f) => { f.state = 'awaiting_human'; f.hold_kind = 'antigaming'; f.reason = 'G4'; f.hold_sha = f.ci_sha; f.hold_ids = ['G4']; });
+  fs.writeFileSync(path.join(r.work, 'src/c.txt'), 'after the hold\n'); g(r.work, 'add', '-A'); g(r.work, 'commit', '-q', '-m', 'sneak'); g(r.work, 'push', '-q', 'origin', 'HEAD');
+  const x = underTty(r, 'retry', 'FEATURE-001', '--note', 'looked at it');
+  if (!x) { t.skip('script(1) is not available'); rm(r); return; }
+  assert.notEqual(x.code, 0); assert.match(x.out + x.err, /head moved since the hold/);
+  const f = r.feat();
+  assert.equal(f.state, 'awaiting_human'); assert.ok(!f.override_note); assert.equal(f.hold_kind, 'antigaming');
+  rm(r);
+});
+
+test('T10 r1 M-1: base config "absent" only when ls-tree lists nothing; a non-file at the config path holds', () => {
+  const r = shipped();
+  const br = g(r.work, 'rev-parse', '--abbrev-ref', 'HEAD');
+  g(r.work, 'checkout', '-q', 'main'); g(r.work, 'rm', '-q', '.product/delivery.json');
+  fs.mkdirSync(path.join(r.work, '.product/delivery.json')); fs.writeFileSync(path.join(r.work, '.product/delivery.json/x'), '{}');
+  g(r.work, 'add', '-A'); g(r.work, 'commit', '-q', '-m', 'dir'); g(r.work, 'push', '-q', 'origin', 'main'); g(r.work, 'checkout', '-q', br);
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /cannot be read/); assert.equal(mergeCalled(r), false);
+  rm(r);
+});
+
+test('T10 r1 M-2: the queue is untrusted when FACTORY_HOME is an ancestor of the repo, or the file is shared-writable or hard-linked', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  const q = r.env.DELIVER_QUEUE;
+  const anc = path.join(r.root, 'queues', 'o__r.json'); fs.mkdirSync(path.dirname(anc), { recursive: true, mode: 0o700 }); fs.copyFileSync(q, anc);
+  const a = r.d({ ...r.env, DELIVER_QUEUE: anc, FACTORY_HOME: r.root }, 'merge', 'FEATURE-001'); // FACTORY_HOME contains the repo
+  assert.match(J(a).reason, /FACTORY_HOME/, a.out + a.err);
+  r.edit((f) => { f.state = 'verified'; });
+  fs.chmodSync(q, 0o664);
+  assert.match(J(merge(r)).reason, /FACTORY_HOME/, 'group-writable');
+  fs.chmodSync(q, 0o600);
+  r.edit((f) => { f.state = 'verified'; });
+  const hl = path.join(r.root, 'fhome', 'queues', 'link.json'); fs.linkSync(q, hl);
+  assert.match(J(merge(r)).reason, /FACTORY_HOME/, 'hard-linked');
+  fs.rmSync(hl);
+  r.edit((f) => { f.state = 'verified'; });
+  const inRepo = path.join(r.work, '.fh'); fs.mkdirSync(path.join(inRepo, 'queues'), { recursive: true, mode: 0o700 }); fs.copyFileSync(q, path.join(inRepo, 'queues', 'o__r.json'));
+  const ir = r.d({ ...r.env, DELIVER_QUEUE: path.join(inRepo, 'queues', 'o__r.json'), FACTORY_HOME: inRepo }, 'merge', 'FEATURE-001'); // FACTORY_HOME inside the repo
+  assert.match(J(ir).reason, /FACTORY_HOME/, ir.out + ir.err);
+  fs.rmSync(inRepo, { recursive: true });
+  r.edit((f) => { f.state = 'verified'; });
+  const ok = merge(r);
+  assert.equal(J(ok)?.state, 'merged', `control: ${ok.out}${ok.err}`);
+  rm(r);
+});
+
+test('T10 r1 M-6: a passing gate does not bypass the later holds (failing GitHub check, ci/hold_paths files, BLOCKED)', () => {
+  const ck = vship();
+  ck.edit((f) => { f.state = 'verified'; }); arm(ck);
+  { const gp = path.join(ck.root, 'gh.json'); const st = JSON.parse(fs.readFileSync(gp, 'utf8')); st.checkQueue = [[{ name: 'ci', bucket: 'fail', link: 'x', state: 'FAILURE' }]]; fs.writeFileSync(gp, JSON.stringify(st)); }
+  assert.match(J(merge(ck)).reason, /required checks/);
+  const hp = vship({ config: { ...REQ, hold_paths: ['src/**'] } });
+  hp.edit((f) => { f.state = 'verified'; }); arm(hp);
+  assert.match(J(merge(hp)).reason, /CI or ownership files/);
+  const bl = vship();
+  bl.edit((f) => { f.state = 'verified'; }); arm(bl);
+  { const gp = path.join(bl.root, 'gh.json'); const st = JSON.parse(fs.readFileSync(gp, 'utf8')); st.prs[0].mergeState = 'BLOCKED'; fs.writeFileSync(gp, JSON.stringify(st)); }
+  assert.match(J(merge(bl)).reason, /BLOCKED/);
+  for (const r of [ck, hp, bl]) assert.equal(mergeCalled(r), false);
+  rm(ck, hp, bl);
+});
+
+test('T10 r1: checkRepoMetadata looks in the common dir too (a linked worktree has its own git dir)', () => {
+  const r = shipped();
+  const wt = path.join(r.root, 'linked');
+  g(r.work, 'worktree', 'add', '-q', '--detach', wt, 'HEAD');
+  assert.doesNotThrow(() => GS.checkRepoMetadata(wt));
+  fs.writeFileSync(path.join(gitDirOf(r), 'info', 'grafts'), ''); // the common dir's grafts apply to every worktree
+  assert.throws(() => GS.checkRepoMetadata(wt), /info\/grafts/);
+  rm(r);
+});
+
+test('T10 r1 M-1: a symlink at the config path on origin/<base> is unreadable, even if its target text is valid JSON', () => {
+  const r = shipped();
+  const br = g(r.work, 'rev-parse', '--abbrev-ref', 'HEAD');
+  g(r.work, 'checkout', '-q', 'main'); g(r.work, 'rm', '-q', '.product/delivery.json');
+  fs.symlinkSync('{"protected_branches":[]}', path.join(r.work, '.product/delivery.json'));
+  g(r.work, 'add', '-A'); g(r.work, 'commit', '-q', '-m', 'link'); g(r.work, 'push', '-q', 'origin', 'main'); g(r.work, 'checkout', '-q', br);
+  const m = r.d({}, 'merge', 'FEATURE-001');
+  assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /cannot be read/); assert.equal(mergeCalled(r), false);
   rm(r);
 });

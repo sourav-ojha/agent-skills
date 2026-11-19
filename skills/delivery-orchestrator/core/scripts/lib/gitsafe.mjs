@@ -179,6 +179,15 @@ export function touchesWorktree(rest) {
   const [cmd, ...a] = rest;
   if (SAFE_NO_WORKTREE.has(cmd)) return false;
   if (cmd === 'config') return !a.some((x) => ['--get', '--get-all', '--get-regexp', '--list', '-l'].includes(x));
+  if (cmd === 'diff' && a.includes('--')) {
+    // A diff between exactly two full commit ids reads only the object database, whatever pathspecs follow `--` (attr magic aside:
+    // it consults .gitattributes files). checkDiff runs this shape; a walk would make any large tree (node_modules) a permanent hold.
+    const i = a.indexOf('--'), opts = a.slice(0, i), specs = a.slice(i + 1);
+    const revs = opts.filter((x) => !x.startsWith('-'));
+    if (revs.length === 2 && revs.every((x) => REVISION.test(x)) && !opts.some((x) => /^--(submodule|no-index|cached|staged)/.test(x))
+      && !specs.some((x) => /^:\(.*attr/i.test(x))) return false;
+    return true;
+  }
   if (['diff', 'log', 'show'].includes(cmd)) {
     if (a.includes('--') || a.some((x) => x.startsWith('--submodule'))) return true;
     const revs = a.filter((x) => !x.startsWith('-'));
@@ -186,19 +195,25 @@ export function touchesWorktree(rest) {
   }
   return true;
 }
+// Repository-level redirections a builder could plant, checked in the git dir and the common dir: alternates (object store
+// elsewhere), info/grafts (rewrites parents: a planted `<base tip> <head>` makes merge-base return head, so a diff looks empty),
+// shallow (cuts history the same way) and per-worktree config. Throws `git worktree not safe: <file> present`.
+const PLANTED = [['objects', 'info', 'alternates'], ['objects', 'info', 'http-alternates'], ['info', 'grafts'], ['shallow'], ['config.worktree']];
+export function checkRepoMetadata(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS } = {}) {
+  const dirs = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...locationOf(global), 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], timeout);
+  if (dirs.status !== 0) throw new Error('git worktree not safe: git dir unreadable');
+  const [gitDir, commonDir] = dirs.stdout.split('\n');
+  if (!gitDir || !commonDir) throw new Error('git worktree not safe: git dir unreadable');
+  const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
+  for (const rel of PLANTED) for (const d of new Set([commonDir, gitDir])) if (exists(path.join(d, ...rel))) throw new Error(`git worktree not safe: ${rel.join('/')} present`);
+}
 // Throws `git worktree not safe: <reason>` (an entry INDEX, never a path) on a gitlink, a .gitmodules or a nested .git.
 export function checkWorktreeSafe(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS, cap = WORKTREE_WALK_CAP } = {}) {
   const loc = locationOf(global);
   const top = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'rev-parse', '--show-toplevel'], timeout);
   if (top.status !== 0) return; // not in a work tree (bare repo or no repo): nothing to walk; git itself will report the error
   const root = top.stdout.replace(/\n$/, '');
-  // Repository-level redirections a builder could plant: alternates (object store elsewhere) and per-worktree config.
-  const dirs = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], timeout);
-  if (dirs.status !== 0) throw new Error('git worktree not safe: git dir unreadable');
-  const [gitDir, commonDir] = dirs.stdout.split('\n');
-  const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
-  if (exists(path.join(commonDir, 'objects', 'info', 'alternates')) || exists(path.join(gitDir, 'objects', 'info', 'alternates'))) throw new Error('git worktree not safe: objects/info/alternates present');
-  if (exists(path.join(gitDir, 'config.worktree')) || exists(path.join(commonDir, 'config.worktree'))) throw new Error('git worktree not safe: config.worktree present');
+  checkRepoMetadata(cwd, { global, timeout });
   const st = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'ls-files', '-z', '--stage'], timeout);
   if (st.status !== 0) throw new Error('git worktree not safe: index unreadable');
   if (st.stdout.split('\0').some((e) => e.startsWith('160000 '))) throw new Error('git worktree not safe: gitlink in the index');
