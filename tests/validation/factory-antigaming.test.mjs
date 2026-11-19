@@ -255,12 +255,13 @@ test('G4: wildcard / runner script calls protect every script; lifecycle scripts
   assert.deepEqual(hit(run(fx, fx.change({ 'package.json': pkg({ ...s1, pretest: 'exit 0' }) }, { fresh: true }), { tests: { all: ['node', '--run=test'] } }), 'G4')?.files, ['package.json']);
   assert.deepEqual(run(fx, fx.change({ 'package.json': pkg({ ...s1, unit: 'true' }) }, { fresh: true }), { tests: { all: ['node', '--run', 'test'] } }), [], 'unrelated script');
 });
-test('G4: a test-runner dependency pointed at a non-registry specifier fires; a registry version change does not', () => {
+test('G4: any dependency pointed at a non-registry specifier fires; a registry version change does not', () => {
   const pkg = (o) => `${JSON.stringify({ name: 'x', devDependencies: { jest: '^29.0.0', lodash: '^4' }, ...o }, null, 2)}\n`;
   const fx = fixture({ 'package.json': pkg({}) });
   const g4 = (o) => hit(run(fx, fx.change({ 'package.json': pkg(o) }, { fresh: true })), 'G4')?.files;
   assert.equal(g4({ devDependencies: { jest: '^30.0.0', lodash: '^4' } }), undefined, 'registry bump');
-  assert.equal(g4({ devDependencies: { jest: '^29.0.0', lodash: 'file:./lodash' } }), undefined, 'non-runner package');
+  assert.equal(g4({ devDependencies: { jest: '^29.0.0', lodash: '^4.17.21' }, dependencies: { react: '18.2.0' } }), undefined, 'registry add/bump');
+  assert.deepEqual(g4({ devDependencies: { jest: '^29.0.0', lodash: 'file:./lodash' } }), ['package.json'], 'any package (bin shadowing)');
   for (const o of [{ devDependencies: { jest: 'file:./fake-jest', lodash: '^4' } }, { devDependencies: { jest: 'github:evil/jest', lodash: '^4' } },
     { devDependencies: { jest: 'npm:fake-jest@1', lodash: '^4' } }, { devDependencies: { jest: '../fake', lodash: '^4' } },
     { dependencies: { '@jest/core': 'git+https://x/y.git' } }, { dependencies: { vitest: 'link:../v' } }, { peerDependencies: { mocha: 'https://x/m.tgz' } },
@@ -297,16 +298,91 @@ test('non-normalised specPaths are refused instead of silently disabling G5', ()
   }
   assert.throws(() => run(fx, head, {}, 'docs/s.md'), /specPaths/);
 });
-test('repo-local diff.external, textconv and a gitattributes diff driver are never run', () => {
-  const fx = fixture({ 'tests/a.test.js': 'it("a", f)\n' });
-  const marker = path.join(fx.root, 'MARKER');
-  const script = path.join(fx.root, 'evil.sh');
-  fs.writeFileSync(script, `#!/bin/sh\ntouch "${marker}"\ncat "$1" 2>/dev/null\n`, { mode: 0o755 });
-  fx.sh(fx.work, 'config', 'diff.external', script);
-  fx.sh(fx.work, 'config', 'diff.evil.textconv', script);
-  fx.sh(fx.work, 'config', 'diff.evil.command', script);
-  fs.writeFileSync(path.join(fx.work, '.git', 'info', 'attributes'), '* diff=evil\n*.js -diff\n');
-  const h = run(fx, fx.change({ 'tests/a.test.js': 'it.only("a", f)\n', 'src/s.js': 'todo!()\n' }));
-  assert.equal(fs.existsSync(marker), false, 'no driver ran');
-  assert.deepEqual(ids(h), ['G1', 'G2', 'G3']);
+test('repo-local diff.external, textconv and a gitattributes diff driver are never run (on a non-.js file)', () => {
+  const fx = fixture({ 'src/impl.py': 'x = 1\n' });
+  const mk = (n) => {
+    const script = path.join(fx.root, `${n}.sh`);
+    fs.writeFileSync(script, `#!/bin/sh\ntouch "${path.join(fx.root, `MARKER-${n}`)}"\ncat "$1" 2>/dev/null\n`, { mode: 0o755 });
+    return script;
+  };
+  fx.sh(fx.work, 'config', 'diff.external', mk('external'));
+  fx.sh(fx.work, 'config', 'diff.evil.textconv', mk('textconv'));
+  fx.sh(fx.work, 'config', 'diff.evil.command', mk('command'));
+  fs.writeFileSync(path.join(fx.work, '.git', 'info', 'attributes'), '*.py diff=evil\n');
+  const h = run(fx, fx.change({ 'src/impl.py': 'x = 1\nraise NotImplementedError\n' }));
+  for (const n of ['external', 'textconv', 'command']) assert.equal(fs.existsSync(path.join(fx.root, `MARKER-${n}`)), false, `${n} ran`);
+  assert.deepEqual(h, [{ id: 'G3', files: ['src/impl.py'] }]);
+});
+
+// ---- fix round 2 regressions -----------------------------------------------------------------------------------------------
+const pkgJ = (scripts, extra = {}) => `${JSON.stringify({ name: 'x', scripts, ...extra }, null, 2)}\n`;
+test('G4: a root script delegating to a workspace makes any scripts change in any package.json a hit', () => {
+  const web = { unit: 'jest', test: 'jest' };
+  for (const v of ['npm --prefix web run unit', 'cd web && npm run unit', 'npm run unit -w web', 'npm run unit --workspace=web', 'pnpm --filter web unit',
+    'yarn workspace web unit', 'pnpm -C web unit', 'npm test --workspaces', 'yarn --cwd web unit', 'npm run $TARGET', 'sh -c "$(cat cmd)"', 'pnpm -r unit']) {
+    const fx = fixture({ 'package.json': pkgJ({ test: v }), 'web/package.json': pkgJ(web) });
+    assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ ...web, build: 'tsc' }) }), { tests: { all: ['npm', 'test'] } }), 'G4')?.files, ['web/package.json'], v);
+  }
+  for (const all of [['npm', '--prefix', 'web', 'run', 'unit'], ['pnpm', '--filter', 'web', 'unit'], ['npm', 'run', 'unit', '-w', 'web'], ['npm', 'run', 'unit', '--workspace=web'], ['sh', '-c', 'cd web && npm run unit']]) {
+    const w2 = { unit: 'jest', other: 'tsc' };
+    const fx = fixture({ 'package.json': pkgJ({}), 'web/package.json': pkgJ(w2) });
+    assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ ...w2, other: 'tsc -b' }) }), { tests: { all } }), 'G4')?.files, ['web/package.json'], all.join(' '));
+  }
+});
+test('G4: the protected-name closure spans every package.json in the diff; unrelated scripts stay clean', () => {
+  const fx = fixture({ 'package.json': pkgJ({ test: 'turbo run unit' }), 'web/package.json': pkgJ({ unit: 'jest', build: 'tsc' }) });
+  assert.deepEqual(hit(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'true', build: 'tsc' }) }, { fresh: true }), { tests: { all: ['npm', 'test'] } }), 'G4')?.files, ['web/package.json']);
+  assert.deepEqual(run(fx, fx.change({ 'web/package.json': pkgJ({ unit: 'jest', build: 'tsc -b' }) }, { fresh: true }), { tests: { all: ['npm', 'test'] } }), []);
+});
+test('G2: quoted, shorthand and non-literal-false option keys fire; literal false does not; ctx.skip() under any name', () => {
+  const fx = fixture({});
+  for (const c of ['test("x", { "skip": true }, f)', "test('x', {'skip':true}, f)", 'test("x", {"todo":"later"}, f)', 'test("x", {skip}, f)', 'test("x", { a: 1, only }, f)',
+    'test("x", {skip: false || true}, f)', 'test("x", {skip: false ? 0 : 1}, f)', 'test("x", { skip /*c*/ : true }, f)', 'test("x", {skip\n:true}, f)',
+    'test("x", {["skip"]:true}, f)', 'test("x", {skip: cond}, f)', 'it("x", {only:1})']) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'tests/n.test.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['tests/n.test.js'], c);
+  }
+  for (const c of ['test("x", {skip:false}, f)', 'test("x", { skip: false })', 'test("x", { "only": false, todo: false }, f)']) {
+    assert.equal(hit(run(fx, fx.change({ 'tests/n.test.js': `${c}\n` }, { fresh: true })), 'G2'), undefined, c);
+  }
+  for (const c of ['ctx.skip("not ready")', '(t2) => t2.skip()', 'function f(t){ t . skip() }', 'unittest . skip("x")']) {
+    assert.deepEqual(hit(run(fx, fx.change({ 'src/h.js': `${c}\n` }, { fresh: true })), 'G2')?.files, ['src/h.js'], c);
+  }
+  assert.equal(hit(run(fx, fx.change({ 'src/h.js': 'rows.skip(2); q.skip(n)\n' }, { fresh: true })), 'G2'), undefined, 'skip with a count');
+});
+test('G4: bin shadowing, workspaces, pnpm patches, patch-package and yarn releases fire', () => {
+  const fx = fixture({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29' } }) });
+  const g4 = (files) => hit(run(fx, fx.change(files, { fresh: true })), 'G4')?.files;
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ devDependencies: { fakej: 'file:../fake' } }), 'fake/package.json': JSON.stringify({ name: 'fakej', bin: { jest: 'x.js' } }) }),
+    ['fake/package.json', 'web/package.json']);
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29' }, workspaces: ['pk/*'] }) }), ['web/package.json']);
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29', Jest: 'file:../f' } }) }), ['web/package.json']);
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29' }, pnpm: { patchedDependencies: { 'jest@29.0.0': 'p/j.patch' } } }) }), ['web/package.json']);
+  assert.deepEqual(g4({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^29' }, packageManager: 'yarn@https://evil/yarn.js' }) }), ['web/package.json']);
+  for (const p of ['patches/jest+29.0.0.patch', 'web/patches/x.patch', '.yarn/patches/jest.patch', '.yarn/releases/yarn-4.cjs', '.yarn/plugins/p.cjs', 'pnpm-workspace.yaml', '.pnpmfile.cjs']) {
+    assert.deepEqual(g4({ [p]: 'x\n' }), [p], p);
+  }
+  assert.equal(g4({ 'web/package.json': JSON.stringify({ devDependencies: { jest: '^30' }, packageManager: 'yarn@4.1.0' }) }), undefined, 'registry bump');
+});
+test('package.json contents are read in one git call; more than 50 changed manifests are a hit without reading', () => {
+  const fx = fixture({});
+  let calls = 0;
+  const git = (...a) => { calls++; return fx.git(...a); };
+  const forty = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`p${i}/package.json`, pkgJ({ build: 'tsc' })]));
+  const head = fx.change(forty, { fresh: true });
+  assert.deepEqual(ag.checkDiff({ git, baseRef: BASE, headSha: head, config: {}, specPaths: [] }), []);
+  assert.ok(calls <= 8, `${calls} git calls`);
+  const many = Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`p${i}/package.json`, pkgJ({ build: 'tsc' })]));
+  calls = 0;
+  const h2 = ag.checkDiff({ git, baseRef: BASE, headSha: fx.change(many, { fresh: true }), config: {}, specPaths: [] });
+  assert.equal(hit(h2, 'G4').files.length, 51);
+  assert.ok(calls <= 7, `${calls} git calls`);
+});
+test('self-attack round 2: escaped option keys, committed node_modules, Python startup hooks and go.mod replace fire', () => {
+  const fx = fixture({ 'go.mod': 'module x\n\ngo 1.22\n' });
+  assert.deepEqual(hit(run(fx, fx.change({ 'tests/n.test.js': 'test("x", { "\\u0073kip": true }, f)\n' }, { fresh: true })), 'G2')?.files, ['tests/n.test.js']);
+  for (const p of ['node_modules/.bin/jest', 'web/node_modules/vitest/index.js', 'sitecustomize.py', 'src/usercustomize.py', 'lib/x.pth']) {
+    assert.deepEqual(hit(run(fx, fx.change({ [p]: 'x\n' }, { fresh: true })), 'G4')?.files, [p], p);
+  }
+  assert.deepEqual(hit(run(fx, fx.change({ 'go.mod': 'module x\n\ngo 1.22\n\nreplace github.com/stretchr/testify => ./fake\n' }, { fresh: true })), 'G4')?.files, ['go.mod']);
+  assert.deepEqual(run(fx, fx.change({ 'go.mod': 'module x\n\ngo 1.23\n' }, { fresh: true })), [], 'go version bump');
 });

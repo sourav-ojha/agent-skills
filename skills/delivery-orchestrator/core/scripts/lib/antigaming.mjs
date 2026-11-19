@@ -11,7 +11,10 @@
 // OUT OF SCOPE for this mechanical check (the hidden verification scenarios are the backstop): semantic stubs and hard-coded
 // results; skips built dynamically (`Reflect.get(it, "skip")`, `globalThis['i' + 't']`); stub strings built at runtime; a new
 // Go `_test.go` whose TestMain calls os.Exit(0); a test that patches `assert`; lockfiles; tsconfig; helpers in directories
-// that are not test-file patterns (e.g. `test/` singular) unless listed in verification.test_globs.
+// that are not test-file patterns (e.g. `test/` singular) unless listed in verification.test_globs; package.yaml /
+// package.json5 manifests; script names built at run time beyond the `$`/backtick rule; the SOURCE of files a script runs
+// (e.g. the content of scripts/test.js); option keys built from computed values; dependency sources outside package.json
+// (requirements*.txt, Pipfile, Cargo.toml, Gemfile) and lockfiles.
 import { globToRegex } from './config.mjs';
 import { CI_PATHS } from './queue.mjs';
 import { canonicalSpec, specRegions, MAX_LINE } from './criteria.mjs';
@@ -49,17 +52,20 @@ const PROTECTED_BASENAMES = new Set(['.mcp.json', 'claude.md', 'claude.local.md'
   'pytest.ini', '.pytest.ini', 'pytest.toml', 'pyproject.toml', 'setup.cfg', 'conftest.py', 'tox.ini',
   '.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml',
   '.pre-commit-config.yaml', 'lefthook.yml', 'lefthook.yaml', '.lefthook.yml',
-  '.travis.yml', 'bitbucket-pipelines.yml', '.drone.yml']); // CI systems not in queue.mjs CI_PATHS
+  '.travis.yml', 'bitbucket-pipelines.yml', '.drone.yml', // CI systems not in queue.mjs CI_PATHS
+  'pnpm-workspace.yaml', '.pnpmfile.cjs', '.pnp.cjs', '.pnp.loader.mjs', // install-time resolution / hooks
+  'sitecustomize.py', 'usercustomize.py']); // imported by every Python process that has the directory on sys.path
 const PROTECTED_BASE_RE = [/^jest\.(config|setup)\./i, /^vitest\.(config|workspace|setup)\./i, /^vite\.config\./i, /^karma\.conf\./i,
   /^playwright\.config\./i, /^cypress\.config\./i, /^ava\.config\./i, /^\.mocharc/i, /^\.nycrc/i, /^\.c8rc/i, /^setuptests\./i,
-  /^babel\.config\./i, /^\.babelrc/i];
-const PROTECTED_DIRS = new Set(['.claude', '.husky', '.githooks', '__mocks__', '.gitea', '.forgejo']);
+  /^babel\.config\./i, /^\.babelrc/i, /\.pth$/i];
+const PROTECTED_DIRS = new Set(['.claude', '.husky', '.githooks', '__mocks__', '.gitea', '.forgejo', 'patches', 'node_modules']); // patches/: patch-package; node_modules/: committed bin/package shadowing
 // Case-insensitive: on a case-insensitive file system a lower-case agent file is read under its upper-case name.
 export function isProtectedPath(p) {
   if (p.toLowerCase() === '.product/delivery.json') return true;
   const b = base(p).toLowerCase();
   if (PROTECTED_BASENAMES.has(b) || PROTECTED_BASE_RE.some((re) => re.test(b))) return true;
   if (dirs(p).some((d) => PROTECTED_DIRS.has(d))) return true;
+  if (/(^|\/)\.yarn\/(patches|releases|plugins)\//i.test(p)) return true;
   return CI_PATHS.some((re) => re.test(p));
 }
 
@@ -67,13 +73,16 @@ export function isProtectedPath(p) {
 // G2 in test files: every listed form plus the trivial dodges: a reference without a call (`const s = it.skip`), bracket or
 // computed access on a test function (`it['sk' + 'ip']`), destructuring (`const { skip } = test`), `.each`/tagged-template
 // chains, bare x-aliases (`const later = xit`), focus (= only), node:test / jasmine idioms (`{ skip: true }`, `{ todo: 'x' }`,
-// `it.todo(`, `pending(`). `.skip` followed by a word is prose and not matched. Any `skip|todo|only:` option other than `false`
-// is a hit in a test file (over-protects, e.g. a pagination `{ skip: 2 }` costs one fix round).
+// `it.todo(`, `pending(`). `.skip` followed by a word is prose and not matched. A `skip|todo|only` option key (bare, quoted
+// or shorthand `{ skip }`) is a hit unless its value is exactly the literal `false` followed by `,` or `}` (so `false || x`
+// and `false ? a : b` are hits). Over-protects: a pagination `{ skip: 2 }` in a test file costs one fix round.
 // Matched over the file's added lines joined by "\n" (so `it.\nskip(` is seen), raw and with /* */ comments removed.
 const SKIP_IN_TESTS = [
   /\.\s*(?:skip|only|skipIf|todo)\b(?!\s+[a-z])/,
   /\[\s*(['"`])(?:skip|only|skipIf|todo)\1\s*\]/,
-  /(?<![\w$])(?:skip|todo|only)\s*:(?!\s*false\b)/,
+  /(?<![\w$])(['"`]?)(?:skip|todo|only)\1\s*:(?!\s*false\s*[,}])/,
+  /[{,]\s*(?:skip|todo|only)\s*[,}]/,
+  /(['"`])[^'"`\n]{0,40}\\(?:u|x)[^'"`\n]{0,40}\1\s*:/, // escaped option key, e.g. { "\u0073kip": true }
   /(?<![\w$.])pending\s*\(/,
   /(?<![\w$.])(?:describe|it|test|context|suite|specify|bench)\s*\[/,
   /\{[^{}]{0,200}(?<![\w$])(?:skip|only|skipIf|todo)(?![\w$])[^{}]{0,200}\}\s*=/, // bounded: no quadratic scan on hostile input
@@ -97,6 +106,9 @@ const SKIP_ANYWHERE = [
   /@Disabled\b/,
   /\bt\.Skip(?:Now|f)?\s*\(/,
   /\bt\s*\.\s*(?:skip|todo)\s*\(/, // node:test context
+  // any `<identifier>.skip()` / `.skip("reason")` (a node:test context under another name: ctx, t2, ...). Costs a fix round
+  // for a non-test API with that exact shape (e.g. `iter.skip()` without a count); `rows.skip(2)` is not matched.
+  /(?<![\w$])[A-Za-z_$][\w$]*\s*\.\s*skip\s*\(\s*(?:(['"`])[^'"`\n]{0,200}\1\s*)?\)/,
   /\bunittest\s*\.\s*(?:skip|expectedFailure)/,
 ];
 // G3 in non-test, non-doc files (joined added text, so `throw new Error(\n  "not implemented")` is seen).
@@ -121,7 +133,7 @@ function stripBlockComments(t) {
 
 // ---- git plumbing -------------------------------------------------------------------------------------------------------------
 function runGit(git, ...args) {
-  const r = git('-c', 'core.quotePath=false', ...args);
+  const r = git('-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', ...args);
   if (!r || typeof r.code !== 'number' || r.code !== 0) fail(`git ${args[0]} failed (exit ${r?.code})`);
   if (typeof r.out !== 'string') fail(`git ${args[0]} returned no output string`); // a missing stdout must never read as clean
   return r.out;
@@ -171,7 +183,7 @@ function patchLines(out, entries) {
       const n = (seen.get(p) ?? 0) + 1;
       if (n > maxSections.get(p)) fail('unexpected repeated patch header');
       seen.set(p, n);
-      if (!res.has(p)) res.set(p, { added: [], removed: [] });
+      if (!res.has(p)) res.set(p, { added: [], removed: [], base: [], head: [] });
       cur = res.get(p);
       continue;
     }
@@ -183,8 +195,9 @@ function patchLines(out, entries) {
       const x = lines[++i];
       if (x === undefined) fail('truncated hunk');
       if (x.startsWith('\\')) continue; // "\ No newline at end of file"
-      if (x[0] === '+' && add > 0) { cur.added.push(x.slice(1)); add--; }
-      else if (x[0] === '-' && rem > 0) { cur.removed.push(x.slice(1)); rem--; }
+      if (x[0] === '+' && add > 0) { cur.added.push(x.slice(1)); cur.head.push(x.slice(1)); add--; }
+      else if (x[0] === '-' && rem > 0) { cur.removed.push(x.slice(1)); cur.base.push(x.slice(1)); rem--; }
+      else if (x[0] === ' ' && rem > 0 && add > 0) { cur.base.push(x.slice(1)); cur.head.push(x.slice(1)); rem--; add--; } // full-context diff only
       else fail('malformed hunk');
     }
   }
@@ -200,82 +213,85 @@ function blob(git, sha, max) {
   return { text: runGit(git, 'cat-file', 'blob', sha) };
 }
 
-// ---- G4 content checks ------------------------------------------------------------------------------------------------------
+// ---- G4 content checks (package.json) --------------------------------------------------------------------------------------
 // Script names an argv runs through npm/pnpm/yarn/bun: every non-flag token after the tool, minus run/run-script (an
 // over-approximation: a flag value such as `--prefix web` is also protected, which only protects more); `node --run <name>`.
+// A shell as the tool, or a delegation flag in the argv, makes every scripts change in every package.json protected.
 const PM = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'cmd', 'powershell', 'pwsh']);
 const NPM_ALIASES = { t: 'test', tst: 'test' };
+const DELEGATE_ARGS = /^(?:--prefix|-C|--dir|--cwd|-w|--workspace|--workspaces|-ws|--filter|-F|-r|--recursive|workspace|workspaces)(?:=.*)?$/;
 const tool = (a) => String(a).split(/[/\\]/).at(-1).replace(/\.(cmd|exe)$/i, '').toLowerCase();
 function scriptNames(config) {
   const cmds = [config?.tests?.all, ...(Array.isArray(config?.local_checks) ? config.local_checks.map((c) => c?.command) : [])];
-  const names = new Set();
+  const names = new Set(); let global = false;
   for (const argv of cmds) {
     if (!Array.isArray(argv) || !argv.length) continue;
     const t = tool(argv[0]); const rest = argv.slice(1).map(String);
+    if (SHELLS.has(t)) { global = true; continue; }
     if (t === 'node') {
       rest.forEach((a, i) => { if (a === '--run' && rest[i + 1]) names.add(rest[i + 1]); else if (a.startsWith('--run=')) names.add(a.slice(6)); });
       continue;
     }
     if (!PM.has(t)) continue;
-    for (const s of rest) {
-      if (!s || s.startsWith('-') || ['run', 'run-script', 'rum', 'urn'].includes(s)) continue;
-      names.add(NPM_ALIASES[s] ?? s);
+    if (rest.some((a) => DELEGATE_ARGS.test(a))) global = true;
+    for (const a of rest) {
+      if (!a || a.startsWith('-') || ['run', 'run-script', 'rum', 'urn'].includes(a)) continue;
+      names.add(NPM_ALIASES[a] ?? a);
     }
   }
-  return names;
+  return { names, global };
 }
 // npm lifecycle scripts run by an install (the driver's test setup) or pack: always protected in every package.json.
 const LIFECYCLE = ['prepare', 'preinstall', 'install', 'postinstall', 'prepublish', 'prepublishOnly', 'prepack', 'postpack'];
-// A protected script that selects scripts by pattern (or through a runner that does) can reach any script: protect them all.
-const WILDCARD = /[*?{}[\]/]|(?<![\w-])(?:npm-run-all2?|run-s|run-p|concurrently|wireit)(?![\w-])/;
+// A protected script value that selects scripts by pattern, runs through a multi-script runner, delegates to another package
+// (--prefix, -C, --dir, --cwd, -w/--workspace(s), --filter/-F, -r/--recursive, `workspace`, cd/pushd) or builds a command at
+// run time ($VAR, $(...), backticks) can reach any script in any package: every scripts change in every package.json is G4.
+const WILDCARD = /[*?{}[\]/$`]|(?<![\w-])(?:npm-run-all2?|run-s|run-p|concurrently|wireit)(?![\w-])/;
+const DELEGATE = /(?<![\w-])(?:--prefix|-C|--dir|--cwd|-w|--workspace|--workspaces|-ws|--filter|-F|-r|--recursive)(?![\w-])|(?<![\w-])(?:workspaces?|cd|pushd)\s/;
 const PKG_TEST_KEYS = ['jest', 'mocha', 'ava', 'c8', 'nyc', 'vitest'];
-// Test-runner packages whose dependency may not be pointed at a non-registry specifier (file:, link:, git, URL, workspace:,
-// portal:, patch:, npm: alias, a path or owner/repo shorthand). A registry version/range change is not a hit. Lockfiles are
-// out of scope.
-const RUNNERS = new Set(['jest', 'vitest', 'mocha', 'ava', 'tap', 'playwright', '@playwright/test', 'cypress', 'karma', 'jasmine', 'uvu', 'ts-jest', 'babel-jest', 'c8', 'nyc']);
-const DEP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'resolutions', 'overrides'];
-const nonRegistry = (v) => typeof v === 'string' && (/[:/\\]/.test(v) || /^\s*[.~]/.test(v));
-function runnerName(key) {
-  // "jest", "jest@^29", "**/jest", "foo/jest", "@jest/core", "@jest/core@1" -> runner?
-  const k = String(key).replace(/(?<=.)@[^@/]*$/, '');
-  const last = k.split('/').at(-1); const scoped = k.split('/').slice(-2).join('/');
-  return RUNNERS.has(last) || RUNNERS.has(scoped) || /(^|\/)@jest\/[^/]+$/.test(k);
-}
-// Map "path -> specifier" for runner packages, walking nested npm overrides (bounded depth).
-function runnerSpecs(pkg) {
-  const out = new Map();
-  const walk = (o, at, depth, isRunner) => {
-    if (!o || typeof o !== 'object' || Array.isArray(o) || depth > 8) return;
-    for (const k of Object.keys(o)) {
-      const v = o[k]; const r = isRunner || runnerName(k);
-      if (typeof v === 'string') { if (r) out.set(`${at}>${k}`, v); } else walk(v, `${at}>${k}`, depth + 1, r);
-    }
-  };
-  for (const sct of DEP_SECTIONS) walk(own(pkg, sct), sct, 0, false);
-  walk(own(own(pkg, 'pnpm'), 'overrides'), 'pnpm.overrides', 0, false);
-  return out;
-}
+// Compared whole: any change is G4 (workspace layout, resolution rewrites, patches, bins can all swap a test runner).
+const PKG_WHOLE_KEYS = ['workspaces', 'pnpm', 'resolutions', 'overrides', 'bin', 'dependenciesMeta', 'bundledDependencies', 'bundleDependencies'];
+// Any new or changed non-registry specifier in a dependency section (file:, link:, git, URL, workspace:, portal:, patch:,
+// npm: alias, a path, owner/repo shorthand). A registry version/range change is not a hit. Lockfiles are out of scope.
+const DEP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const nonRegistry = (v) => typeof v !== 'string' || /[:/\\]/.test(v) || /^\s*[.~]/.test(v);
 const own = (o, k) => (o && typeof o === 'object' && !Array.isArray(o) && Object.hasOwn(o, k) ? o[k] : undefined);
-function packageJsonHit(baseText, headText, names) {
-  let b; let h;
-  try { b = baseText === '' ? {} : JSON.parse(baseText); h = headText === '' ? {} : JSON.parse(headText); } catch { return true; }
-  if (PKG_TEST_KEYS.some((k) => JSON.stringify(own(b, k)) !== JSON.stringify(own(h, k)))) return true;
-  const bd = runnerSpecs(b);
-  for (const [k, v] of runnerSpecs(h)) if (nonRegistry(v) && bd.get(k) !== v) return true;
-  const bs = own(b, 'scripts'); const hs = own(h, 'scripts');
-  const keys = new Set([...Object.keys(bs && typeof bs === 'object' ? bs : {}), ...Object.keys(hs && typeof hs === 'object' ? hs : {})]);
-  if (keys.size > SCRIPTS_MAX) return true;
-  const changed = (k) => JSON.stringify(own(bs, k)) !== JSON.stringify(own(hs, k));
-  // Close over scripts a protected script calls (any other script name appearing as a token in its base or head value), with
-  // the pre/post hooks of every protected script; a wildcard/runner call protects every script.
+const same = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+const PKG_MAX_FILES = 50;
+
+// Per-file checks that need no script closure. true = G4.
+function pkgFileHit(b, h) {
+  if (PKG_TEST_KEYS.some((k) => !same(own(b, k), own(h, k)))) return true;
+  if (PKG_WHOLE_KEYS.some((k) => !same(own(b, k), own(h, k)))) return true;
+  const pmB = own(b, 'packageManager'); const pmH = own(h, 'packageManager'); // corepack accepts a URL
+  if (!same(pmB, pmH) && pmH !== undefined && (typeof pmH !== 'string' || /[:/\\]/.test(pmH.replace(/^[^@]*@/, '')))) return true;
+  for (const sct of DEP_SECTIONS) {
+    const hd = own(h, sct); const bd = own(b, sct);
+    if (hd === undefined) continue;
+    if (!hd || typeof hd !== 'object' || Array.isArray(hd)) { if (!same(bd, hd)) return true; continue; }
+    for (const k of Object.keys(hd)) if (nonRegistry(hd[k]) && !same(own(bd, k), hd[k])) return true;
+  }
+  return false;
+}
+const scriptsOf = (o) => { const sc = own(o, 'scripts'); return sc && typeof sc === 'object' && !Array.isArray(sc) ? sc : {}; };
+
+// pkgs: [{ path, b, h }] (parsed base/head objects of every package.json in the diff). Returns the set of paths that are G4.
+// The protected-name closure is computed across ALL of them (a root script may call a workspace script) and applied to each.
+function pkgScriptHits(pkgs, config) {
+  const hits = new Set();
+  const { names, global: argvGlobal } = scriptNames(config);
+  const keys = new Set(); for (const x of pkgs) for (const k of [...Object.keys(scriptsOf(x.b)), ...Object.keys(scriptsOf(x.h))]) keys.add(k);
+  const changedKeys = (x) => [...new Set([...Object.keys(scriptsOf(x.b)), ...Object.keys(scriptsOf(x.h))])].filter((k) => !same(own(scriptsOf(x.b), k), own(scriptsOf(x.h), k)));
+  let global = argvGlobal || keys.size > SCRIPTS_MAX;
   const prot = new Set(); const todo = [];
-  const add = (n) => { for (const x of [n, `pre${n}`, `post${n}`]) if (!prot.has(x)) { prot.add(x); todo.push(x); } };
+  const add = (n) => { for (const v of [n, `pre${n}`, `post${n}`]) if (!prot.has(v)) { prot.add(v); todo.push(v); } };
   for (const n of [...names, ...LIFECYCLE]) add(n);
-  while (todo.length) {
+  while (!global && todo.length) {
     const n = todo.pop();
-    const vals = [own(bs, n), own(hs, n)].filter((v) => typeof v === 'string').join('\n');
+    const vals = pkgs.flatMap((x) => [own(scriptsOf(x.b), n), own(scriptsOf(x.h), n)]).filter((v) => v !== undefined).map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join('\n');
     if (!vals) continue;
-    if (WILDCARD.test(vals)) return [...keys].some(changed);
+    if (WILDCARD.test(vals) || DELEGATE.test(vals)) { global = true; break; }
     const tokens = new Set(vals.split(/[^\w:.-]+/));
     for (const k of keys) {
       if (prot.has(k)) continue;
@@ -283,7 +299,11 @@ function packageJsonHit(baseText, headText, names) {
       if (/^[\w:.-]+$/.test(k) ? tokens.has(k) : vals.includes(k)) add(k);
     }
   }
-  return [...prot].some(changed);
+  for (const x of pkgs) {
+    const ch = changedKeys(x);
+    if (global ? ch.length > 0 : ch.some((k) => prot.has(k))) hits.add(x.path);
+  }
+  return hits;
 }
 
 // ---- G5 ---------------------------------------------------------------------------------------------------------------------
@@ -337,7 +357,7 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
   const patch = patchLines(runGit(git, 'diff', '--no-color', '--text', '--unified=0', '--src-prefix=a/', '--dst-prefix=b/', ...common), entries);
 
   const globs = testGlobs(config);
-  const names = scriptNames(config);
+  const pkgEntries = [];
   const specs = new Set(specPaths);
   const found = { G1: new Set(), G2: new Set(), G3: new Set(), G4: new Set(), G5: new Set() };
   for (const e of entries) {
@@ -350,11 +370,40 @@ export function checkDiff({ git, baseRef, headSha, config = {}, specPaths = [], 
     if (any(test ? SKIP_IN_TESTS : SKIP_ANYWHERE)) found.G2.add(p);
     if (!test && !isDoc(p) && any(STUBS)) found.G3.add(p);
     if (isProtectedPath(p)) found.G4.add(p);
-    else if (base(p).toLowerCase() === 'package.json') {
-      const bt = blob(git, e.oldSha, BLOB_MAX); const ht = blob(git, e.newSha, BLOB_MAX);
-      if (bt.tooBig || ht.tooBig || packageJsonHit(bt.text, ht.text, names)) found.G4.add(p);
-    }
+    else if (base(p).toLowerCase() === 'go.mod' && any([/(^|\n)\s*replace\b/, /=>/])) found.G4.add(p); // module replace (e.g. a fake testify)
+    else if (base(p).toLowerCase() === 'package.json') pkgEntries.push(e);
     if (specs.has(p) && specChanged(git, e, parser)) found.G5.add(p);
+  }
+  // package.json: all base/head texts from ONE full-context diff limited by a fixed pathspec (no names in argv, no per-file
+  // process). More than PKG_MAX_FILES changed manifests is a hit without reading them.
+  if (pkgEntries.length > PKG_MAX_FILES) for (const e of pkgEntries) found.G4.add(e.path);
+  else if (pkgEntries.length) {
+    const full = patchLines(runGit(git, 'diff', '--no-color', '--text', '--unified=100000000', '--src-prefix=a/', '--dst-prefix=b/', ...common, ':(glob,icase)**/package.json'), pkgEntries);
+    const pkgs = [];
+    for (const e of pkgEntries) {
+      const { base: bl, head: hl } = full.get(e.path);
+      const bt = bl.join('\n'); const ht = hl.join('\n');
+      let b; let h;
+      try {
+        if (bt.length > BLOB_MAX || ht.length > BLOB_MAX) throw new Error('too big');
+        b = bt === '' ? {} : JSON.parse(bt); h = ht === '' ? {} : JSON.parse(ht);
+      } catch { found.G4.add(e.path); continue; }
+      if (pkgFileHit(b, h)) found.G4.add(e.path);
+      pkgs.push({ path: e.path, b, h });
+    }
+    // The configured commands run at the repo root: an unchanged root manifest still feeds the closure (read by fixed path).
+    if (!pkgEntries.some((e) => e.path === 'package.json')) {
+      const t = runGit(git, 'ls-tree', '-z', head, '--', 'package.json');
+      const m = /^100(?:644|755) blob ([0-9a-f]{40,64})\tpackage\.json\0?$/.exec(t);
+      if (t && !m) found.G4.add('package.json'); // root manifest is not a regular file: hold
+      else if (m) {
+        const r = blob(git, m[1], BLOB_MAX); let o;
+        try { if (r.tooBig) throw new Error('too big'); o = JSON.parse(r.text); } catch { o = undefined; }
+        if (o === undefined) for (const x of pkgs) found.G4.add(x.path); // unreadable root: cannot prove the closure
+        else pkgs.push({ path: 'package.json', b: o, h: o });
+      }
+    }
+    for (const p of pkgScriptHits(pkgs, config)) found.G4.add(p);
   }
   return Object.entries(found).filter(([, s]) => s.size).map(([id, s]) => ({ id, files: [...s].sort() }));
 }
