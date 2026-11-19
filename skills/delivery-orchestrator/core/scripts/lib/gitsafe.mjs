@@ -3,6 +3,20 @@
 // must be on ALLOWED_CONFIG, so a builder-written .git/config cannot define filters, textconv/merge drivers, editors, gpg programs,
 // credential helpers, upload/receive-pack commands, includes or URL rewrites. The neutralising -c flags stay as a second layer.
 // Supported: read-only commands, plus fetch/checkout/worktree/merge --ff-only against a config the driver itself wrote.
+// WORKTREE PREFLIGHT: every command that may touch the work tree (status, add, commit, checkout, diff/log/show without explicit
+// revisions, diff --submodule=..., ...) first runs checkWorktreeSafe: it THROWS on a gitlink in the index, a .gitmodules, or any entry
+// named .git (any case: dir, gitfile, symlink) below the top level, found by a bounded walk (WORKTREE_WALK_CAP entries, symlinks not
+// followed). An embedded repo's own config (filters, textconv, fsmonitor) would otherwise run UNSANDBOXED in the driver: git consults
+// nested repos for `status`/`add`/`diff --submodule=diff`. Only fetch, ls-remote, rev-parse, cat-file, ls-tree, rev-list, merge-base,
+// show-ref, for-each-ref, config reads, and diff/log/show whose every revision is a full SHA or a refs/... name skip the walk.
+// The driver should not run `add`/`commit` in builder worktrees at all (it reads them; the builder commits).
+// Network commands: a positional remote NAME must be a configured remote (git otherwise falls through to a same-named local path,
+// e.g. a builder-planted bare repo `./origin` whose receive hooks then run); file:// transport is off; options are allowlisted per
+// command; `submodule` is refused (.gitmodules URLs are builder-writable).
+// CARRY (Task 7): the builder's own Claude Code session is NOT sandbox-exec'd, so its settings must also deny Write/Edit/Bash writes to
+// any `.git` at any depth of the worktree; the sandbox profile does this only for code it runs.
+import fs from 'node:fs';
+import path from 'node:path';
 // Returns the RAW result: stdout is not trimmed and the real exit code is kept (checkDiff needs exact full-context diffs). A signal,
 // timeout or buffer overflow THROWS (without output): a partial `out` is never returned.
 import { spawnSync } from 'node:child_process';
@@ -18,8 +32,10 @@ export const GIT_SAFE_FLAGS = Object.freeze([
   '-c', 'gpg.program=false', '-c', 'commit.gpgSign=false', // no signing program
   '-c', 'credential.helper=', '-c', 'core.askPass=', // no credential helper or askpass program
   '-c', 'core.attributesFile=/dev/null', '-c', 'core.excludesFile=/dev/null',
-  '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
-  '-c', 'http.followRedirects=false', // an allowed public remote cannot redirect the driver to a private/metadata address // auto-gc / maintenance never runs inside a driver git call
+  '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', // auto-gc / maintenance never runs inside a driver git call
+  '-c', 'http.followRedirects=false', // an allowed public remote cannot redirect the driver to a private/metadata address
+  '-c', 'protocol.file.allow=never', // no local-path / file:// transport (local transport also drops these -c flags for the other side)
+  '-c', 'submodule.recurse=false', '-c', 'fetch.recurseSubmodules=false', // never recurse into submodule repos
   // `-c diff.external=` is NOT used: git 2.52 then tries to exec "" and every `git diff` dies ("cannot run :"). Config cannot be unset
   // with -c, so diff-producing commands get --no-ext-diff --no-textconv instead (DIFF_GUARD below).
 ]);
@@ -120,73 +136,165 @@ function spawnGit(cwd, argv, timeout) {
   return r;
 }
 
-// Lists the repository config with origins (no command executes) and throws `git config not allowed: <key>` on the first key not allowed.
-export function verifyGitConfig(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS } = {}) {
-  const loc = []; // only the options that select the repository; caller -c pairs were checked by splitGlobal
+// Only the global options that select the repository (-C, --git-dir, --work-tree); caller -c pairs were checked by splitGlobal.
+function locationOf(global) {
+  const loc = [];
   for (let i = 0; i < global.length; i++) {
     if (global[i] === '-c') { i++; continue; }
     loc.push(global[i]);
     if (GLOBAL_WITH_VALUE.has(global[i])) loc.push(global[++i]);
   }
+  return loc;
+}
+function readConfig(cwd, loc, timeout) {
   const r = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'config', '--list', '--show-origin', '-z'], timeout);
   if (r.status !== 0) throw new Error(`git config could not be verified (exit ${r.status})`);
-  const parts = r.stdout.split('\0');
+  const parts = r.stdout.split('\0'), entries = [];
   for (let i = 0; i + 1 < parts.length; i += 2) {
-    const origin = parts[i], entry = parts[i + 1];
-    if (origin.startsWith('command line:')) continue; // GIT_SAFE_FLAGS
-    const nl = entry.indexOf('\n');
-    const key = nl < 0 ? entry : entry.slice(0, nl);
-    if (!configAllowed(key, nl < 0 ? undefined : entry.slice(nl + 1))) throw new Error(`git config not allowed: ${key}`);
+    if (parts[i].startsWith('command line:')) continue; // GIT_SAFE_FLAGS
+    const nl = parts[i + 1].indexOf('\n');
+    entries.push(nl < 0 ? [parts[i + 1], undefined] : [parts[i + 1].slice(0, nl), parts[i + 1].slice(nl + 1)]);
   }
+  return entries;
+}
+const remotesOf = (entries) => new Set(entries.map(([k]) => /^remote\.(.+)\.url$/i.exec(k)?.[1]).filter(Boolean));
+
+// Lists the repository config with origins (no command executes) and throws `git config not allowed: <key>` on the first key not allowed.
+// Returns the configured remote names (those with a url).
+export function verifyGitConfig(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS } = {}) {
+  const entries = readConfig(cwd, locationOf(global), timeout);
+  for (const [key, value] of entries) if (!configAllowed(key, value)) throw new Error(`git config not allowed: ${key}`);
+  return { remotes: remotesOf(entries) };
 }
 
-// gitSafeOpts(cwd, args, { timeout, verified }): `verified: true` skips the config listing; pass it only within one call chain right
-// after a verified call on the same cwd.
-// Positional arguments of network commands. git treats ANY argument with a ':' whose part before the first ':' has no '/' as an
-// scp-like remote (127.0.0.1:path, host:path, [::1]:path), so every positional (and every --opt=value) must be one of:
-//   a remote/branch/ref name   [A-Za-z0-9_*][A-Za-z0-9._/*-]*  (no ':', no leading '/', '.' or '-': never a local path)
-//   a refspec                  [+][<HEAD|refs/...|name>]:refs/...
-//   an https:// or ssh:// URL  passing SAFE_URL + publicHost
-// scp-like URLs are refused outright (the driver always uses configured remote names); `clone` may end with a destination path
-// without ':'. Errors name the argument INDEX only. DNS-resolve-before-fetch is NOT done (a public name resolving privately passes).
-// `unsafeAllowLocalUrls` exists for tests against a local server ONLY.
-const NET_CMDS = new Set(['fetch', 'ls-remote', 'clone', 'pull', 'push', 'remote', 'archive', 'submodule']);
+// ---- worktree preflight -----------------------------------------------------------------------------------------------------------
+export const WORKTREE_WALK_CAP = 100000;
+const SAFE_NO_WORKTREE = new Set(['fetch', 'ls-remote', 'rev-parse', 'cat-file', 'ls-tree', 'rev-list', 'merge-base', 'show-ref', 'for-each-ref']);
+const REVISION = /^([0-9a-f]{40}|[0-9a-f]{64}|refs\/[A-Za-z0-9._/-]+)$/;
+export function touchesWorktree(rest) {
+  const [cmd, ...a] = rest;
+  if (SAFE_NO_WORKTREE.has(cmd)) return false;
+  if (cmd === 'config') return !a.some((x) => ['--get', '--get-all', '--get-regexp', '--list', '-l'].includes(x));
+  if (['diff', 'log', 'show'].includes(cmd)) {
+    if (a.includes('--') || a.some((x) => x.startsWith('--submodule'))) return true;
+    const revs = a.filter((x) => !x.startsWith('-'));
+    return !(revs.length >= (cmd === 'diff' ? 2 : 1) && revs.every((x) => REVISION.test(x)));
+  }
+  return true;
+}
+// Throws `git worktree not safe: <reason>` (an entry INDEX, never a path) on a gitlink, a .gitmodules or a nested .git.
+export function checkWorktreeSafe(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS, cap = WORKTREE_WALK_CAP } = {}) {
+  const loc = locationOf(global);
+  const top = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'rev-parse', '--show-toplevel'], timeout);
+  if (top.status !== 0) return; // not in a work tree (bare repo or no repo): nothing to walk; git itself will report the error
+  const root = top.stdout.replace(/\n$/, '');
+  const st = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'ls-files', '-z', '--stage'], timeout);
+  if (st.status !== 0) throw new Error('git worktree not safe: index unreadable');
+  if (st.stdout.split('\0').some((e) => e.startsWith('160000 '))) throw new Error('git worktree not safe: gitlink in the index');
+  if (fs.existsSync(path.join(root, '.gitmodules')) || isLink(path.join(root, '.gitmodules'))) throw new Error('git worktree not safe: .gitmodules present');
+  let seen = 0;
+  const stack = [[root, 0]];
+  while (stack.length) {
+    const [dir, depth] = stack.pop();
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { throw new Error(`git worktree not safe: unreadable directory (${e.code})`); }
+    for (const d of ents) {
+      if (depth === 0 && d.name.toLowerCase() === '.git') continue; // the work tree's own repository
+      if (++seen > cap) throw new Error(`git worktree not safe: more than ${cap} entries`);
+      if (d.name.toLowerCase() === '.git') throw new Error(`git worktree not safe: nested .git at entry ${seen}`);
+      if (d.isDirectory() && !d.isSymbolicLink()) stack.push([path.join(dir, d.name), depth + 1]);
+    }
+  }
+}
+const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+
+// Network commands. git treats ANY argument with a ':' whose part before the first ':' has no '/' as an scp-like remote, and a plain
+// NAME that is not a configured remote as a local path. So:
+//   fetch/ls-remote/pull/push: the repository (first positional) must be a CONFIGURED remote name or an https/ssh URL passing
+//     SAFE_URL + publicHost; later positionals must be ref names or refspecs ([+][src]:refs/...).
+//   clone: the first positional must be an https/ssh URL (SAFE_URL + publicHost); an optional second is a RELATIVE destination
+//     without '..' segments; nothing more.
+//   options: allowlisted per command (OPTIONS below); every other option (--upload-pack, --receive-pack, --exec, --template, --config,
+//     -c, --recurse-submodules, --server-option, push -o, --separate-git-dir, --reference, --shared, --mirror, --bare, ...) is refused.
+//   remote add/set-url: URL arguments are checked like positional URLs. submodule: refused. archive --remote/--exec: refused.
+// Errors name the argument INDEX only. DNS-resolve-before-fetch is NOT done. `unsafeAllowLocalUrls` (tests only) skips this check.
+const NET_CMDS = new Set(['fetch', 'ls-remote', 'clone', 'pull', 'push']);
 const NAMEISH = /^[A-Za-z0-9_*][A-Za-z0-9._/*-]*$/;
 const REFSPEC = /^\+?(HEAD|refs\/[A-Za-z0-9._/*-]*|[A-Za-z0-9_*][A-Za-z0-9._/*-]*)?:refs\/[A-Za-z0-9._/*-]+$/;
-function argAllowed(a) {
-  if (/^(https|ssh):\/\//.test(a)) return SAFE_URL.test(a) && publicHost(urlHost(a));
-  if (a.includes('://')) return false;
-  if (a.includes(':')) return REFSPEC.test(a);
-  return NAMEISH.test(a.replace(/^\+/, ''));
-}
-export function checkNetworkArgs(rest, { unsafeAllowLocalUrls = false } = {}) {
-  if (!NET_CMDS.has(rest[0]) || unsafeAllowLocalUrls) return; // the unsafe flag skips the whole check (tests only)
+const COMMON_OPTS = ['--quiet', '-q', '--verbose', '-v'];
+const OPTIONS = {
+  fetch: { flags: [...COMMON_OPTS, '--prune', '--no-prune', '--tags', '--no-tags', '--force', '-f', '--all', '--atomic', '--no-recurse-submodules'], depth: true },
+  pull: { flags: [...COMMON_OPTS, '--ff-only', '--no-rebase', '--prune', '--no-prune', '--tags', '--no-tags', '--force', '-f', '--no-recurse-submodules'], depth: true },
+  push: { flags: [...COMMON_OPTS, '--force', '-f', '--atomic', '--set-upstream', '-u', '--tags', '--no-verify', '--porcelain', '--all'] },
+  'ls-remote': { flags: [...COMMON_OPTS, '--tags', '--heads', '--refs', '--exit-code'] },
+  clone: { flags: [...COMMON_OPTS, '--single-branch', '--no-checkout', '--no-tags', '--no-recurse-submodules'], depth: true, withName: ['--branch', '-b', '--origin', '-o'] },
+};
+const isSafeUrl = (a) => /^(https|ssh):\/\//.test(a) && SAFE_URL.test(a) && publicHost(urlHost(a));
+const refArg = (a) => (a.includes(':') ? REFSPEC.test(a) : NAMEISH.test(a.replace(/^\+/, '')));
+export function checkNetworkArgs(rest, { remotes = new Set(), unsafeAllowLocalUrls = false } = {}) {
+  const cmd = rest[0];
+  if (unsafeAllowLocalUrls) return; // tests only
+  if (cmd === 'remote') {
+    for (let i = 1; i < rest.length; i++) if (/[:/]/.test(rest[i]) && !rest[i].startsWith('-') && !isSafeUrl(rest[i])) throw new Error(`git URL not allowed: argument ${i}`);
+    return;
+  }
+  if (cmd === 'archive') {
+    for (let i = 1; i < rest.length; i++) if (/^--(remote|exec)/.test(rest[i])) throw new Error(`git option not allowed: argument ${i}`);
+    return;
+  }
+  if (!NET_CMDS.has(cmd)) return;
+  const spec = OPTIONS[cmd];
   const positional = [];
+  let afterDashDash = false;
   for (let i = 1; i < rest.length; i++) {
     const a = rest[i];
-    if (a === '--') continue;
-    if (a.startsWith('-')) {
-      const eq = a.indexOf('=');
-      if (eq > 0 && !argAllowed(a.slice(eq + 1)) && /[:/]/.test(a.slice(eq + 1))) throw new Error(`git URL not allowed: argument ${i}`);
+    if (afterDashDash || !a.startsWith('-')) { positional.push(i); continue; }
+    if (a === '--') { afterDashDash = true; continue; }
+    if (spec.flags.includes(a)) continue;
+    if (spec.depth && /^--depth=[1-9][0-9]{0,6}$/.test(a)) continue;
+    if (spec.withName?.includes(a) && typeof rest[i + 1] === 'string' && NAMEISH.test(rest[i + 1])) { i++; continue; }
+    throw new Error(`git option not allowed: argument ${i}`);
+  }
+  if (cmd === 'clone') {
+    const [src, dst, ...extra] = positional;
+    if (src === undefined || !isSafeUrl(rest[src])) throw new Error(`git URL not allowed: argument ${src ?? 0}`);
+    if (dst !== undefined) {
+      const d = rest[dst];
+      if (path.isAbsolute(d) || d.includes(':') || d.split('/').includes('..') || !d || d.startsWith('-')) throw new Error(`git URL not allowed: argument ${dst}`);
+    }
+    if (extra.length) throw new Error(`git URL not allowed: argument ${extra[0]}`);
+    return;
+  }
+  for (const [n, i] of positional.entries()) {
+    const a = rest[i];
+    if (n === 0) {
+      if (isSafeUrl(a)) continue;
+      if (/^(https|ssh):\/\//.test(a) || a.includes(':') || a.includes('/') || !REMOTE_NAME.test(a)) throw new Error(`git URL not allowed: argument ${i}`);
+      if (!remotes.has(a)) throw new Error(`git remote not configured: argument ${i}`);
       continue;
     }
-    positional.push(i);
-  }
-  for (const i of positional) {
-    const a = rest[i];
-    if (argAllowed(a)) continue;
-    if (rest[0] === 'clone' && i === positional.at(-1) && positional.length > 1 && !a.includes(':')) continue; // destination directory
-    throw new Error(`git URL not allowed: argument ${i}`);
+    if (!refArg(a)) throw new Error(`git URL not allowed: argument ${i}`);
   }
 }
 
-export function gitSafeOpts(cwd, args, { timeout = DEFAULT_TIMEOUT_MS, verified = false, unsafeAllowLocalUrls = false } = {}) {
+// gitSafeOpts(cwd, args, { timeout, verified, unsafeSkipWorktreeCheck, worktreeWalkCap, unsafeAllowLocalUrls }):
+//   verified: true skips the config allowlist (only within one call chain right after a verified call on the same cwd);
+//   unsafeSkipWorktreeCheck / unsafeAllowLocalUrls: TESTS ONLY; worktreeWalkCap can only LOWER WORKTREE_WALK_CAP.
+export function gitSafeOpts(cwd, args, { timeout = DEFAULT_TIMEOUT_MS, verified = false, unsafeAllowLocalUrls = false, unsafeSkipWorktreeCheck = false, worktreeWalkCap = WORKTREE_WALK_CAP } = {}) {
   if (typeof cwd !== 'string' || !cwd) throw new Error('gitSafe: cwd is required');
   if (!Array.isArray(args)) throw new Error('gitSafe: args must be an array');
   for (const a of args) if (typeof a !== 'string') throw new Error('gitSafe: every argument must be a string');
+  if (!Number.isInteger(worktreeWalkCap) || worktreeWalkCap < 1 || worktreeWalkCap > WORKTREE_WALK_CAP) throw new Error(`gitSafe: worktreeWalkCap must be 1..${WORKTREE_WALK_CAP}`);
   const { global, rest } = splitGlobal(args);
-  checkNetworkArgs(rest, { unsafeAllowLocalUrls });
-  if (!verified) verifyGitConfig(cwd, { global, timeout });
+  if (rest[0] === 'submodule') throw new Error('gitSafe: submodule is not supported');
+  if (DIFF_CMDS.has(rest[0]) || rest[0] === 'stash') {
+    for (let i = 1; i < rest.length; i++) if (/^--(ext-diff|textconv)$/.test(rest[i])) throw new Error(`git option not allowed: argument ${i}`);
+  }
+  let remotes;
+  if (!verified) ({ remotes } = verifyGitConfig(cwd, { global, timeout }));
+  else if (NET_CMDS.has(rest[0]) && !unsafeAllowLocalUrls) remotes = remotesOf(readConfig(cwd, locationOf(global), timeout));
+  checkNetworkArgs(rest, { remotes, unsafeAllowLocalUrls });
+  if (!unsafeSkipWorktreeCheck && touchesWorktree(rest)) checkWorktreeSafe(cwd, { global, timeout, cap: worktreeWalkCap });
   let argv = rest;
   if (DIFF_CMDS.has(rest[0])) argv = [rest[0], ...DIFF_GUARD, ...rest.slice(1)];
   else if (rest[0] === 'stash' && rest[1] === 'show') argv = ['stash', 'show', ...DIFF_GUARD, ...rest.slice(2)];

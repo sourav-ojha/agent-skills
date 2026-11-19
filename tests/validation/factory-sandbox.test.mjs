@@ -187,7 +187,7 @@ test('sandboxProfile: realpaths, deny-before-allow order, default secrets, .git 
   assert.ok(idx('(allow default)') < idx('(deny file-write*)'));
   assert.ok(idx('(deny file-write*)') < idx('(allow file-read* file-write*'));
   assert.ok(idx('(deny file-read*') < idx('(allow file-read* file-write*'));
-  assert.ok(idx('(allow file-read* file-write*') < idx(`(deny file-write* (subpath "${realRaw}/.git")`));
+  assert.ok(idx('(allow file-read* file-write*') < idx(`(deny file-write* (regex #"^${realRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(.*/)?\\.[gG][iI][tT](/.*)?$")`));
   assert.ok(idx('(deny mach-lookup)') < idx('(allow mach-lookup'));
   const lines = prof.split('\n');
   const denyReads = lines.map((l, i) => [l, i]).filter(([l]) => l.startsWith('(deny file-read*'));
@@ -211,7 +211,10 @@ test('sandboxProfile: escaping, control characters, relative/missing/protected p
   const root = tmp(t);
   const weird = path.join(root, 'we"ird\\dir'); fs.mkdirSync(weird);
   const U = { unsafeAllowOutsideFactoryHome: true };
-  const prof = S.sandboxProfile({ writable: [weird], network: 'none', factoryHome: path.join(root, 'fh'), ...U });
+  // A worktree path is used inside an SBPL regex literal, which cannot carry a '"': such a writable dir is refused clearly.
+  assert.throws(() => S.sandboxProfile({ writable: [weird], network: 'none', factoryHome: path.join(root, 'fh'), ...U }), /cannot be used in an SBPL regex/);
+  const plain = path.join(root, 'plain'); fs.mkdirSync(plain);
+  const prof = S.sandboxProfile({ writable: [plain], readDeny: [weird], network: 'none', factoryHome: path.join(root, 'fh'), ...U });
   assert.ok(prof.includes(`(subpath "${root}/we\\"ird\\\\dir")`), prof);
   assert.throws(() => S.sandboxProfile({ writable: [path.join(root, 'a\nb')], network: 'none' }), /control character/);
   assert.throws(() => S.sandboxProfile({ writable: [root], readDeny: [`${root}/x\u0000`], network: 'none' }), /control character/);
@@ -222,7 +225,7 @@ test('sandboxProfile: escaping, control characters, relative/missing/protected p
   assert.throws(() => S.sandboxProfile({ writable: ['/'], network: 'none', ...U }), /must not be \/|protected/);
   assert.throws(() => S.sandboxProfile({ writable: [], readAllow: [path.dirname(root)], network: 'none', factoryHome: path.join(root, 'fh') }), /contains denied root/);
   for (const bad of [undefined, 'all', { localhostPort: 0 }, { localhostPort: 70000 }, { localhostPort: '80' }, { localhostPort: 80, extra: 1 }]) {
-    assert.throws(() => S.sandboxProfile({ writable: [weird], network: bad, factoryHome: path.join(root, 'fh'), ...U }), /network|localhostPort/);
+    assert.throws(() => S.sandboxProfile({ writable: [plain], network: bad, factoryHome: path.join(root, 'fh'), ...U }), /network|localhostPort/);
   }
 });
 
@@ -774,7 +777,8 @@ test('minor gitSafe: git killed by an outside signal (no timeout, no error) thro
 // ---- fix round 3: exact credential names (no prefix patterns), near-miss readability, real toolchain layouts ---------------------
 const NEAR_MISS = ['.envrc', '.envX', '.environment', '.env-prod', 'environment.js', 'tokenize.js', 'tokenizer.js', 'token.js', 'tokens.js', 'token.rs', 'token.py',
   'tokenize.py', 'tokens/list.js', 'token/index.js', 'rc', 'rc.js', 'rcfile', 'rcedit', 'node_modules/rc/index.js', 'credentialsX', 'credentials-foo', 'npmrcX',
-  'npmrc-backup', 'id_rsa_tool.js', 'id_rsa.pub', 'id_x/y.js', 'server.key', 'cert.pem', 'id.p12', 'a.keys', 'pip.config', 'auth.json.d/x', '.env/x', 'credentials/inner.txt',
+  'npmrc-backup', 'id_rsa_tool.js', 'id_rsa.pub', 'id_x/y.js', 'cert.pem', 'cacert.pem', 'certifi/cacert.pem', 'ca-bundle.crt', 'credentials.js', 'lib/credentials.js', 'a.keys',
+  'keyboard.pem.js', 'x.key/inner.txt', 'pubkey.pem', 'token.jsonx', 'mytoken.json', 'pip.config', 'auth.json.d/x', '.env/x', 'credentials/inner.txt',
   'npmrc.bak.js', 'monkey', 'x-y.z~', 'xnpmrc', 'pipXconf', 'id_rsaXbak', '_env'];
 
 test('R3 sandbox fs: near-miss names in toolchain dirs stay READABLE; directories named like credentials stay usable', { skip: SKIP }, async (t) => {
@@ -867,14 +871,143 @@ test('R3 addendum gitSafe: positional args of network commands are remote names,
   const bad = [['fetch', '127.0.0.1:path'], ['fetch', 'localhost:path'], ['ls-remote', '[::1]:path'], ['clone', 'git@127.0.0.1:o/r', 'dst'], ['pull', 'host:path'],
     ['push', 'git@github.com:o/r.git', 'main'], ['fetch', 'https://127.0.0.1/x'], ['fetch', 'http://example.com/x'], ['fetch', 'file:///tmp/x'], ['fetch', '/tmp/repo'],
     ['fetch', './repo'], ['fetch', 'origin', 'x:y'], ['fetch', 'origin', 'main:main'], ['clone', '/tmp/src', 'dst'], ['fetch', '--upload-pack=x:y', 'origin'], ['fetch', 'origin', 'a b']];
+  const R = { remotes: new Set(['origin']) };
   for (const args of bad) {
-    assert.throws(() => G.checkNetworkArgs(args), (e) => /^git URL not allowed: argument \d+$/.test(e.message) && !e.message.includes(args.at(-1)), args.join(' '));
+    assert.throws(() => G.checkNetworkArgs(args, R), (e) => /^git (URL|option) not allowed: argument \d+$/.test(e.message) && !e.message.includes(args.at(-1)), args.join(' '));
   }
   const good = [['fetch', 'origin'], ['fetch', 'origin', '+refs/heads/*:refs/remotes/origin/*'], ['push', 'origin', 'HEAD:refs/heads/x'], ['push', 'origin', 'refs/heads/a:refs/heads/b'],
     ['fetch', 'origin', 'refs/heads/main'], ['fetch', 'origin', 'feature/x'], ['fetch', '--prune', 'origin'], ['ls-remote', 'https://github.com/o/r.git'],
-    ['ls-remote', 'ssh://git@github.com/o/r.git', 'HEAD'], ['clone', 'https://github.com/o/r.git', 'dst'], ['clone', 'https://github.com/o/r.git', '/tmp/abs/dst'],
+    ['ls-remote', 'ssh://git@github.com/o/r.git', 'HEAD'], ['clone', 'https://github.com/o/r.git', 'dst'], // an absolute destination is refused since round 4
     ['push', 'origin', ':refs/heads/old'], ['remote', 'add', 'up', 'https://gitlab.com/a/b.git'], ['fetch', 'origin', 'v1.2.3']];
-  for (const args of good) assert.doesNotThrow(() => G.checkNetworkArgs(args), args.join(' '));
+  for (const args of good) assert.doesNotThrow(() => G.checkNetworkArgs(args, R), args.join(' '));
   const repo = repoWithCommit(t);
   assert.throws(() => G.gitSafe(repo, 'fetch', '127.0.0.1:path'), /^Error: git URL not allowed: argument 1$/);
+});
+
+// ---- fix round 4: nested .git, worktree preflight, configured remotes, option allowlist, key material ------------------------------
+test('R4 sandbox: no .git file or directory can be created or written at ANY depth of the worktree (the run temp may hold repos)', { skip: SKIP }, async (t) => {
+  const w = world(t);
+  fs.mkdirSync(path.join(w.work, 'vendor', 'pre'), { recursive: true }); fs.writeFileSync(path.join(w.work, 'vendor', 'pre', 'x'), 'x');
+  const r = await sb(w, `const W=A[0];const sh=(c)=>{try{cp.execFileSync('/bin/sh',['-c',c],{cwd:W,stdio:'ignore'});return 'OK'}catch{return 'FAIL'}};
+    out({ nestedDir: t(()=>fs.mkdirSync(path.join(W,'vendor/lib/.git'),{recursive:true})), nestedCfg: sh('mkdir -p vendor/lib && echo "[filter \\"x\\"]" > vendor/lib/.git'),
+      upper: t(()=>fs.mkdirSync(path.join(W,'vendor/.GIT'))), gitfile: t(()=>fs.writeFileSync(path.join(W,'vendor/pre/.git'),'gitdir: /tmp/x')),
+      mv: t(()=>fs.renameSync(path.join(W,'vendor/pre/x'),path.join(W,'vendor/pre/.git'))), mvDir: sh('mkdir -p d/repo && mv d/repo d/.git'),
+      symlink: t(()=>fs.symlinkSync('/tmp',path.join(W,'vendor/.git'))), hardlink: t(()=>fs.linkSync(path.join(W,'vendor/pre/x'),path.join(W,'a/.git'.replace('a/','vendor/')))),
+      gitInit: sh('git init -q sub'), gitInitTmp: sh('cd "$TMPDIR" && git init -q tmprepo && git -C tmprepo -c user.name=a -c user.email=a@b commit -q --allow-empty -m x'),
+      gitignore: t(()=>fs.writeFileSync(path.join(W,'.gitignore'),'x')), github: t(()=>{fs.mkdirSync(path.join(W,'.github/workflows'),{recursive:true});fs.writeFileSync(path.join(W,'.github/workflows/ci.yml'),'x')}),
+      attrs: t(()=>fs.writeFileSync(path.join(W,'vendor/.gitattributes'),'x')), dotgitSuffix: t(()=>fs.mkdirSync(path.join(W,'foo.git'))), blame: t(()=>fs.writeFileSync(path.join(W,'.git-blame-ignore-revs'),'x')) })`,
+  { args: [w.work] });
+  assert.deepEqual(r, { nestedDir: 'EPERM', nestedCfg: 'FAIL', upper: 'EPERM', gitfile: 'EPERM', mv: 'EPERM', mvDir: 'FAIL', symlink: 'EPERM', hardlink: 'EPERM', gitInit: 'FAIL',
+    gitInitTmp: 'OK', gitignore: 'OK', github: 'OK', attrs: 'OK', dotgitSuffix: 'OK', blame: 'OK' });
+  assert.equal(fs.existsSync(path.join(w.work, 'vendor', 'lib', '.git')), false);
+});
+
+function nestedRepo(t) {
+  const repo = repoWithCommit(t); const marker = path.join(repo, '..', `${path.basename(repo)}-CLEAN-RAN`); gone(t, marker);
+  const sub = path.join(repo, 'vendor', 'lib'); fs.mkdirSync(sub, { recursive: true });
+  git(sub, 'init', '-q', '-b', 'main'); fs.writeFileSync(path.join(sub, '.gitattributes'), '* filter=x\n'); fs.writeFileSync(path.join(sub, 'f'), '1');
+  git(sub, 'add', '.'); git(sub, '-c', 'user.name=a', '-c', 'user.email=a@b', 'commit', '-qm', 's');
+  git(sub, 'config', 'filter.x.clean', `sh -c 'touch "${marker}"; cat'`); fs.writeFileSync(path.join(sub, 'f'), '2');
+  return { repo, marker, sub };
+}
+
+test('R4 gitSafe: an embedded repo (nested .git with a filter) makes worktree commands THROW before git runs; SAFE commands still work', (t) => {
+  const { repo, marker } = nestedRepo(t);
+  for (const cmd of [['add', '-A'], ['status', '--porcelain'], ['commit', '-qm', 'x'], ['diff'], ['diff', 'HEAD~0'], ['diff', 'HEAD~1', 'HEAD'], ['log', 'HEAD'], ['show', 'main'], ['checkout', 'other'], ['stash'], ['log', '-p']]) {
+    assert.throws(() => G.gitSafe(repo, ...cmd), /^Error: git worktree not safe: nested \.git at entry \d+$/, cmd.join(' '));
+  }
+  assert.equal(fs.existsSync(marker), false, 'the nested repo\'s clean filter ran');
+  const head = git(repo, 'rev-parse', 'HEAD').stdout.trim(), other = git(repo, 'rev-parse', 'other').stdout.trim();
+  for (const cmd of [['rev-parse', 'HEAD'], ['ls-tree', '-r', head], ['diff', head, other], ['log', '--format=%H', head], ['show', `${head}`], ['cat-file', '-t', head],
+    ['for-each-ref'], ['show-ref'], ['rev-list', head], ['merge-base', head, other], ['diff', 'refs/heads/main', 'refs/heads/other'], ['config', '--get', 'core.bare']]) {
+    assert.equal(G.gitSafe(repo, ...cmd).code, 0, cmd.join(' '));
+  }
+  assert.throws(() => G.gitSafe(repo, 'diff', '--submodule=diff', head, other), /worktree not safe/);
+  assert.throws(() => G.gitSafe(repo, 'diff', head, other, '--', 'a.txt'), /worktree not safe/);
+  assert.throws(() => G.gitSafe(repo, 'diff', '--ext-diff', head, other), /option not allowed/);
+  assert.equal(fs.existsSync(marker), false);
+  git(repo, 'add', '-A'); git(repo, 'diff'); // control: once staged as a gitlink, plain `git diff` runs the embedded repo's filter
+  assert.equal(fs.existsSync(marker), true, 'control: plain git add -A + diff runs the embedded repo\'s clean filter');
+});
+
+test('R4 gitSafe: gitlinks in the index, .gitmodules, nested .git FILES and symlinks named .git all throw; a clean tree passes', (t) => {
+  const a = repoWithCommit(t); git(a, 'update-index', '--add', '--cacheinfo', `160000,${git(a, 'rev-parse', 'HEAD').stdout.trim()},sub`);
+  assert.throws(() => G.gitSafe(a, 'status'), /^Error: git worktree not safe: gitlink in the index$/);
+  const b = repoWithCommit(t); fs.writeFileSync(path.join(b, '.gitmodules'), '[submodule "x"]\n\tpath = x\n\turl = https://github.com/o/r\n');
+  assert.throws(() => G.gitSafe(b, 'status'), /^Error: git worktree not safe: \.gitmodules present$/);
+  const c = repoWithCommit(t); fs.mkdirSync(path.join(c, 'd')); fs.writeFileSync(path.join(c, 'd', '.git'), 'gitdir: /tmp/elsewhere\n');
+  assert.throws(() => G.gitSafe(c, 'status'), /nested \.git/);
+  const d = repoWithCommit(t); fs.mkdirSync(path.join(d, 'e')); fs.symlinkSync('/tmp', path.join(d, 'e', '.GIT'));
+  assert.throws(() => G.gitSafe(d, 'status'), /nested \.git/);
+  const e = repoWithCommit(t); fs.mkdirSync(path.join(e, 'deep', 'er'), { recursive: true }); fs.symlinkSync(os.tmpdir(), path.join(e, 'deep', 'link')); // symlinks are not followed
+  assert.equal(G.gitSafe(e, 'status', '--porcelain').code, 0);
+  assert.equal(G.gitSafeOpts(a, ['status'], { unsafeSkipWorktreeCheck: true }).code, 0, 'test-only opt-out');
+});
+
+test('R4 gitSafe: the worktree walk is capped (over the cap THROWS); the cap can only be lowered', (t) => {
+  const repo = repoWithCommit(t); fs.mkdirSync(path.join(repo, 'many'));
+  for (let i = 0; i < 60; i++) fs.writeFileSync(path.join(repo, 'many', `f${i}`), '');
+  assert.throws(() => G.gitSafeOpts(repo, ['status'], { worktreeWalkCap: 50 }), /^Error: git worktree not safe: more than 50 entries$/);
+  assert.equal(G.gitSafeOpts(repo, ['status'], { worktreeWalkCap: 500 }).code, 0);
+  assert.equal(G.WORKTREE_WALK_CAP, 100000);
+  assert.throws(() => G.gitSafeOpts(repo, ['status'], { worktreeWalkCap: 10 ** 9 }), /worktreeWalkCap/);
+});
+
+test('R4 gitSafe: an unconfigured remote NAME is refused (no fall-through to a builder-planted local repo); file transport is off', (t) => {
+  const repo = repoWithCommit(t); const marker = path.join(repo, '..', `${path.basename(repo)}-HOOK`); gone(t, marker);
+  const ev = path.join(repo, 'origin'); git(repo, 'init', '-q', '--bare', ev);
+  for (const h of ['pre-receive', 'post-receive', 'update', 'reference-transaction']) fs.writeFileSync(path.join(ev, 'hooks', h), `#!/bin/sh\ntouch "${marker}"\ncat >/dev/null\n`, { mode: 0o755 });
+  const opts = { unsafeSkipWorktreeCheck: true };
+  for (const args of [['push', 'origin', 'HEAD:refs/heads/x'], ['fetch', 'origin'], ['ls-remote', 'origin'], ['pull', '--ff-only', 'origin', 'main']]) {
+    assert.throws(() => G.gitSafeOpts(repo, args, opts), /^Error: git remote not configured: argument \d+$/, args.join(' '));
+  }
+  assert.ok(G.GIT_SAFE_FLAGS.includes('protocol.file.allow=never'));
+  const r = G.gitSafeOpts(repo, ['push', './origin', 'HEAD:refs/heads/x'], { ...opts, unsafeAllowLocalUrls: true });
+  assert.notEqual(r.code, 0); assert.match(r.err, /transport 'file' not allowed/);
+  assert.equal(fs.existsSync(marker), false, 'a receive hook in the planted repo ran');
+  spawnSync('git', ['push', './origin', 'HEAD:refs/heads/x'], { cwd: repo, env: G.gitEnv(), stdio: 'ignore' });
+  assert.equal(fs.existsSync(marker), true, 'control: plain git push to the local path runs its receive hooks');
+  git(repo, 'remote', 'add', 'origin', 'https://github.com/example/repo.git');
+  assert.doesNotThrow(() => G.checkNetworkArgs(['push', 'origin', 'HEAD:refs/heads/x'], { remotes: new Set(['origin']) }));
+});
+
+test('R4 gitSafe: network-command options are allowlisted per command; clone needs an https/ssh URL and a relative destination; submodule is refused', (t) => {
+  const R = { remotes: new Set(['origin']) };
+  const bad = [['fetch', '--upload-pack=x', 'origin'], ['fetch', '--upload-pack', 'x', 'origin'], ['push', '--receive-pack=x', 'origin'], ['push', '--exec=x', 'origin'],
+    ['clone', '--template=/x', 'https://github.com/o/r.git', 'd'], ['clone', '--config=filter.x.smudge=touch PWN', 'https://github.com/o/r.git', 'd'], ['clone', '-c', 'a=b', 'https://github.com/o/r.git', 'd'],
+    ['fetch', '--recurse-submodules', 'origin'], ['fetch', '--recurse-submodules=yes', 'origin'], ['push', '--server-option=x', 'origin'], ['push', '-o', 'x', 'origin'],
+    ['clone', '--separate-git-dir=/x', 'https://github.com/o/r.git', 'd'], ['clone', '--reference=/x', 'https://github.com/o/r.git', 'd'], ['clone', '--shared', 'https://github.com/o/r.git', 'd'],
+    ['clone', '--mirror', 'https://github.com/o/r.git', 'd'], ['clone', '--bare', 'https://github.com/o/r.git', 'd'], ['push', '--force-with-lease', 'origin'], ['fetch', '--depth=x', 'origin'],
+    ['fetch', '-j', '4', 'origin']];
+  for (const args of bad) assert.throws(() => G.checkNetworkArgs(args, R), (e) => /^git option not allowed: argument \d+$/.test(e.message), args.join(' '));
+  for (const args of [['clone', 'https://github.com/o/r.git', '/tmp/abs'], ['clone', 'https://github.com/o/r.git', '../up'], ['clone', 'https://github.com/o/r.git', 'a/../../x'],
+    ['clone', 'origin', 'd'], ['clone', 'git@github.com:o/r.git', 'd'], ['clone', 'https://github.com/o/r.git', 'd', 'extra']]) {
+    assert.throws(() => G.checkNetworkArgs(args, R), /not allowed: argument \d+|not configured/, args.join(' '));
+  }
+  const good = [['fetch', '--prune', '--no-tags', '--depth=1', '-q', 'origin'], ['fetch', '--all', '--tags'], ['push', '--force', '--atomic', '-u', '--no-verify', '--porcelain', 'origin', 'HEAD:refs/heads/x'],
+    ['pull', '--ff-only', '--no-recurse-submodules', 'origin', 'main'], ['ls-remote', '--tags', 'origin'], ['clone', '-b', 'main', '--single-branch', '--depth=1', '--no-checkout', 'https://github.com/o/r.git', 'dst'],
+    ['clone', '--origin', 'up', '-q', 'https://github.com/o/r.git', 'a/b'], ['clone', '-o', 'up', 'https://github.com/o/r.git'], ['fetch', '-v', 'origin', '--', 'main']];
+  for (const args of good) assert.doesNotThrow(() => G.checkNetworkArgs(args, R), args.join(' '));
+  const repo = repoWithCommit(t); const marker = path.join(repo, 'PWN');
+  assert.throws(() => G.gitSafeOpts(repo, ['clone', `--config=filter.x.smudge=touch ${marker}`, 'https://github.com/o/r.git', 'd'], {}), /option not allowed: argument 1/);
+  assert.throws(() => G.gitSafe(repo, 'submodule', 'update', '--init'), /^Error: gitSafe: submodule is not supported$/);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test('R4 SBPL length is checked on the FINAL escaped regex body: a 790-character dotted path fails with the clear error', (t) => {
+  const w = { fh: path.join(tmp(t), 'fh') }; fs.mkdirSync(path.join(w.fh, 'work'), { recursive: true });
+  let deep = tmp(t, 'f-'); while (deep.length < 770) deep = path.join(deep, 'a.b.c.d.e.f.g.h.i.j');
+  deep = path.join(deep, 'x'.repeat(790 - deep.length - 1)); fs.mkdirSync(deep, { recursive: true });
+  assert.equal(deep.length, 790);
+  assert.throws(() => S.sandboxProfile({ writable: [], network: 'none', factoryHome: w.fh, readAllow: [deep] }), /SBPL string longer than 1000 characters/);
+});
+
+test('R4 sandbox fs: key material in toolchain dirs is denied (dot-anchored .key/.p12/.pfx, private-key-shaped .pem, token(s).json); certificates stay readable', { skip: SKIP }, async (t) => {
+  const w = world(t); const H = fakeHome(t);
+  const T = path.join(H, '.nvm', 'kx');
+  const denied = ['server.key', 'ID.P12', 'x.pfx', 'privkey.pem', 'privkey1.pem', 'private.pem', 'private-tls.pem', 'tls-key.pem', 'my_key.pem', 'token.json', 'tokens.json', 'deep/Server.KEY', 'token.json.bak'];
+  const readable = ['cacert.pem', 'certifi/cacert.pem', 'ca-bundle.crt', 'credentials.js', 'lib/credentials.js', 'cert.pem', 'fullchain.pem', 'key.pem.js', 'monkey.keys', 'tokenize.js', 'token.rs', 'token.py'];
+  for (const n of [...denied, ...readable]) { const f = path.join(T, n); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, 'S'); }
+  const r = await sb(w, `out(JSON.parse(A[1]).map(n=>t(()=>fs.readFileSync(path.join(A[0],n),'utf8'))))`, { args: [T, JSON.stringify([...denied, ...readable])], profile: profileOf(w, 'none', { home: H }) });
+  assert.deepEqual(Object.fromEntries([...denied, ...readable].map((n, i) => [n, r[i]])), Object.fromEntries([...denied.map((n) => [n, 'EPERM']), ...readable.map((n) => [n, 'S'])]));
 });

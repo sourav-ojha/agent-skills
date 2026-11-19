@@ -109,7 +109,7 @@ const NODE_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.asdf', '.pyenv', '.bun'
 // under another name inside a toolchain dir stays readable. `.envrc` is deliberately readable (direnv script, not a credential store).
 export const CRED_EXACT_NAMES = Object.freeze(['.npmrc', 'npmrc', '.yarnrc', '.yarnrc.yml', '.pypirc', 'pip.conf', 'pip.ini', '.netrc', '_netrc',
   'auth.json', 'auth.ini', 'credentials', 'credentials.toml', 'credentials.json', '.git-credentials', '.env', '.env.local', '.env.production',
-  '.env.development', '.env.staging', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'bunfig.toml']);
+  '.env.development', '.env.staging', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'bunfig.toml', 'token.json', 'tokens.json']);
 const CRED_SUFFIXES = ['.bak', '.orig', '~', '.swp', '.old'];
 const reLit = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // SBPL regex has no (?i): every letter becomes [xX]; letter RANGES inside a class are folded too ([a-z] -> [a-zA-Z]).
@@ -120,11 +120,20 @@ export const caseFold = (re) => re.replace(/\\.|\[[^\]]*\]|[a-zA-Z]/g, (m) => {
 });
 // One short regex per name: SBPL rejects string literals over ~1024 characters ("Error reading string"), and the case-folded
 // alternation of all names exceeded that under a long toolchain path.
+// Key material (restored as separate short rules): any basename ending in .key/.p12/.pfx, and .pem ONLY for private-key-shaped names
+// (privkey*.pem, private*.pem, *-key.pem, *_key.pem). Certificates (cacert.pem, cert.pem, fullchain.pem, ca-bundle.crt) stay readable.
+const KEY_MATERIAL = [String.raw`[^/]*\.(key|p12|pfx)`, String.raw`(privkey[^/]*|private[^/]*|[^/]*-key|[^/]*_key)\.pem`];
 export function credNameRegexBodies(dir) {
   const suffixes = CRED_SUFFIXES.map(reLit).join('|');
-  return CRED_EXACT_NAMES.map((n) => `^${regexEscape(dir)}/(.*/)?${caseFold(`${reLit(n)}(${suffixes})?`)}$`);
+  return [...CRED_EXACT_NAMES.map((n) => `^${regexEscape(dir)}/(.*/)?${caseFold(`${reLit(n)}(${suffixes})?`)}$`),
+    ...KEY_MATERIAL.map((k) => `^${regexEscape(dir)}/(.*/)?${caseFold(k)}$`)];
 }
-const credNameRule = (dir) => credNameRegexBodies(dir).map((b) => `(require-all (regex #"${b}") (vnode-type REGULAR-FILE))`).join(' ');
+// Every regex literal is length-checked on its FINAL text (after escaping, name and suffix expansion).
+const regexLit = (body) => {
+  if (body.length > SBPL_MAX) throw new Error(`SBPL string longer than ${SBPL_MAX} characters`);
+  return `(regex #"${body}")`;
+};
+const credNameRule = (dir) => credNameRegexBodies(dir).map((b) => `(require-all ${regexLit(b)} (vnode-type REGULAR-FILE))`).join(' ');
 
 // os.userInfo().homedir AND $HOME when they differ (a planted HOME must not move the deny away from the real home).
 export function homeDirs(env = process.env) {
@@ -161,7 +170,6 @@ export const MACH_ALLOW = Object.freeze([
 const within = (child, parent) => child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
 const regexEscape = (s) => {
   if (s.includes('"')) throw new Error(`path cannot be used in an SBPL regex: ${s}`);
-  if (s.length > SBPL_MAX - 200) throw new Error(`path too long for an SBPL regex: ${s.slice(0, 60)}...`);
   return s.replace(/[.*+?^${}()|[\]\\/]/g, (c) => (c === '/' ? '/' : `\\${c}`));
 };
 const sameFile = (a, b) => { try { const x = fs.statSync(a), y = fs.statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
@@ -246,7 +254,7 @@ export function sandboxProfile({
   const readAllowAll = [...new Set([...node.subpaths, ...toolchains])];
   const ancestors = new Set();
   for (const p of [...wr, ...readAllowAll, ...node.literals]) for (const a of ancestorsOf(p)) ancestors.add(a);
-  const historyRegex = homes.map((h) => `(regex #"^${regexEscape(h)}/\\.[^/]*_history$")`);
+  const historyRegex = homes.map((h) => regexLit(`^${regexEscape(h)}/\\.[^/]*_history$`));
   // Credential-named files INSIDE an allowed toolchain dir (found by probe: ~/.nvm/.npmrc, a pnpm auth.json) stay denied too.
   const toolchainCreds = readAllowAll.map(credNameRule);
   const lines = [
@@ -261,8 +269,11 @@ export function sandboxProfile({
   if (readAllowAll.length || node.literals.length) lines.push(`(allow file-read* ${[...readAllowAll.map(subpath), ...node.literals.map(literal)].join(' ')})`);
   if (wr.length) {
     lines.push(`(allow file-read* file-write* ${wr.map(subpath).join(' ')})`);
-    // A full clone's .git (config, hooks, attributes) stays read-only: driver git must not pick up planted config or hooks.
-    lines.push(`(deny file-write* ${wr.map((w) => subpath(path.join(w, '.git'))).join(' ')})`);
+    // No `.git` (directory, gitfile or symlink; any case) can be created or written at ANY depth of a worktree: an embedded repo's
+    // config (filters, textconv) would run UNSANDBOXED when the driver later runs git there. The run temp dir is exempt (tests may
+    // `git init` scratch repos in $TMPDIR): it is never a gitSafe cwd. gitSafe's worktree preflight is the second layer.
+    const repoDirs = wr.filter((w) => w !== tmp);
+    if (repoDirs.length) lines.push(`(deny file-write* ${repoDirs.map((w) => regexLit(`^${regexEscape(w)}/(.*/)?${caseFold(String.raw`\.git`)}(/.*)?$`)).join(' ')})`);
   }
   lines.push(`(deny file-read* ${[...credentials.map(subpath), ...historyRegex, ...toolchainCreds].join(' ')})`);
   lines.push('(allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (literal "/dev/stdout") (literal "/dev/stderr") (regex #"^/dev/fd/[0-9]+$"))');
