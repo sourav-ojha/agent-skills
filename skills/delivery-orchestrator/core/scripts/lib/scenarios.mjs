@@ -7,8 +7,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { factoryHome, writeJsonAtomic, readJson } from './factoryhome.mjs';
 import { FEATURE_ID } from './queue.mjs';
 
-const CRIT_ID = /^(AC|EC|ER)-[1-9]\d{0,3}$/;
-const SCEN_ID = /^S-\d{1,4}$/;
+export const CRIT_ID = /^(AC|EC|ER)-[1-9]\d{0,3}$/;
+export const SCEN_ID = /^S-\d{1,4}$/;
 const CANARY = /^fx-[0-9a-f]{6}$/;
 const KINDS = ['api', 'ui'];
 
@@ -153,7 +153,7 @@ export function lintScenarios(doc, criteria, currentHash) {
 }
 
 const KEY_PART = /^[A-Za-z0-9._-]+$/;
-function checkRepoKey(k) {
+export function checkRepoKey(k) {
   const parts = typeof k === 'string' ? k.split('__') : [];
   if (parts.length !== 2 || !parts.every((x) => KEY_PART.test(x) && x !== '.' && x !== '..')) throw new Error('invalid repo key (expected <owner>__<repo>)');
 }

@@ -605,8 +605,8 @@ C.merge = () => {
   const ci = [...new Set([...(f.ci_files || []), ...ciFiles(q, f.ci_sha)])]; // recomputed on the verified commit, renames included
   if (f.tier === 'T3') { // T3 needs the opt-in AND a passing verdict for this exact commit; otherwise a person reviews it, in every mode
     if (!q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
-    const vd = readVerdict(f.id, f.ci_sha);
-    if (!(vd && vd.verdict === 'pass')) return hold(`T3 work needs a passing verification verdict for commit ${String(f.ci_sha).slice(0, 8)} and there is none: a person reviews it`);
+    const vd = readVerdict(repoKey(q.repo), f.id, f.ci_sha); // fail-closed: null unless a shape-valid file for exactly this feature and sha (Task 10 adds the hash binding)
+    if (!(vd && vd.verdict === 'pass' && vd.sha === f.ci_sha)) return hold(`T3 work needs a passing verification verdict for commit ${String(f.ci_sha).slice(0, 8)} and there is none: a person reviews it`);
   }
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
