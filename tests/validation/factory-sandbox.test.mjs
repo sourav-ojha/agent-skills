@@ -1011,3 +1011,14 @@ test('R4 sandbox fs: key material in toolchain dirs is denied (dot-anchored .key
   const r = await sb(w, `out(JSON.parse(A[1]).map(n=>t(()=>fs.readFileSync(path.join(A[0],n),'utf8'))))`, { args: [T, JSON.stringify([...denied, ...readable])], profile: profileOf(w, 'none', { home: H }) });
   assert.deepEqual(Object.fromEntries([...denied, ...readable].map((n, i) => [n, r[i]])), Object.fromEntries([...denied.map((n) => [n, 'EPERM']), ...readable.map((n) => [n, 'S'])]));
 });
+
+test('T7 gitSafe: objects/info/alternates or config.worktree planted in the repo make worktree commands throw', (t) => {
+  const a = repoWithCommit(t);
+  assert.equal(G.gitSafe(a, 'status', '--porcelain').code, 0);
+  fs.writeFileSync(path.join(a, '.git', 'objects', 'info', 'alternates'), '/tmp/elsewhere/objects\n');
+  assert.throws(() => G.gitSafe(a, 'status', '--porcelain'), /^Error: git worktree not safe: objects\/info\/alternates present$/);
+  const b = repoWithCommit(t);
+  fs.writeFileSync(path.join(b, '.git', 'config.worktree'), '[core]\n');
+  assert.throws(() => G.gitSafe(b, 'status'), /^Error: git worktree not safe: config\.worktree present$/);
+  assert.equal(G.gitSafe(b, 'rev-parse', 'HEAD').code, 0, 'non-worktree commands still work');
+});

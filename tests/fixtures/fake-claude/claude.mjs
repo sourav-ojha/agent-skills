@@ -7,6 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const fromFile = (() => {
   const dir = process.env.FAKE_CLAUDE_DIR;
@@ -34,7 +35,8 @@ function stdinStatus() {
 
 function record(extra = {}) {
   if (!cfg.log) return;
-  const entry = { argv: process.argv.slice(2), stdin: stdinStatus(), envKeys: Object.keys(process.env).sort(), cwd: process.cwd(), pid: process.pid, pgid: null, ...extra };
+  // TMPDIR is recorded as a hash only (never env values).
+  const entry = { argv: process.argv.slice(2), stdin: stdinStatus(), envKeys: Object.keys(process.env).sort(), tmpdirHash: createHash('sha256').update(String(process.env.TMPDIR)).digest('hex'), cwd: process.cwd(), pid: process.pid, pgid: null, ...extra };
   fs.appendFileSync(cfg.log, JSON.stringify(entry) + '\n');
 }
 
@@ -76,6 +78,13 @@ async function main() {
     case 'rejected-rate-event': {
       await init(); await rate('rejected');
       await result({ is_error: true, result: 'API Error', terminal_reason: 'api_error' });
+      return 1;
+    }
+    case 'max-turns-error': { await init(); await assistant('msg_1', 'x'); await result({ subtype: 'error_max_turns', is_error: true, result: undefined }); return 1; }
+    case 'rejected-then-error': {
+      // A rejected rate event earlier in the stream, then an unrelated execution failure.
+      await init(); await rate('rejected'); await assistant('msg_1', 'x');
+      await result({ subtype: 'error_during_execution', is_error: true, result: 'tool crashed', terminal_reason: 'error' });
       return 1;
     }
     case 'max-turns': { await init(); await assistant('msg_1', 'x'); await result({ subtype: 'error_max_turns', is_error: false }); return 1; }

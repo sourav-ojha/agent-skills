@@ -26,9 +26,12 @@ const CTRL = /[\u0000-\u001f\u007f]/;
 // keychain account; which one was not isolated). No token variable is passed: API-key or CLAUDE_CODE_OAUTH_TOKEN auth is
 // not supported here (open question, documented). CLAUDE_CONFIG_DIR is set only when the caller passes configDir.
 export const ENV_ALLOWLIST = Object.freeze(['PATH', 'HOME', 'LANG', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL']);
-export function scrubEnv(base = process.env, { configDir } = {}) {
+// PATH keeps absolute entries only (a relative entry such as "." would resolve inside the session's cwd).
+export function scrubEnv(base = process.env, { configDir, tmpDir } = {}) {
   const env = {};
   for (const k of ENV_ALLOWLIST) if (typeof base[k] === 'string') env[k] = base[k];
+  if (env.PATH !== undefined) env.PATH = env.PATH.split(':').filter((d) => d && path.isAbsolute(d)).join(':');
+  if (tmpDir) env.TMPDIR = tmpDir;
   if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
   return env;
 }
@@ -40,8 +43,9 @@ export function settingsTemplate(role) {
   return path.join(CORE, 'settings', `${role}.json`);
 }
 
-// CLAUDE_PROJECTS is the projects dir (other roles' transcripts) under the home Claude Code config dir, derived from home.
-const PLACEHOLDERS = ['FACTORY_HOME', 'HOME', 'REPO', 'CLAUDE_PROJECTS'];
+// CLAUDE_DIR is the home Claude Code config dir (transcripts, credentials), derived from home. GITDIR and GIT_COMMON are the
+// repo's git dir and common dir (the same dir for a plain clone; resolved through the `.git` file for a linked worktree).
+const PLACEHOLDERS = ['FACTORY_HOME', 'HOME', 'REPO', 'CLAUDE_DIR', 'GITDIR', 'GIT_COMMON'];
 const PH = /\{\{([A-Za-z0-9_]*)\}\}/g;
 function safeAbs(name, v) {
   if (typeof v !== 'string' || !path.isAbsolute(v)) throw new TypeError(`${name} must be an absolute path`);
@@ -80,6 +84,25 @@ export function substitutePlaceholders(obj, vars) {
 
 const variantsOf = (p) => { let real = p; try { real = fs.realpathSync(p); } catch { /* not created yet */ } return real === p ? [p] : [p, real]; };
 
+// The repo's git dir and common dir. A `.git` FILE (linked worktree) points at a gitdir whose config/hooks live elsewhere;
+// those must be denied too. Throws on a symlinked or malformed `.git`.
+export function gitDirsOf(repo) {
+  const dotgit = path.join(repo, '.git');
+  let st;
+  try { st = fs.lstatSync(dotgit); } catch { return { gitdir: dotgit, common: dotgit, gitFile: false }; }
+  if (st.isSymbolicLink()) throw new TypeError('repoDir/.git is a symlink');
+  let gitdir = dotgit; let gitFile = false;
+  if (st.isFile()) {
+    if (st.size > 4096) throw new TypeError('repoDir/.git file too large');
+    const m = /^gitdir: ([^\n\r]+)\r?\n?$/.exec(fs.readFileSync(dotgit, 'utf8'));
+    if (!m) throw new TypeError('repoDir/.git file is not a gitdir pointer');
+    gitdir = path.resolve(repo, m[1]); gitFile = true;
+  }
+  let common = gitdir;
+  try { const c = fs.readFileSync(path.join(gitdir, 'commondir'), 'utf8').trim(); if (c) common = path.resolve(gitdir, c); } catch { /* plain repo */ }
+  return { gitdir, common, gitFile };
+}
+
 // Writes a per-run copy of the role's settings with absolute paths substituted; returns the file path (mode 0600).
 export function materialiseSettings(role, { factoryHome, repoDir, home = os.homedir(), outDir } = {}) {
   const tpl = settingsTemplate(role);
@@ -87,9 +110,16 @@ export function materialiseSettings(role, { factoryHome, repoDir, home = os.home
   safeAbs('factoryHome', factoryHome);
   if (repoDir) safeAbs('repoDir', repoDir);
   safeAbs('home', home);
-  const vars = { FACTORY_HOME: variantsOf(factoryHome), HOME: variantsOf(home), CLAUDE_PROJECTS: variantsOf(path.join(home, '.claude', 'projects')) };
-  if (repoDir) vars.REPO = variantsOf(repoDir);
+  const vars = { FACTORY_HOME: variantsOf(factoryHome), HOME: variantsOf(home), CLAUDE_DIR: variantsOf(path.join(home, '.claude')) };
+  let git = null;
+  if (repoDir) {
+    git = gitDirsOf(repoDir);
+    Object.assign(vars, { REPO: variantsOf(repoDir), GITDIR: variantsOf(git.gitdir), GIT_COMMON: variantsOf(git.common) });
+  }
   const out = substitutePlaceholders(JSON.parse(fs.readFileSync(tpl, 'utf8')), vars);
+  if (git?.gitFile) { // the pointer file itself must not be re-pointed
+    for (const r of vars.REPO) { out.permissions.deny.push(`Edit(/${r}/.git)`); out.sandbox?.filesystem?.denyWrite?.push(`${r}/.git`); }
+  }
   const problems = checkSettings(out);
   if (problems.length) throw new Error(`settings for ${role} failed checks: ${problems.join('; ')}`);
   const dir = outDir ? safeAbs('outDir', outDir) : path.join(factoryHome, 'run', 'settings');
@@ -114,11 +144,32 @@ function widens(allow, deny) {
   return globRe(d.spec).test(a.spec) || globRe(a.spec).test(d.spec);
 }
 
-const FORBIDDEN_KEYS = ['hooks', 'apiKeyHelper', 'statusLine', 'env', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper', 'enabledMcpjsonServers', 'enabledPlugins'];
+// ALLOWLIST of keys our role settings may use. Anything else (hooks, env, apiKeyHelper, statusLine, plugins, ...) is refused.
+const KEYS = {
+  '': ['$schema', 'permissions', 'disableAllHooks', 'enableAllProjectMcpServers', 'sandbox'],
+  permissions: ['allow', 'deny', 'ask', 'defaultMode', 'disableBypassPermissionsMode', 'blockWritesOutsideWorkingDirectories'],
+  sandbox: ['enabled', 'failIfUnavailable', 'allowUnsandboxedCommands', 'autoAllowBashIfSandboxed', 'excludedCommands', 'filesystem', 'network'],
+  'sandbox.filesystem': ['denyRead', 'denyWrite'],
+  'sandbox.network': ['allowedDomains', 'allowLocalBinding'],
+};
+const keyName = (k) => (/^[A-Za-z0-9_$]{1,64}$/.test(k) ? k : '<key>');
+function unknownKeys(s) {
+  const out = [];
+  for (const [scope, allowed] of Object.entries(KEYS)) {
+    const o = scope ? scope.split('.').reduce((a, k) => (isObj(a) ? a[k] : undefined), s) : s;
+    if (o === undefined) continue;
+    if (!isObj(o)) { out.push(`${scope} must be an object`); continue; }
+    for (const k of Object.keys(o)) if (!allowed.includes(k)) out.push(`unknown key ${scope ? scope + '.' : ''}${keyName(k)}`);
+  }
+  return out;
+}
+// `Read(//abs/**)` / `Read(/{{X}}/**)` / `Read(~/p)` -> the path a sandbox denyRead entry must name.
+const canonRead = (spec) => spec.replace(/^\/(?=\/|\{\{)/, '').replace(/\/\*\*$/, '');
 // Returns a list of problems (empty = acceptable). Shape and policy only; it cannot prove Claude Code enforces the rules.
 export function checkSettings(s, { allowPlaceholders = false } = {}) {
   const p = [];
-  if (!s || typeof s !== 'object' || Array.isArray(s)) return ['not an object'];
+  if (!isObj(s)) return ['not an object'];
+  p.push(...unknownKeys(s));
   const perm = s.permissions;
   if (!perm || typeof perm !== 'object') return ['no permissions'];
   const deny = perm.deny; const allow = perm.allow ?? [];
@@ -130,7 +181,6 @@ export function checkSettings(s, { allowPlaceholders = false } = {}) {
   if (Array.isArray(deny) && Array.isArray(allow)) for (const a of allow) for (const d of deny) if (widens(a, d)) { p.push(`allow rule widens deny (${parseRule(a).tool})`); break; }
   if (s.disableAllHooks !== true) p.push('hooks not disabled');
   if (s.enableAllProjectMcpServers !== false) p.push('project MCP servers not disabled');
-  for (const k of FORBIDDEN_KEYS) if (k in s) p.push(`forbidden key ${k}`);
   const sb = s.sandbox;
   if (!sb || sb.enabled !== true) p.push('sandbox not enabled');
   else {
@@ -140,8 +190,55 @@ export function checkSettings(s, { allowPlaceholders = false } = {}) {
     const dom = sb.network?.allowedDomains;
     if (dom !== undefined && !(Array.isArray(dom) && dom.length === 0)) p.push('sandbox network allows domains');
   }
+  // Every Read(...) path deny needs a sandbox denyRead twin: the Read rule covers the Read tool, the sandbox covers Bash children.
+  const denyRead = new Set((Array.isArray(sb?.filesystem?.denyRead) ? sb.filesystem.denyRead : []).map((x) => String(x).replace(/\/\*\*$/, '')));
+  if (Array.isArray(deny)) deny.forEach((d, i) => { const r = parseRule(d); if (r.tool === 'Read' && r.spec !== undefined && !denyRead.has(canonRead(r.spec))) p.push(`Read deny #${i} has no sandbox denyRead entry`); });
   if (!allowPlaceholders && JSON.stringify(s).includes('{{')) p.push('unsubstituted placeholder');
   return p;
+}
+
+// `--setting-sources user` loads the user settings file (<config dir>/settings.json) UNDER our --settings. Lists merge, and
+// keys we do not set (env, apiKeyHelper, hooks, extra allow rules, sandbox widenings) would apply to the session. Returns the
+// offending KEY NAMES only (never values). Whether our disableAllHooks overrides user hooks is unverified, so hooks refuse.
+const USER_ENV_OK = /^(?:DISABLE_[A-Z0-9_]+|CLAUDE_CODE_DISABLE_[A-Z0-9_]+|BASH_DEFAULT_TIMEOUT_MS|BASH_MAX_TIMEOUT_MS|MAX_THINKING_TOKENS)$/;
+const present = (v) => v !== undefined && v !== null && v !== false && !(Array.isArray(v) && v.length === 0) && !(isObj(v) && Object.keys(v).length === 0);
+export function checkUserSettings(s) {
+  if (!isObj(s)) return ['settings.json (not an object)'];
+  const bad = [];
+  if (isObj(s.env)) { for (const k of Object.keys(s.env)) if (!USER_ENV_OK.test(k)) bad.push(`env.${keyName(k)}`); } else if (present(s.env)) bad.push('env');
+  for (const k of ['hooks', 'apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper', 'statusLine']) if (present(s[k])) bad.push(k);
+  const perm = isObj(s.permissions) ? s.permissions : {};
+  for (const k of ['allow', 'additionalDirectories']) if (present(perm[k])) bad.push(`permissions.${k}`);
+  if (perm.defaultMode === 'bypassPermissions') bad.push('permissions.defaultMode');
+  const sb = isObj(s.sandbox) ? s.sandbox : {};
+  for (const k of ['excludedCommands', 'enableWeakerNestedSandbox']) if (present(sb[k])) bad.push(`sandbox.${k}`);
+  if (sb.allowUnsandboxedCommands === true) bad.push('sandbox.allowUnsandboxedCommands');
+  const net = isObj(sb.network) ? sb.network : {};
+  for (const k of ['allowedDomains', 'allowUnixSockets', 'allowAllUnixSockets', 'httpProxyPort', 'socksProxyPort']) if (present(net[k])) bad.push(`sandbox.network.${k}`);
+  const fsx = isObj(sb.filesystem) ? sb.filesystem : {};
+  for (const k of ['allowWrite', 'allowRead']) if (present(fsx[k])) bad.push(`sandbox.filesystem.${k}`);
+  return bad;
+}
+function lintUserSettings(env, configDir) {
+  const dir = configDir ?? (env.HOME ? path.join(env.HOME, '.claude') : null);
+  if (!dir) return ['HOME unset'];
+  const file = path.join(dir, 'settings.json');
+  let st;
+  try { st = fs.statSync(file); } catch (e) { return e.code === 'ENOENT' ? [] : ['settings.json (unreadable)']; }
+  if (!st.isFile() || st.size > 1024 * 1024) return ['settings.json (not a regular file or too large)'];
+  try { return checkUserSettings(JSON.parse(fs.readFileSync(file, 'utf8'))); } catch { return ['settings.json (unparsable)']; }
+}
+
+// Resolves the claude binary to an absolute path once (no PATH lookup at spawn time). Refuses one inside the session's cwd.
+function resolveBin(bin, envPath, cwd) {
+  const cands = path.isAbsolute(bin) ? [bin] : String(envPath ?? '').split(':').filter((d) => path.isAbsolute(d)).map((d) => path.join(d, bin));
+  let found = null;
+  for (const c of cands) { try { if (fs.statSync(c).isFile()) { fs.accessSync(c, fs.constants.X_OK); found = c; break; } } catch { /* next */ } }
+  if (!found) return { error: 'spawn_failed' };
+  let real = found; let realCwd = cwd;
+  try { real = fs.realpathSync(found); realCwd = fs.realpathSync(cwd); } catch { /* keep */ }
+  for (const [b, c] of [[found, cwd], [real, realCwd]]) if (b === c || b.startsWith(c + path.sep)) return { error: 'unsafe_binary' };
+  return { bin: found };
 }
 
 // ------------------------------------------------------------------------------------------------ prompts
@@ -155,7 +252,7 @@ export function renderPrompt(name, vars = {}) {
 
 // ------------------------------------------------------------------------------------------------ runSession
 
-const DEFAULT_MAX_LINE = 8 * 1024 * 1024; // chars per stream line; longer lines are dropped (truncated: true)
+const DEFAULT_MAX_LINE_CHARS = 8 * 1024 * 1024; // UTF-16 chars per stream line (up to ~3x in bytes); longer lines are dropped (truncated: true)
 const MAX_RESULT = 1024 * 1024;
 const MAX_SETTINGS = 256 * 1024;
 const MAX_IDS = 10000;
@@ -182,6 +279,11 @@ function checkArgs(o) {
     if (!absNoCtrl(o.configDir)) bad('configDir must be an absolute path');
   }
   if (o.claudeBin !== undefined && o.claudeBin !== 'claude' && !absNoCtrl(o.claudeBin)) bad('claudeBin must be "claude" or an absolute path');
+  if (o.tmpDir !== undefined && o.tmpDir !== null) {
+    if (!absNoCtrl(o.tmpDir)) bad('tmpDir must be an absolute path');
+    let t; try { t = fs.lstatSync(o.tmpDir); } catch { bad('tmpDir does not exist'); }
+    if (!t.isDirectory()) bad('tmpDir must be a directory (not a symlink)');
+  }
   if (!absNoCtrl(o.settingsFile)) bad('settingsFile must be an absolute path');
   let lst; try { lst = fs.lstatSync(o.settingsFile); } catch { bad('settingsFile does not exist'); }
   if (!lst.isFile()) bad('settingsFile must be a regular file (not a symlink)');
@@ -210,9 +312,15 @@ const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 // eat the budget) -> SIGTERM to the process group, SIGKILL after killGraceMs.
 export async function runSession(opts) {
   checkArgs(opts);
-  const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineBytes = DEFAULT_MAX_LINE, onSpawn } = opts;
+  const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineChars = DEFAULT_MAX_LINE_CHARS, onSpawn, tmpDir } = opts;
   const argv = buildArgv(opts);
-  const env = scrubEnv(baseEnv, { configDir: role === 'author' ? configDir : undefined });
+  const env = scrubEnv(baseEnv, { configDir: role === 'author' ? configDir : undefined, tmpDir });
+  const early = (failure) => ({ ok: false, sessionId: null, result: null, usage: { in: 0, out: 0, cache_create: 0, cache_read: 0 }, turns: 0, costUsd: null, failure, timedOut: false, truncated: false, exitCode: null, signal: null });
+  const unsafe = lintUserSettings(env, role === 'author' ? configDir : undefined);
+  if (unsafe.length) return early({ kind: 'settings_unsafe', resetAt: null, keys: unsafe });
+  const resolved = resolveBin(claudeBin, env.PATH, cwd);
+  if (resolved.error) return early({ kind: resolved.error, resetAt: null });
+  const maxLineBytes = maxLineChars;
 
   return new Promise((resolve) => {
     const st = { sessionId: null, last: null, rejected: null, ids: new Map(), truncated: false };
@@ -259,21 +367,26 @@ export async function runSession(opts) {
       if (timedOut) failure = { kind: 'timeout', resetAt: null };
       else if (spawnFailed) failure = { kind: 'spawn_failed', resetAt: null };
       else if (!ok) {
-        if (st.rejected || r?.is_error === true) {
+        // Most specific first: max turns (even with is_error:true); a result naming its own error subtype is classified on
+        // its own text (an earlier rejected rate event does not override it); a rejected event decides only when the
+        // result is missing or a plain is_error result.
+        const specific = r && typeof r.subtype === 'string' && r.subtype !== 'success';
+        if (r?.subtype === 'error_max_turns') failure = { kind: 'max_turns', resetAt: null };
+        else if (specific) { const c = classifyFailure([{ ...r, is_error: true }]); failure = { kind: c.kind, resetAt: c.resetAt }; }
+        else if (st.rejected || r?.is_error === true) {
           const events = [];
           if (st.rejected) events.push(st.rejected);
           events.push({ ...(r ?? {}), is_error: true });
           const c = classifyFailure(events);
           failure = { kind: c.kind, resetAt: c.resetAt };
         } else if (!r) failure = { kind: 'no_result', resetAt: null };
-        else if (r.subtype === 'error_max_turns') failure = { kind: 'max_turns', resetAt: null };
         else failure = { kind: 'other', resetAt: null };
       }
       resolve({ ok, sessionId: st.sessionId, result, usage, turns, costUsd, failure, timedOut, truncated: st.truncated, exitCode, signal });
     };
 
     try {
-      child = spawn(claudeBin, argv, { cwd, env, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(resolved.bin, argv, { cwd, env, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     } catch { return finish({ spawnFailed: true }); }
     const pgid = child.pid;
     if (pgid) {
@@ -284,7 +397,8 @@ export async function runSession(opts) {
     child.stdout.on('data', (d) => feed(dec.write(d)));
     child.stdout.on('end', () => feed(dec.end()));
     child.stderr.on('data', () => {}); // drained, never kept: it can echo prompt text
-    child.on('error', () => { if (pgid) killGroup(pgid, 'SIGKILL'); finish({ spawnFailed: true }); });
+    // spawn_failed only when no process was created; with a pid, 'exit' follows and decides.
+    child.on('error', () => { if (!pgid) finish({ spawnFailed: true }); });
     child.on('exit', (code, signal) => {
       if (pgid) killGroup(pgid, 'SIGKILL'); // sweep what the session left in its group
       let settled = false;
@@ -309,8 +423,10 @@ export async function runSession(opts) {
 const NO_RESULT = Object.freeze({ status: 'blocked', question: 'no_result' });
 const RESULT_MAX = 64 * 1024;
 const FIELD_MAX = 2000;
-// C0/C1 controls and bidi/format characters are dropped; tabs and newlines become spaces.
-const clean = (s) => Array.from(s.replace(/[\t\n\r]/g, ' ').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, '')).slice(0, FIELD_MAX).join('').trim();
+// C0/C1 controls, bidi/format characters (incl. U+061C, U+180E), variation selectors and tag characters are dropped;
+// tabs and newlines become spaces.
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufe00-\ufe0f\ufeff\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu;
+const clean = (s) => Array.from(s.replace(/[\t\n\r]/g, ' ').replace(INVISIBLE, '')).slice(0, FIELD_MAX).join('').trim();
 
 export function readBuilderResult(cloneDir, id) {
   if (!absNoCtrl(cloneDir)) throw new TypeError('cloneDir must be an absolute path');

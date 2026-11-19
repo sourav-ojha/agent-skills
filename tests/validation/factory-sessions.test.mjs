@@ -12,6 +12,10 @@ const LIB = path.join(SKILL_DIR, 'core', 'scripts', 'lib', 'sessions.mjs');
 const S = await import(LIB);
 const FAKE = path.join(REPO, 'tests', 'fixtures', 'fake-claude');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// An isolated HOME: runSession lints <HOME>/.claude/settings.json, and the developer's real one must not decide the tests.
+const ISO_HOME = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'factory-sess-home-')));
+process.env.HOME = ISO_HOME;
+process.on('exit', () => fs.rmSync(ISO_HOME, { recursive: true, force: true }));
 
 const tmp = (t, prefix = 'factory-sess-') => {
   const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -40,27 +44,38 @@ async function waitDead(pid, ms = 5000) { const end = Date.now() + ms; while (Da
 
 const readTemplate = (role) => JSON.parse(fs.readFileSync(S.settingsTemplate(role), 'utf8'));
 
-// The list a reviewer signed off on. Kept here, independent of the settings file, so deleting a rule fails a test.
+// The lists a reviewer signed off on. Kept here, independent of the settings file, so deleting a rule fails a test.
+const CRED_DIRS = ['.ssh', '.aws', '.config/gcloud', '.kube', '.gnupg', '.config/gh'];
+const CRED_FILES = ['.npmrc', '.docker/config.json', '.claude.json', '.git-credentials', '.netrc'];
+const CLAUDE_DIRS = ['projects', 'todos', 'file-history', 'sessions', 'session-env', 'shell-snapshots', 'paste-cache', 'tasks', 'backups'];
+const CLAUDE_FILES = ['.credentials.json', 'history.jsonl'];
+const GIT_PARTS = ['config', 'hooks/**', 'info/**', 'modules/**', 'commondir', 'config.worktree', 'objects/info/**', 'worktrees/**'];
+const READ_PAIRS = [['/{{FACTORY_HOME}}/**', '{{FACTORY_HOME}}']];
+for (const d of CRED_DIRS) READ_PAIRS.push([`~/${d}/**`, `~/${d}`], [`/{{HOME}}/${d}/**`, `{{HOME}}/${d}`]);
+for (const f of CRED_FILES) READ_PAIRS.push([`~/${f}`, `~/${f}`], [`/{{HOME}}/${f}`, `{{HOME}}/${f}`]);
+for (const d of CLAUDE_DIRS) READ_PAIRS.push([`~/.claude*/${d}/**`, `~/.claude*/${d}`], [`/{{CLAUDE_DIR}}/${d}/**`, `{{CLAUDE_DIR}}/${d}`]);
+for (const f of CLAUDE_FILES) READ_PAIRS.push([`~/.claude*/${f}`, `~/.claude*/${f}`], [`/{{CLAUDE_DIR}}/${f}`, `{{CLAUDE_DIR}}/${f}`]);
 const REQUIRED_BUILDER_DENY = [
-  'Read(/{{FACTORY_HOME}}/**)', 'Edit(/{{FACTORY_HOME}}/**)', 'Write(/{{FACTORY_HOME}}/**)',
-  'Read(~/.claude*/projects/**)', 'Read(/{{HOME}}/.claude*/projects/**)',
-  'Read(~/.claude*/todos/**)', 'Read(~/.claude*/file-history/**)', 'Read(~/.claude*/history.jsonl)',
+  ...READ_PAIRS.map(([r]) => `Read(${r})`),
+  'Edit(/{{FACTORY_HOME}}/**)', 'Write(/{{FACTORY_HOME}}/**)',
   'Edit(~/.claude*/**)', 'Edit(/{{HOME}}/.claude*/**)', 'Edit(~/.claude.json)',
-  'Read(~/.config/gh/**)', 'Read(~/.git-credentials)', 'Read(~/.netrc)',
-  'Edit(**/.git/config)', 'Edit(**/.git/hooks/**)', 'Edit(**/.git/info/**)', 'Edit(**/.git/modules/**)',
-  'Edit(/{{REPO}}/.git/config)', 'Edit(/{{REPO}}/.git/hooks/**)', 'Edit(/{{REPO}}/.git/info/**)', 'Edit(/{{REPO}}/.git/modules/**)',
+  ...GIT_PARTS.map((g) => `Edit(**/.git/${g})`), ...GIT_PARTS.map((g) => `Edit(/{{GITDIR}}/${g})`), ...GIT_PARTS.map((g) => `Edit(/{{GIT_COMMON}}/${g})`),
   'Edit(/{{REPO}}/*/**/.git)', 'Edit(/{{REPO}}/*/**/.git/**)',
   'Write(**/.git/**)', 'Write(**/.git)', 'NotebookEdit(**/.git/**)',
-  'Bash(gh)', 'Bash(gh *)', 'Bash(git push)', 'Bash(git push *)', 'Bash(git * push *)',
+  'Bash(gh)', 'Bash(gh *)', 'Bash(git push)', 'Bash(git push *)', 'Bash(git * push)', 'Bash(git * push *)',
   'Bash(node *factory.mjs*)', 'Bash(node *deliver.mjs*)', 'Bash(*factory.mjs*)', 'Bash(*deliver.mjs*)',
   'WebFetch', 'WebSearch',
 ];
-const REQUIRED_AUTHOR_DENY = ['Bash', 'Read', 'Edit', 'Write', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Agent', 'Task', 'Read(/{{FACTORY_HOME}}/**)', 'Edit(/{{FACTORY_HOME}}/**)', 'Read(~/.claude*/projects/**)', 'Read(/{{HOME}}/.claude*/projects/**)'];
+const REQUIRED_DENY_WRITE = ['{{FACTORY_HOME}}', '{{CLAUDE_DIR}}', '{{HOME}}/.claude.json', '{{REPO}}/*/**/.git',
+  ...['{{GITDIR}}', '{{GIT_COMMON}}'].flatMap((b) => GIT_PARTS.map((g) => `${b}/${g.replace('/**', '')}`))];
+const REQUIRED_AUTHOR_DENY = ['Bash', 'Read', 'Edit', 'Write', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Agent', 'Task', 'Read(/{{FACTORY_HOME}}/**)', 'Edit(/{{FACTORY_HOME}}/**)', 'Read(~/.claude*/projects/**)', 'Read(/{{CLAUDE_DIR}}/projects/**)'];
 
 test('builder settings: every required deny rule, sandbox, hooks and bypass locks are present', () => {
   const s = readTemplate('builder');
   for (const r of REQUIRED_BUILDER_DENY) assert.ok(s.permissions.deny.includes(r), `missing deny ${r}`);
   assert.deepEqual([...s.permissions.deny].sort(), [...REQUIRED_BUILDER_DENY].sort(), 'deny list changed: update the reviewed list');
+  assert.deepEqual([...s.sandbox.filesystem.denyRead].sort(), READ_PAIRS.map(([, p]) => p).sort(), 'every credential/transcript path is denied to Bash children too');
+  assert.deepEqual([...s.sandbox.filesystem.denyWrite].sort(), [...REQUIRED_DENY_WRITE].sort());
   assert.equal(s.permissions.defaultMode, 'acceptEdits');
   assert.equal(s.permissions.disableBypassPermissionsMode, 'disable');
   assert.equal(s.permissions.blockWritesOutsideWorkingDirectories, true);
@@ -73,15 +88,26 @@ test('builder settings: every required deny rule, sandbox, hooks and bypass lock
   assert.equal(s.sandbox.allowUnsandboxedCommands, false);
   assert.deepEqual(s.sandbox.excludedCommands, []);
   assert.deepEqual(s.sandbox.network.allowedDomains, []);
-  for (const p of ['{{FACTORY_HOME}}', '{{CLAUDE_PROJECTS}}', '{{HOME}}/.config/gh']) assert.ok(s.sandbox.filesystem.denyRead.includes(p), `denyRead ${p}`);
-  for (const p of ['{{FACTORY_HOME}}', '{{HOME}}/.claude', '{{HOME}}/.claude.json', '{{REPO}}/.git/config', '{{REPO}}/.git/hooks', '{{REPO}}/.git/info', '{{REPO}}/.git/modules']) assert.ok(s.sandbox.filesystem.denyWrite.includes(p), `denyWrite ${p}`);
   assert.deepEqual(S.checkSettings(s, { allowPlaceholders: true }), []);
 });
 
 test('builder settings: the top-level .git stays committable (no Edit deny on the whole .git, which the sandbox would merge)', () => {
   const s = readTemplate('builder');
-  for (const r of s.permissions.deny) assert.ok(!/^Edit\((?:\*\*\/|\/\{\{REPO\}\}\/)\.git(?:\/\*\*)?\)$/.test(r), `over-broad ${r}`);
-  for (const p of s.sandbox.filesystem.denyWrite) assert.notEqual(p, '{{REPO}}/.git');
+  for (const r of s.permissions.deny) assert.ok(!/^Edit\((?:\*\*\/\.git|\/\{\{REPO\}\}\/\.git|\/\{\{GITDIR\}\}|\/\{\{GIT_COMMON\}\})(?:\/\*\*)?\)$/.test(r), `over-broad ${r}`);
+  for (const p of s.sandbox.filesystem.denyWrite) assert.ok(!['{{REPO}}/.git', '{{GITDIR}}', '{{GIT_COMMON}}', '{{GITDIR}}/objects', '{{GITDIR}}/refs'].includes(p), p);
+});
+
+test('checkSettings: a Read deny without a sandbox denyRead twin, and unknown keys at any level, are refused', () => {
+  const base = () => JSON.parse(JSON.stringify(readTemplate('builder')));
+  const a = base(); a.sandbox.filesystem.denyRead = a.sandbox.filesystem.denyRead.filter((x) => x !== '~/.ssh');
+  assert.ok(S.checkSettings(a, { allowPlaceholders: true }).some((m) => /has no sandbox denyRead entry/.test(m)));
+  const b = base(); b.permissions.deny.push('Read(~/.secret/**)');
+  assert.ok(S.checkSettings(b, { allowPlaceholders: true }).some((m) => /has no sandbox denyRead entry/.test(m)));
+  for (const mut of [(s) => { s.env = {}; }, (s) => { s.statusLine = {}; }, (s) => { s.apiKeyHelper = 'x'; }, (s) => { s.enabledPlugins = {}; },
+    (s) => { s.permissions.additionalDirectories = []; }, (s) => { s.sandbox.enableWeakerNestedSandbox = true; }, (s) => { s.sandbox.filesystem.allowWrite = []; },
+    (s) => { s.sandbox.network.allowUnixSockets = []; }, (s) => { s.sandbox.network = []; }]) {
+    const s = base(); mut(s); assert.ok(S.checkSettings(s, { allowPlaceholders: true }).some((m) => /unknown key|must be an object/.test(m)), String(mut));
+  }
 });
 
 test('author settings: no tools, no network, hooks off', () => {
@@ -142,9 +168,10 @@ test('materialiseSettings: substitutes FACTORY_HOME, HOME and REPO as absolute p
   const s = JSON.parse(text);
   assert.ok(s.permissions.deny.includes(`Read(/${fh}/**)`));
   assert.ok(s.permissions.deny.includes(`Edit(/${repo}/.git/config)`));
-  assert.ok(s.permissions.deny.includes(`Read(/${home}/.claude*/projects/**)`));
+  assert.ok(s.permissions.deny.includes(`Read(/${path.join(home, '.claude', 'projects')}/**)`));
   assert.ok(s.sandbox.filesystem.denyRead.includes(fh));
   assert.ok(s.sandbox.filesystem.denyRead.includes(path.join(home, '.claude', 'projects')));
+  assert.ok(s.sandbox.filesystem.denyRead.includes(`${home}/.ssh`) && s.permissions.deny.includes(`Read(/${home}/.ssh/**)`));
   assert.ok(s.sandbox.filesystem.denyWrite.includes(`${repo}/.git/hooks`));
   assert.ok(s.permissions.deny.includes('Bash(gh *)'));
   assert.deepEqual(S.checkSettings(s), []);
@@ -229,7 +256,7 @@ test('runSession env: only the allowlist reaches claude (no GH_TOKEN, cloud keys
 test('runSession via PATH: the committed shim is found by name and the real claude is not called', async (t) => {
   const f = fake(t, { mode: 'echo-argv' });
   const { cwd, settingsFile } = setup(t);
-  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, baseEnv: { ...process.env, PATH: `${f.dir}:${process.env.PATH}` } });
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, baseEnv: { ...process.env, PATH: `${f.dir}:${path.dirname(process.execPath)}:/usr/bin:/bin` } });
   assert.equal(r.ok, true);
   assert.equal(f.entries().length, 1);
 });
@@ -316,17 +343,17 @@ test('runSession output cap: an over-long line inside one chunk, and an untermin
   const { cwd, settingsFile } = setup(t);
   const long = JSON.stringify({ type: 'assistant', pad: 'y'.repeat(5000) }) + '\n';
   const a = fake(t, script([{ b: long + ev(RES) }]));
-  const ra = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: a.bin, maxLineBytes: 1000 });
+  const ra = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: a.bin, maxLineChars: 1000 });
   assert.equal(ra.truncated, true); assert.equal(ra.ok, true);
   const b = fake(t, script([{ b: ev(RES) + '{"type":"assistant","pad":"' + 'z'.repeat(5000) }]));
-  const rb = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: b.bin, maxLineBytes: 1000 });
+  const rb = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: b.bin, maxLineChars: 1000 });
   assert.equal(rb.truncated, true);
 });
 
 test('runSession output cap: a huge line is dropped and flagged, the result is still parsed', async (t) => {
   const f = fake(t, { mode: 'big-output', bigBytes: 6 * 1024 * 1024 });
   const { cwd, settingsFile } = setup(t);
-  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 60, claudeBin: f.bin, maxLineBytes: 1024 * 1024 });
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 60, claudeBin: f.bin, maxLineChars: 1024 * 1024 });
   assert.equal(r.truncated, true);
   assert.equal(r.ok, true);
   assert.equal(r.result, 'finished');
@@ -498,4 +525,116 @@ test('implementer SKILL.md: --fix-brief input and the unattended result.json con
   assert.match(text, /\.implementation\/<ID>\/result\.json/);
   assert.match(text, /"status": "done" \| "blocked"/);
   assert.match(text, /last act/i);
+});
+
+// ---------------------------------------------------------------- fix round 1
+
+const userSettings = (t, obj) => {
+  const home = tmp(t, 'user-home-');
+  fs.mkdirSync(path.join(home, '.claude'));
+  if (obj !== undefined) fs.writeFileSync(path.join(home, '.claude', 'settings.json'), typeof obj === 'string' ? obj : JSON.stringify(obj));
+  return home;
+};
+
+test('user settings: unsafe keys refuse the session before spawning, naming keys only (never values)', async (t) => {
+  const f = fake(t, { mode: 'done' });
+  const { cwd, settingsFile } = setup(t);
+  const cases = [
+    [{ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'cat SECRETVALUE' }] }] } }, ['hooks']],
+    [{ env: { GH_TOKEN: 'SECRETVALUE', DISABLE_TELEMETRY: '1' } }, ['env.GH_TOKEN']],
+    [{ apiKeyHelper: '/bin/SECRETVALUE' }, ['apiKeyHelper']],
+    [{ statusLine: { type: 'command', command: 'x' } }, ['statusLine']],
+    [{ permissions: { allow: ['Bash(gh *)'], additionalDirectories: ['/'] } }, ['permissions.allow', 'permissions.additionalDirectories']],
+    [{ permissions: { defaultMode: 'bypassPermissions' } }, ['permissions.defaultMode']],
+    [{ sandbox: { excludedCommands: ['git'], enableWeakerNestedSandbox: true, allowUnsandboxedCommands: true } }, ['sandbox.excludedCommands', 'sandbox.enableWeakerNestedSandbox', 'sandbox.allowUnsandboxedCommands']],
+    [{ sandbox: { network: { allowedDomains: ['x'], allowUnixSockets: ['/s'], allowAllUnixSockets: true }, filesystem: { allowWrite: ['/'], allowRead: ['/'] } } },
+      ['sandbox.network.allowedDomains', 'sandbox.network.allowUnixSockets', 'sandbox.network.allowAllUnixSockets', 'sandbox.filesystem.allowWrite', 'sandbox.filesystem.allowRead']],
+    ['{not json', ['settings.json (unparsable)']],
+  ];
+  for (const [obj, keys] of cases) {
+    const home = userSettings(t, obj);
+    const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, baseEnv: { ...process.env, HOME: home } });
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.failure, { kind: 'settings_unsafe', resetAt: null, keys }, JSON.stringify(obj));
+    assert.ok(!JSON.stringify(r).includes('SECRETVALUE'));
+  }
+  assert.equal(f.entries().length, 0, 'nothing may be spawned');
+  for (const ok of [undefined, { permissions: { deny: ['Bash(rm *)'] }, model: 'opus', env: { DISABLE_TELEMETRY: '1' }, enabledPlugins: { a: true }, sandbox: { network: {} } }]) {
+    const home = userSettings(t, ok);
+    const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, baseEnv: { ...process.env, HOME: home } });
+    assert.equal(r.ok, true, JSON.stringify(ok));
+  }
+});
+
+test('user settings: the author with a configDir is linted against that dir, not HOME', async (t) => {
+  const f = fake(t, { mode: 'echo-argv' });
+  const { fh, cwd, settingsFile } = setup(t, 'author');
+  const cfg = path.join(fh, 'claude-author'); fs.mkdirSync(cfg);
+  fs.writeFileSync(path.join(cfg, 'settings.json'), JSON.stringify({ hooks: { Stop: [] } }));
+  const home = userSettings(t, {});
+  const r = await S.runSession({ role: 'author', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, configDir: cfg, baseEnv: { ...process.env, HOME: home } });
+  assert.deepEqual(r.failure, { kind: 'settings_unsafe', resetAt: null, keys: ['hooks'] });
+  const r2 = await S.runSession({ role: 'author', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, baseEnv: { ...process.env, HOME: home } });
+  assert.equal(r2.ok, true);
+});
+
+test('materialiseSettings: a linked worktree (.git file) gets its gitdir and common dir denied, and the pointer file itself', (t) => {
+  const fh = tmp(t, 'fh-'); const main = tmp(t, 'main-'); const wt = path.join(tmp(t, 'wtp-'), 'wt');
+  const g = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
+  g(main, 'init', '-q', '-b', 'main'); fs.writeFileSync(path.join(main, 'a'), '1'); g(main, 'add', '.'); g(main, '-c', 'user.name=a', '-c', 'user.email=a@b', 'commit', '-qm', 'x');
+  g(main, 'worktree', 'add', '-q', wt, '-b', 'feat');
+  const dirs = S.gitDirsOf(wt);
+  assert.equal(dirs.gitFile, true);
+  assert.equal(fs.realpathSync(dirs.common), fs.realpathSync(path.join(main, '.git')));
+  const s = JSON.parse(fs.readFileSync(S.materialiseSettings('builder', { factoryHome: fh, repoDir: wt }), 'utf8'));
+  const common = fs.realpathSync(path.join(main, '.git'));
+  for (const part of ['config', 'hooks', 'info', 'commondir', 'config.worktree', 'objects/info', 'worktrees']) assert.ok(s.sandbox.filesystem.denyWrite.includes(`${common}/${part}`), part);
+  assert.ok(s.sandbox.filesystem.denyWrite.some((p) => p.startsWith(`${common}/worktrees/wt`) || p.startsWith(`${dirs.gitdir}/`)), 'worktree gitdir parts');
+  assert.ok(s.permissions.deny.includes(`Edit(/${common}/config)`));
+  assert.ok(s.permissions.deny.includes(`Edit(/${wt}/.git)`) && s.sandbox.filesystem.denyWrite.includes(`${wt}/.git`));
+  assert.ok(!s.sandbox.filesystem.denyWrite.includes(`${main}/.git`), 'a plain clone keeps its .git dir writable');
+  const bad = tmp(t, 'bad-'); fs.symlinkSync(main, path.join(bad, '.git'));
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: bad }), /symlink/);
+  const bad2 = tmp(t, 'bad2-'); fs.writeFileSync(path.join(bad2, '.git'), 'nonsense');
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: bad2 }), /gitdir pointer/);
+});
+
+test('failure classification: max turns wins even with is_error; an unrelated error after a rejected rate event is not a limit', async (t) => {
+  const { cwd, settingsFile } = setup(t);
+  const a = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: fake(t, { mode: 'max-turns-error' }).bin });
+  assert.deepEqual(a.failure, { kind: 'max_turns', resetAt: null });
+  const b = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: fake(t, { mode: 'rejected-then-error' }).bin });
+  assert.deepEqual(b.failure, { kind: 'other', resetAt: null });
+  const c = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: fake(t, { mode: 'rejected-rate-event' }).bin });
+  assert.equal(c.failure.kind, 'session', 'a plain is_error result after a rejected event is still a limit');
+});
+
+test('binary and PATH: relative PATH entries dropped; a claude inside cwd is refused; a missing one is spawn_failed', async (t) => {
+  assert.equal(S.scrubEnv({ PATH: '.:bin::/usr/bin:./x:/bin' }).PATH, '/usr/bin:/bin');
+  const { cwd, settingsFile } = setup(t);
+  fs.symlinkSync(path.join(FAKE, 'claude'), path.join(cwd, 'claude'));
+  fs.writeFileSync(path.join(cwd, 'fake.json'), JSON.stringify({ mode: 'echo-argv' }));
+  const viaPath = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, baseEnv: { ...process.env, PATH: `${cwd}:${path.dirname(process.execPath)}:/usr/bin:/bin` } });
+  assert.deepEqual(viaPath.failure, { kind: 'unsafe_binary', resetAt: null });
+  const abs = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: path.join(cwd, 'claude') });
+  assert.deepEqual(abs.failure, { kind: 'unsafe_binary', resetAt: null });
+  const rel = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, baseEnv: { ...process.env, PATH: `.:${path.dirname(process.execPath)}` } });
+  assert.deepEqual(rel.failure, { kind: 'spawn_failed', resetAt: null }, 'the relative "." entry must not find ./claude');
+});
+
+test('tmpDir: TMPDIR for the session is the private dir the caller passes', async (t) => {
+  const f = fake(t, { mode: 'echo-argv' });
+  const { fh, cwd, settingsFile } = setup(t);
+  const td = path.join(fh, 'run', 'tmp-1'); fs.mkdirSync(td, { recursive: true });
+  await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, tmpDir: td });
+  const { createHash } = await import('node:crypto');
+  assert.equal(f.entries()[0].tmpdirHash, createHash('sha256').update(td).digest('hex'));
+  await assert.rejects(S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, tmpDir: 'rel' }), TypeError);
+});
+
+test('readBuilderResult: tag characters, Arabic letter mark, Mongolian vowel separator and variation selectors are stripped', (t) => {
+  const c = clone(t);
+  const cp = (...x) => String.fromCodePoint(...x);
+  put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f` }));
+  assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdef');
 });

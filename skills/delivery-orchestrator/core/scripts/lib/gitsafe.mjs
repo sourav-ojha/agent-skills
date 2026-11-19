@@ -188,6 +188,13 @@ export function checkWorktreeSafe(cwd, { global = [], timeout = DEFAULT_TIMEOUT_
   const top = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'rev-parse', '--show-toplevel'], timeout);
   if (top.status !== 0) return; // not in a work tree (bare repo or no repo): nothing to walk; git itself will report the error
   const root = top.stdout.replace(/\n$/, '');
+  // Repository-level redirections a builder could plant: alternates (object store elsewhere) and per-worktree config.
+  const dirs = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], timeout);
+  if (dirs.status !== 0) throw new Error('git worktree not safe: git dir unreadable');
+  const [gitDir, commonDir] = dirs.stdout.split('\n');
+  const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
+  if (exists(path.join(commonDir, 'objects', 'info', 'alternates')) || exists(path.join(gitDir, 'objects', 'info', 'alternates'))) throw new Error('git worktree not safe: objects/info/alternates present');
+  if (exists(path.join(gitDir, 'config.worktree')) || exists(path.join(commonDir, 'config.worktree'))) throw new Error('git worktree not safe: config.worktree present');
   const st = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...loc, 'ls-files', '-z', '--stage'], timeout);
   if (st.status !== 0) throw new Error('git worktree not safe: index unreadable');
   if (st.stdout.split('\0').some((e) => e.startsWith('160000 '))) throw new Error('git worktree not safe: gitlink in the index');
