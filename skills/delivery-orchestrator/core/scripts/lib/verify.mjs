@@ -7,18 +7,23 @@
 //   `baseRef` in the factory clone (git cat-file), not from the worktree. The app gets HOST=127.0.0.1 and PORT=<base_url port>.
 // - Nothing from the feature branch runs outside the sandbox: no sandbox, no verification. app.setup gets registry network;
 //   app.seed, app.start and app.stop get only the app's port on localhost (spec: run phase). Stopping is a process-group kill.
-// - The port must be free on BOTH 127.0.0.1 and ::1 before every start and after every stop (impostor / leaked listener).
-// - Git on the verification worktree: only `worktree add` / `worktree remove` / `worktree prune`, all run from the factory clone,
-//   and never while a sandboxed process from this run may still be alive (Task 6 rulings). Removal runs even on errors.
+// - After EVERY sandboxed phase (setup, seed, app stop; whatever its exit code, timeout or throw) nothing may listen on the app port
+//   on 127.0.0.1 or ::1 and no process carrying the worktree / run-temp marker (argv, environment or cwd) may survive. Otherwise the
+//   run is treated as ESCAPED: verification throws, and the worktree and run temp are left in place with no git call on them.
+// - Git: only `worktree add` and `worktree prune`, run from the factory clone. Removal first rename(2)s the worktree into
+//   FACTORY_HOME/trash/<random> (if that fails it stays in place), then prunes, then deletes the quarantined tree.
+// - Bounded: at most MAX_SCENARIOS scenarios, and an overall wall-clock budget (budgetS) checked before every phase.
 // - Each scenario runs twice from a fresh seed and app start; it passes only if both runs pass. Disagreement is `fail` + flaky.
 // - The symptom brief carries criterion IDs and one fixed sentence only.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import * as sbx from './sandbox.mjs';
 import * as proc from './proc.mjs';
 import { runApiScenario } from './apicheck.mjs';
-import { readVerdict, writeVerdict, verdictMatches } from './verdict.mjs';
+import { readVerdict, writeVerdict, verdictMatches, validVerdict } from './verdict.mjs';
 import { checkRepoKey, scenariosHash, CRIT_ID, SCEN_ID } from './scenarios.mjs';
 import { isLocalUrl } from './config.mjs';
 import { FEATURE_ID } from './queue.mjs';
@@ -33,6 +38,10 @@ const STOP_TIMEOUT_S = 30;
 const STOP_GRACE_MS = 10000;
 const ENV_EXAMPLE_MAX = 64 * 1024;
 const RUNS = 2;
+const MAX_SCENARIOS = 1000;
+const DEFAULT_BUDGET_S = 7200;
+const MAX_BUDGET_S = 86400;
+const SWEEP_WAIT_MS = 3000;
 const STATUSES = new Set(['pass', 'fail', 'blocked']);
 
 // Process group still alive (EPERM means it exists but is not ours to signal: treat as alive).
@@ -40,6 +49,41 @@ const groupAlive = (app) => {
   if (!app?.pgid) return false;
   try { process.kill(-app.pgid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const within = (p, root) => p === root || p.startsWith(`${root}/`);
+
+// Number of live (non-zombie) processes other than this one whose argv or environment (ps -E) mentions a marker path, or whose cwd
+// (lsof) is inside one. Every sandboxed process gets TMPDIR/HOME in the run temp and starts in the worktree, so a survivor of a
+// phase (a setsid daemon included) normally shows one of them. Fails closed: a ps or lsof failure counts as a survivor.
+// Residual: a process that clears its environment, rewrites its argv AND leaves the worktree cwd is not found.
+export function scanSurvivors(markers) {
+  const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 15000 });
+  if (ps.status !== 0 || ps.error) return 1;
+  const hits = new Set();
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line);
+    if (!m || m[2].startsWith('Z') || Number(m[1]) === process.pid) continue;
+    if (markers.some((k) => m[3].includes(k))) hits.add(m[1]);
+  }
+  const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 15000 });
+  if (lsof.error || !lsof.stdout) return 1;
+  let pid = null;
+  for (const line of lsof.stdout.split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1);
+    else if (line.startsWith('n') && pid && Number(pid) !== process.pid && markers.some((k) => within(line.slice(1), k))) hits.add(pid);
+  }
+  return hits.size;
+}
+// Polls briefly: processes the phase's process-group kill just ended may still be listed for a moment.
+async function sweepSurvivors(markers) {
+  const until = Date.now() + SWEEP_WAIT_MS;
+  for (;;) {
+    const n = scanSurvivors(markers);
+    if (n === 0 || Date.now() >= until) return n;
+    await sleep(200);
+  }
+}
 
 // Every side effect goes through these, so tests can stand in for the sandbox and the app.
 const DEFAULT_SEAMS = {
@@ -54,6 +98,8 @@ const DEFAULT_SEAMS = {
   portInUse: proc.portInUse,
   runApiScenario,
   alive: groupAlive,
+  survivors: (markers) => sweepSurvivors(markers),
+  now: () => Date.now(),
 };
 
 const isArgv = (a) => Array.isArray(a) && a.length > 0 && a.every((x) => typeof x === 'string' && x !== '');
@@ -82,13 +128,14 @@ function appPlan(config) {
 // API scenarios of a doc bound to the current criteria. 1a cannot verify UI scenarios: refuse rather than pass or fail them.
 function apiScenarios(doc, criteriaHash) {
   if (!doc || typeof doc !== 'object' || !Array.isArray(doc.scenarios)) throw new Error('scenario doc has no scenarios array');
+  if (doc.scenarios.length > MAX_SCENARIOS) throw new Error(`scenario doc has more than ${MAX_SCENARIOS} scenarios`);
   if (doc.criteria_hash !== criteriaHash) throw new Error('scenario doc criteria_hash is not current');
   if (doc.scenarios.some((s) => s?.kind === 'ui')) throw new Error('UI scenarios need the Phase 1b evaluator: refusing to verify this feature in 1a');
   const list = doc.scenarios.filter((s) => s?.kind === 'api');
   if (!list.length || list.length !== doc.scenarios.length) throw new Error('scenario doc has no api scenarios (or entries of unknown kind)');
   for (const [i, s] of list.entries()) {
     if (typeof s.id !== 'string' || !SCEN_ID.test(s.id)) throw new Error(`scenario #${i + 1}: invalid id`);
-    if (!Array.isArray(s.covers) || !s.covers.length || s.covers.length > 50 || !s.covers.every((x) => typeof x === 'string' && CRIT_ID.test(x))) throw new Error(`scenario ${s.id}: invalid covers`);
+    if (!Array.isArray(s.covers) || !s.covers.length || s.covers.length > 50 || !s.covers.every((x) => typeof x === 'string' && CRIT_ID.test(x))) throw new Error(`scenario #${i + 1}: invalid covers`);
   }
   return list;
 }
@@ -116,12 +163,28 @@ function workDir(repoKey, id, sha) {
   return path.join(work, repoKey, `${id}-${sha}`);
 }
 
-// Returns null, or a message (no paths) when the worktree is still on disk afterwards. Only run once nothing sandboxed is alive.
-function removeWorktree(git, dir) {
-  try { git('worktree', 'remove', '--force', dir); } catch { /* fall through to rm + prune */ }
-  if (exists(dir)) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* reported below */ } }
-  try { git('worktree', 'prune'); } catch { /* reported below if the dir is still there */ }
-  return exists(dir) ? 'the verification worktree could not be removed' : null;
+// Quarantine-then-delete. Only call once nothing sandboxed from the run can be alive. Returns null, or a message (no paths).
+//   1. rename(2) the worktree to FACTORY_HOME/trash/<random> (same volume, 0700); on failure it stays where it is (never rm in place);
+//   2. `git worktree prune` from the clone (the only git call; it checks the registered path, now gone, and never reads the moved tree);
+//   3. delete the quarantined tree (fs.rmSync unlinks symlinks, it does not follow them).
+function removeWorktree(git, dir, trashRoot) {
+  if (exists(dir)) {
+    let q;
+    try {
+      const st = fs.lstatSync(trashRoot.parent);
+      if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('FACTORY_HOME is not a plain directory');
+      if (!exists(trashRoot.dir)) fs.mkdirSync(trashRoot.dir, { mode: 0o700 });
+      const t = fs.lstatSync(trashRoot.dir);
+      if (t.isSymbolicLink() || !t.isDirectory()) throw new Error('trash is not a plain directory');
+      q = path.join(trashRoot.dir, crypto.randomBytes(12).toString('hex'));
+      fs.renameSync(dir, q);
+    } catch { return 'the verification worktree could not be moved to the trash: it was left in place'; }
+    try { git('worktree', 'prune'); } catch { /* a stale registration only; the tree itself is gone */ }
+    try { fs.rmSync(q, { recursive: true, force: true }); } catch { /* reported below */ }
+    return exists(q) ? 'the quarantined verification worktree could not be deleted' : null;
+  }
+  try { git('worktree', 'prune'); } catch { /* nothing to remove */ }
+  return null;
 }
 
 const combine = (runs) => {
@@ -129,10 +192,12 @@ const combine = (runs) => {
   return { status: flaky ? 'fail' : runs[0], flaky };
 };
 
-// verifyFeature({ repoKey, id, sha, baseRef, config, scenarios, criteriaHash, git }, seams?) -> { verdict, doc, brief, reused[, cleanupError] }
+// verifyFeature({ repoKey, id, sha, baseRef, config, scenarios, criteriaHash, git, budgetS }, seams?) -> { verdict, doc, brief, reused[, cleanupError] }
 //   git: (...args) => { code, out, err }, bound to the factory clone (gitSafe). config: the BASE config. scenarios: the stored doc.
-// Throws (after stopping the app and removing the worktree) on refusals and crashes; a thrown error may carry `cleanupError`.
-export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenarios, criteriaHash, git } = {}, seams = {}) {
+//   budgetS: overall wall-clock budget in seconds (default 7200); exceeding it throws (after cleanup).
+// Throws (after stopping the app and removing the worktree when that is safe) on refusals and crashes; a thrown error may carry
+// `cleanupError`.
+export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenarios, criteriaHash, git, budgetS = DEFAULT_BUDGET_S } = {}, seams = {}) {
   const s = { ...DEFAULT_SEAMS, ...seams };
   checkRepoKey(repoKey);
   if (typeof id !== 'string' || id.length > 64 || !FEATURE_ID.test(id)) throw new Error('invalid feature id (expected FEATURE-<n>)');
@@ -140,6 +205,7 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   if (typeof baseRef !== 'string' || !BASE_REF.test(baseRef) || baseRef.split('/').some((p) => p === '..' || p === '.')) throw new Error('invalid base ref (expected refs/remotes/origin/<branch>)');
   if (typeof git !== 'function') throw new Error('invalid git runner (expected a function bound to the factory clone)');
   if (typeof criteriaHash !== 'string' || !HASH.test(criteriaHash)) throw new Error('invalid criteria hash');
+  if (!Number.isInteger(budgetS) || budgetS < 1 || budgetS > MAX_BUDGET_S) throw new Error(`invalid budget (expected 1-${MAX_BUDGET_S} seconds)`);
   const list = apiScenarios(scenarios, criteriaHash);
   const plan = appPlan(config);
   const scHash = scenariosHash(scenarios);
@@ -147,17 +213,35 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   const prior = readVerdict(repoKey, id, sha);
   if (prior && verdictMatches(prior, { sha, scenariosHash: scHash, criteriaHash })) return { verdict: 'pass', doc: prior, brief: [], reused: true };
 
+  const deadline = s.now() + budgetS * 1000;
+  const leftS = () => Math.ceil((deadline - s.now()) / 1000);
+  const checkBudget = () => { if (leftS() <= 0) throw new Error('verification exceeded its time budget'); };
+  const listening = async () => (await s.portInUse(plan.port, '127.0.0.1')) || (await s.portInUse(plan.port, '::1'));
+
   const avail = s.sandboxAvailable();
   if (!avail?.ok) throw new Error(`untrusted-code sandbox unavailable (${avail?.reason ?? 'unknown'}); refusing to verify: there is no unsandboxed fallback`);
-  if (await s.portInUse(plan.port, 'localhost')) throw new Error(`port ${plan.port} is already in use (127.0.0.1 or ::1): refusing to verify while another process listens there`);
+  if (await listening()) throw new Error(`port ${plan.port} is already in use (127.0.0.1 or ::1): refusing to verify while another process listens there`);
   if (git('rev-parse', '--verify', '--quiet', `${baseRef}^{commit}`).code !== 0) throw new Error('base ref cannot be resolved in the factory clone');
   if (git('cat-file', '-e', `${sha}^{commit}`).code !== 0) throw new Error('sha is not a commit in the factory clone');
   const env = appEnv(git, baseRef, plan);
 
   const wt = workDir(repoKey, id, sha);
-  if (exists(wt)) { const left = removeWorktree(git, wt); if (left) throw new Error(`a leftover ${left.replace(/^the /, '')}`); }
+  const fhReal = sbx.canonical(factoryHome());
+  const trash = { parent: fhReal, dir: path.join(fhReal, 'trash') };
+  if (exists(wt)) { // a crashed or escaped earlier run: only cleared when nothing from it is still alive
+    if ((await s.survivors([wt])) > 0) throw new Error('leftover worktree: a process from an earlier run is still running there; refusing to verify');
+    const left = removeWorktree(git, wt, trash);
+    if (left) throw new Error(`leftover worktree: ${left}`);
+  }
 
   let tmp = null, running = null, escaped = false, failure = null, outcome = null;
+  // After a sandboxed phase: anything listening on either loopback, or any process still carrying this run's markers, is an escape.
+  const afterPhase = async (phase) => {
+    if (await listening() || (await s.survivors([wt, tmp].filter(Boolean))) > 0) {
+      escaped = true;
+      throw new Error(`a process from ${phase} is still running or listening on port ${plan.port} after it finished`);
+    }
+  };
   const stopRunning = async (profile) => {
     if (!running) return;
     if (plan.stop) { try { await s.runSandboxed(plan.stop, { cwd: wt, env, timeoutS: STOP_TIMEOUT_S, profile, tmpDir: tmp }); } catch { /* the group kill below is the real stop */ } }
@@ -174,11 +258,13 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
     const runProfile = s.sandboxProfile({ writable: [wt], tmpDir: tmp, network: { localhostPort: plan.port } });
 
     const oneRun = async (sc) => {
-      if (await s.portInUse(plan.port, 'localhost')) throw new Error(`port ${plan.port} is in use before the app start`);
+      checkBudget();
       if (plan.seed) {
-        const r = await s.runSandboxed(plan.seed, { cwd: wt, env, timeoutS: SEED_TIMEOUT_S, profile: runProfile, tmpDir: tmp });
+        let r;
+        try { r = await s.runSandboxed(plan.seed, { cwd: wt, env, timeoutS: Math.min(SEED_TIMEOUT_S, leftS()), profile: runProfile, tmpDir: tmp }); } finally { await afterPhase('app.seed'); }
         if (r?.code !== 0 || r?.timedOut) return 'blocked';
-      }
+      } else if (await listening()) { escaped = true; throw new Error(`port ${plan.port} is in use right before the app start`); }
+      // With a seed, afterPhase('app.seed') above was the port check immediately before the start.
       let status = 'blocked';
       running = s.startSandboxed(plan.start, { cwd: wt, env, profile: runProfile, tmpDir: tmp });
       try {
@@ -188,16 +274,15 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
           if (!s.alive(running)) status = 'blocked'; // the app died: whoever answered may not have been the app
         }
       } finally { await stopRunning(runProfile); }
-      if (await s.portInUse(plan.port, 'localhost')) {
-        escaped = true; // most likely a sandboxed process that left the app's process group (setsid): it may still touch the worktree
-        throw new Error(`a process is still listening on port ${plan.port} after the app was stopped`);
-      }
+      await afterPhase('the app');
       return status;
     };
 
+    checkBudget();
     let setupOk = true;
     if (plan.setup) {
-      const r = await s.runSandboxed(plan.setup, { cwd: wt, env, timeoutS: SETUP_TIMEOUT_S, profile: setupProfile, tmpDir: tmp });
+      let r;
+      try { r = await s.runSandboxed(plan.setup, { cwd: wt, env, timeoutS: Math.min(SETUP_TIMEOUT_S, leftS()), profile: setupProfile, tmpDir: tmp }); } finally { await afterPhase('app.setup'); }
       setupOk = r?.code === 0 && !r?.timedOut;
     }
     const results = [];
@@ -206,6 +291,7 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
       for (let i = 0; i < RUNS; i++) runs.push(setupOk ? await oneRun(sc) : 'blocked');
       results.push({ id: sc.id, covers: [...sc.covers], ...combine(runs) });
     }
+    checkBudget();
     const verdict = results.length > 0 && results.every((r) => r.status === 'pass' && !r.flaky) ? 'pass' : 'fail';
     const doc = { feature: id, sha, scenarios_hash: scHash, criteria_hash: criteriaHash, results, verdict, at: new Date().toISOString() };
     writeVerdict(repoKey, doc);
@@ -216,11 +302,16 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
     if (running) { try { await stopRunning(); } catch { /* still alive: the worktree stays (below) */ } }
   }
 
-  // No git call on the worktree while a sandboxed process from this run may still be alive.
+  // Final sweep whatever happened (a phase may have thrown before its own check): no git call on the worktree while a
+  // sandboxed process from this run may still be alive or listening.
+  if (tmp && !running && !escaped) {
+    try { if (await listening() || (await s.survivors([wt, tmp])) > 0) escaped = true; } catch { escaped = true; }
+  }
   const cleanupError = running ? 'the app did not exit: the verification worktree was left in place'
-    : escaped ? 'a process from the run is still listening: the verification worktree was left in place'
-      : removeWorktree(git, wt);
+    : escaped ? 'a process from the run is still running or listening: the verification worktree was left in place'
+      : removeWorktree(git, wt, trash);
   if (tmp && !running && !escaped) { try { s.removeRunTemp(tmp); } catch { /* removed on process exit */ } }
+  if (escaped && !failure) failure = new Error('a process from the run is still running or listening after verification');
   if (failure) {
     if (cleanupError && failure && typeof failure === 'object') failure.cleanupError = cleanupError;
     throw failure;
@@ -262,7 +353,8 @@ function scenarioStrings(list, canary) {
 
 // symptomBrief(failures, scenarios, canary) -> string[]: per failure `<covers IDs>: an endpoint returned an unexpected status or body`.
 // Only covers entries that are exactly criterion IDs survive; scenario ids, paths, data, the canary, quotes and URLs never appear.
-// A line that would contain any scenario string falls back to `behaviour does not satisfy <IDs>`, else it is dropped. Deduped, capped.
+// A line that would contain any scenario string falls back to `behaviour does not satisfy <IDs>`, else it is dropped. Deduped, then
+// sorted by the covers string (the order of scenarios or results is not a signal), then capped.
 export function symptomBrief(failures, scenarios, canary) {
   if (!Array.isArray(failures)) return [];
   const list = Array.isArray(scenarios) ? scenarios : Array.isArray(scenarios?.scenarios) ? scenarios.scenarios : [];
@@ -270,17 +362,16 @@ export function symptomBrief(failures, scenarios, canary) {
   if (!forbidden) return [];
   const safeId = (x) => typeof x === 'string' && x.length <= 7 && CRIT_ID.test(x);
   const clean = (line) => line.length <= MAX_LINE && LINE_SHAPE.test(line) && ![...forbidden].some((f) => line.includes(f));
-  const lines = [];
-  for (const f of failures) {
+  const lines = new Map(); // covers head -> line
+  for (const f of failures.slice(0, MAX_SCENARIOS)) {
     if (!f || typeof f !== 'object' || (f.status === 'pass' && f.flaky !== true)) continue;
     const ids = [...new Set((Array.isArray(f.covers) ? f.covers : []).filter(safeId))].slice(0, MAX_IDS);
     if (!ids.length) continue;
     const head = ids.join(', ');
     const line = [`${head}: ${API_SYMPTOM}`, `${FALLBACK} ${head}`].find(clean);
-    if (line && !lines.includes(line)) lines.push(line);
-    if (lines.length >= MAX_LINES) break;
+    if (line && !lines.has(head)) lines.set(head, line);
   }
-  return lines;
+  return [...lines.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, MAX_LINES).map((k) => lines.get(k));
 }
 
 // ---- factory/verified ------------------------------------------------------------------------------------------------------------
@@ -303,15 +394,18 @@ export function withVerifiedLine(body, line) {
 
 const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
-// postVerified({ gh, repo, sha, n, pr }): commit status factory/verified=success on `sha`, then the PR body line
+// postVerified({ gh, repo, sha, n, pr, doc }): commit status factory/verified=success on `sha`, then the PR body line
 // `Verified: N/N scenarios at <short sha>` (a count only). gh: (...args) => { code, out, err }, argv only.
-// `pr` (the PR number) is required: the body edit needs it, and the PR head must still be `sha`.
-export function postVerified({ gh, repo, sha, n, pr } = {}) {
+// `pr` (the PR number) is required: the body edit needs it, and the PR head must still be `sha`. `doc` is the verdict: it must be a
+// consistent pass for exactly `sha` (verdictMatches against its own hashes) with exactly `n` results.
+export function postVerified({ gh, repo, sha, n, pr, doc } = {}) {
   if (typeof gh !== 'function') throw new Error('invalid gh runner');
   if (typeof repo !== 'string' || !REPO.test(repo) || repo.split('/').some((p) => p === '.' || p === '..')) throw new Error('invalid repo (expected owner/name)');
   if (typeof sha !== 'string' || !SHA.test(sha)) throw new Error('invalid sha (expected 40 lowercase hex characters)');
   if (!Number.isInteger(n) || n < 1 || n > 1000) throw new Error('invalid scenario count');
   if (!Number.isInteger(pr) || pr < 1) throw new Error('invalid PR number');
+  if (!validVerdict(doc) || !verdictMatches(doc, { sha, scenariosHash: doc.scenarios_hash, criteriaHash: doc.criteria_hash })) throw new Error('invalid verdict: a passing verdict for this exact commit is required');
+  if (doc.results.length !== n) throw new Error('invalid scenario count: it must equal the number of verdict results');
 
   const view = gh('pr', 'view', String(pr), '--json', 'body,headRefOid');
   const v = view.code === 0 ? parse(view.out) : null;

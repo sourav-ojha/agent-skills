@@ -768,6 +768,7 @@ function vseams(log, over = {}) {
     alive: (app) => app.up,
     waitReady: async (ready) => { log.push(['ready', ready]); return true; },
     portInUse: async () => false,
+    survivors: async () => 0,
     runApiScenario: async (sc, base) => { log.push(['api', sc.id, base]); return { status: 'pass' }; },
     ...over,
   };
@@ -790,7 +791,8 @@ test('verifyFeature (real sandbox): a wrong endpoint fails with only its covers 
   assert.equal(w.worktrees(), 1, 'only the clone itself is registered');
   assert.equal(await PR.portInUse(w.port), false, 'nothing listens after verification');
   assert.deepEqual(fs.readdirSync(path.join(w.fh, 'tmp')), [], 'run temp removed');
-  assert.deepEqual(kinds(w.log), ['git add', 'git remove', 'git prune']);
+  assert.deepEqual(kinds(w.log), ['git add', 'git prune']);
+  assert.deepEqual(fs.readdirSync(path.join(w.fh, 'trash')), [], 'quarantined worktree deleted');
 
   const ok = await VF.verifyFeature(w.args({ sha: w.good }));
   assert.equal(ok.verdict, 'pass', JSON.stringify(ok.doc.results));
@@ -823,7 +825,7 @@ test('verifyFeature: commands come from the base config, env from the base env e
   for (const e of w.log.filter((x) => x[0] === 'ready')) assert.equal(e[1].url, `http://127.0.0.1:${w.port}/health`, 'localhost ready URL pinned to 127.0.0.1');
   for (const e of w.log.filter((x) => x[0] === 'stop')) assert.equal(e[1], undefined, 'app.stop is never run unsandboxed');
   assert.deepEqual(kinds(w.log).filter((k) => ['start', 'stop', 'api'].includes(k)), ['start', 'api', 'stop', 'start', 'api', 'stop', 'start', 'api', 'stop', 'start', 'api', 'stop']);
-  assert.ok(kinds(w.log).lastIndexOf('stop') < kinds(w.log).indexOf('git remove'), 'app stopped before the worktree is touched');
+  assert.ok(kinds(w.log).lastIndexOf('stop') < kinds(w.log).indexOf('git prune'), 'app stopped before the worktree is touched');
 });
 
 test('verifyFeature: a configured app.stop runs sandboxed on the app port, before the process-group stop', async (t) => {
@@ -872,8 +874,8 @@ test('verifyFeature: the app is always stopped and the worktree removed on throw
     const w = await vworld(t);
     await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, over)), new RegExp(`boom-${name}`));
     const k = kinds(w.log);
-    if (k.includes('start')) assert.ok(k.indexOf('stop') > k.indexOf('start') && k.indexOf('stop') < k.indexOf('git remove'), `${name}: ${k}`);
-    assert.ok(k.includes('git remove'), name);
+    if (k.includes('start')) assert.ok(k.indexOf('stop') > k.indexOf('start') && k.indexOf('stop') < k.indexOf('git prune'), `${name}: ${k}`);
+    assert.ok(k.includes('git prune') && !k.includes('git remove'), name);
     assert.ok(!fs.existsSync(w.wtOf(w.bad)), name); assert.equal(w.worktrees(), 1, name);
     assert.deepEqual(fs.readdirSync(path.join(w.fh, 'tmp')), [], `${name}: run temp removed`);
     assert.equal(V.readVerdict('o__r', 'FEATURE-001', w.bad), null, `${name}: no verdict on a crash`);
@@ -884,17 +886,18 @@ test('verifyFeature: an app that will not exit leaves the worktree in place (no 
   const w = await vworld(t);
   const e = await VF.verifyFeature(w.args(), vseams(w.log, { stopApp: async () => {}, alive: () => true })).catch((x) => x);
   assert.match(e.message, /did not exit/);
-  assert.ok(!kinds(w.log).includes('git remove'), 'no worktree git command while the app may still run');
+  assert.ok(!kinds(w.log).some((k) => k.startsWith('git ') && k !== 'git add'), 'no worktree git command while the app may still run');
   assert.match(e.cleanupError, /left in place/);
 
   if (process.getuid?.() === 0) return;
   const w2 = await vworld(t);
   const parent = path.dirname(w2.wtOf(w2.bad));
-  const git = (...a) => (a[0] === 'worktree' && a[1] === 'remove' ? { code: 1, out: '', err: 'nope' } : w2.git(...a));
-  const e2 = await VF.verifyFeature(w2.args({ git }), vseams(w2.log, { runApiScenario: async () => { fs.chmodSync(parent, 0o500); throw new Error('boom-original'); } })).catch((x) => x);
+  const e2 = await VF.verifyFeature(w2.args(), vseams(w2.log, { runApiScenario: async () => { fs.chmodSync(parent, 0o500); throw new Error('boom-original'); } })).catch((x) => x);
   fs.chmodSync(parent, 0o700);
   assert.match(e2.message, /boom-original/);
-  assert.match(e2.cleanupError, /could not be removed/);
+  assert.match(e2.cleanupError, /could not be moved to the trash: it was left in place/);
+  assert.ok(fs.existsSync(w2.wtOf(w2.bad)), 'never deleted in place when the quarantine move fails');
+  assert.ok(!kinds(w2.log).includes('git prune'), 'no prune while the tree is still registered in place');
 });
 
 test('verifyFeature: refuses when something already listens on the port (127.0.0.1 or ::1), and when it is still listening after stop', async (t) => {
@@ -913,12 +916,13 @@ test('verifyFeature: refuses when something already listens on the port (127.0.0
   } else t.diagnostic('::1 unavailable: IPv6 impostor check skipped');
 
   const w2 = await vworld(t);
-  let calls = 0;
-  const e = await VF.verifyFeature(w2.args(), vseams(w2.log, { portInUse: async () => ++calls > 2 })).catch((x) => x);
-  assert.match(e.message, /still listening/);
+  let busy = false;
+  const e = await VF.verifyFeature(w2.args(), vseams(w2.log, { stopApp: async (app) => { app.up = false; busy = true; }, portInUse: async () => busy })).catch((x) => x);
+  assert.match(e.message, /still running or listening/);
   // an escaped listener is a sandboxed process that may still touch the worktree: no git command runs there, the dir stays
   assert.match(e.cleanupError, /left in place/);
-  assert.ok(!kinds(w2.log).includes('git remove')); assert.ok(fs.existsSync(w2.wtOf(w2.bad)));
+  assert.ok(!kinds(w2.log).includes('git prune')); assert.ok(fs.existsSync(w2.wtOf(w2.bad)));
+  assert.equal(fs.readdirSync(path.join(w2.fh, 'tmp')).length, 1, 'run temp left in place too');
 });
 
 test('verifyFeature: refuses without the sandbox, before creating anything', async (t) => {
@@ -1001,6 +1005,8 @@ test('symptomBrief: a scenario string that overlaps the fixed sentence falls bac
   assert.deepEqual(VF.symptomBrief([{ covers: ['AC-1', 'zz'], status: 'fail' }], 'junk', 42), ['AC-1: an endpoint returned an unexpected status or body']);
 });
 
+const pdoc = (sha, n) => ({ feature: 'FEATURE-001', sha, scenarios_hash: SH, criteria_hash: CH, results: Array.from({ length: n }, (_, i) => ({ id: `S-${i + 1}`, covers: ['AC-1'], status: 'pass', flaky: false })), verdict: 'pass', at: '2026-11-19T10:00:00.000Z' });
+
 // Fake gh as a function (argv only), state in a JSON file; the PR's head comes from a real repo.
 function ghWorld(t, body = 'Adds notes.\n\nCloses FEATURE-001.') {
   const root = fs.realpathSync(tmpDir('factory-ghv-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -1017,7 +1023,7 @@ function ghWorld(t, body = 'Adds notes.\n\nCloses FEATURE-001.') {
 
 test('postVerified: factory/verified success on the exact sha, PR body line with the count only, idempotent', (t) => {
   const w = ghWorld(t);
-  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7 });
+  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2) });
   assert.equal(r.line, `Verified: 2/2 scenarios at ${w.sha.slice(0, 7)}`);
   const st = w.state();
   assert.deepEqual(st.statuses[w.sha], [{ state: 'success', context: 'factory/verified', description: VF.VERIFIED_DESCRIPTION }]);
@@ -1030,25 +1036,25 @@ test('postVerified: factory/verified success on the exact sha, PR body line with
   const all = JSON.stringify(st);
   for (const s of LEAK_STRINGS) assert.ok(!all.includes(s), `gh traffic leaks ${s}`);
   // again with a new count: the Verified line is replaced, never duplicated; the rest of the body is kept
-  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7 });
+  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, doc: pdoc(w.sha, 3) });
   assert.equal(w.state().prs[0].body, `Adds notes.\n\nCloses FEATURE-001.\n\nVerified: 3/3 scenarios at ${w.sha.slice(0, 7)}`);
   const edits = w.state().calls.filter((c) => c[0] === 'pr' && c[1] === 'edit').length;
-  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7 });
+  VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, doc: pdoc(w.sha, 3) });
   assert.equal(w.state().calls.filter((c) => c[0] === 'pr' && c[1] === 'edit').length, edits, 'unchanged body is not re-edited');
 });
 
 test('postVerified: validates inputs before any gh call; refuses a moved PR head; gh failures throw', (t) => {
   const w = ghWorld(t, '');
   for (const bad of [{ sha: 'A'.repeat(40) }, { sha: w.sha.slice(0, 39) }, { n: 0 }, { n: 1.5 }, { n: '2' }, { repo: 'o' }, { repo: 'o/r/x' }, { repo: '-o/r' }, { pr: 0 }, { pr: '7' }, { gh: null }]) {
-    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, ...bad }), /invalid/, JSON.stringify(bad));
+    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2), ...bad }), /invalid/, JSON.stringify(bad));
   }
   assert.equal(w.state().calls.length, 0);
-  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: 'c'.repeat(40), n: 2, pr: 7 }), /PR head/);
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: 'c'.repeat(40), n: 2, pr: 7, doc: pdoc('c'.repeat(40), 2) }), /PR head/);
   assert.ok(!w.state().calls.some((c) => c[1] === 'edit'));
-  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 1, pr: 7 });
+  const r = VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 1, pr: 7, doc: pdoc(w.sha, 1) });
   assert.equal(w.state().prs[0].body, r.line, 'empty body gets just the line');
   const failing = (...a) => (a[0] === 'api' ? { code: 1, out: '', err: 'HTTP 403' } : w.gh(...a));
-  assert.throws(() => VF.postVerified({ gh: failing, repo: 'o/r', sha: w.sha, n: 1, pr: 7 }), /factory\/verified/);
+  assert.throws(() => VF.postVerified({ gh: failing, repo: 'o/r', sha: w.sha, n: 1, pr: 7, doc: pdoc(w.sha, 1) }), /factory\/verified/);
 });
 
 test('withVerifiedLine replaces every existing Verified line in place and keeps the rest', () => {
@@ -1083,19 +1089,181 @@ test('symptomBrief: object keys inside request bodies are data too; schema keys 
 test('postVerified: a status that does not show up after posting throws before the body edit', (t) => {
   const w = ghWorld(t);
   const gh = (...a) => (a[0] === 'api' && a[1].endsWith('/status') ? { code: 0, out: JSON.stringify({ statuses: [{ context: 'factory/verified', state: 'pending' }] }), err: '' } : w.gh(...a));
-  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7 }), /not visible/);
+  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2) }), /not visible/);
   assert.ok(!w.state().calls.some((c) => c[1] === 'edit'));
-});
-
-test('verifyFeature: an impostor that appears between the pre-check and an app start is refused', async (t) => {
-  const w = await vworld(t);
-  let n = 0; // call 1: the up-front check; call 2: the check right before the first start
-  await assert.rejects(VF.verifyFeature(w.args(), vseams(w.log, { portInUse: async () => ++n === 2 })), /in use before the app start/);
-  assert.ok(!w.log.some((e) => e[0] === 'start')); assert.ok(!fs.existsSync(w.wtOf(w.bad)));
 });
 
 test('postVerified: a failing pr edit throws', (t) => {
   const w = ghWorld(t);
   const gh = (...a) => (a[0] === 'pr' && a[1] === 'edit' ? { code: 1, out: '', err: 'HTTP 422' } : w.gh(...a));
-  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7 }), /pr edit #7 failed/);
+  assert.throws(() => VF.postVerified({ gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc: pdoc(w.sha, 2) }), /pr edit #7 failed/);
+});
+
+// ---- Task 9 fix round 1 ------------------------------------------------------------------------------------------------------
+const noGitAfterAdd = (log) => !kinds(log).some((k) => k.startsWith('git ') && k !== 'git add');
+
+test('I-1: a listener left by any sandboxed phase (setup, seed exiting 0 or non-zero, app) is an escape: throw, worktree + run temp kept, no git', async (t) => {
+  const cases = [
+    ['setup', (w, busy) => ({ runSandboxed: async (argv) => { if (argv === w.config.app.setup) busy.on = true; return { code: 1, timedOut: false }; } })],
+    ['seed exit 0', (w, busy) => ({ runSandboxed: async (argv) => { if (argv === w.config.app.seed) busy.on = true; return { code: 0, timedOut: false }; } })],
+    ['seed exit 3', (w, busy) => ({ runSandboxed: async (argv) => { if (argv === w.config.app.seed) busy.on = true; return { code: argv === w.config.app.seed ? 3 : 0, timedOut: false }; } })],
+    ['seed throws', (w, busy) => ({ runSandboxed: async (argv) => { if (argv === w.config.app.seed) { busy.on = true; throw new Error('seed crashed'); } return { code: 0, timedOut: false }; } })],
+    ['seed timeout', (w, busy) => ({ runSandboxed: async (argv) => { if (argv === w.config.app.seed) busy.on = true; return argv === w.config.app.seed ? { code: null, timedOut: true } : { code: 0, timedOut: false }; } })],
+  ];
+  for (const [name, make] of cases) for (const host of ['127.0.0.1', '::1']) {
+    const w = await vworld(t);
+    const busy = { on: false };
+    const hosts = [];
+    const e = await VF.verifyFeature(w.args(), vseams(w.log, { ...make(w, busy), portInUse: async (_p, h) => { hosts.push(h); return busy.on && h === host; } })).catch((x) => x);
+    assert.ok(e instanceof Error, `${name}/${host}: must throw`);
+    assert.match(e.message, /still running or listening/, `${name}/${host}: ${e.message}`);
+    assert.match(e.cleanupError, /left in place/, name);
+    assert.ok(fs.existsSync(w.wtOf(w.bad)), name); assert.ok(noGitAfterAdd(w.log), `${name}: ${kinds(w.log)}`);
+    assert.equal(fs.readdirSync(path.join(w.fh, 'tmp')).length, 1, `${name}: run temp kept`);
+    assert.ok(!w.log.some((x) => x[0] === 'start'), `${name}: app never started after the escape`);
+    assert.ok(hosts.includes('127.0.0.1') && hosts.includes('::1'), 'both loopbacks probed');
+    assert.equal(V.readVerdict('o__r', 'FEATURE-001', w.bad), null);
+  }
+});
+
+test('I-1: a surviving non-listening process after setup / seed / app stop, or at the final sweep, is an escape', async (t) => {
+  for (const [name, when] of [['setup', 1], ['seed', 2], ['app stop', 3]]) {
+    const w = await vworld(t);
+    let n = 0; const seen = [];
+    const e = await VF.verifyFeature(w.args(), vseams(w.log, { survivors: async (m) => { seen.push(m); return ++n === when ? 1 : 0; } })).catch((x) => x);
+    assert.match(e?.message ?? '', /still running or listening/, name);
+    assert.ok(fs.existsSync(w.wtOf(w.bad)) && noGitAfterAdd(w.log), name);
+    assert.deepEqual(seen[0], [w.wtOf(w.bad), fs.readdirSync(path.join(w.fh, 'tmp')).map((d) => path.join(fs.realpathSync(w.fh), 'tmp', d))[0]], 'markers: worktree and run temp');
+  }
+  // a phase that crashes is still followed by a sweep: the original error is kept, the worktree stays
+  const w = await vworld(t);
+  let sweeps = 0;
+  const e = await VF.verifyFeature(w.args(), vseams(w.log, { runApiScenario: async () => { throw new Error('boom-api'); }, survivors: async () => (++sweeps >= 3 ? 1 : 0) })).catch((x) => x);
+  assert.match(e.message, /boom-api/); assert.match(e.cleanupError, /left in place/); assert.ok(noGitAfterAdd(w.log));
+  // the final sweep alone (every phase check clean) still blocks removal and turns a result into an error
+  const w2 = await vworld(t);
+  let k = 0; const total = 1 + 2 * 2 * 2; // setup + (seed + app) x 2 runs x 2 scenarios
+  const e2 = await VF.verifyFeature(w2.args(), vseams(w2.log, { survivors: async () => (++k > total ? 1 : 0) })).catch((x) => x);
+  assert.match(e2?.message ?? '', /still running or listening after verification/); assert.ok(noGitAfterAdd(w2.log));
+});
+
+test('M-3: without a seed, the port is checked immediately before every start', async (t) => {
+  const w = await vworld(t);
+  const config = { ...w.config, app: { ...w.config.app, seed: null, setup: null } };
+  let n = 0; // calls 1-2: the up-front check on 127.0.0.1 and ::1; call 3: right before the first start
+  const e = await VF.verifyFeature(w.args({ config }), vseams(w.log, { portInUse: async () => ++n === 3 })).catch((x) => x);
+  assert.match(e.message, /in use right before the app start/);
+  assert.ok(!w.log.some((x) => x[0] === 'start')); assert.ok(noGitAfterAdd(w.log));
+});
+
+test('I-2: removal quarantines the worktree first; a symlink planted inside is unlinked, never followed', async (t) => {
+  const w = await vworld(t);
+  const outside = path.join(w.root, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'keep.txt'), 'KEEP');
+  let planted = false;
+  const plant = () => { if (planted) return; planted = true; const wt = w.wtOf(w.bad); fs.rmSync(path.join(wt, '.product'), { recursive: true, force: true }); fs.symlinkSync(outside, path.join(wt, '.product')); fs.symlinkSync(outside, path.join(wt, 'link')); };
+  const r = await VF.verifyFeature(w.args(), vseams(w.log, { runApiScenario: async () => { plant(); return { status: 'pass' }; } }));
+  assert.equal(r.verdict, 'pass');
+  assert.equal(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8'), 'KEEP');
+  assert.ok(!fs.existsSync(w.wtOf(w.bad))); assert.deepEqual(fs.readdirSync(path.join(w.fh, 'trash')), []);
+  assert.deepEqual(kinds(w.log).filter((k) => k.startsWith('git ')), ['git add', 'git prune']); assert.equal(w.worktrees(), 1, 'prune dropped the registration');
+  // a symlinked trash dir is refused: the worktree stays where it is
+  const w2 = await vworld(t);
+  const elsewhere = path.join(w2.root, 'elsewhere'); fs.mkdirSync(elsewhere); fs.symlinkSync(elsewhere, path.join(w2.fh, 'trash'));
+  const r2 = await VF.verifyFeature(w2.args(), vseams(w2.log));
+  assert.match(r2.cleanupError, /left in place/); assert.ok(fs.existsSync(w2.wtOf(w2.bad))); assert.deepEqual(fs.readdirSync(elsewhere), []);
+  // and the leftover clear refuses the same way (throws before any run)
+  w2.log.length = 0;
+  const changed = vscenarios(); changed.scenarios[0].assert.push({ json_path: '$.items', not_contains: 'y' }); // no verdict reuse
+  await assert.rejects(VF.verifyFeature(w2.args({ scenarios: changed }), vseams(w2.log)), /leftover worktree: .*left in place/);
+  assert.ok(!w2.log.some((x) => x[0] === 'run'));
+});
+
+test('M-7: more than 1000 scenarios refused up front; the wall-clock budget throws after cleanup', async (t) => {
+  const w = await vworld(t);
+  const many = vscenarios({ scenarios: Array.from({ length: 1001 }, (_, i) => ({ ...vscenarios().scenarios[0], id: `S-${i + 1}` })) });
+  await assert.rejects(VF.verifyFeature(w.args({ scenarios: many }), vseams(w.log)), /more than 1000 scenarios/);
+  assert.deepEqual(w.log, []);
+  for (const b of [0, 1.5, 86401, '60']) await assert.rejects(VF.verifyFeature(w.args({ budgetS: b }), vseams(w.log)), /invalid budget/);
+  let clock = 1_000_000; let calls = 0;
+  const r = VF.verifyFeature(w.args({ budgetS: 100 }), vseams(w.log, { now: () => clock, runApiScenario: async () => { calls++; clock += 60_000; return { status: "pass" }; } }));
+  await assert.rejects(r, /exceeded its time budget/);
+  assert.equal(calls, 2, `stopped at the first check after the budget ran out: ${kinds(w.log)}`);
+  assert.ok(!fs.existsSync(w.wtOf(w.bad))); assert.equal(V.readVerdict('o__r', 'FEATURE-001', w.bad), null);
+  const timeouts = w.log.filter((e) => e[0] === 'run').map((e) => e[0]);
+  assert.ok(timeouts.length > 0);
+});
+
+test('M-2: validation errors name scenarios by index, never by id', async (t) => {
+  const w = await vworld(t);
+  const bad = vscenarios({ scenarios: [vscenarios().scenarios[0], { ...vscenarios().scenarios[1], id: 'S-77', covers: ['nope'] }] });
+  const e = await VF.verifyFeature(w.args({ scenarios: bad }), vseams(w.log)).catch((x) => x);
+  assert.match(e.message, /scenario #2: invalid covers/); assert.ok(!e.message.includes('S-77'));
+});
+
+test('M-4: brief lines are sorted by their covers, whatever the result order', () => {
+  const f = [{ covers: ['EC-2'], status: 'fail' }, { covers: ['AC-3'], status: 'fail' }, { covers: ['AC-1', 'ER-1'], status: 'fail' }];
+  const a = VF.symptomBrief(f, vscenarios(), CANARY);
+  assert.deepEqual(a.map((l) => l.split(':')[0]), ['AC-1, ER-1', 'AC-3', 'EC-2']);
+  assert.deepEqual(VF.symptomBrief([...f].reverse(), vscenarios(), CANARY), a);
+});
+
+test('M-1: portInUse fails closed (a timeout or an unexpected error counts as in use); refused means free', async () => {
+  assert.equal(await PR.portInUse(await vfreePort(), '127.0.0.1'), false);
+  assert.equal(await PR.portInUse(9, '192.0.2.1'), true, 'TEST-NET address: timeout or unreachable is not "free"');
+});
+
+test('M-5: postVerified needs a consistent pass verdict for this sha with exactly n results', (t) => {
+  const w = ghWorld(t);
+  for (const doc of [undefined, { ...pdoc(w.sha, 2), verdict: 'fail', results: [{ id: 'S-1', covers: ['AC-1'], status: 'fail', flaky: false }] }, pdoc('d'.repeat(40), 2),
+    { ...pdoc(w.sha, 2), results: [{ id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: true }, { id: 'S-2', covers: ['AC-1'], status: 'pass', flaky: false }] }, { ...pdoc(w.sha, 2), extra: 1 }]) {
+    assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 2, pr: 7, doc }), /invalid verdict/);
+  }
+  assert.throws(() => VF.postVerified({ gh: w.gh, repo: 'o/r', sha: w.sha, n: 3, pr: 7, doc: pdoc(w.sha, 2) }), /invalid scenario count/);
+  assert.equal(w.state().calls.length, 0);
+});
+
+test('I-1 (real sandbox): a seed that exits non-zero after leaving a setsid daemon (listening or not) is caught; the worktree stays', { skip: SBX_SKIP }, async (t) => {
+  for (const listen of [true, false]) {
+    const w = await vworld(t);
+    // the seed writes the daemon's pid into the worktree so the test can kill it afterwards
+    const seed = ['node', '-e', `const cp=require('child_process');const c=cp.spawn(process.execPath,['-e',${JSON.stringify(`${listen ? "require('http').createServer(()=>{}).listen(+process.env.PORT,'::1');" : ''}setTimeout(()=>{},120000)`)}],{detached:true,stdio:'ignore',env:process.env});require('fs').writeFileSync('daemon.pid',String(c.pid));c.unref();process.exit(4)`];
+    const config = { ...w.config, app: { ...w.config.app, seed } };
+    const e = await VF.verifyFeature(w.args({ config })).catch((x) => x);
+    const pidFile = path.join(w.wtOf(w.bad), 'daemon.pid');
+    const pid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : null;
+    if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+    assert.ok(e instanceof Error, `listen=${listen}: must throw`);
+    assert.match(e.message, /app\.seed is still running or listening/, `listen=${listen}: ${e.message}`);
+    assert.ok(pid, 'daemon started and the worktree was kept'); assert.match(e.cleanupError, /left in place/);
+    assert.ok(noGitAfterAdd(w.log), `listen=${listen}: ${kinds(w.log)}`);
+  }
+});
+
+test('round 1 mutants: a failing sweep is fail-closed; a leftover with a live process is refused, not cleared', async (t) => {
+  const w = await vworld(t);
+  const e = await VF.verifyFeature(w.args(), vseams(w.log, { survivors: async () => { throw new Error('ps broke'); } })).catch((x) => x);
+  assert.ok(e instanceof Error); assert.match(e.cleanupError, /left in place/); assert.ok(noGitAfterAdd(w.log));
+  const w2 = await vworld(t);
+  fs.mkdirSync(w2.wtOf(w2.bad), { recursive: true });
+  await assert.rejects(VF.verifyFeature(w2.args(), vseams(w2.log, { survivors: async (m) => (m.length === 1 ? 1 : 0) })), /earlier run is still running there/);
+  assert.ok(fs.existsSync(w2.wtOf(w2.bad))); assert.ok(!w2.log.some((x) => x[0] === 'git'));
+});
+
+test('scanSurvivors finds a process by its environment (ps -E) and by its cwd (lsof), each on its own', { skip: process.platform !== 'darwin' && 'macOS only' }, async (t) => {
+  const marker = fs.realpathSync(tmpDir('factory-sweep-')); t.after(() => fs.rmSync(marker, { recursive: true, force: true }));
+  const other = fs.realpathSync(tmpDir('factory-sweep-other-')); t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  assert.equal(VF.scanSurvivors([marker]), 0);
+  const { spawn } = await import('node:child_process');
+  const run = (opts) => { const c = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore', ...opts }); t.after(() => c.kill('SIGKILL')); return c; };
+  const byEnv = run({ cwd: other, env: { PATH: process.env.PATH, TMPDIR: marker } });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(VF.scanSurvivors([marker]), 1, 'found by environment');
+  byEnv.kill('SIGKILL'); await new Promise((r) => setTimeout(r, 300));
+  run({ cwd: marker, env: { PATH: process.env.PATH } });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(VF.scanSurvivors([marker]), 1, 'found by cwd');
+});
+
+test('M-1: an error other than refused (unresolvable host) also counts as in use', async () => {
+  assert.equal(await PR.portInUse(80, 'nonexistent.invalid'), true);
 });

@@ -124,12 +124,15 @@ export function portOf(url) {
   return u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80;
 }
 
+// Fail closed: only a refused connection, or a loopback address this host does not have (no IPv6: EADDRNOTAVAIL / EAFNOSUPPORT),
+// means free. A timeout or any other error counts as in use (something may be there, e.g. a listener that never accepts).
+const FREE_CODES = new Set(['ECONNREFUSED', 'EADDRNOTAVAIL', 'EAFNOSUPPORT']);
 const probe = (port, host) => new Promise((resolve) => {
   const s = net.connect({ port, host });
   const end = (v) => { s.destroy(); resolve(v); };
-  s.setTimeout(1000, () => end(false));
+  s.setTimeout(1000, () => end(true));
   s.on('connect', () => end(true));
-  s.on('error', () => end(false));
+  s.on('error', (e) => end(!FREE_CODES.has(e.code)));
 });
 
 // `localhost` (the default) is checked on both loopbacks: dev servers may bind only ::1 (Vite on macOS).
