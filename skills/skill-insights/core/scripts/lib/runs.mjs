@@ -1,5 +1,7 @@
 // Summarise and redact skill run logs (.skill-runs/*.jsonl) for export. Pure; no I/O.
 const NOTE_KEYS = ['unclear', 'skipped', 'improvised', 'suggest'];
+// Outcomes that only mean "run it again" (CI still running, branch moved): exit code 2, but not a failure.
+const WAITING = new Set(['timeout', 'stale', 'updated']);
 
 // Free text from an agent is redacted again here: absolute paths, emails, long token-like strings.
 export function redactText(s, max = 400) {
@@ -34,12 +36,14 @@ export function summarizeRuns(events, { notes: withNotes = true } = {}) {
   return [...by.entries()].map(([run, evs]) => {
     evs.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     const count = (name) => evs.filter((e) => e.event === name).length;
-    const failed = evs.filter((e) => e.ok === false);
+    const notOk = evs.filter((e) => e.ok === false);
+    const waiting = notOk.filter((e) => WAITING.has(e.result));
+    const failed = notOk.filter((e) => !WAITING.has(e.result));
     const notes = !withNotes ? [] : evs.filter((e) => e.event === 'retro').map((e) => Object.fromEntries(NOTE_KEYS.filter((k) => e[k]).map((k) => [k, redactText(e[k])])));
     const init = evs.find((e) => e.event === 'init');
     return {
       run: pick(run, /^[A-Za-z0-9:_.-]{1,80}$/, 'run-?'), skill: pick(evs[0].skill, /^[A-Za-z0-9_-]{1,40}$/, 'unknown'), start: pick(evs[0].ts, /^[0-9T:.\-Z]{10,30}$/, '?'), end: pick(evs[evs.length - 1].ts, /^[0-9T:.\-Z]{10,30}$/, '?'), commands: evs.length,
-      failedCommands: failed.map((e) => pick(e.event, /^[a-z-]{1,24}$/, 'other')), tier: pick(init?.tier, /^T[0-3]$/, undefined), spec: pick(init?.spec, /^(FEATURE-\d{1,6}|file)$/, undefined),
+      failedCommands: failed.map((e) => pick(e.event, /^[a-z-]{1,24}$/, 'other')), waitingCommands: waiting.length, tier: pick(init?.tier, /^T[0-3]$/, undefined), spec: pick(init?.spec, /^(FEATURE-\d{1,6}|file)$/, undefined),
       fixRounds: count('reopen'), blocked: count('block'), passed: count('pass') - failed.filter((e) => e.event === 'pass').length,
       rulings: count('ruling'), ids: [...new Set(evs.map((e) => pick(e.opp, /^OPP-\d{1,6}$/, null)).filter(Boolean))],
       validate: evs.filter((e) => e.event === 'validate').map((e) => ({ errors: Number.isFinite(e.errors) ? e.errors : null, warnings: Number.isFinite(e.warnings) ? e.warnings : null })),

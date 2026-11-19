@@ -109,7 +109,7 @@ function exportBundle() {
   if (opt.json) { emit(JSON.stringify({ runs, cost }, null, 2)); return; }
   const L = ['# Skill run bundle (redacted)', '', 'Metadata-only run logs plus agent self-report. No prompts, code, paths or emails. Review it, then bring it to the skill author (use --no-notes to leave out the agent self-report).', '', '## Runs', ''];
   for (const r of runs) {
-    L.push(`### ${r.skill} (${r.run})`, `- window: ${r.start} .. ${r.end}; commands: ${r.commands}; failed commands: ${r.failedCommands.join(', ') || 'none'}`);
+    L.push(`### ${r.skill} (${r.run})`, `- window: ${r.start} .. ${r.end}; commands: ${r.commands}; failed commands: ${r.failedCommands.join(', ') || 'none'}; waits (CI still running, re-run needed): ${r.waitingCommands}`);
     if (r.skill === 'implementer') L.push(`- tier: ${r.tier || '?'}; input spec: ${r.spec || 'idea'}; tasks passed: ${r.passed}; fix rounds: ${r.fixRounds}; blocked: ${r.blocked}; rulings: ${r.rulings}; delivery: ${r.delivery || 'not reported'}`);
     else L.push(`- opportunities touched: ${r.ids.join(', ') || 'none'}; validate runs: ${r.validate.map((v) => `${v.errors}E/${v.warnings}W`).join(', ') || 'none'}`);
     for (const n of r.notes) for (const [k, v] of Object.entries(n)) L.push(`- ${k}: ${v}`);

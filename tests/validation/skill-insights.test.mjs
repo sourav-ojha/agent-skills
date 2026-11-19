@@ -7,6 +7,7 @@ import { REPO, tmpDir } from './helpers.mjs';
 import { parseSession } from '../../skills/skill-insights/core/scripts/lib/transcripts.mjs';
 import { windows, inventory, dedupeSessions } from '../../skills/skill-insights/core/scripts/lib/analyze.mjs';
 import crypto from 'node:crypto';
+import { summarizeRuns } from '../../skills/skill-insights/core/scripts/lib/runs.mjs';
 import { joinTokens, coverage, latestPerFeature } from '../../skills/skill-insights/core/scripts/lib/factory.mjs';
 
 const SI = path.join(REPO, 'skills/skill-insights/core/scripts/si.mjs');
@@ -296,4 +297,11 @@ test('M4 CLI report: --top limits the cost table to the costliest skills; repeat
   const costRows = (t) => t.split('## Cost and friction per skill')[1].split('## Flags')[0].split('\n').filter((l) => /^\| (quick|slow) /.test(l));
   assert.deepEqual(costRows(full).map((l) => l.split(' | ')[0].replace('| ', '')), ['slow', 'quick'], 'sorted by total minutes, costliest first');
   assert.equal(costRows(run('--top', '1').stdout).length, 1);
+});
+
+test('M5 run summary separates CI waits (timeout, stale, updated) from real failures; old logs without a result stay failures', () => {
+  const ev = (n, event, ok, result) => ({ ts: `2026-11-18T10:0${n}:00Z`, skill: 'delivery-orchestrator', run: 'r', event, ok, ...(result ? { result } : {}) });
+  const [r] = summarizeRuns([ev(1, 'ci', false, 'timeout'), ev(2, 'ci', false, 'timeout'), ev(3, 'ci', false, 'stale'), ev(4, 'ci', false, 'failed'), ev(5, 'ci', false), ev(6, 'ci', true, 'passed')]);
+  assert.equal(r.waitingCommands, 3);
+  assert.deepEqual(r.failedCommands, ['ci', 'ci'], 'a real failure and a legacy entry with no result');
 });
