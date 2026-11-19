@@ -75,8 +75,10 @@ function checkPath(p) {
 export const sbplString = (s) => {
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f]/.test(s)) throw new Error('control character in SBPL string');
+  if (String(s).length > SBPL_MAX) throw new Error(`SBPL string longer than ${SBPL_MAX} characters`);
   return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 };
+const SBPL_MAX = 1000; // sandbox-exec fails to parse string literals of ~1024+ characters
 const subpath = (p) => `(subpath ${sbplString(p)})`;
 const literal = (p) => `(literal ${sbplString(p)})`;
 
@@ -90,6 +92,7 @@ export const CREDENTIAL_PATHS = Object.freeze([
   '.ssh', '.aws', '.config/gh', '.netrc', '.git-credentials', '.npmrc', '.yarnrc', '.yarnrc.yml', '.docker', '.kube', '.config/gcloud',
   '.config/git', '.gitconfig', '.azure', '.pypirc', '.cargo/credentials', '.cargo/credentials.toml', '.gem/credentials', '.gnupg',
   'Library/Keychains', 'Library/Application Support', 'Library/Cookies', 'Library/Mail', 'Library/Messages', '.claude', '.claude.json',
+  '.local/share/pnpm/rc',
   '.codex', '.mcp-auth', '.fly', '.zsh_history', '.bash_history', '.zsh_sessions', '.zshenv', '.viminfo',
 ]);
 // Relative to each home: toolchains that node/npm/python/rust builds may need to READ. Missing ones are skipped. Override with `readAllow`.
@@ -100,12 +103,28 @@ export const TOOLCHAIN_PATHS = Object.freeze([
 // Toolchain layouts a node prefix under a home may live in (then the whole prefix is allowed, minus credential names).
 const NODE_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.asdf', '.pyenv', '.bun', '.cargo', '.rustup'];
 
-// Basenames denied anywhere under an allowed read dir (toolchains, node prefix, npm, corepack). SBPL regex has no (?i), so every letter
-// becomes a [xX] class: APFS is case-insensitive and a file named NPMRC is the same credential.
-// Suffixed copies (npmrc.bak, .env.local, credentials.toml, tokens.json) count as the same credential.
-const CRED_BASENAMES = String.raw`(\.?npmrc[^/]*|\.yarnrc[^/]*|[._]?netrc[^/]*|\.git-credentials[^/]*|\.pypirc[^/]*|pip\.(conf|ini)[^/]*|rc|auth\.(ini|json)[^/]*|bunfig\.toml[^/]*|[^/]*\.(key|pem|p12|pfx)|tokens?([._-][^/]*)?|\.env([._-][^/]*)?|credentials[^/]*|id_[a-z0-9_]+[^/]*)`;
-const caseFold = (re) => re.replace(/\\.|\[[^\]]*\]|[a-zA-Z]/g, (m) => (m.length === 1 ? `[${m.toLowerCase()}${m.toUpperCase()}]` : m));
-const credNameRegex = (dir) => `(regex #"^${regexEscape(dir)}/(.*/)?${caseFold(CRED_BASENAMES)}$")`;
+// EXACT credential basenames denied (as regular files only) anywhere under an allowed read dir: toolchains, the node prefix, npm,
+// corepack. No prefix patterns: `token*` once hid npm's tokenize.js, syn's token.rs and Python's token.py, and SBPL misparses a class with
+// a trailing dash ([._-]). Backup copies of these exact names (.bak .orig ~ .swp .old) count too. Residual (accepted): a secret stored
+// under another name inside a toolchain dir stays readable. `.envrc` is deliberately readable (direnv script, not a credential store).
+export const CRED_EXACT_NAMES = Object.freeze(['.npmrc', 'npmrc', '.yarnrc', '.yarnrc.yml', '.pypirc', 'pip.conf', 'pip.ini', '.netrc', '_netrc',
+  'auth.json', 'auth.ini', 'credentials', 'credentials.toml', 'credentials.json', '.git-credentials', '.env', '.env.local', '.env.production',
+  '.env.development', '.env.staging', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'bunfig.toml']);
+const CRED_SUFFIXES = ['.bak', '.orig', '~', '.swp', '.old'];
+const reLit = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// SBPL regex has no (?i): every letter becomes [xX]; letter RANGES inside a class are folded too ([a-z] -> [a-zA-Z]).
+export const caseFold = (re) => re.replace(/\\.|\[[^\]]*\]|[a-zA-Z]/g, (m) => {
+  if (m.startsWith('\\')) return m;
+  if (m.startsWith('[')) return m.replace(/([a-z])-([a-z])|([A-Z])-([A-Z])/g, (r, a, b, c, d) => (a ? `${a}-${b}${a.toUpperCase()}-${b.toUpperCase()}` : `${c}-${d}${c.toLowerCase()}-${d.toLowerCase()}`));
+  return `[${m.toLowerCase()}${m.toUpperCase()}]`;
+});
+// One short regex per name: SBPL rejects string literals over ~1024 characters ("Error reading string"), and the case-folded
+// alternation of all names exceeded that under a long toolchain path.
+export function credNameRegexBodies(dir) {
+  const suffixes = CRED_SUFFIXES.map(reLit).join('|');
+  return CRED_EXACT_NAMES.map((n) => `^${regexEscape(dir)}/(.*/)?${caseFold(`${reLit(n)}(${suffixes})?`)}$`);
+}
+const credNameRule = (dir) => credNameRegexBodies(dir).map((b) => `(require-all (regex #"${b}") (vnode-type REGULAR-FILE))`).join(' ');
 
 // os.userInfo().homedir AND $HOME when they differ (a planted HOME must not move the deny away from the real home).
 export function homeDirs(env = process.env) {
@@ -142,6 +161,7 @@ export const MACH_ALLOW = Object.freeze([
 const within = (child, parent) => child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`);
 const regexEscape = (s) => {
   if (s.includes('"')) throw new Error(`path cannot be used in an SBPL regex: ${s}`);
+  if (s.length > SBPL_MAX - 200) throw new Error(`path too long for an SBPL regex: ${s.slice(0, 60)}...`);
   return s.replace(/[.*+?^${}()|[\]\\/]/g, (c) => (c === '/' ? '/' : `\\${c}`));
 };
 const sameFile = (a, b) => { try { const x = fs.statSync(a), y = fs.statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
@@ -168,7 +188,7 @@ function networkRules(network) {
 //  - P outside every deny root (e.g. /opt/homebrew/Cellar/node/X, /usr/local)      -> allow P
 //  - P inside a home's toolchain layout (~/.nvm, ~/.volta, ~/.fnm, ~/.asdf, ...)      -> allow P
 //  - anything else (e.g. ~/opt/node, ~/bin)  -> allow only P/bin/{node,npm,npx,corepack} (literal) and P/lib/node_modules/{npm,corepack}
-// Credential names under every allowed subpath stay denied (credNameRegex).
+// Exact credential names under every allowed subpath stay denied (credNameRule).
 export function nodeReadPaths({ nodePaths = defaultNodePaths(), homes = homeDirs(), denyRoots = [] } = {}) {
   const subpaths = [], literals = [];
   for (const b of nodePaths) {
@@ -228,7 +248,7 @@ export function sandboxProfile({
   for (const p of [...wr, ...readAllowAll, ...node.literals]) for (const a of ancestorsOf(p)) ancestors.add(a);
   const historyRegex = homes.map((h) => `(regex #"^${regexEscape(h)}/\\.[^/]*_history$")`);
   // Credential-named files INSIDE an allowed toolchain dir (found by probe: ~/.nvm/.npmrc, a pnpm auth.json) stay denied too.
-  const toolchainCreds = readAllowAll.map(credNameRegex);
+  const toolchainCreds = readAllowAll.map(credNameRule);
   const lines = [
     '(version 1)',
     `; factory-tmpdir: ${tmp ?? ''}`,

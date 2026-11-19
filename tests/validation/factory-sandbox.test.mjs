@@ -104,7 +104,8 @@ test('gitSafe second layer (allowlist bypassed with verified:true): repo-configu
   G.gitSafeOpts(repo, ['-C', repo, 'diff'], v); // the guard finds the subcommand after global options
   G.gitSafeOpts(repo, ['--no-pager', 'blame', 'a.txt'], v);
   G.gitSafeOpts(repo, ['log', '-p', '-1'], v);
-  G.gitSafeOpts(repo, ['ls-remote', `ext::${script('ext')}`], v);
+  G.gitSafeOpts(repo, ['ls-remote', `ext::${script('ext')}`], { ...v, unsafeAllowLocalUrls: true }); // the arg check alone would refuse ext::
+  assert.throws(() => G.gitSafeOpts(repo, ['ls-remote', `ext::${script('ext')}`], v), /git URL not allowed: argument 1/);
   for (const n of ['fsmon', 'extdiff', 'ext', 'textconv']) assert.equal(fs.existsSync(mk(n)), false, `${n} ran under gitSafe`);
   git(repo, 'diff'); // control: plain git honours the planted diff.external
   assert.equal(fs.existsSync(mk('extdiff')), true, 'control: plain git should run diff.external');
@@ -116,7 +117,7 @@ test('gitSafe: repo-configured core.sshCommand is replaced by plain ssh', (t) =>
   git(repo, 'config', 'core.sshCommand', f);
   assert.throws(() => G.gitSafe(repo, 'status'), /git config not allowed: core\.sshcommand/);
   // Port 1 on loopback: ssh fails immediately with connection refused; nothing leaves the machine.
-  const r = G.gitSafeOpts(repo, ['ls-remote', 'ssh://git@127.0.0.1:1/x.git'], { verified: true });
+  const r = G.gitSafeOpts(repo, ['ls-remote', 'ssh://git@127.0.0.1:1/x.git'], { verified: true, unsafeAllowLocalUrls: true });
   assert.notEqual(r.code, 0);
   assert.equal(fs.existsSync(marker), false, 'gitSafe ran the repo-configured ssh command');
 });
@@ -623,7 +624,7 @@ test('second layer: credential.helper and core.askPass never run on an HTTP 401'
   const srv = spawn(process.execPath, ['-e', "require('http').createServer((q,s)=>{s.writeHead(401,{'WWW-Authenticate':'Basic realm=x'});s.end()}).listen(0,'127.0.0.1',function(){console.log(this.address().port)})"], { stdio: ['ignore', 'pipe', 'ignore'] });
   t.after(() => srv.kill('SIGKILL'));
   const port = await new Promise((res) => srv.stdout.once('data', (d) => res(String(d).trim())));
-  const r = G.gitSafeOpts(repo, ['ls-remote', `http://127.0.0.1:${port}/x.git`], { ...v, timeout: 20000 });
+  const r = G.gitSafeOpts(repo, ['ls-remote', `http://127.0.0.1:${port}/x.git`], { ...v, timeout: 20000, unsafeAllowLocalUrls: true });
   assert.notEqual(r.code, 0);
   assert.equal(ran(mk, 'cred') || ran(mk, 'askpass'), false);
   spawnSync('git', ['ls-remote', `http://127.0.0.1:${port}/x.git`], { cwd: repo, env: G.gitEnv(), stdio: 'ignore', timeout: 20000 });
@@ -639,6 +640,7 @@ test('second layer: core.attributesFile cannot select a clean filter; core.exclu
   G.gitSafeOpts(repo, ['add', 'a.txt'], v);
   assert.equal(ran(mk, 'clean'), false);
   assert.match(G.gitSafeOpts(repo, ['status', '--porcelain'], v).out, /\?\? hidden\.txt/);
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'changed again for the control\n'); // new content: git cannot skip the filter via the stat cache
   git(repo, 'add', 'a.txt');
   assert.equal(ran(mk, 'clean'), true, 'control: plain git runs the clean filter selected by core.attributesFile');
 });
@@ -700,10 +702,10 @@ test('N2 sandbox fs: credential-named files inside default toolchain dirs (incl.
   const put = (rel, body = 'CRED\n') => { fs.mkdirSync(path.dirname(path.join(H, rel)), { recursive: true }); fs.writeFileSync(path.join(H, rel), body); return rel; };
   const creds = ['.nvm/versions/node/v1/etc/npmrc', '.nvm/versions/node/v1/lib/node_modules/x/.npmrc', '.cargo/registry/index/x/credentials.toml',
     '.volta/tools/image/x/auth.json', '.local/share/pnpm/rc', '.local/share/pnpm/auth.ini', '.pyenv/pip.conf', '.pyenv/pip.ini', '.bun/bunfig.toml',
-    '.bun/install/global/.npmrc', '.asdf/.env', '.asdf/.env.local', '.rustup/tls/server.key', '.rustup/tls/cert.pem', '.rustup/tls/id.p12', '.fnm/token',
-    '.fnm/tokens', '.volta/credentials', '.volta/credentials.json', '.nvm/_netrc', '.nvm/.netrc', '.nvm/versions/node/v1/etc/NPMRC', '.pyenv/Pip.Conf',
-    '.nvm/versions/node/v1/lib/node_modules/x/npmrc.bak', '.asdf/x/.env-prod', '.bun/tokens.json', '.rustup/id_ed25519.pub',
-    '.local/bin/deploy.sh'].map((c) => put(c));
+    '.bun/install/global/.npmrc', '.asdf/.env', '.asdf/.env.local', '.asdf/.env.production', '.volta/credentials', '.volta/credentials.json',
+    '.nvm/_netrc', '.nvm/.netrc', '.nvm/versions/node/v1/etc/NPMRC', '.pyenv/Pip.Conf', '.nvm/versions/node/v1/lib/node_modules/x/npmrc.bak',
+    '.nvm/x/.npmrc.orig', '.nvm/x/credentials.toml~', '.nvm/x/.env.swp', '.nvm/x/auth.json.old', '.rustup/id_ed25519', '.rustup/ID_RSA', '.nvm/x/.yarnrc.yml',
+    '.nvm/x/.git-credentials', '.nvm/x/.pypirc', '.local/bin/deploy.sh'].map((c) => put(c));
   put('.nvm/versions/node/v1/lib/node_modules/x/index.js', 'module.exports=1\n');
   const r = await sb(w, `out({ creds: JSON.parse(A[1]).map(c=>t(()=>fs.readFileSync(path.join(A[0],c),'utf8'))),
     ok: t(()=>fs.readFileSync(path.join(A[0],'.nvm/versions/node/v1/lib/node_modules/x/index.js'),'utf8')) })`,
@@ -766,5 +768,113 @@ test('minor gitSafe: git killed by an outside signal (no timeout, no error) thro
   const tag = `sigprobe${rnd()}`;
   const killer = spawn('/bin/sh', ['-c', `p=127.0.0.1:${port}; sleep 1; pkill -KILL -f "$p/${tag}"`], { stdio: 'ignore', detached: true });
   t.after(() => { try { process.kill(-killer.pid, 'SIGKILL'); } catch { /* done */ } });
-  assert.throws(() => G.gitSafeOpts(repo, ['ls-remote', `http://127.0.0.1:${port}/${tag}`], { timeout: 30000 }), /^Error: git ls-remote was killed by SIGKILL$/);
+  assert.throws(() => G.gitSafeOpts(repo, ['ls-remote', `http://127.0.0.1:${port}/${tag}`], { timeout: 30000, unsafeAllowLocalUrls: true }), /^Error: git ls-remote was killed by SIGKILL$/);
+});
+
+// ---- fix round 3: exact credential names (no prefix patterns), near-miss readability, real toolchain layouts ---------------------
+const NEAR_MISS = ['.envrc', '.envX', '.environment', '.env-prod', 'environment.js', 'tokenize.js', 'tokenizer.js', 'token.js', 'tokens.js', 'token.rs', 'token.py',
+  'tokenize.py', 'tokens/list.js', 'token/index.js', 'rc', 'rc.js', 'rcfile', 'rcedit', 'node_modules/rc/index.js', 'credentialsX', 'credentials-foo', 'npmrcX',
+  'npmrc-backup', 'id_rsa_tool.js', 'id_rsa.pub', 'id_x/y.js', 'server.key', 'cert.pem', 'id.p12', 'a.keys', 'pip.config', 'auth.json.d/x', '.env/x', 'credentials/inner.txt',
+  'npmrc.bak.js', 'monkey', 'x-y.z~', 'xnpmrc', 'pipXconf', 'id_rsaXbak', '_env'];
+
+test('R3 sandbox fs: near-miss names in toolchain dirs stay READABLE; directories named like credentials stay usable', { skip: SKIP }, async (t) => {
+  const w = world(t); const H = fakeHome(t);
+  for (const n of NEAR_MISS) { const f = path.join(H, '.nvm/x', n); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, 'S'); }
+  const r = await sb(w, `out({ reads: JSON.parse(A[1]).map(n=>t(()=>fs.readFileSync(path.join(A[0],n),'utf8'))),
+    statRc: t(()=>fs.statSync(path.join(A[0],'node_modules/rc')).isDirectory()), listCred: t(()=>fs.readdirSync(path.join(A[0],'credentials')).join()) })`,
+  { args: [path.join(H, '.nvm/x'), JSON.stringify(NEAR_MISS)], profile: profileOf(w, 'none', { home: H }) });
+  assert.deepEqual(Object.fromEntries(NEAR_MISS.map((n, i) => [n, r.reads[i]])), Object.fromEntries(NEAR_MISS.map((n) => [n, 'S'])));
+  assert.equal(r.statRc, true); assert.equal(r.listCred, 'inner.txt');
+});
+
+test('R3 sandbox fs: real toolchain layouts work (nvm npm tokenize.js via require, cargo syn token.rs, pyenv token.py/tokenize.py)', { skip: SKIP }, async (t) => {
+  const w = world(t); const H = fakeHome(t);
+  const put = (rel, body) => { const f = path.join(H, rel); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, body); return f; };
+  const tok = put('.nvm/versions/node/v20.0.0/lib/node_modules/npm/node_modules/postcss-selector-parser/dist/tokenize.js', 'module.exports = "TOKENIZE";\n');
+  put('.nvm/versions/node/v20.0.0/lib/node_modules/npm/lib/commands/token.js', 'module.exports = "TOKENCMD";\n');
+  const rs = put('.cargo/registry/src/index.crates.io-6f17d22bba15001f/syn-2.0.87/src/token.rs', '// token.rs\n');
+  const py = put('.pyenv/versions/3.12.1/lib/python3.12/token.py', '# token\n'); const py2 = put('.pyenv/versions/3.12.1/lib/python3.12/tokenize.py', '# tokenize\n');
+  const cred = put('.nvm/versions/node/v20.0.0/etc/npmrc', '//r/:_authToken=FAKE\n');
+  const r = await sb(w, `out({ req: t(()=>require(A[0])), cmd: t(()=>require(A[1])), rs: t(()=>fs.readFileSync(A[2],'utf8')), py: t(()=>fs.readFileSync(A[3],'utf8')),
+    py2: t(()=>fs.readFileSync(A[4],'utf8')), cred: t(()=>fs.readFileSync(A[5],'utf8')) })`,
+  { args: [tok, tok.replace(/node_modules\/postcss-selector-parser\/dist\/tokenize\.js$/, 'lib/commands/token.js'), rs, py, py2, cred], profile: profileOf(w, 'none', { home: H }) });
+  assert.deepEqual(r, { req: 'TOKENIZE', cmd: 'TOKENCMD', rs: '// token.rs\n', py: '# token\n', py2: '# tokenize\n', cred: 'EPERM' });
+});
+
+const NVM_NODE = (() => { try { const d = path.join(os.userInfo().homedir, '.nvm', 'versions', 'node'); const v = fs.readdirSync(d).sort().pop(); const n = path.join(d, v, 'bin', 'node'); return fs.existsSync(n) ? n : null; } catch { return null; } })();
+test('R3 sandbox: the real ~/.nvm node runs npm (npm ls / install of a local package) inside the sandbox (read-only use of the real home)', { skip: SKIP || (!NVM_NODE && 'no ~/.nvm node installed') }, async (t) => {
+  const w = world(t);
+  const dep = path.join(w.work, 'dep'); fs.mkdirSync(path.join(dep, 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(dep, 'package.json'), JSON.stringify({ name: 'dep', version: '1.0.0', main: 'lib/tokenize.js' }));
+  fs.writeFileSync(path.join(dep, 'lib', 'tokenize.js'), 'module.exports = "DEP-TOKENIZE";\n');
+  fs.writeFileSync(path.join(w.work, 'package.json'), JSON.stringify({ name: 'app', version: '1.0.0', dependencies: { dep: 'file:./dep' } }));
+  const npmCli = path.join(path.dirname(path.dirname(NVM_NODE)), 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const env = { ...P.allowEnv(null), PATH: `${path.dirname(NVM_NODE)}:/usr/bin:/bin`, npm_config_cache: path.join(w.tmpDir, 'npm-cache'), npm_config_update_notifier: 'false' };
+  const prof = profileOf(w, 'none', { nodePaths: [NVM_NODE] });
+  const i = await S.runSandboxed([NVM_NODE, npmCli, 'install', '--no-audit', '--no-fund', '--offline'], { cwd: w.work, env, profile: prof, timeoutS: 120 });
+  assert.equal(i.code, 0, i.tail);
+  const l = await S.runSandboxed([NVM_NODE, npmCli, 'ls'], { cwd: w.work, env, profile: prof, timeoutS: 60 });
+  assert.equal(l.code, 0, l.tail);
+  const q = await S.runSandboxed([NVM_NODE, '-e', 'process.exit(require("dep")==="DEP-TOKENIZE"?0:3)'], { cwd: w.work, env, profile: prof, timeoutS: 30 });
+  assert.equal(q.code, 0, q.tail);
+});
+
+test('R3 credential-name regex text: exact names, suffix forms, letter ranges folded (case-sensitive check of the generated text)', () => {
+  const bodies = S.credNameRegexBodies('/h/.nvm');
+  for (const body of bodies) {
+    assert.ok(!/\[[^\]]*-\]/.test(body), 'no trailing-dash class (SBPL misparses it)');
+    assert.ok(body.length < 1000, 'SBPL string literal limit');
+  }
+  assert.equal(S.caseFold('[a-z0-9_]'), '[a-zA-Z0-9_]', 'letter ranges inside classes are folded');
+  // JS reads the same subset (anchors, groups, alternation, folded [xX] classes)
+  const re = { test: (p) => bodies.some((b) => new RegExp(b).test(p)) };
+  for (const p of ['/h/.nvm/.npmrc', '/h/.nvm/a/b/NPMRC', '/h/.nvm/ID_RSA', '/h/.nvm/id_ed25519', '/h/.nvm/Credentials.TOML.bak', '/h/.nvm/.env.Production', '/h/.nvm/auth.json~',
+    '/h/.nvm/x/.git-credentials.swp', '/h/.nvm/pip.ini.old', '/h/.nvm/_netrc', '/h/.nvm/bunfig.toml.orig']) assert.ok(re.test(p), p);
+  for (const n of NEAR_MISS) assert.ok(!re.test(`/h/.nvm/${n}`), n);
+  assert.ok(!re.test('/h/.nvmx/.npmrc') && !re.test('/other/.npmrc'));
+});
+
+test('R3 gitSafe: http.followRedirects=false; positional network URLs pass the same host check (unsafeAllowLocalUrls for tests only)', (t) => {
+  const repo = repoWithCommit(t);
+  assert.ok(G.GIT_SAFE_FLAGS.includes('http.followRedirects=false'));
+  for (const [args, bad] of [[['ls-remote', 'https://127.0.0.1/x'], true], [['fetch', 'git@10.0.0.1:a/b'], true], [['clone', 'file:///tmp/x', 'y'], true],
+    [['pull', 'https://metadata.google.internal/x'], true], [['push', 'ssh://git@localhost./a', 'main'], true], [['remote', 'add', 'o', 'https://192.168.1.2/x'], true],
+    [['ls-remote', 'https://169.254.169.254/latest'], true], [['fetch', 'http://example.com/x.git'], true], [['ls-remote', '--', 'https://10.1.1.1/x'], true]]) {
+    assert.throws(() => G.gitSafeOpts(repo, args, { timeout: 5000 }), /git URL not allowed/, args.join(' '));
+  }
+  assert.doesNotThrow(() => G.checkNetworkArgs(['ls-remote', 'https://github.com/example/repo.git', 'HEAD']));
+  assert.doesNotThrow(() => G.checkNetworkArgs(['show', 'HEAD:a.txt']));
+  assert.doesNotThrow(() => G.checkNetworkArgs(['ls-remote', 'https://127.0.0.1/x'], { unsafeAllowLocalUrls: true }));
+});
+
+test('R3 publicHost: localdomain, internal, home.arpa, local, localhost names and metadata hosts are refused', () => {
+  for (const h of ['localhost.localdomain', 'x.localdomain', 'metadata.google.internal', 'svc.internal', 'router.home.arpa', 'printer.local', 'a.localhost', 'LOCALHOST.', 'Foo.Internal.',
+    'localhost..', 'a..b.com', 'ip6-localhost', '127.0.0.1.nip.io', 'x.10.0.0.1.sslip.io']) {
+    assert.equal(G.publicHost(h), false, h);
+  }
+  for (const h of ['github.com', 'internal.example.com', 'local.example.org', 'arpa.example.net', 'cafe.babe', '1password.com', 'v1.2.example.com']) assert.equal(G.publicHost(h), true, h);
+});
+
+test('R3 sandboxProfile: a long toolchain path still yields a parseable profile; over-long paths are refused clearly', { skip: SKIP }, async (t) => {
+  const w = world(t);
+  const deep = path.join(w.fh, 'work', 'wt', 'x'.repeat(120), 'y'.repeat(120), 'toolchain'); fs.mkdirSync(deep, { recursive: true });
+  const prof = profileOf(w, 'none', { readAllow: [deep] });
+  assert.equal((await S.runSandboxed(['/usr/bin/true'], { cwd: w.work, profile: prof })).code, 0);
+  assert.throws(() => S.sbplString('z'.repeat(1001)), /longer than 1000/);
+});
+
+test('R3 addendum gitSafe: positional args of network commands are remote names, refspecs or checked https/ssh URLs; scp-like forms are refused', (t) => {
+  const bad = [['fetch', '127.0.0.1:path'], ['fetch', 'localhost:path'], ['ls-remote', '[::1]:path'], ['clone', 'git@127.0.0.1:o/r', 'dst'], ['pull', 'host:path'],
+    ['push', 'git@github.com:o/r.git', 'main'], ['fetch', 'https://127.0.0.1/x'], ['fetch', 'http://example.com/x'], ['fetch', 'file:///tmp/x'], ['fetch', '/tmp/repo'],
+    ['fetch', './repo'], ['fetch', 'origin', 'x:y'], ['fetch', 'origin', 'main:main'], ['clone', '/tmp/src', 'dst'], ['fetch', '--upload-pack=x:y', 'origin'], ['fetch', 'origin', 'a b']];
+  for (const args of bad) {
+    assert.throws(() => G.checkNetworkArgs(args), (e) => /^git URL not allowed: argument \d+$/.test(e.message) && !e.message.includes(args.at(-1)), args.join(' '));
+  }
+  const good = [['fetch', 'origin'], ['fetch', 'origin', '+refs/heads/*:refs/remotes/origin/*'], ['push', 'origin', 'HEAD:refs/heads/x'], ['push', 'origin', 'refs/heads/a:refs/heads/b'],
+    ['fetch', 'origin', 'refs/heads/main'], ['fetch', 'origin', 'feature/x'], ['fetch', '--prune', 'origin'], ['ls-remote', 'https://github.com/o/r.git'],
+    ['ls-remote', 'ssh://git@github.com/o/r.git', 'HEAD'], ['clone', 'https://github.com/o/r.git', 'dst'], ['clone', 'https://github.com/o/r.git', '/tmp/abs/dst'],
+    ['push', 'origin', ':refs/heads/old'], ['remote', 'add', 'up', 'https://gitlab.com/a/b.git'], ['fetch', 'origin', 'v1.2.3']];
+  for (const args of good) assert.doesNotThrow(() => G.checkNetworkArgs(args), args.join(' '));
+  const repo = repoWithCommit(t);
+  assert.throws(() => G.gitSafe(repo, 'fetch', '127.0.0.1:path'), /^Error: git URL not allowed: argument 1$/);
 });

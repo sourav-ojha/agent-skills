@@ -18,7 +18,8 @@ export const GIT_SAFE_FLAGS = Object.freeze([
   '-c', 'gpg.program=false', '-c', 'commit.gpgSign=false', // no signing program
   '-c', 'credential.helper=', '-c', 'core.askPass=', // no credential helper or askpass program
   '-c', 'core.attributesFile=/dev/null', '-c', 'core.excludesFile=/dev/null',
-  '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', // auto-gc / maintenance never runs inside a driver git call
+  '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
+  '-c', 'http.followRedirects=false', // an allowed public remote cannot redirect the driver to a private/metadata address // auto-gc / maintenance never runs inside a driver git call
   // `-c diff.external=` is NOT used: git 2.52 then tries to exec "" and every `git diff` dies ("cannot run :"). Config cannot be unset
   // with -c, so diff-producing commands get --no-ext-diff --no-textconv instead (DIFF_GUARD below).
 ]);
@@ -48,8 +49,11 @@ const urlHost = (u) => (/^(?:https|ssh):\/\/(?:[^@/]+@)?([^/:]+)/.exec(u) ?? /^[
 // short forms like 127.1). Private ranges are numeric too, so every 10.*, 172.16-31.*, 192.168.*, 169.254.*, 0.0.0.0 is covered;
 // IPv6 literals ([::1], [fe80::], [fd00::]) cannot pass SAFE_URL's host pattern. A NAME that resolves privately (DNS rebinding) is not caught.
 export function publicHost(host) {
-  const h = String(host).toLowerCase().replace(/\.$/, '');
-  if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) return false;
+  const h = String(host).toLowerCase().replace(/\.+$/, '');
+  if (!h || h.split('.').includes('')) return false; // empty labels (a..b)
+  if (['ip6-localhost', 'ip6-loopback'].includes(h)) return false;
+  if (/(^|\.)\d+\.\d+\.\d+\.\d+(\.|$)/.test(h)) return false; // embedded dotted IPv4 (127.0.0.1.nip.io, 10.0.0.1.sslip.io)
+  if (h === 'localhost' || /\.(localhost|local|localdomain|internal|home\.arpa)$/.test(h) || h === 'localhost.localdomain') return false;
   if (/^[0-9.]+$/.test(h) || /^0x[0-9a-f]+$/.test(h) || h.split('.').some((l) => /^0x[0-9a-f]*$/.test(l)) || /^[0-9a-fx.]+$/.test(h) && /\d$/.test(h)) return false;
   return true;
 }
@@ -138,11 +142,50 @@ export function verifyGitConfig(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS
 
 // gitSafeOpts(cwd, args, { timeout, verified }): `verified: true` skips the config listing; pass it only within one call chain right
 // after a verified call on the same cwd.
-export function gitSafeOpts(cwd, args, { timeout = DEFAULT_TIMEOUT_MS, verified = false } = {}) {
+// Positional arguments of network commands. git treats ANY argument with a ':' whose part before the first ':' has no '/' as an
+// scp-like remote (127.0.0.1:path, host:path, [::1]:path), so every positional (and every --opt=value) must be one of:
+//   a remote/branch/ref name   [A-Za-z0-9_*][A-Za-z0-9._/*-]*  (no ':', no leading '/', '.' or '-': never a local path)
+//   a refspec                  [+][<HEAD|refs/...|name>]:refs/...
+//   an https:// or ssh:// URL  passing SAFE_URL + publicHost
+// scp-like URLs are refused outright (the driver always uses configured remote names); `clone` may end with a destination path
+// without ':'. Errors name the argument INDEX only. DNS-resolve-before-fetch is NOT done (a public name resolving privately passes).
+// `unsafeAllowLocalUrls` exists for tests against a local server ONLY.
+const NET_CMDS = new Set(['fetch', 'ls-remote', 'clone', 'pull', 'push', 'remote', 'archive', 'submodule']);
+const NAMEISH = /^[A-Za-z0-9_*][A-Za-z0-9._/*-]*$/;
+const REFSPEC = /^\+?(HEAD|refs\/[A-Za-z0-9._/*-]*|[A-Za-z0-9_*][A-Za-z0-9._/*-]*)?:refs\/[A-Za-z0-9._/*-]+$/;
+function argAllowed(a) {
+  if (/^(https|ssh):\/\//.test(a)) return SAFE_URL.test(a) && publicHost(urlHost(a));
+  if (a.includes('://')) return false;
+  if (a.includes(':')) return REFSPEC.test(a);
+  return NAMEISH.test(a.replace(/^\+/, ''));
+}
+export function checkNetworkArgs(rest, { unsafeAllowLocalUrls = false } = {}) {
+  if (!NET_CMDS.has(rest[0]) || unsafeAllowLocalUrls) return; // the unsafe flag skips the whole check (tests only)
+  const positional = [];
+  for (let i = 1; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--') continue;
+    if (a.startsWith('-')) {
+      const eq = a.indexOf('=');
+      if (eq > 0 && !argAllowed(a.slice(eq + 1)) && /[:/]/.test(a.slice(eq + 1))) throw new Error(`git URL not allowed: argument ${i}`);
+      continue;
+    }
+    positional.push(i);
+  }
+  for (const i of positional) {
+    const a = rest[i];
+    if (argAllowed(a)) continue;
+    if (rest[0] === 'clone' && i === positional.at(-1) && positional.length > 1 && !a.includes(':')) continue; // destination directory
+    throw new Error(`git URL not allowed: argument ${i}`);
+  }
+}
+
+export function gitSafeOpts(cwd, args, { timeout = DEFAULT_TIMEOUT_MS, verified = false, unsafeAllowLocalUrls = false } = {}) {
   if (typeof cwd !== 'string' || !cwd) throw new Error('gitSafe: cwd is required');
   if (!Array.isArray(args)) throw new Error('gitSafe: args must be an array');
   for (const a of args) if (typeof a !== 'string') throw new Error('gitSafe: every argument must be a string');
   const { global, rest } = splitGlobal(args);
+  checkNetworkArgs(rest, { unsafeAllowLocalUrls });
   if (!verified) verifyGitConfig(cwd, { global, timeout });
   let argv = rest;
   if (DIFF_CMDS.has(rest[0])) argv = [rest[0], ...DIFF_GUARD, ...rest.slice(1)];
