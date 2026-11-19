@@ -36,6 +36,9 @@ export const GIT_SAFE_FLAGS = Object.freeze([
   '-c', 'http.followRedirects=false', // an allowed public remote cannot redirect the driver to a private/metadata address
   '-c', 'protocol.file.allow=never', // no local-path / file:// transport (local transport also drops these -c flags for the other side)
   '-c', 'submodule.recurse=false', '-c', 'fetch.recurseSubmodules=false', // never recurse into submodule repos
+  // A planted commit-graph (objects/info/commit-graph[s]) can carry false parents / generations and so falsify merge-base and
+  // ancestry: never read one, never write one.
+  '-c', 'core.commitGraph=false', '-c', 'gc.writeCommitGraph=false', '-c', 'fetch.writeCommitGraph=false',
   // `-c diff.external=` is NOT used: git 2.52 then tries to exec "" and every `git diff` dies ("cannot run :"). Config cannot be unset
   // with -c, so diff-producing commands get --no-ext-diff --no-textconv instead (DIFF_GUARD below).
 ]);
@@ -105,7 +108,7 @@ const GLOBAL_WITH_VALUE = new Set(['-C', '--git-dir', '--work-tree']);
 const GLOBAL_FLAGS = new Set(['--no-pager', '-P', '--no-replace-objects', '--literal-pathspecs', '--no-optional-locks']);
 // Command-line only (never accepted in a repo's own config): the exact display pairs antigaming.mjs checkDiff passes on every call,
 // so checkDiff can run on gitSafe. Key case-insensitive, value exact.
-const CLI_ONLY = new Set(['core.quotepath=false', 'diff.suppressblankempty=false']);
+const CLI_ONLY = new Set(['core.quotepath=false', 'diff.suppressblankempty=false', 'core.commitgraph=false', 'gc.writecommitgraph=false', 'fetch.writecommitgraph=false']);
 const cliOnly = (kv) => { const eq = kv.indexOf('='); return eq > 0 && CLI_ONLY.has(`${kv.slice(0, eq).toLowerCase()}=${kv.slice(eq + 1)}`); };
 export function splitGlobal(args) {
   const global = [];
@@ -197,8 +200,11 @@ export function touchesWorktree(rest) {
 }
 // Repository-level redirections a builder could plant, checked in the git dir and the common dir: alternates (object store
 // elsewhere), info/grafts (rewrites parents: a planted `<base tip> <head>` makes merge-base return head, so a diff looks empty),
-// shallow (cuts history the same way) and per-worktree config. Throws `git worktree not safe: <file> present`.
-const PLANTED = [['objects', 'info', 'alternates'], ['objects', 'info', 'http-alternates'], ['info', 'grafts'], ['shallow'], ['config.worktree']];
+// shallow (cuts history the same way), commit-graph files (false parents; also ignored via core.commitGraph=false) and
+// per-worktree config. Throws `git worktree not safe: <file> present`.
+// objects/info/packs is not refused: it only lists packs for dumb http transport and never changes what an object id resolves to.
+const PLANTED = [['objects', 'info', 'alternates'], ['objects', 'info', 'http-alternates'], ['info', 'grafts'], ['shallow'], ['config.worktree'],
+  ['objects', 'info', 'commit-graph'], ['objects', 'info', 'commit-graphs']];
 export function checkRepoMetadata(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS } = {}) {
   const dirs = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...locationOf(global), 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], timeout);
   if (dirs.status !== 0) throw new Error('git worktree not safe: git dir unreadable');
@@ -206,6 +212,14 @@ export function checkRepoMetadata(cwd, { global = [], timeout = DEFAULT_TIMEOUT_
   if (!gitDir || !commonDir) throw new Error('git worktree not safe: git dir unreadable');
   const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
   for (const rel of PLANTED) for (const d of new Set([commonDir, gitDir])) if (exists(path.join(d, ...rel))) throw new Error(`git worktree not safe: ${rel.join('/')} present`);
+}
+// Throws when any refs/replace/* ref exists (loose, packed or reftable: listed by for-each-ref; a failing listing throws). gitSafe
+// itself ignores replace refs (GIT_NO_REPLACE_OBJECTS), so ordinary gitSafe calls do not need this; a checkout whose PLAIN git
+// (deliver's fetch, ciFiles, a person's own commands) would see swapped objects is refused where trust in it matters (merge gate).
+export function checkNoReplaceRefs(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS } = {}) {
+  const r = spawnGit(cwd, [...GIT_SAFE_FLAGS, ...locationOf(global), 'for-each-ref', '--format=%(refname)', 'refs/replace/'], timeout);
+  if (r.status !== 0) throw new Error('git repository not safe: refs unreadable');
+  if (r.stdout.trim()) throw new Error('git repository not safe: refs/replace present');
 }
 // Throws `git worktree not safe: <reason>` (an entry INDEX, never a path) on a gitlink, a .gitmodules or a nested .git.
 export function checkWorktreeSafe(cwd, { global = [], timeout = DEFAULT_TIMEOUT_MS, cap = WORKTREE_WALK_CAP } = {}) {

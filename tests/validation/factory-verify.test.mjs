@@ -1861,3 +1861,51 @@ test('T10 r1 M-1: a symlink at the config path on origin/<base> is unreadable, e
   assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /cannot be read/); assert.equal(mergeCalled(r), false);
   rm(r);
 });
+
+// ---- Task 10 fix round 2 ------------------------------------------------------------------------------------------------------------
+// git replace <real config blob> <forged blob>: plain git in this checkout would now read the forged policy.
+const forgeConfig = (r, cfg) => {
+  const real = g(r.work, 'rev-parse', 'refs/remotes/origin/main:.product/delivery.json');
+  const tmp = path.join(r.root, 'forged.json'); fs.writeFileSync(tmp, JSON.stringify(cfg));
+  const fake = g(r.work, 'hash-object', '-w', tmp);
+  g(r.work, 'replace', '-f', real, fake);
+  assert.match(g(r.work, 'show', 'refs/remotes/origin/main:.product/delivery.json'), /"required":false/, 'control: plain git sees the forged policy');
+};
+
+test('T10 r2: a refs/replace-forged base config (required:false) is ignored by the policy read; the preflight refuses refs/replace', () => {
+  const a = vship();
+  forgeConfig(a, { protected_branches: [], verification: { required: false } });
+  const x = merge(a); // ci_passed: still refused because the REAL base config requires verification
+  assert.equal(x.code, 1, x.out + x.err); assert.match(x.err, /verification is required/);
+  a.edit((f) => { f.state = 'verified'; });
+  arm(a);
+  const y = merge(a);
+  assert.equal(J(y)?.state, 'awaiting_human', y.out + y.err); assert.match(J(y).reason, /not a trusted clone/); assert.equal(mergeCalled(a), false);
+  assert.throws(() => GS.checkNoReplaceRefs(a.work), /refs\/replace present/);
+  assert.doesNotThrow(() => GS.checkRepoMetadata(a.work), 'ordinary gitSafe calls ignore replace refs instead (GIT_NO_REPLACE_OBJECTS)');
+  g(a.work, 'pack-refs', '--all'); // packed replace refs are found too
+  assert.ok(!fs.existsSync(path.join(gitDirOf(a), 'refs', 'replace', g(a.work, 'rev-parse', 'refs/remotes/origin/main:.product/delivery.json'))), 'control: the replace ref is packed now');
+  assert.throws(() => GS.checkNoReplaceRefs(a.work), /refs\/replace present/);
+  g(a.work, 'replace', '-d', g(a.work, 'rev-parse', 'refs/remotes/origin/main:.product/delivery.json'));
+  assert.doesNotThrow(() => GS.checkNoReplaceRefs(a.work));
+  rm(a);
+});
+
+test('T10 r2: commit-graphs are never read or written by gitSafe, and a planted one is refused', () => {
+  for (const kv of ['core.commitGraph=false', 'gc.writeCommitGraph=false', 'fetch.writeCommitGraph=false']) assert.ok(GS.GIT_SAFE_FLAGS.includes(kv), kv);
+  const r = vship();
+  for (const kv of ['core.commitGraph=false', 'gc.writeCommitGraph=false', 'fetch.writeCommitGraph=false']) assert.equal(GS.gitSafeOpts(r.work, ['-c', kv, 'rev-parse', 'HEAD'], { verified: true }).code, 0, `caller may pass ${kv}`);
+  assert.throws(() => GS.gitSafeOpts(r.work, ['-c', 'core.commitGraph=true', 'rev-parse', 'HEAD'], { verified: true }), /not allowed/);
+  r.edit((f) => { f.state = 'verified'; });
+  arm(r);
+  g(r.work, 'commit-graph', 'write', '--reachable');
+  assert.ok(fs.existsSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graph')));
+  assert.throws(() => GS.checkRepoMetadata(r.work), /objects\/info\/commit-graph present/);
+  assert.throws(() => GS.gitSafe(r.work, 'status'), /commit-graph present/);
+  const m = merge(r);
+  assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /not a trusted clone/); assert.equal(mergeCalled(r), false);
+  fs.rmSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graph'));
+  fs.mkdirSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graphs'));
+  assert.throws(() => GS.checkRepoMetadata(r.work), /commit-graphs present/);
+  rm(r);
+});

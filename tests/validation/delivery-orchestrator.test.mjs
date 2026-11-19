@@ -46,7 +46,7 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
   const gh = () => JSON.parse(fs.readFileSync(state, 'utf8'));
   const setGh = (fn) => { const s = gh(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };
-  return { root, origin, work, d, gh, setGh };
+  return { root, origin, work, d, gh, setGh, env };
 }
 
 // What the implementer would leave behind: commits on the feature branch and a spec that says delivery: complete.
@@ -268,9 +268,13 @@ test('merge guards: not authorised, T3, and CI-file changes all hold the PR for 
   t3ok.d('init', '--merge', '--note', 'ok', '--merge-t3');
   ship(t3ok, 'FEATURE-001', { tier: 'T3' });
   // Phase 1a: --merge-t3 is no longer enough on its own; a passing verdict for the exact commit is also needed (none exists yet).
-  const held = t3ok.d('merge', 'FEATURE-001');
-  assert.equal(held.json.state, 'awaiting_human');
-  assert.match(held.json.reason, /verdict/);
+  // The gate needs an allowlisted repo config (as in a driver clone), so the origin rewrite moves from the config to the process env.
+  sh(t3ok.work, 'config', '--unset', `url.${t3ok.origin}.insteadOf`);
+  const rw = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${t3ok.origin}.insteadOf`, GIT_CONFIG_VALUE_0: 'git@github.com:o/r.git' };
+  const x = spawnSync('node', [DELIVER, 'merge', 'FEATURE-001', '--dir', t3ok.work], { encoding: 'utf8', env: { ...t3ok.env, ...rw } });
+  const held = JSON.parse(x.stdout);
+  assert.equal(held.state, 'awaiting_human', x.stdout + x.stderr);
+  assert.match(held.reason, /no valid verification verdict for commit/, 'the verdict path itself is exercised, not the preflight');
 });
 
 test('merge guards: head changed after CI is stale; behind updates the branch; conflict blocks; branch protection holds', () => {

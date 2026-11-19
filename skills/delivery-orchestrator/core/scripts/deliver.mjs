@@ -16,7 +16,7 @@ import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
 import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios.mjs';
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
-import { gitSafeOpts, verifyGitConfig, checkRepoMetadata } from './lib/gitsafe.mjs';
+import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -237,16 +237,21 @@ function baseConfigHash(base) {
 }
 
 // The policy in force is the config committed on origin/<base> right now, never the queue's copy (the builder can edit that).
+// Read through gitSafe (GIT_* scrubbed, GIT_NO_REPLACE_OBJECTS, neutralising -c flags, raw exit codes): a planted refs/replace/* or
+// repo config in this checkout cannot swap the blob that decides verification.required. Only rev-parse / ls-tree / cat-file run here,
+// none of which runs a config-defined program, so the per-call config listing is skipped (verified: true) for interactive checkouts.
 function baseConfigNow(base) {
+  const og = (...a) => { try { return gitSafeOpts(root, a, { verified: true }); } catch { return { code: 1, out: '', err: '' }; } };
   // Fail closed: a ref that does not resolve is not "no config". Defaults apply only when the ref resolves and the file is genuinely absent.
-  if (git('rev-parse', '--verify', '--quiet', OR(base)).code !== 0) return null;
+  if (og('rev-parse', '--verify', '--quiet', `${OR(base)}^{commit}`).code !== 0) return null;
   // "Absent" only when ls-tree succeeds and lists nothing; any other failure, or anything but a regular file, is unreadable (null).
-  const t = git('ls-tree', '--full-tree', OR(base), '--', CONFIG_PATH);
+  const t = og('ls-tree', '--full-tree', '-z', OR(base), '--', CONFIG_PATH);
   if (t.code !== 0) return null;
   if (t.out === '') return parseConfig(undefined).config;
-  if (!/^100(644|755) blob [0-9a-f]{40,64}\t/.test(t.out)) return null;
-  const s = git('show', `${OR(base)}:${CONFIG_PATH}`);
-  if (s.code !== 0) return null;
+  const m = /^100(?:644|755) blob ([0-9a-f]{40,64})\t/.exec(t.out);
+  if (!m) return null;
+  const s = og('cat-file', 'blob', m[1]);
+  if (s.code !== 0 || s.out.length > 1024 * 1024) return null;
   try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; }
 }
 
@@ -599,9 +604,10 @@ C.push = () => {
 // refs (rev-parse, merge-base, ls-tree, cat-file, diff between two shas). `verified: true` skips the per-call config listing: the gate
 // runs gatePreflight() once first on the same cwd (config allowlist + planted repository metadata), as gitsafe requires.
 const rawGit = (...a) => gitSafeOpts(root, a, { verified: true });
-// Throws unless the checkout's config passes the gitsafe allowlist and no grafts / shallow / alternates / config.worktree exist.
+// Throws unless the checkout's config passes the gitsafe allowlist, no grafts / shallow / alternates / commit-graph / config.worktree
+// exist, and there is no refs/replace/* ref.
 // PRECONDITION (safety.md): merge with a verdict gate runs in a driver-owned clone the builder cannot write to.
-const gatePreflight = () => { verifyGitConfig(root); checkRepoMetadata(root); };
+const gatePreflight = () => { verifyGitConfig(root); checkRepoMetadata(root); checkNoReplaceRefs(root); };
 // The queue file is trusted only as a private regular file under FACTORY_HOME (by realpath: a sibling "fhome-x" or a link out does
 // not count), outside the repository, with FACTORY_HOME neither the repository nor an ancestor of it; one link, ours, not
 // group/other writable.
