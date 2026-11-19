@@ -47,7 +47,7 @@ export function inventory(sessions, installed = []) {
 // A resumed or forked session starts with a copy of its parent's transcript, so the same turns show up twice.
 // Drop, within one project, any entry an earlier session already holds (same timestamp and content). The skill
 // that was active at the fork point is kept as an inherited marker so the child's own work is not left unowned.
-const sig = (e) => JSON.stringify([e.ts, e.skill, e.usage, e.tool, e.error, e.bytes, e.fileKey, e.read && e.read.file]);
+const sig = (e) => JSON.stringify([e.ts, e.skill, e.usage, e.tool, e.error, e.bytes, e.tid, e.fileKey, e.read && e.read.file]);
 export function dedupeSessions(sessions) {
   const byProject = new Map();
   for (const s of sessions) { const a = byProject.get(s.project) || []; a.push(s); byProject.set(s.project, a); }

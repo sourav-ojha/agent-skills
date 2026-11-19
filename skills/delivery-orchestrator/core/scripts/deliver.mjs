@@ -158,6 +158,7 @@ function refresh(q) {
 }
 
 function block(q, f, reason) {
+  extra.blocked = true; // the run log must not file a command that blocked the feature (e.g. an exhausted CI budget, result 'timeout') as a wait
   transition(f, 'blocked', flat(reason));
   if (!clean()) git('stash', 'push', '-u', '-m', `delivery-orchestrator: partial work on ${f.id}`);
   git('checkout', q.base);

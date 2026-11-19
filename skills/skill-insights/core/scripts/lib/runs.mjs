@@ -37,8 +37,9 @@ export function summarizeRuns(events, { notes: withNotes = true } = {}) {
     evs.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     const count = (name) => evs.filter((e) => e.event === name).length;
     const notOk = evs.filter((e) => e.ok === false);
-    const waiting = notOk.filter((e) => WAITING.has(e.result));
-    const failed = notOk.filter((e) => !WAITING.has(e.result));
+    const isWait = (e) => WAITING.has(e.result) && e.blocked !== true; // a timeout that blocked the feature (budget used up) is a failure
+    const waiting = notOk.filter(isWait);
+    const failed = notOk.filter((e) => !isWait(e));
     const notes = !withNotes ? [] : evs.filter((e) => e.event === 'retro').map((e) => Object.fromEntries(NOTE_KEYS.filter((k) => e[k]).map((k) => [k, redactText(e[k])])));
     const init = evs.find((e) => e.event === 'init');
     return {

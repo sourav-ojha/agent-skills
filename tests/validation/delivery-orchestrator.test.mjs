@@ -240,6 +240,19 @@ test('the run log records the outcome word, so a CI wait is distinguishable from
   assert.equal(ci.result, 'timeout');
 });
 
+test('a CI timeout that exhausts the budget blocks the feature and the run log says so', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok', '--ci-budget', '1');
+  e.setGh((s) => { s.checkQueue = [[{ name: 'ci', bucket: 'pending' }]]; });
+  e.d('next'); build(e, 'FEATURE-001'); e.d('built', 'FEATURE-001', '--tier', 'T2'); e.d('pr', 'FEATURE-001', '--title', 'feat: thing here', '--body-file', body(e));
+  const r = spawnSync('node', [DELIVER, 'ci', 'FEATURE-001', '--interval', '0.2', '--grace', '0', '--timeout', '1.2', '--dir', e.work], { encoding: 'utf8', env: { ...e.env, SKILL_RUNLOG: 'on' } });
+  assert.equal(JSON.parse(r.stdout).state, 'blocked');
+  const log = fs.readFileSync(path.join(e.work, '.skill-runs', 'delivery-orchestrator.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const ci = log.filter((x) => x.event === 'ci').pop();
+  assert.equal(ci.result, 'timeout');
+  assert.equal(ci.blocked, true);
+});
+
 test('no CI at all: the run stops instead of merging unverified; --no-ci allows it explicitly', () => {
   const e = setup({ 'FEATURE-001': {}, 'FEATURE-002': {} });
   e.d('init', '--merge', '--note', 'ok');

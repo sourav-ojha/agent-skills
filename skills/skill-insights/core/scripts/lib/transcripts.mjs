@@ -27,11 +27,11 @@ export function parseSession(text) {
       for (const b of Array.isArray(m.content) ? m.content : []) {
         if (b.type !== 'tool_use') continue;
         if (b.name === 'Skill' && b.input?.skill) { mine.push({ ts, skill: String(b.input.skill) }); continue; }
-        const file = b.input?.file_path;
+        const file = b.input?.file_path ?? b.input?.notebook_path;
         const sk = typeof file === 'string' && b.name === 'Read' ? file.match(SKILL_PATH) : null;
         const key = typeof file === 'string' && (b.name === 'Read' || WRITERS.has(b.name)) ? fileKey(file) : null;
-        if (sk) mine.push({ ts, read: { skill: sk[1], file }, ...(key ? { fileKey: key } : {}) });
-        else mine.push({ ts, tool: String(b.name), ...(key ? { fileKey: key, ...(b.name === 'Read' ? {} : { wrote: true }) } : {}) });
+        if (sk) mine.push({ ts, read: { skill: sk[1], file }, ...(b.id ? { tid: String(b.id) } : {}), ...(key ? { fileKey: key } : {}) });
+        else mine.push({ ts, tool: String(b.name), ...(b.id ? { tid: String(b.id) } : {}), ...(key ? { fileKey: key, ...(b.name === 'Read' ? {} : { wrote: true }) } : {}) });
       }
       // After the tool blocks, so a Skill invocation's own tokens are charged to the skill it opens.
       if (m.usage) mine.push({ ts, usage: { in: num(m.usage.input_tokens), out: num(m.usage.output_tokens), cacheRead: num(m.usage.cache_read_input_tokens), cacheWrite: num(m.usage.cache_creation_input_tokens) } });
@@ -44,7 +44,7 @@ export function parseSession(text) {
       }
       if (pending && --pending.left <= 0) pending = null;
       for (const b of Array.isArray(m.content) ? m.content : []) {
-        if (b.type === 'tool_result') mine.push({ ts, bytes: size(b.content), ...(b.is_error ? { error: true } : {}) });
+        if (b.type === 'tool_result') mine.push({ ts, bytes: size(b.content), ...(b.tool_use_id ? { tid: String(b.tool_use_id) } : {}), ...(b.is_error ? { error: true } : {}) });
       }
     }
     if (o.type === 'assistant' && m.id) {
