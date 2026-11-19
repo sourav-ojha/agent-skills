@@ -46,7 +46,7 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
   const gh = () => JSON.parse(fs.readFileSync(state, 'utf8'));
   const setGh = (fn) => { const s = gh(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };
-  return { root, origin, work, d, gh, setGh };
+  return { root, origin, work, d, gh, setGh, env };
 }
 
 // What the implementer would leave behind: commits on the feature branch and a spec that says delivery: complete.
@@ -226,6 +226,31 @@ test('CI that never finishes times out without merging', () => {
   assert.equal(r.json.result, 'timeout');
   assert.equal(r.code, 2);
   assert.match(e.d('merge', 'FEATURE-001').err, /needs ci_passed/);
+});
+
+test('the run log records the outcome word, so a CI wait is distinguishable from a failure', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok');
+  e.setGh((s) => { s.checkQueue = [[{ name: 'ci', bucket: 'pending' }]]; });
+  e.d('next'); build(e, 'FEATURE-001'); e.d('built', 'FEATURE-001', '--tier', 'T2'); e.d('pr', 'FEATURE-001', '--title', 'feat: thing here', '--body-file', body(e));
+  spawnSync('node', [DELIVER, 'ci', 'FEATURE-001', '--interval', '0.2', '--grace', '0', '--timeout', '0.5', '--dir', e.work], { encoding: 'utf8', env: { ...e.env, SKILL_RUNLOG: 'on' } }); // the other tests switch the run log off
+  const log = fs.readFileSync(path.join(e.work, '.skill-runs', 'delivery-orchestrator.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const ci = log.filter((r) => r.event === 'ci').pop();
+  assert.equal(ci.ok, false, 'exit code 2 is still not ok');
+  assert.equal(ci.result, 'timeout');
+});
+
+test('a CI timeout that exhausts the budget blocks the feature and the run log says so', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok', '--ci-budget', '1');
+  e.setGh((s) => { s.checkQueue = [[{ name: 'ci', bucket: 'pending' }]]; });
+  e.d('next'); build(e, 'FEATURE-001'); e.d('built', 'FEATURE-001', '--tier', 'T2'); e.d('pr', 'FEATURE-001', '--title', 'feat: thing here', '--body-file', body(e));
+  const r = spawnSync('node', [DELIVER, 'ci', 'FEATURE-001', '--interval', '0.2', '--grace', '0', '--timeout', '1.2', '--dir', e.work], { encoding: 'utf8', env: { ...e.env, SKILL_RUNLOG: 'on' } });
+  assert.equal(JSON.parse(r.stdout).state, 'blocked');
+  const log = fs.readFileSync(path.join(e.work, '.skill-runs', 'delivery-orchestrator.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const ci = log.filter((x) => x.event === 'ci').pop();
+  assert.equal(ci.result, 'timeout');
+  assert.equal(ci.blocked, true);
 });
 
 test('no CI at all: the run stops instead of merging unverified; --no-ci allows it explicitly', () => {
