@@ -58,7 +58,7 @@ for (const f of CLAUDE_FILES) READ_PAIRS.push([`~/.claude*/${f}`, `~/.claude*/${
 const REQUIRED_BUILDER_DENY = [
   ...READ_PAIRS.map(([r]) => `Read(${r})`),
   'Edit(/{{FACTORY_HOME}}/**)', 'Write(/{{FACTORY_HOME}}/**)',
-  'Edit(~/.claude*/**)', 'Edit(/{{HOME}}/.claude*/**)', 'Edit(~/.claude.json)',
+  'Edit(~/.claude*/**)', 'Edit(/{{HOME}}/.claude*/**)', 'Edit(~/.claude.json)', 'Edit(/{{CLAUDE_DIR}}/**)', 'Edit(/{{HOME}}/.claude.json)',
   ...GIT_PARTS.map((g) => `Edit(**/.git/${g})`), ...GIT_PARTS.map((g) => `Edit(/{{GITDIR}}/${g})`), ...GIT_PARTS.map((g) => `Edit(/{{GIT_COMMON}}/${g})`),
   'Edit(/{{REPO}}/*/**/.git)', 'Edit(/{{REPO}}/*/**/.git/**)',
   'Write(**/.git/**)', 'Write(**/.git)', 'NotebookEdit(**/.git/**)',
@@ -581,18 +581,20 @@ test('user settings: a settings file inside the session cwd or tmpDir is refused
   assert.equal(r3.failure?.kind, 'settings_unsafe', 'realpath inside cwd');
 });
 
-test('materialiseSettings: every config dir entry except skills/plugins/agents/commands/CLAUDE.md is read-denied; unsafe names fail closed', (t) => {
-  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-');
+test('materialiseSettings: every config dir entry except skills/agents/commands/memory file is read-denied (plugins too); unsafe names fail closed', (t) => {
+  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-'); const ext = tmp(t, 'ext-');
   const cd = path.join(home, '.claude');
   for (const d of ['skills', 'plugins', 'agents', 'commands', 'ide', 'ssh', 'brand-new-dir']) fs.mkdirSync(path.join(cd, d), { recursive: true });
   fs.writeFileSync(path.join(cd, 'ide', 'x.lock'), 'x'); fs.writeFileSync(path.join(cd, 'newthing.json'), '{}'); fs.writeFileSync(path.join(cd, 'CLAUDE.md'), 'x');
+  fs.symlinkSync(ext, path.join(cd, 'linkdir')); fs.symlinkSync(path.join(ext, 'gone'), path.join(cd, 'dangling'));
   const s = JSON.parse(fs.readFileSync(S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), 'utf8'));
-  for (const [n, dir] of [['ide', true], ['ssh', true], ['brand-new-dir', true], ['newthing.json', false]]) {
+  for (const [n, forms] of [['ide', ['/**']], ['ssh', ['/**']], ['brand-new-dir', ['/**']], ['plugins', ['/**']], ['newthing.json', ['']], ['linkdir', ['/**']], ['dangling', ['', '/**']]]) {
     const abs = path.join(cd, n);
     assert.ok(s.sandbox.filesystem.denyRead.includes(abs), n);
-    assert.ok(s.permissions.deny.includes(`Read(/${abs}${dir ? '/**' : ''})`), n);
+    for (const f of forms) assert.ok(s.permissions.deny.includes(`Read(/${abs}${f})`), `${n}${f}`);
   }
-  for (const n of ['skills', 'plugins', 'agents', 'commands', 'CLAUDE.md']) {
+  assert.ok(s.sandbox.filesystem.denyRead.includes(ext) && s.permissions.deny.includes(`Read(/${ext}/**)`), 'symlinked entry: real path denied as a dir');
+  for (const n of ['skills', 'agents', 'commands', 'CLAUDE.md']) {
     const abs = path.join(cd, n);
     assert.ok(!s.sandbox.filesystem.denyRead.some((p) => p === abs || p.startsWith(abs + '/')), n);
     assert.ok(!s.permissions.deny.some((r) => r.startsWith(`Read(/${abs}`)), n);
@@ -600,7 +602,65 @@ test('materialiseSettings: every config dir entry except skills/plugins/agents/c
   assert.deepEqual(S.checkSettings(s), []);
   fs.writeFileSync(path.join(cd, 'bad*name'), 'x');
   assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), (e) => e.code === 'settings_unsafe');
+  fs.rmSync(path.join(cd, 'bad*name'));
+  fs.chmodSync(cd, 0o000);
+  try {
+    assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), (e) => e.code === 'settings_unsafe', 'an unlistable config dir fails closed');
+  } finally { fs.chmodSync(cd, 0o755); }
 });
+
+test('materialiseSettings: HOME entries named .claude* (backups) are read-denied; the config dir itself is not', (t) => {
+  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-');
+  fs.mkdirSync(path.join(home, '.claude', 'skills'), { recursive: true });
+  for (const f of ['.claude.json.backup', '.claude.json.backup.1700000000', '.claude.json.corrupted.1']) fs.writeFileSync(path.join(home, f), '{}');
+  fs.mkdirSync(path.join(home, '.claude-old'));
+  const s = JSON.parse(fs.readFileSync(S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), 'utf8'));
+  for (const f of ['.claude.json.backup', '.claude.json.backup.1700000000', '.claude.json.corrupted.1']) {
+    assert.ok(s.sandbox.filesystem.denyRead.includes(path.join(home, f)) && s.permissions.deny.includes(`Read(/${path.join(home, f)})`), f);
+  }
+  assert.ok(s.permissions.deny.includes(`Read(/${path.join(home, '.claude-old')}/**)`));
+  assert.ok(!s.sandbox.filesystem.denyRead.includes(path.join(home, '.claude')), 'the config dir is handled entry by entry');
+  fs.writeFileSync(path.join(home, '.claude bad'), 'x');
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), (e) => e.code === 'settings_unsafe');
+});
+
+test('materialiseSettings: a symlinked write-denied path gets real-path Edit/Write/NotebookEdit twins; checkSettings requires an Edit twin for every denyWrite', (t) => {
+  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-'); const hooks = tmp(t, 'hooks-');
+  fs.mkdirSync(path.join(repo, '.git')); fs.symlinkSync(hooks, path.join(repo, '.git', 'hooks'));
+  const s = JSON.parse(fs.readFileSync(S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), 'utf8'));
+  assert.ok(s.sandbox.filesystem.denyWrite.includes(hooks));
+  for (const tool of ['Edit', 'Write', 'NotebookEdit']) assert.ok(s.permissions.deny.includes(`${tool}(/${hooks}/**)`), tool);
+  assert.deepEqual(S.checkSettings(s), []);
+  const broken = JSON.parse(JSON.stringify(s));
+  broken.permissions.deny = broken.permissions.deny.filter((r) => r !== `Edit(/${hooks}/**)`);
+  assert.ok(S.checkSettings(broken).some((m) => /has no Edit deny/.test(m)));
+  const tpl = readTemplate('builder'); tpl.permissions.deny = tpl.permissions.deny.filter((r) => r !== 'Edit(/{{CLAUDE_DIR}}/**)');
+  assert.ok(S.checkSettings(tpl, { allowPlaceholders: true }).some((m) => /has no Edit deny/.test(m)));
+});
+
+test('materialiseSettings: read denies may not cover the repo, the run dir or a readable entry; a readable entry may not resolve into the repo', (t) => {
+  const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-');
+  fs.symlinkSync(repo, path.join(home, '.ssh'));
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home }), (e) => e.code === 'settings_unsafe', '~/.ssh -> repo');
+  const home2 = tmp(t, 'home2-');
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home: home2, runDir: path.join(fh, 'run', 'r1') }), (e) => e.code === 'settings_unsafe', 'run dir under FACTORY_HOME');
+  const ok = S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home: home2, runDir: tmp(t, 'run-') });
+  assert.ok(fs.existsSync(ok));
+  const home3 = tmp(t, 'home3-'); fs.mkdirSync(path.join(home3, '.claude')); fs.mkdirSync(path.join(repo, 'planted'));
+  fs.symlinkSync(path.join(repo, 'planted'), path.join(home3, '.claude', 'skills'));
+  assert.throws(() => S.materialiseSettings('builder', { factoryHome: fh, repoDir: repo, home: home3 }), (e) => e.code === 'settings_unsafe', 'skills -> repo');
+});
+
+test('runSession home: one home for the lint and the child; PATH entries are compared resolved', async (t) => {
+  const f = fake(t, { mode: 'echo-argv' });
+  const { cwd, settingsFile } = setup(t);
+  const bad = userSettings(t, { hooks: { Stop: [] } });
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 1, timeoutS: 30, claudeBin: f.bin, home: bad });
+  assert.deepEqual(r.failure, { kind: 'settings_unsafe', resetAt: null, keys: ['hooks'] });
+  assert.equal(S.defaultHome({ HOME: '/h' }), '/h');
+  assert.equal(S.scrubEnv({ PATH: `${path.dirname(cwd)}/./${path.basename(cwd)}/nobin:/usr/bin` }, { cwd }).PATH, '/usr/bin');
+});
+
 
 test('materialiseSettings: a symlinked credential dir is denied by its real path too', (t) => {
   const fh = tmp(t, 'fh-'); const repo = tmp(t, 'repo-'); const home = tmp(t, 'home-'); const keys = tmp(t, 'keys-');
@@ -687,6 +747,6 @@ test('tmpDir: TMPDIR for the session is the private dir the caller passes', asyn
 test('readBuilderResult: tag characters, Arabic letter mark, Mongolian vowel separator and variation selectors are stripped', (t) => {
   const c = clone(t);
   const cp = (...x) => String.fromCodePoint(...x);
-  put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f${cp(0x2028)}g${cp(0x2029, 0x200b, 0xad)}h` }));
-  assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdefgh');
+  put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f${cp(0x2028)}g${cp(0x2029, 0x200b, 0xad)}h${cp(0x034f, 0x115f, 0x1160, 0x3164, 0xffa0)}i${cp(0xe000, 0x0378, 0xe0000)}j${String.fromCharCode(0xd800)}k` }));
+  assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdefghijk');
 });

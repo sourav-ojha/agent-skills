@@ -16,6 +16,10 @@ const SPEC_KEYS = ['name', 'description', 'license', 'compatibility', 'metadata'
 const CLAUDE_KEYS = ['when_to_use', 'argument-hint', 'arguments', 'disable-model-invocation', 'user-invocable', 'disallowed-tools', 'model', 'effort', 'context', 'agent', 'background', 'hooks', 'paths', 'shell'];
 // Host-specific tokens that must not leak into the agent-neutral methodology.
 const HOST_TOKENS = [/AskUserQuestion/, /\bTask tool\b/, /mcp__/, /\$ARGUMENTS/, /\$\{CLAUDE_/, /\.claude\//, /\.codex\//, /\.agents\//, /\/plugin\b/, /CLAUDE\.md/];
+// Exemption from the host-token check ONLY, for files whose subject is the Claude Code runtime itself: the factory's
+// `claude -p` session runner and the settings files it passes to Claude Code (they must name its config dir layout, e.g.
+// the memory file). Narrowest list: exact skill-relative paths, nothing else in those skills is exempt.
+const HOST_TOKEN_EXEMPT = { 'delivery-orchestrator': ['core/scripts/lib/sessions.mjs', 'core/settings/builder.json', 'core/settings/author.json'] };
 const SECRET_PATTERNS = [/AKIA[0-9A-Z]{16}/, /ghp_[A-Za-z0-9]{30,}/, /sk-[A-Za-z0-9]{32,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/];
 
 // Imported (first-party legacy) and vendored (third-party) skills get the spec-level checks only: they are not written to this repo's
@@ -148,6 +152,7 @@ async function validateSkill(dirName) {
     return /\.(md|json|mjs)$/.test(r);
   });
   for (const f of neutral) {
+    if ((HOST_TOKEN_EXEMPT[dirName] ?? []).includes(rel(f))) continue;
     const t = fs.readFileSync(f, 'utf8');
     for (const re of HOST_TOKENS) if (re.test(t)) S('error', `${rel(f)}: host-specific token ${re} in agent-neutral content (move to adapters/)`);
   }

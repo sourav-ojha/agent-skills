@@ -57,6 +57,8 @@
       "Edit(~/.claude*/**)",
       "Edit(/{{HOME}}/.claude*/**)",
       "Edit(~/.claude.json)",
+      "Edit(/{{CLAUDE_DIR}}/**)",
+      "Edit(/{{HOME}}/.claude.json)",
       "Edit(**/.git/config)",
       "Edit(**/.git/hooks/**)",
       "Edit(**/.git/info/**)",

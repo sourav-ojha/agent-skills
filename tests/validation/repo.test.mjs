@@ -150,3 +150,14 @@ test('security: user-scope install ignores the current project config', () => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(fs.readFileSync(path.join(home, '.claude/agents/pi-repository-analyst.md'), 'utf8'), /^model: haiku$/m);
 });
+
+test('validator: host-token exemption covers only the factory Claude-runtime files', () => {
+  const root = tmpDir('skills-root-');
+  const d = path.join(root, 'delivery-orchestrator');
+  fs.cpSync(path.join(REPO, 'skills', 'delivery-orchestrator'), d, { recursive: true });
+  fs.appendFileSync(path.join(d, 'core/scripts/lib/sessions.mjs'), '\n// see CLAUDE.md and ~/.claude/settings.json\n');
+  fs.appendFileSync(path.join(d, 'core/scripts/lib/proc.mjs'), '\n// see CLAUDE.md\n');
+  const msgs = JSON.parse(validate(root).stdout).errors.map((e) => e.msg).filter((m) => m.includes('host-specific token'));
+  assert.ok(msgs.some((m) => m.includes('core/scripts/lib/proc.mjs')), 'a non-exempt file is still checked');
+  assert.ok(!msgs.some((m) => m.includes('sessions.mjs')), 'the exempt file is not');
+});

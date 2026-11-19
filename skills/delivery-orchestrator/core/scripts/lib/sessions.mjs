@@ -30,11 +30,13 @@ export const ENV_ALLOWLIST = Object.freeze(['PATH', 'HOME', 'LANG', 'TMPDIR', 'U
 // entry that is, lexically or by realpath, inside `cwd` (the repo the builder writes).
 const realOr = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
 const inside = (p, dir) => p === dir || p.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
+// One home for everything: the materialised settings, the user-settings lint and the child's HOME.
+export const defaultHome = (env = process.env) => env.HOME || os.homedir();
 export function scrubEnv(base = process.env, { configDir, tmpDir, cwd } = {}) {
   const env = {};
   for (const k of ENV_ALLOWLIST) if (typeof base[k] === 'string') env[k] = base[k];
   const roots = cwd ? [...new Set([cwd, realOr(cwd)])] : [];
-  if (env.PATH !== undefined) env.PATH = env.PATH.split(':').filter((d) => d && path.isAbsolute(d) && !roots.some((r) => inside(d, r) || inside(realOr(d), r))).join(':');
+  if (env.PATH !== undefined) env.PATH = env.PATH.split(':').filter((d) => d && path.isAbsolute(d) && !roots.some((r) => inside(path.resolve(d), r) || inside(realOr(d), r))).join(':');
   if (tmpDir) env.TMPDIR = tmpDir;
   if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
   return env;
@@ -107,52 +109,68 @@ export function gitDirsOf(repo) {
   return { gitdir, common, gitFile };
 }
 
-// Entries of the home Claude Code config dir the builder may read: the implementer skill and plugins it runs. Every other
-// entry present at materialise time is read-denied (Read rule + sandbox denyRead), on top of the static template list for
-// entries that do not exist yet. An entry name that cannot be written safely into a rule fails closed.
-export const CONFIG_DIR_READABLE = Object.freeze(['skills', 'plugins', 'agents', 'commands', ['CLAUDE', 'md'].join('.')]);
+// Entries of the home Claude Code config dir the builder may read: the implementer skill (skills, agents, commands) and the
+// memory file. Every other entry present at materialise time is read-denied (Read rule + sandbox denyRead), on top of the
+// static template list for entries that do not exist yet. `plugins` is NOT readable: plugins cannot run while
+// enabledPlugins must be empty (known gap 15); re-add it only with plugins/data denied once that gap is closed.
+// An entry name that cannot be written safely into a rule fails closed.
+export const CONFIG_DIR_READABLE = Object.freeze(['skills', 'agents', 'commands', 'CLAUDE.md']);
 const SAFE_ENTRY = /^[A-Za-z0-9._@+-]{1,255}$/;
-function pushDenyRead(out, abs, isDir) {
-  const rule = `Read(/${abs}${isDir ? '/**' : ''})`;
-  if (!out.permissions.deny.includes(rule)) out.permissions.deny.push(rule);
+const unsafeSettings = (msg) => { const e = new Error(`settings_unsafe: ${msg}`); e.code = 'settings_unsafe'; return e; };
+// 'dir' -> rule with /**; 'file' -> bare rule; 'both' when the kind is unknown (dangling link): both rule forms.
+const kindOf = (abs) => { try { return fs.statSync(abs).isDirectory() ? 'dir' : 'file'; } catch { return 'both'; } };
+const ruleForms = (tool, abs, kind) => (kind === 'both' ? [`${tool}(/${abs})`, `${tool}(/${abs}/**)`] : [`${tool}(/${abs}${kind === 'dir' ? '/**' : ''})`]);
+function pushDenyRead(out, abs, kind) {
+  for (const rule of ruleForms('Read', abs, kind)) if (!out.permissions.deny.includes(rule)) out.permissions.deny.push(rule);
   if (!out.sandbox.filesystem.denyRead.includes(abs)) out.sandbox.filesystem.denyRead.push(abs);
 }
-function denyConfigDirEntries(out, dir) {
+function pushDenyWrite(out, abs, kind) {
+  for (const tool of ['Edit', 'Write', 'NotebookEdit']) for (const rule of ruleForms(tool, abs, kind)) if (!out.permissions.deny.includes(rule)) out.permissions.deny.push(rule);
+  if (!out.sandbox.filesystem.denyWrite.includes(abs)) out.sandbox.filesystem.denyWrite.push(abs);
+}
+function denyEntries(out, dir, pick) {
   let ents;
-  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const d of ents) {
-    if (CONFIG_DIR_READABLE.includes(d.name)) continue;
-    if (!SAFE_ENTRY.test(d.name) || d.name === '.' || d.name === '..') {
-      const e = new Error('settings_unsafe: a config dir entry name cannot be written into a deny rule'); e.code = 'settings_unsafe'; throw e;
-    }
-    for (const base of variantsOf(dir)) pushDenyRead(out, path.join(base, d.name), d.isDirectory());
+  try { ents = fs.readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return; throw unsafeSettings(`cannot list ${path.basename(dir)} (${e.code})`); }
+  for (const name of ents) {
+    if (!pick(name)) continue;
+    if (!SAFE_ENTRY.test(name) || name === '.' || name === '..') throw unsafeSettings('an entry name cannot be written into a deny rule');
+    for (const base of variantsOf(dir)) pushDenyRead(out, path.join(base, name), kindOf(path.join(base, name)));
   }
 }
 // For every absolute denyRead / denyWrite path that exists and resolves elsewhere (a symlinked ~/.ssh, say), deny the
-// real path too. Read twins are mirrored so the twin check keeps holding.
+// real path too, with the matching permission rules mirrored (Read for reads; Edit, Write, NotebookEdit for writes).
 function addRealpathTwins(out) {
   const fsx = out.sandbox.filesystem;
-  for (const p of [...fsx.denyRead]) {
-    if (!path.isAbsolute(p) || /[*?[\]{}]/.test(p)) continue;
-    let real, st; try { real = fs.realpathSync(p); st = fs.statSync(real); } catch { continue; }
-    if (real === p) continue;
-    safeAbs('denied path', real);
-    pushDenyRead(out, real, st.isDirectory());
+  for (const [list, push] of [[fsx.denyRead, pushDenyRead], [fsx.denyWrite ?? [], pushDenyWrite]]) {
+    for (const p of [...list]) {
+      if (!path.isAbsolute(p) || /[*?[\]{}]/.test(p)) continue;
+      let real; try { real = fs.realpathSync(p); } catch { continue; }
+      if (real === p) continue;
+      safeAbs('denied path', real);
+      push(out, real, kindOf(real));
+    }
   }
-  for (const p of [...(fsx.denyWrite ?? [])]) {
-    if (!path.isAbsolute(p) || /[*?[\]{}]/.test(p)) continue;
-    let real; try { real = fs.realpathSync(p); } catch { continue; }
-    if (real !== p && !fsx.denyWrite.includes(real)) { safeAbs('denied path', real); fsx.denyWrite.push(real); }
+}
+// After the twins: a read deny must never cover the repo, the run dir or a readable config-dir entry, and a readable
+// config-dir entry must not resolve into the repo (the builder could plant its own "skill").
+function checkDenyScope(out, { claudeDir, repoDir, runDir }) {
+  const readable = CONFIG_DIR_READABLE.map((n) => path.join(claudeDir, n)).filter((p) => fs.existsSync(p)).map(realOr);
+  if (repoDir) for (const r of readable) for (const rr of [repoDir, realOr(repoDir)]) if (inside(r, rr)) throw unsafeSettings('a readable config dir entry resolves inside the repo');
+  const keep = [...readable, ...(repoDir ? [repoDir, realOr(repoDir)] : []), ...(runDir ? [runDir, realOr(runDir)] : [])];
+  for (const d of out.sandbox.filesystem.denyRead) {
+    if (!path.isAbsolute(d) || /[*?[\]{}]/.test(d)) continue;
+    if (keep.some((k) => inside(k, d))) throw unsafeSettings('a read deny covers the repo, the run dir or a readable config dir entry');
   }
 }
 
 // Writes a per-run copy of the role's settings with absolute paths substituted; returns the file path (mode 0600).
-export function materialiseSettings(role, { factoryHome, repoDir, home = os.homedir(), outDir } = {}) {
+export function materialiseSettings(role, { factoryHome, repoDir, home = defaultHome(), outDir, runDir } = {}) {
   const tpl = settingsTemplate(role);
   if (role === 'builder' && !repoDir) throw new TypeError('builder settings need repoDir');
   safeAbs('factoryHome', factoryHome);
   if (repoDir) safeAbs('repoDir', repoDir);
   safeAbs('home', home);
+  if (runDir) safeAbs('runDir', runDir);
   const vars = { FACTORY_HOME: variantsOf(factoryHome), HOME: variantsOf(home), CLAUDE_DIR: variantsOf(path.join(home, '.claude')) };
   let git = null;
   if (repoDir) {
@@ -161,11 +179,14 @@ export function materialiseSettings(role, { factoryHome, repoDir, home = os.home
   }
   const out = substitutePlaceholders(JSON.parse(fs.readFileSync(tpl, 'utf8')), vars);
   if (out.sandbox?.filesystem?.denyRead) {
-    denyConfigDirEntries(out, path.join(home, '.claude'));
+    const claudeDir = path.join(home, '.claude');
+    denyEntries(out, claudeDir, (n) => !CONFIG_DIR_READABLE.includes(n));
+    denyEntries(out, home, (n) => n.startsWith('.claude') && n !== '.claude'); // .claude.json.backup, rotated backups, ...
     addRealpathTwins(out);
+    checkDenyScope(out, { claudeDir, repoDir, runDir });
   }
   if (git?.gitFile) { // the pointer file itself must not be re-pointed
-    for (const r of vars.REPO) { out.permissions.deny.push(`Edit(/${r}/.git)`); out.sandbox?.filesystem?.denyWrite?.push(`${r}/.git`); }
+    for (const r of vars.REPO) { out.permissions.deny.push(`Edit(/${r}/.git)`); if (out.sandbox?.filesystem?.denyWrite) pushDenyWrite(out, `${r}/.git`, 'file'); }
   }
   const problems = checkSettings(out);
   if (problems.length) throw new Error(`settings for ${role} failed checks: ${problems.join('; ')}`);
@@ -240,6 +261,9 @@ export function checkSettings(s, { allowPlaceholders = false } = {}) {
   // Every Read(...) path deny needs a sandbox denyRead twin: the Read rule covers the Read tool, the sandbox covers Bash children.
   const denyRead = new Set((Array.isArray(sb?.filesystem?.denyRead) ? sb.filesystem.denyRead : []).map((x) => String(x).replace(/\/\*\*$/, '')));
   if (Array.isArray(deny)) deny.forEach((d, i) => { const r = parseRule(d); if (r.tool === 'Read' && r.spec !== undefined && !denyRead.has(canonRead(r.spec))) p.push(`Read deny #${i} has no sandbox denyRead entry`); });
+  // And every sandbox denyWrite path needs an Edit deny twin: the sandbox covers Bash children, Edit covers the edit tools.
+  const editPaths = new Set((Array.isArray(deny) ? deny : []).map(parseRule).filter((r) => r.tool === 'Edit' && r.spec !== undefined).map((r) => canonRead(r.spec)));
+  (Array.isArray(sb?.filesystem?.denyWrite) ? sb.filesystem.denyWrite : []).forEach((w, i) => { if (!editPaths.has(String(w).replace(/\/\*\*$/, ''))) p.push(`sandbox denyWrite #${i} has no Edit deny`); });
   if (!allowPlaceholders && JSON.stringify(s).includes('{{')) p.push('unsubstituted placeholder');
   return p;
 }
@@ -274,7 +298,7 @@ export function checkUserSettings(s) {
   return bad;
 }
 function lintUserSettings(env, configDir, { cwd, tmpDir } = {}) {
-  const dir = configDir ?? (env.HOME ? path.join(env.HOME, '.claude') : null);
+  const dir = configDir ?? (env.HOME ? path.join(env.HOME, '.claude') : null); // env.HOME is the session's one home
   if (!dir) return ['HOME unset'];
   const file = path.join(dir, 'settings.json');
   // The settings file and its dir must not live where the builder writes (its repo or its TMPDIR).
@@ -318,7 +342,7 @@ const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,99}$/;
 const absNoCtrl = (v) => typeof v === 'string' && path.isAbsolute(v) && !CTRL.test(v) && path.normalize(v) === v;
 const bad = (msg) => { throw new TypeError(msg); };
 
-const OPTIONS = ['role', 'cwd', 'prompt', 'settingsFile', 'configDir', 'maxTurns', 'timeoutS', 'model', 'claudeBin', 'baseEnv', 'killGraceMs', 'maxLineChars', 'onSpawn', 'tmpDir'];
+const OPTIONS = ['role', 'cwd', 'prompt', 'settingsFile', 'configDir', 'maxTurns', 'timeoutS', 'model', 'claudeBin', 'baseEnv', 'killGraceMs', 'maxLineChars', 'onSpawn', 'tmpDir', 'home'];
 function checkArgs(o) {
   if (!o || typeof o !== 'object') bad('runSession needs an options object');
   for (const k of Object.keys(o)) if (!OPTIONS.includes(k)) bad(`unknown option ${cleanKey(k)}`);
@@ -338,6 +362,7 @@ function checkArgs(o) {
     if (!absNoCtrl(o.configDir)) bad('configDir must be an absolute path');
   }
   if (o.claudeBin !== undefined && o.claudeBin !== 'claude' && !absNoCtrl(o.claudeBin)) bad('claudeBin must be "claude" or an absolute path');
+  if (o.home !== undefined && o.home !== null && !absNoCtrl(o.home)) bad('home must be an absolute path');
   if (o.tmpDir !== undefined && o.tmpDir !== null) {
     if (!absNoCtrl(o.tmpDir)) bad('tmpDir must be an absolute path');
     let t; try { t = fs.lstatSync(o.tmpDir); } catch { bad('tmpDir does not exist'); }
@@ -373,7 +398,9 @@ export async function runSession(opts) {
   checkArgs(opts);
   const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineChars = DEFAULT_MAX_LINE_CHARS, onSpawn, tmpDir } = opts;
   const argv = buildArgv(opts);
-  const env = scrubEnv(baseEnv, { configDir: role === 'author' ? configDir : undefined, tmpDir, cwd });
+  // `home` (default: the parent's HOME, as materialiseSettings uses) becomes the child's HOME and the lint's home.
+  const home = opts.home ?? defaultHome(baseEnv);
+  const env = scrubEnv({ ...baseEnv, HOME: home }, { configDir: role === 'author' ? configDir : undefined, tmpDir, cwd });
   const early = (failure) => ({ ok: false, sessionId: null, result: null, usage: { in: 0, out: 0, cache_create: 0, cache_read: 0 }, turns: 0, costUsd: null, failure, timedOut: false, truncated: false, exitCode: null, signal: null });
   const unsafe = lintUserSettings(env, role === 'author' ? configDir : undefined, { cwd, tmpDir });
   if (unsafe.length) return early({ kind: 'settings_unsafe', resetAt: null, keys: unsafe });
@@ -481,9 +508,9 @@ export async function runSession(opts) {
 const NO_RESULT = Object.freeze({ status: 'blocked', question: 'no_result' });
 const RESULT_MAX = 64 * 1024;
 const FIELD_MAX = 2000;
-// Control (Cc) and format (Cf: bidi, zero-width, U+061C, U+180E, tags) characters, line/paragraph separators and
-// variation selectors are dropped; tabs and newlines become spaces first.
-const INVISIBLE = /[\p{Cc}\p{Cf}\u{2028}\u{2029}\u{fe00}-\u{fe0f}\u{e0100}-\u{e01ef}]/gu;
+// Control, format, unassigned, private-use and surrogate characters, line/paragraph separators, fillers (U+034F, Hangul
+// fillers U+115F/1160/3164/FFA0), variation selectors and tags are dropped; tabs and newlines become spaces first.
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cn}\p{Co}\p{Cs}\u{2028}\u{2029}\u{034f}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{fe00}-\u{fe0f}\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/gu;
 const clean = (s) => Array.from(s.replace(/[\t\n\r]/g, ' ').replace(INVISIBLE, '')).slice(0, FIELD_MAX).join('').trim();
 
 export function readBuilderResult(cloneDir, id) {
