@@ -60,20 +60,24 @@ function parsePath(expr) {
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // Own properties only: `.key` on plain objects, `[n]` on arrays, `[*]` over own values of either.
-export function jsonPath(obj, expr) {
-  let cur = [obj];
+// `resolved` is false when any step drops a value: a `.key` or `[n]` that is absent, or a `[*]` over a non-container.
+// A `[*]` over an empty container is resolved (an empty list is a real answer; a typo is not).
+function walk(obj, expr) {
+  let cur = [obj]; let resolved = true;
   for (const s of parsePath(expr)) {
     const next = [];
     for (const v of cur) {
-      if ('key' in s) { if (isPlainObject(v) && Object.hasOwn(v, s.key)) next.push(v[s.key]); }
-      else if ('index' in s) { if (Array.isArray(v) && s.index < v.length) next.push(v[s.index]); }
-      else if (Array.isArray(v)) next.push(...v);
+      if ('key' in s) { if (isPlainObject(v) && Object.hasOwn(v, s.key)) next.push(v[s.key]); else resolved = false; }
+      else if ('index' in s) { if (Array.isArray(v) && s.index < v.length) next.push(v[s.index]); else resolved = false; }
+      else if (Array.isArray(v)) for (let i = 0; i < v.length; i++) next.push(v[i]);
       else if (isPlainObject(v)) for (const k of Object.keys(v)) next.push(v[k]);
+      else resolved = false;
     }
     cur = next;
   }
-  return cur;
+  return { values: cur, resolved };
 }
+export const jsonPath = (obj, expr) => walk(obj, expr).values;
 
 function deepEqual(a, b, d = 0) {
   if (d > MAX_EQ_DEPTH) return false;
@@ -123,7 +127,8 @@ function checkBaseUrl(baseUrl) {
   let u;
   try { u = new URL(String(baseUrl)); } catch { throw err(); }
   if (u.protocol !== 'http:' || !['localhost', '127.0.0.1'].includes(u.hostname) || u.username || u.password || u.pathname !== '/' || u.search || u.hash) throw err();
-  return u.origin;
+  // "localhost" may resolve to ::1 first, where another local process could answer: always connect to 127.0.0.1.
+  return `http://127.0.0.1${u.port ? `:${u.port}` : ''}`;
 }
 
 // Build fetch input for one scenario request. Returns null when the request shape is not acceptable.
@@ -135,15 +140,15 @@ function buildRequest(r, origin) {
   let url;
   try { url = new URL(p, `${origin}/`); } catch { return null; }
   if (url.origin !== origin) return null;
-  const h = {};
+  const h = Object.create(null);
   if (headers !== undefined) {
     if (!isPlainObject(headers)) return null;
     const names = Object.keys(headers);
     if (names.length > MAX_HEADERS) return null;
     for (const n of names) {
       const v = headers[n];
-      if (!TOKEN.test(n) || DENIED_HEADERS.has(n.toLowerCase()) || /^(proxy-|sec-)/i.test(n) || typeof v !== 'string' || !HEADER_VALUE.test(v)) return null;
-      if (Object.hasOwn(h, n.toLowerCase())) return null;
+      if (!TOKEN.test(n) || FORBIDDEN_KEYS.has(n.toLowerCase()) || DENIED_HEADERS.has(n.toLowerCase()) || /^(proxy-|sec-)/i.test(n) || typeof v !== 'string' || !HEADER_VALUE.test(v)) return null;
+      if (n.toLowerCase() in h) return null;
       h[n.toLowerCase()] = v;
     }
   }
@@ -152,7 +157,7 @@ function buildRequest(r, origin) {
     try { payload = JSON.stringify(body); } catch { return null; }
     if (typeof payload !== 'string' || Buffer.byteLength(payload) > MAX_REQ_BODY) return null;
     if (method === 'GET' || method === 'HEAD') return null;
-    if (!Object.hasOwn(h, 'content-type')) h['content-type'] = 'application/json';
+    if (!('content-type' in h)) h['content-type'] = 'application/json';
   }
   return { url: url.href, init: { method, headers: h, ...(payload !== undefined ? { body: payload } : {}) } };
 }
@@ -252,9 +257,10 @@ export async function runApiScenario(scenario, baseUrl, { fetchImpl = globalThis
         else ok = await allMatch(a.matches, [v], regexMs());
       } else if (!json()) ok = false;
       else {
-        const m = jsonPath(parsed, a.json_path);
+        const { values: m, resolved } = walk(parsed, a.json_path);
         const v = a[op];
-        if (op === 'equals') ok = m.length > 0 && m.every((x) => deepEqual(x, v));
+        if ((op === 'not_contains' || op === 'count') && !resolved) ok = false; // a typo or an error body must not pass vacuously
+        else if (op === 'equals') ok = m.length > 0 && m.every((x) => deepEqual(x, v));
         else if (op === 'contains') ok = m.some((x) => containsOne(x, v));
         else if (op === 'not_contains') ok = !m.some((x) => containsOne(x, v));
         else if (op === 'count') ok = (!a.json_path.includes('[*]') && m.length === 1 && Array.isArray(m[0]) ? m[0].length : m.length) === v;

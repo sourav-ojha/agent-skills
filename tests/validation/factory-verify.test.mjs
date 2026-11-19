@@ -271,6 +271,7 @@ test('a hand-merged ci_passed feature resolves to merged even when verification 
 import http from 'node:http';
 const A = await import(path.join(SK, 'core', 'scripts', 'lib', 'apicheck.mjs'));
 const V = await import(path.join(SK, 'core', 'scripts', 'lib', 'verdict.mjs'));
+const SC = await import(path.join(SK, 'core', 'scripts', 'lib', 'scenarios.mjs'));
 
 const SECRET_PATH = '/api/secret-path-fx-1a2b3c';
 const SECRET_HDR = 'header-value-fx-9z9z9z';
@@ -291,6 +292,9 @@ async function fixtureServer() {
     if (u === '/api/big') { res.writeHead(200, { 'content-type': 'application/json' }); const chunk = Buffer.alloc(64 * 1024, 0x61); let n = 0; const w = () => { while (n < 200) { n++; if (!res.write(chunk)) return res.once('drain', w); } res.end(); }; res.on('error', () => {}); return w(); }
     if (u === '/api/slow') { res.writeHead(200, { 'content-type': 'application/json' }); res.write('{"a":'); return; } // never finishes
     if (u === '/api/hang') return; // never answers
+    if (u === '/api/err') return json(500, { error: 'boom' });
+    if (u === '/api/empty') return json(200, { items: [], meta: {} });
+    if (u === '/api/huge-array') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(`{"a":[${Array(300000).fill('0').join(',')}]}`); }
     if (u === '/api/long') return json(200, { s: 'a'.repeat(70 * 1024), short: 'aaa' });
     if (u === '/api/redos') return json(200, { s: `${'a'.repeat(40)}!` });
     if (u === '/api/proto') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end('{"__proto__":{"polluted":"yes"},"a":{"b":1},"arr":[1,2,3]}'); }
@@ -500,7 +504,10 @@ test('runApiScenario: prototype keys in the response are not traversable', async
   const s = await fixtureServer();
   try {
     await assert.rejects(A.runApiScenario(scen(GET('/api/proto'), [{ json_path: '$.__proto__.polluted', equals: 'yes' }]), s.base), /unsupported json_path/);
-    assert.deepEqual(await A.runApiScenario(scen(GET('/api/proto'), [{ json_path: '$.a.toString', count: 0 }, { json_path: '$.arr.length', count: 0 }, { json_path: '$.a.hasOwnProperty', count: 0 }]), s.base), { status: 'pass' });
+    for (const jp of ['$.a.toString', '$.arr.length', '$.a.hasOwnProperty']) { // inherited members never resolve
+      assert.deepEqual(await A.runApiScenario(scen(GET('/api/proto'), [{ json_path: jp, count: 0 }]), s.base), { status: 'fail', failed: 'json_path' }, jp);
+      assert.deepEqual(await A.runApiScenario(scen(GET('/api/proto'), [{ json_path: jp, contains: 'function' }]), s.base), { status: 'fail', failed: 'json_path' }, jp);
+    }
     assert.deepEqual(await A.runApiScenario(scen(GET('/api/proto'), [{ json_path: '$.a.b', equals: 1 }]), s.base), { status: 'pass' });
     assert.equal({}.polluted, undefined);
   } finally { s.close(); }
@@ -515,6 +522,62 @@ function withHome(fn) {
   process.env.FACTORY_HOME = home;
   try { return fn(home); } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; fs.rmSync(home, { recursive: true, force: true }); }
 }
+
+test('round 1: not_contains and count need the path to resolve (no vacuous passes on typos or error bodies)', async () => {
+  const s = await fixtureServer();
+  try {
+    const r = (p, a) => A.runApiScenario(scen(GET(p), a), s.base);
+    assert.deepEqual(await r('/api/err', [{ json_path: '$.items[*].name', not_contains: 'Alpha' }]), { status: 'fail', failed: 'json_path' }, '500 error body');
+    assert.deepEqual(await r('/api/err', [{ json_path: '$.items', count: 0 }]), { status: 'fail', failed: 'json_path' });
+    assert.deepEqual(await r('/api/items', [{ json_path: '$.itmes', count: 0 }]), { status: 'fail', failed: 'json_path' }, 'typo key');
+    assert.deepEqual(await r('/api/items', [{ json_path: '$.itmes[*].name', not_contains: 'Alpha' }]), { status: 'fail', failed: 'json_path' });
+    assert.deepEqual(await r('/api/items', [{ json_path: '$.items[*].nmae', not_contains: 'Alpha' }]), { status: 'fail', failed: 'json_path' }, 'typo leaf');
+    assert.deepEqual(await r('/api/items', [{ json_path: '$.items[5].name', not_contains: 'Alpha' }]), { status: 'fail', failed: 'json_path' }, 'missing index');
+    assert.deepEqual(await r('/api/items', [{ json_path: '$.msg[*]', count: 0 }]), { status: 'fail', failed: 'json_path' }, '[*] over a non-container');
+    // legitimate empties still pass
+    assert.deepEqual(await r('/api/empty', [{ json_path: '$.items[*].name', not_contains: 'Alpha' }, { json_path: '$.items', count: 0 }, { json_path: '$.items[*]', count: 0 }, { json_path: '$.meta[*]', count: 0 }]), { status: 'pass' });
+    assert.deepEqual(await r('/api/items', [{ json_path: '$.items[*].name', not_contains: 'Gamma' }, { json_path: '$.items[*].name', count: 2 }]), { status: 'pass' });
+  } finally { s.close(); }
+});
+
+test('round 1: localhost is pinned to 127.0.0.1; an impostor on [::1] is never reached', async (t) => {
+  const real = http.createServer((q, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"who":"real"}'); });
+  await new Promise((r) => real.listen(0, '127.0.0.1', r));
+  const port = real.address().port;
+  let impostorHits = 0;
+  const imp = http.createServer((q, res) => { impostorHits++; res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"who":"impostor"}'); });
+  const v6 = await new Promise((r) => { imp.once('error', () => r(false)); imp.listen(port, '::1', () => r(true)); });
+  try {
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(await A.runApiScenario(scen(GET('/x'), [{ status: 200 }, { json_path: '$.who', equals: 'real' }]), `http://localhost:${port}`), { status: 'pass' });
+    }
+    assert.equal(impostorHits, 0);
+    if (!v6) t.diagnostic('IPv6 loopback unavailable: impostor not started');
+    let used;
+    await A.runApiScenario(scen(GET('/y'), [{ status: 200 }]), 'http://localhost:4321', { fetchImpl: async (u) => { used = u; return new Response('{}'); } });
+    assert.equal(used, 'http://127.0.0.1:4321/y');
+    await A.runApiScenario(scen(GET('/y'), [{ status: 200 }]), 'http://LOCALHOST', { fetchImpl: async (u) => { used = u; return new Response('{}'); } });
+    assert.equal(used, 'http://127.0.0.1/y');
+    await assert.rejects(A.runApiScenario(scen(GET('/x'), [{ status: 200 }]), `http://[::1]:${port}`), /base URL/);
+  } finally { real.close(); if (v6) imp.close(); }
+});
+
+test('round 1: header names __proto__ / sec-* are refused; large [*] arrays are handled', async () => {
+  const s = await fixtureServer();
+  try {
+    let calls = 0; const spy = async () => { calls++; return new Response('{}'); };
+    for (const h of [JSON.parse('{"__proto__":"x"}'), JSON.parse('{"x-a":"1","__proto__":"x"}'), { 'sec-fetch-site': 'none' }, { 'Sec-X': '1' }, { constructor: 'x' }, { prototype: 'x' }]) {
+      assert.deepEqual(await A.runApiScenario(scen({ method: 'GET', path: '/x', headers: h }, [{ status: 200 }]), s.base, { fetchImpl: spy }), { status: 'blocked', failed: 'request' }, JSON.stringify(h));
+    }
+    assert.equal(calls, 0);
+    assert.deepEqual(await A.runApiScenario(scen(GET('/api/huge-array'), [{ json_path: '$.a[*]', count: 300000 }, { json_path: '$.a[*]', not_contains: 1 }]), s.base), { status: 'pass' });
+  } finally { s.close(); }
+});
+
+test('validAssertion refuses empty-string contains and matches', () => {
+  for (const a of [{ json_path: '$.a', contains: '' }, { json_path: '$.a', matches: '' }, { header: 'x', matches: '' }, { json_path: '$.a', matches: 5 }]) assert.equal(SC.validAssertion(a), false, JSON.stringify(a));
+  for (const a of [{ json_path: '$.a', not_contains: '' }, { json_path: '$.a', equals: '' }, { header: 'x', equals: '' }, { json_path: '$.a', contains: 0 }]) assert.equal(SC.validAssertion(a), true, JSON.stringify(a));
+});
 
 test('verdictPath validates repo key, feature id and sha', () => withHome((home) => {
   assert.equal(V.verdictPath('o__r', 'FEATURE-001', SHA), path.join(home, 'verdicts', 'o__r', `FEATURE-001.${SHA}.json`));

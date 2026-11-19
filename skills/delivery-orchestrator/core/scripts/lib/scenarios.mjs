@@ -18,8 +18,10 @@ const MAX_DEPTH = 50;
 const BY = /^[\w.@-]{1,64}$/;
 // Accepted assertion shapes: ONE place. Task 8's verification engine must execute exactly this list.
 //   { status: <integer 100-599> }
-//   { header: <name>, equals: <string> } or { header: <name>, matches: <regex string> }
+//   { header: <name>, equals: <string> } or { header: <name>, matches: <non-empty regex string> }
 //   { json_path: <path>, <exactly one of equals|contains|not_contains|count|matches>: <value> }
+// An empty-string `contains` or `matches` is vacuous (always true on strings) and is refused. Every api scenario must also
+// carry at least one `status` assertion (lintScenarios), so an error response cannot pass on body assertions alone.
 export const JSON_PATH_OPS = ['equals', 'contains', 'not_contains', 'count', 'matches'];
 export const validAssertion = (a) => {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
@@ -27,11 +29,14 @@ export const validAssertion = (a) => {
   if ('status' in a) return keys.length === 1 && Number.isInteger(a.status) && a.status >= 100 && a.status <= 599;
   if ('header' in a) {
     const ops = keys.filter((k) => k !== 'header');
-    return typeof a.header === 'string' && a.header !== '' && ops.length === 1 && (ops[0] === 'equals' || ops[0] === 'matches') && typeof a[ops[0]] === 'string';
+    return typeof a.header === 'string' && a.header !== '' && ops.length === 1 && (ops[0] === 'equals' || ops[0] === 'matches') && typeof a[ops[0]] === 'string'
+      && !(ops[0] === 'matches' && a.matches === '');
   }
   if ('json_path' in a) {
     const ops = keys.filter((k) => k !== 'json_path');
-    return typeof a.json_path === 'string' && a.json_path !== '' && ops.length === 1 && JSON_PATH_OPS.includes(ops[0]);
+    return typeof a.json_path === 'string' && a.json_path !== '' && ops.length === 1 && JSON_PATH_OPS.includes(ops[0])
+      && !(ops[0] === 'contains' && a.contains === '')
+      && !(ops[0] === 'matches' && (typeof a.matches !== 'string' || a.matches === ''));
   }
   return false;
 };
@@ -127,6 +132,7 @@ export function lintScenarios(doc, criteria, currentHash) {
         if (!matchesContract(criteria.contract, r.method, r.path)) problems.push(`scenario ${label}: api request is not an endpoint in the HTTP contract`);
         const bad = s.assert.filter((a) => !validAssertion(a)).length;
         if (bad) problems.push(`scenario ${label}: ${bad} assertion(s) are not a recognised shape`);
+        if (!s.assert.some((a) => validAssertion(a) && 'status' in a)) problems.push(`scenario ${label}: api scenario needs a status assertion`);
       }
       if (s.setup !== undefined) {
         if (!Array.isArray(s.setup)) problems.push(`scenario ${label}: setup must be an array of requests`);

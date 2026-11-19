@@ -658,12 +658,27 @@ test('M1: assertion shapes and non-empty string steps', () => {
     const d = nbase(); d.scenarios[0].assert = [bad]; assert.equal(nl(d).ok, false, JSON.stringify(bad));
   }
   for (const good of [{ status: 404 }, { header: 'content-type', equals: 'x' }, { json_path: '$.a', not_contains: 'x' }, { json_path: '$.a', count: 2 }]) {
-    const d = nbase(); d.scenarios[0].assert = [good]; assert.equal(nl(d).ok, true, JSON.stringify(good));
+    const d = nbase(); d.scenarios[0].assert = [{ status: 200 }, good]; assert.equal(nl(d).ok, true, JSON.stringify(good));
+  }
+  // Task 8 round 1: empty-string contains / matches are vacuous and refused
+  for (const bad of [{ json_path: '$.a', contains: '' }, { json_path: '$.a', matches: '' }, { header: 'x', matches: '' }]) {
+    const d = nbase(); d.scenarios[0].assert = [{ status: 200 }, bad]; assert.equal(nl(d).ok, false, JSON.stringify(bad));
   }
   const u = () => ({ id: 'S-2', covers: ['AC-1'], kind: 'ui', steps: ['a'], expect: ['b'] });
   for (const mut of [(x) => { x.steps = ['']; }, (x) => { x.expect = [1]; }, (x) => { x.steps = ['a'.repeat(501)]; }, (x) => { x.setup = [{}]; }]) {
     const d = nbase(); const x = u(); mut(x); d.scenarios.push(x); assert.equal(nl(d).ok, false);
   }
+});
+
+test('api scenarios need at least one status assertion (kind-only message)', () => {
+  const d = nbase(); d.scenarios[0].assert = [{ json_path: '$.items[*].name', not_contains: 'SECRET-VALUE' }, { header: 'x-secret', equals: 'SECRET-HDR' }];
+  const r = nl(d);
+  assert.equal(r.ok, false);
+  const p = r.problems.find((x) => /status assertion/.test(x));
+  assert.ok(p, JSON.stringify(r.problems));
+  assert.equal(p, 'scenario S-1: api scenario needs a status assertion');
+  d.scenarios[0].assert.push({ status: 200 });
+  assert.equal(nl(d).ok, true);
 });
 
 test('M2: dot segments and encoded separators never match', () => {
