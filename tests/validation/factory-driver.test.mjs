@@ -17,7 +17,7 @@ const tmp = (t) => { const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdi
 const lockFile = (home) => path.join(home, 'locks', `${KEY}.lock`);
 const readDoc = (home) => JSON.parse(fs.readFileSync(lockFile(home), 'utf8'));
 const writeLock = (home, doc) => { fs.mkdirSync(path.join(home, 'locks'), { recursive: true, mode: 0o700 }); fs.writeFileSync(lockFile(home), JSON.stringify(doc), { mode: 0o600 }); };
-const START = 'Thu Nov 20 10:11:12 2026';
+const START = 'ps:Thu Nov 20 10:11:12 2026';
 const TOK = 'a'.repeat(32);
 const lockDoc = (over = {}) => ({ v: 1, pid: 4242, start: START, token: TOK, groups: [], orphans: [], ...over });
 const errCode = (code) => (e) => e instanceof L.LockError && e.code === code;
@@ -32,7 +32,7 @@ function fakeSys({ starts = {}, rows = [], killFails = {} } = {}) {
     kill(pid, sig) { if (killFails[-pid]) { const e = new Error('x'); e.code = killFails[-pid]; throw e; } killed.push([pid, sig]); },
   };
 }
-const selfSys = (extra = {}) => fakeSys({ ...extra, starts: { [process.pid]: 'Fri Nov 21 09:00:00 2026', ...(extra.starts || {}) } });
+const selfSys = (extra = {}) => fakeSys({ ...extra, starts: { [process.pid]: 'ps:Fri Nov 21 09:00:00 2026', ...(extra.starts || {}) } });
 
 // Child process that takes the lock. mode: hold (waits for stdin to close), try (exits at once), exit (exits without release).
 const CHILD = `
@@ -72,16 +72,16 @@ async function deadPid() {
 test('lock: normStart parses ps lstart robustly and rejects anything else', () => {
   assert.equal(L.normStart('Thu Nov  5 10:11:12 2026\n'), 'Thu Nov 5 10:11:12 2026');
   assert.equal(L.normStart('  Thu Nov 05 10:11:12 2026 '), 'Thu Nov 5 10:11:12 2026');
-  assert.equal(L.normStart(START), START);
+  assert.equal(L.normStart('Thu Nov 20 10:11:12 2026'), 'Thu Nov 20 10:11:12 2026');
   for (const bad of ['', 'Thu Nov 20 10:11:12', 'Thu Nov 20 25:11:12 2026', 'Thx Nov 20 10:11:12 2026', 'Thu Nov 32 10:11:12 2026', 'Thu Nov 20 10:11:12 2026 x', null, undefined, '12345'])
     assert.equal(L.normStart(bad), null, String(bad));
-  assert.ok(L.startSecs('Thu Nov 20 10:11:13 2026') - L.startSecs(START) === 1);
+  assert.ok(L.startSecs('Thu Nov 20 10:11:13 2026') - L.startSecs('Thu Nov 20 10:11:12 2026') === 1);
   assert.equal(L.startSecs('junk'), null);
 });
 
 test('lock: real ps start time of this process is readable and stable', () => {
   const a = L.SYSTEM.startOf(process.pid);
-  assert.ok(L.normStart(a) === a, a);
+  assert.ok(L.validStart(a) && a.startsWith(`${L.SYSTEM.source}:`), a);
   assert.equal(L.SYSTEM.startOf(process.pid), a);
   const rows = L.SYSTEM.table();
   assert.ok(rows.some((r) => r.pid === process.pid && r.start === a));
@@ -102,6 +102,14 @@ test('lock: acquire creates a 0600 lock holding pid, start time, a random token 
   assert.deepEqual(h.orphans(), []);
   assert.ok(L.validLock(doc));
   assert.deepEqual(fs.readdirSync(path.join(home, 'locks')), [`${KEY}.lock`]);
+});
+
+test('lock: an unreadable start time of this very process refuses the lock without creating anything', (t) => {
+  const home = tmp(t);
+  for (const bad of ['garbage', 'Thu Nov 20 10:11:12 2026', '', 42]) {
+    assert.throws(() => L.acquire(KEY, { home, sys: fakeSys({ starts: { [process.pid]: bad } }) }), errCode('LOCK_PS'), String(bad));
+    assert.deepEqual(fs.readdirSync(path.join(home, 'locks')), []);
+  }
 });
 
 test('lock: invalid repo keys are refused before touching the filesystem', (t) => {
@@ -168,6 +176,7 @@ test('lock: takeover marker: a live taker holds it (refused); one left by a dead
   const stale = lockDoc({ pid: 4242, groups: [{ pgid: 810, start: START }] });
   for (const [content, code, re] of [
     [JSON.stringify(lockDoc({ pid: 4343, token: 'e'.repeat(32) })), 'LOCK_HELD', /taking over/], // taker alive
+    [JSON.stringify(lockDoc({ pid: 4343, token: 'e'.repeat(32), start: 'proc:77' })), 'LOCK_HELD', /taking over/], // taker start from another source: unverifiable
     [JSON.stringify(lockDoc({ pid: 4444, token: 'e'.repeat(32) })), 'LOCK_UNREADABLE', /remove .*takeover by hand/], // taker died mid-takeover
     ['{garbled', 'LOCK_UNREADABLE', /remove .*takeover by hand/],
   ]) {
@@ -205,7 +214,7 @@ test('lock: a stale lock replaced by a live one while it is being judged is not 
 test('lock: a recycled pid (same pid, different start time) is stale', (t) => {
   const home = tmp(t);
   writeLock(home, lockDoc({ pid: 4242, start: START, groups: [{ pgid: 5151, start: START }] }));
-  const sys = selfSys({ starts: { 4242: 'Fri Nov 21 10:11:12 2026' } });
+  const sys = selfSys({ starts: { 4242: 'ps:Fri Nov 21 10:11:12 2026' } });
   const h = L.acquire(KEY, { home, sys });
   t.after(() => h.release());
   assert.deepEqual(h.orphans(), [{ pgid: 5151, start: START }]);
@@ -231,7 +240,7 @@ test('lock: when the holder\'s start time cannot be read the lock is held (fail 
 test('lock: a garbled or invalid lock is HELD, not stale, and is left untouched', (t) => {
   const home = tmp(t);
   const variants = ['', '{', 'null', '[]', '"x"', JSON.stringify({ ...lockDoc(), extra: 1 }), JSON.stringify({ ...lockDoc(), v: 2 }),
-    JSON.stringify(lockDoc({ start: 'yesterday' })), JSON.stringify(lockDoc({ token: 'short' })), JSON.stringify(lockDoc({ pid: 1 })),
+    JSON.stringify(lockDoc({ start: 'yesterday' })), JSON.stringify(lockDoc({ start: 'xx:Thu Nov 20 10:11:12 2026' })), JSON.stringify(lockDoc({ start: 'Thu Nov 20 10:11:12 2026' })), JSON.stringify(lockDoc({ start: 'proc:-1' })), JSON.stringify(lockDoc({ start: 'proc:01' })), JSON.stringify(lockDoc({ token: 'short' })), JSON.stringify(lockDoc({ pid: 1 })),
     JSON.stringify(lockDoc({ pid: '4242' })), JSON.stringify(lockDoc({ groups: [{ pgid: 0, start: null }] })), JSON.stringify(lockDoc({ groups: 'x' })),
     JSON.stringify(lockDoc({ orphans: [{ pgid: 5, start: 'x' }] })), JSON.stringify(lockDoc({ groups: [{ pgid: 5 }] })), Buffer.from([0xff, 0xfe, 0x7b]), 'x'.repeat(70 * 1024)];
   for (const v of variants) {
@@ -257,6 +266,108 @@ test('lock: a symlinked lock file (live or dangling) is refused and its target u
   fs.unlinkSync(lockFile(home));
   fs.mkdirSync(lockFile(home));
   assert.throws(() => L.acquire(KEY, { home }), errCode('LOCK_UNSAFE'), 'a directory is not a lock');
+});
+
+test('lock: Linux start identity comes from /proc/<pid>/stat field 22, split after the LAST ")"', () => {
+  const tail = (pgrp, ticks) => `S 1 ${pgrp} ${pgrp} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ${ticks} 1000 10 18446744073709551615`;
+  assert.deepEqual(L.parseProcStat(`1234 (node) ${tail(1234, 98765)}`), { pgid: 1234, start: 'proc:98765' });
+  assert.deepEqual(L.parseProcStat(`1234 (a) b (c)) ) ${tail(77, 5)}`), { pgid: 77, start: 'proc:5' }, 'comm with spaces and parens');
+  assert.deepEqual(L.parseProcStat(`1234 (x 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20) ${tail(9, 42)}`), { pgid: 9, start: 'proc:42' }, 'comm with digits');
+  for (const bad of ['', 'garbage', '1234 node S 1', `1234 (n) S 1`, `x (n) ${tail(1, 2)}`, `1234 (n) ${tail('x', 2)}`, `1234 (n) ${tail(1, '-3')}`, null])
+    assert.equal(L.parseProcStat(bad), null, String(bad));
+});
+
+test('lock: a wall-clock step on Linux does not make a live holder stale (ticks since boot are compared, not lstart)', (t) => {
+  const home = tmp(t);
+  const stat = (pid, ticks) => `${pid} (node) S 1 ${pid} ${pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${ticks} 0 0`;
+  // The clock was stepped by a day since the holder started: ps lstart would now print another date, the ticks did not move.
+  const table = { 4242: stat(4242, 555000), [process.pid]: stat(process.pid, 900000) };
+  const read = (p) => { const pid = p.split('/')[2]; if (table[pid]) return table[pid]; const e = new Error('x'); e.code = 'ENOENT'; throw e; };
+  const kill = () => { const e = new Error('x'); e.code = 'ESRCH'; throw e; };
+  const sys = L.procSystem({ read, list: () => Object.keys(table), kill });
+  writeLock(home, lockDoc({ pid: 4242, start: 'proc:555000' }));
+  assert.throws(() => L.acquire(KEY, { home, sys, register: () => () => {} }), errCode('LOCK_HELD'));
+  writeLock(home, lockDoc({ pid: 4242, start: 'proc:555001' })); // same pid, other ticks: recycled
+  const h = L.acquire(KEY, { home, sys, register: () => () => {} });
+  assert.equal(readDoc(home).start, 'proc:900000', 'the source tag is recorded in the lock');
+  h.release();
+  writeLock(home, lockDoc({ pid: 4242, start: START })); // recorded by ps, checked by /proc: cannot be verified -> held
+  assert.throws(() => L.acquire(KEY, { home, sys, register: () => () => {} }), (e) => errCode('LOCK_HELD')(e) && /another source/.test(e.message));
+  writeLock(home, lockDoc({ pid: 4242, start: 'proc:555000' })); // and the other way round
+  assert.throws(() => L.acquire(KEY, { home, sys: selfSys({ starts: { 4242: 'ps:Fri Nov 21 10:11:12 2026' } }) }), errCode('LOCK_HELD'));
+  assert.equal(L.startCmp('proc:9', 'proc:10'), -1);
+  assert.equal(L.startCmp('proc:10', START), null);
+});
+
+test('lock: "no such process" needs proof: empty ps output and stderr, then signal 0 must say ESRCH (otherwise LOCK_PS)', () => {
+  const err = (code) => () => { const e = new Error(code); e.code = code; throw e; };
+  const run = (status, stdout = '', stderr = '') => () => ({ status, stdout, stderr });
+  assert.equal(L.psSystem({ run: run(1), kill: err('ESRCH') }).startOf(4242), null);
+  for (const [r, k] of [[run(1), err('EPERM')], [run(1), () => {}], [run(1, '', 'ps: bad pid'), err('ESRCH')], [run(0, 'garbage'), err('ESRCH')], [run(0, 'Thu Nov 20 10:11:12 2026', 'warn'), err('ESRCH')], [run(2, 'x'), err('ESRCH')]])
+    assert.throws(() => L.psSystem({ run: r, kill: k }).startOf(4242), errCode('LOCK_PS'));
+  assert.equal(L.psSystem({ run: run(0, ' Thu Nov  5 10:11:12 2026\n'), kill: err('ESRCH') }).startOf(4242), 'ps:Thu Nov 5 10:11:12 2026');
+  const enoent = () => { const e = new Error('x'); e.code = 'ENOENT'; throw e; };
+  assert.equal(L.procSystem({ read: enoent, kill: err('ESRCH') }).startOf(4242), null);
+  assert.throws(() => L.procSystem({ read: enoent, kill: err('EPERM') }).startOf(4242), errCode('LOCK_PS'));
+  assert.throws(() => L.procSystem({ read: err('EACCES'), kill: err('ESRCH') }).startOf(4242), errCode('LOCK_PS'));
+  assert.throws(() => L.procSystem({ read: () => 'junk', kill: err('ESRCH') }).startOf(4242), errCode('LOCK_PS'));
+  assert.deepEqual(L.procSystem({ read: (p) => { if (p.includes('/9/')) return enoent(); return `${p.split('/')[2]} (n) S 1 5 5 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 7 0 0`; }, list: () => ['5', '9', 'self', 'net'] }).table(),
+    [{ pid: 5, pgid: 5, start: 'proc:7' }], 'a pid gone between listing and reading is skipped; non-numeric entries ignored');
+});
+
+test('lock: FACTORY_HOME is resolved to an absolute path and must be a real directory owned by this user; long keys refused cleanly', (t) => {
+  const home = tmp(t);
+  const rel = path.relative(process.cwd(), home);
+  const h = L.acquire(KEY, { home: rel });
+  assert.equal(h.file, lockFile(home));
+  assert.ok(path.isAbsolute(h.file));
+  h.release();
+  const link = path.join(tmp(t), 'home-link');
+  fs.symlinkSync(home, link);
+  const target = tmp(t);
+  fs.rmSync(link); fs.symlinkSync(target, link);
+  assert.throws(() => L.acquire(KEY, { home: link }), (e) => errCode('LOCK_UNSAFE')(e) && /FACTORY_HOME/.test(e.message));
+  assert.deepEqual(fs.readdirSync(target), [], 'nothing created through the link');
+  const file = path.join(tmp(t), 'a-file');
+  fs.writeFileSync(file, 'x');
+  assert.throws(() => L.acquire(KEY, { home: file }), errCode('LOCK_UNSAFE'));
+  assert.throws(() => L.acquire(KEY, { home: path.join(file, 'sub') }), errCode('LOCK_UNSAFE'), 'ENOTDIR wrapped');
+  const long = `${'a'.repeat(110)}__${'b'.repeat(110)}`;
+  assert.throws(() => L.acquire(long, { home }), (e) => errCode('LOCK_UNSAFE')(e) && /repo key longer/.test(e.message));
+  assert.throws(() => L.lockPath(long, { home }), errCode('LOCK_UNSAFE'));
+  const ok = `${'a'.repeat(100)}__${'b'.repeat(100)}`;
+  const h2 = L.acquire(ok, { home });
+  h2.release();
+});
+
+test('lock: the exit/signal cleanup is registered before any file is created and removes only what this acquire made', (t) => {
+  const home = tmp(t);
+  writeLock(home, lockDoc({ pid: 4242, groups: [{ pgid: 810, start: START }] }));
+  let cleanup = null; let filesAtRegister = null;
+  const register = (fn) => { cleanup = fn; filesAtRegister = fs.readdirSync(path.join(home, 'locks')); return () => { cleanup = null; }; };
+  const sys = selfSys({ starts: { 4242: null } });
+  const realStart = sys.startOf;
+  let calls = 0;
+  sys.startOf = (pid) => { // a signal arriving in the middle of the takeover: the handler runs the cleanup, then the process exits
+    if (pid === 4242 && ++calls === 1) { fs.writeFileSync(`${lockFile(home)}.takeover`, JSON.stringify(lockDoc({ pid: process.pid, start: realStart(process.pid), token: 'f'.repeat(32) }))); }
+    return realStart(pid);
+  };
+  assert.throws(() => L.acquire(KEY, { home, sys, register }), errCode('LOCK_HELD'), 'the planted marker names this process as a live taker');
+  assert.deepEqual(filesAtRegister, [`${KEY}.lock`], 'registered before the first temp file');
+  assert.equal(cleanup, null, 'an acquire that throws unregisters its cleanup');
+  assert.ok(fs.existsSync(`${lockFile(home)}.takeover`), 'a marker with another token is not ours to remove');
+  fs.rmSync(`${lockFile(home)}.takeover`);
+  assert.deepEqual(readDoc(home).token, TOK, 'the stale lock is untouched');
+  // A successful acquire: the registered cleanup (what SIGINT/SIGTERM/exit run) removes the lock and leaves nothing behind.
+  const h = L.acquire(KEY, { home, sys: selfSys({ starts: { 4242: null } }), register });
+  assert.equal(typeof cleanup, 'function');
+  cleanup();
+  assert.deepEqual(fs.readdirSync(path.join(home, 'locks')), []);
+  assert.equal(h.release(), false, 'already released');
+  L.acquire(KEY, { home, register });
+  fs.writeFileSync(`${lockFile(home)}.takeover`, fs.readFileSync(lockFile(home))); // a marker carrying this acquire's token
+  cleanup();
+  assert.deepEqual(fs.readdirSync(path.join(home, 'locks')), [], 'its own marker is removed too');
 });
 
 test('lock: an unsafe locks directory (symlink, group/world-writable) is refused', (t) => {
@@ -335,31 +446,33 @@ test('lock: killOrphans signals only provably-recorded groups that are not this 
     { pgid: 705, start: START }, // leaderless, a member older than the recorded leader -> reused
     { pgid: 706, start: START }, // this process's own group -> self
     { pgid: 707, start: START }, // kill fails with EPERM -> failed (kept)
+    { pgid: 709, start: 'proc:123' }, // recorded by /proc, table from ps: not comparable -> unverified (kept)
   ];
   writeLock(home, lockDoc({ pid: 4242, groups: [], orphans }));
   const rows = [
-    { pid: me, pgid: 706, start: 'Fri Nov 21 09:00:00 2026' },
+    { pid: me, pgid: 706, start: 'ps:Fri Nov 21 09:00:00 2026' },
     { pid: 700, pgid: 700, start: START }, { pid: 7001, pgid: 700, start: START },
-    { pid: 701, pgid: 701, start: 'Sat Nov 22 10:00:00 2026' },
+    { pid: 701, pgid: 701, start: 'ps:Sat Nov 22 10:00:00 2026' },
     { pid: 703, pgid: 703, start: START },
-    { pid: 7041, pgid: 704, start: 'Thu Nov 20 10:11:13 2026' },
-    { pid: 7051, pgid: 705, start: 'Wed Nov 19 10:11:12 2026' },
+    { pid: 7041, pgid: 704, start: 'ps:Thu Nov 20 10:11:13 2026' },
+    { pid: 7051, pgid: 705, start: 'ps:Wed Nov 19 10:11:12 2026' },
     { pid: 707, pgid: 707, start: START },
+    { pid: 709, pgid: 709, start: START },
   ];
-  const sys = fakeSys({ starts: { [me]: 'Fri Nov 21 09:00:00 2026', 4242: null }, rows, killFails: { 707: 'EPERM' } });
+  const sys = fakeSys({ starts: { [me]: 'ps:Fri Nov 21 09:00:00 2026', 4242: null }, rows, killFails: { 707: 'EPERM' } });
   const h = L.acquire(KEY, { home, sys });
   t.after(() => h.release());
   const got = Object.fromEntries(h.killOrphans({ signal: 'SIGTERM' }).map((x) => [x.pgid, x.outcome]));
-  assert.deepEqual(got, { 700: 'killed', 701: 'reused', 702: 'gone', 703: 'unverified', 704: 'killed', 705: 'reused', 706: 'self', 707: 'failed' });
+  assert.deepEqual(got, { 700: 'killed', 701: 'reused', 702: 'gone', 703: 'unverified', 704: 'killed', 705: 'reused', 706: 'self', 707: 'failed', 709: 'unverified' });
   assert.deepEqual(sys.killed, [[-700, 'SIGTERM'], [-704, 'SIGTERM']]);
-  assert.deepEqual(h.orphans(), [{ pgid: 707, start: START }], 'only failed ones stay recorded');
-  assert.deepEqual(h.killOrphans(), [{ pgid: 707, outcome: 'failed' }], 'retried on the next call');
+  assert.deepEqual(h.orphans(), [{ pgid: 703, start: null }, { pgid: 707, start: START }, { pgid: 709, start: 'proc:123' }], 'failed and unverified ones stay recorded');
+  assert.deepEqual(h.killOrphans(), [{ pgid: 703, outcome: 'unverified' }, { pgid: 707, outcome: 'failed' }, { pgid: 709, outcome: 'unverified' }], 'retried on the next call');
 });
 
 test('lock: killOrphans never signals a group containing this process, and refuses when this process is not listed', (t) => {
   const home = tmp(t);
   const me = process.pid;
-  const myStart = 'Fri Nov 21 09:00:00 2026';
+  const myStart = 'ps:Fri Nov 21 09:00:00 2026';
   writeLock(home, lockDoc({ orphans: [{ pgid: 900, start: START }] }));
   const sys = fakeSys({ starts: { [me]: myStart }, rows: [{ pid: 900, pgid: 900, start: START }, { pid: me, pgid: 900, start: myStart }] });
   const h = L.acquire(KEY, { home, sys });
@@ -460,6 +573,7 @@ test('Driver actions: pr_open | ci timeout | wait again within the CI budget', (
 
 test('Driver actions: pr_open | ci unconfirmed (no required check reported) | awaiting_human; attention entry; run stops', () => {
   const a = D.nextAction(feat('awaiting_human'), R('ci', 'unconfirmed'), { ...RUN, stop: 'no CI checks were reported' });
+  assert.equal(a.kind, 'ci_unconfirmed');
   assert.equal(a.do, 'stop'); assert.equal(a.attention, true); assert.match(a.reason, /no CI checks/);
   assert.equal(D.nextAction(feat('awaiting_human'), R('ci', 'unconfirmed'), RUN).do, 'stop');
 });
@@ -467,6 +581,8 @@ test('Driver actions: pr_open | ci unconfirmed (no required check reported) | aw
 test('Driver actions: ci_passed | verification pass | post factory/verified status, gh pr edit, -> verified', () => {
   assert.deepEqual(D.nextAction(feat('ci_passed'), R('verify', 'pass'), RUN), { do: 'verified' });
   assert.deepEqual(D.nextAction(feat('verified'), R('verified', 'ok'), RUN), { do: 'merge' });
+  const v = D.nextAction(feat('verified'), null, RUN);
+  assert.equal(v.do, 'hold', 'verified with no result never merges directly: the restart rules re-check the verdict'); assert.equal(v.kind, 'inconsistent');
   assert.equal(D.nextAction(feat('ci_passed'), R('verified', 'error'), RUN).do, 'hold');
 });
 
@@ -586,7 +702,11 @@ test('driver: sessionResult normalises runSession + readBuilderResult into a dri
   assert.deepEqual(D.sessionResult(ok, { status: 'blocked', question: 'q?' }), { step: 'session', kind: 'blocked', question: 'q?' });
   assert.deepEqual(D.sessionResult(ok, { status: 'blocked', question: 'no_result' }), { step: 'session', kind: 'blocked', question: 'no_result' });
   assert.deepEqual(D.sessionResult(ok, null), { step: 'session', kind: 'blocked', question: 'no_result' });
-  for (const k of ['session', 'weekly', 'model', 'rate']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k, resetAt: 'R' } }, { status: 'done' }), { step: 'session', kind: 'usage_limit', resetAt: 'R' });
+  const at = '2026-11-20T15:00:00.000Z';
+  for (const k of ['session', 'weekly', 'model', 'rate']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k, resetAt: at } }, { status: 'done' }), { step: 'session', kind: 'usage_limit', resetAt: at });
+  for (const bad of ['R', '2026-13-45T99:00:00Z', 'tomorrow', 5, {}, null, undefined, '2026-11-20T15:00:00.000Z<script>'])
+    assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'session', resetAt: bad } }), { step: 'session', kind: 'usage_limit', resetAt: null }, String(bad));
+  assert.equal(D.nextAction(feat('building'), S('usage_limit', { resetAt: 'not a date' }), RUN).resetAt, null);
   for (const k of ['max_turns', 'timeout', 'no_result', 'other', 'spawn_failed', 'unsafe_binary']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k } }, { status: 'done' }), { step: 'session', kind: k }, k);
   assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'settings_unsafe', keys: ['hooks'] } }), { step: 'session', kind: 'settings_unsafe', keys: ['hooks'] });
   assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'brand_new' } }), { step: 'session', kind: 'other' });
@@ -617,17 +737,38 @@ test('driver: every action returned is in ACTIONS', () => {
 });
 
 // One test per Crash-and-resume rule.
-const FACTS = { branch_exists: true, ahead: 2, dirty: false, head: SHA_A, result: 'done', pr_exists: true, pr_head: SHA_A, verdict: 'pass', orphans_alive: 0, leftover_worktrees: 0 };
+const BASE = { orphans_alive: 0, leftover_worktrees: 0, resumes: 0 };
+const FACTS = { branch_exists: true, ahead: 2, dirty: false, head: SHA_A, result: 'done', pr_exists: true, pr_head: SHA_A, verdict: 'pass', ...BASE };
 
 test('Crash and resume: building: commits ahead of base and result.json says done -> continue at built', () => {
   assert.deepEqual(D.resumeAction(feat('building'), FACTS, RUN), { do: 'built' });
 });
 
 test('Crash and resume: building: otherwise reset the branch to base and start a fresh build session', () => {
-  for (const over of [{ ahead: 0 }, { result: 'blocked' }, { result: 'absent' }, { branch_exists: false }, { dirty: true }]) {
+  for (const over of [{ ahead: 0 }, { result: 'absent' }, { branch_exists: false }, { dirty: true }]) {
     assert.deepEqual(D.resumeAction(feat('building'), { ...FACTS, ...over }, RUN), { do: 'build', brief: 'build', reset: true }, JSON.stringify(over));
   }
   for (const over of [{ ahead: -1 }, { ahead: '2' }, { result: 'maybe' }, { dirty: 'no' }, { branch_exists: undefined }]) assert.equal(D.resumeAction(feat('building'), { ...FACTS, ...over }, RUN).do, 'hold', JSON.stringify(over));
+});
+
+test('Crash and resume: building: a builder result "blocked" already written -> block (the "builder blocked" row), not a rebuild', () => {
+  for (const over of [{}, { ahead: 0 }, { dirty: true }]) {
+    const a = D.resumeAction(feat('building'), { ...FACTS, result: 'blocked', ...over }, RUN);
+    assert.equal(a.do, 'block', JSON.stringify(over)); assert.equal(a.attention, true);
+  }
+});
+
+test('Crash and resume: a feature resumed too many times holds instead of looping (default 3, run.max_resumes overrides)', () => {
+  const cp = feat('ci_passed', { ci_sha: SHA_A });
+  for (const st of ['building', 'fixing', 'ci_passed', 'verified', 'pr_open', 'built']) {
+    const f = feat(st, { ci_sha: SHA_A, built_sha: SHA_A, history: hist('ci_failed', 'fixing'), pr: { head_sha: SHA_A } });
+    const a = D.resumeAction(f, { ...FACTS, resumes: 3 }, RUN);
+    assert.equal(a.do, 'hold', st); assert.equal(a.kind, 'resume_loop', st);
+    assert.notEqual(D.resumeAction(f, { ...FACTS, resumes: 2 }, RUN).kind, 'resume_loop', st);
+  }
+  assert.equal(D.resumeAction(cp, { ...FACTS, resumes: 1 }, { ...RUN, max_resumes: 1 }).kind, 'resume_loop');
+  assert.equal(D.resumeAction(cp, FACTS, { ...RUN, max_resumes: -1 }).kind, 'limits');
+  assert.deepEqual(D.resumeAction(feat('merged'), { ...BASE, resumes: 9 }, RUN), { do: 'next' }, 'terminal states are not capped');
 });
 
 test('Crash and resume: fixing: the head moved since the last CI run -> deliver push', () => {
@@ -668,11 +809,19 @@ test('Crash and resume: leftover evaluation worktrees and app process groups fro
       assert.equal(a.do, 'stop', `${st} ${JSON.stringify(over)}`); assert.equal(a.kind, 'leftovers');
     }
   }
-  for (const over of [{ orphans_alive: -1 }, { leftover_worktrees: '0' }]) assert.equal(D.resumeAction(feat('queued'), { ...FACTS, ...over }, RUN).do, 'hold');
+  for (const over of [{ orphans_alive: -1 }, { leftover_worktrees: '0' }, { resumes: 1.5 }]) assert.equal(D.resumeAction(feat('queued'), { ...FACTS, ...over }, RUN).do, 'hold');
+  for (const k of ['orphans_alive', 'leftover_worktrees', 'resumes']) { // required: missing never reads as zero
+    const facts = { ...FACTS }; delete facts[k];
+    for (const st of ['queued', 'building', 'merged']) {
+      const a = D.resumeAction(feat(st), facts, RUN);
+      assert.equal(a.do, 'hold', `${st} without ${k}`); assert.equal(a.kind, 'unknown_result', `${st} without ${k}`);
+    }
+    assert.equal(D.resumeAction(feat('building'), { ...facts, [k]: undefined }, RUN).do, 'hold', `${k} undefined`);
+  }
 });
 
 test('Crash and resume: other states resume as the table says', () => {
-  assert.deepEqual(D.resumeAction(feat('queued'), {}, RUN), { do: 'next' });
+  assert.deepEqual(D.resumeAction(feat('queued'), BASE, RUN), { do: 'next' });
   assert.deepEqual(D.resumeAction(feat('built', { built_sha: SHA_A }), FACTS, RUN), { do: 'pr' });
   assert.equal(D.resumeAction(feat('built', { built_sha: SHA_B }), FACTS, RUN).do, 'hold', 'commits after built');
   assert.deepEqual(D.resumeAction(feat('pr_open'), FACTS, RUN), { do: 'ci' });
@@ -680,9 +829,18 @@ test('Crash and resume: other states resume as the table says', () => {
   assert.equal(D.resumeAction(feat('pr_open', { antigaming_hold: { sha: SHA_A, ids: ['G4'] } }), FACTS, RUN).kind, 'antigaming');
   assert.deepEqual(D.resumeAction(feat('ci_failed', { fix_rounds: 0 }), FACTS, RUN), { do: 'fix_ci', brief: 'ci_fix' });
   assert.deepEqual(D.resumeAction(feat('verify_failed', { fix_rounds: 0 }), FACTS, RUN), { do: 'fix_verify', brief: 'symptom_fix' });
-  for (const st of ['awaiting_human', 'blocked', 'skipped', 'merged']) assert.deepEqual(D.resumeAction(feat(st), {}, RUN), { do: 'next' }, st);
+  for (const st of ['awaiting_human', 'blocked', 'skipped', 'merged']) assert.deepEqual(D.resumeAction(feat(st), BASE, RUN), { do: 'next' }, st);
   assert.equal(D.resumeAction(feat('nope'), FACTS, RUN).do, 'hold');
   assert.equal(D.resumeAction(feat('building'), null, RUN).do, 'hold');
+});
+
+test('driver: returned actions are frozen; anti-gaming results are only "fix" (G1/G4/G5 travel in f.antigaming_hold)', () => {
+  const a = D.nextAction(feat('pr_open', { antigaming_hold: { sha: SHA_A, ids: ['G1'] } }), null, RUN);
+  assert.ok(Object.isFrozen(a)); assert.ok(Object.isFrozen(a.ids));
+  assert.throws(() => { 'use strict'; a.do = 'merge'; }, TypeError);
+  assert.ok(Object.isFrozen(D.resumeAction(feat('queued'), BASE, RUN)));
+  assert.deepEqual([...D.RESULTS.antigaming], ['fix']);
+  for (const k of ['clean', 'hold']) assert.equal(D.nextAction(feat('building'), R('antigaming', k), RUN).kind, 'unknown_result', k);
 });
 
 test('driver: pure: inputs are never mutated', () => {

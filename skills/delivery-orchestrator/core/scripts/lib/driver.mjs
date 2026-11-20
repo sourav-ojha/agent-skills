@@ -2,14 +2,14 @@
 // docs/factory/specs/phase-1-verification-gate.md. The caller (factory.mjs) executes the returned action and feeds the step's
 // result back in. The feature passed in is in the state the queue holds when the decision is made, i.e. after `deliver` (or the
 // driver) applied the last step's own transition. Anything unknown (state, result, fact, limit) holds: fail closed.
-import { TRANSITIONS, overrideValid } from './queue.mjs';
+import { TRANSITIONS, ACTIVE, overrideValid } from './queue.mjs';
 
 export const ACTIONS = Object.freeze(['next', 'build', 'built', 'pr', 'ci', 'fix_ci', 'verify', 'verified', 'fix_verify', 'push', 'merge', 'block', 'hold', 'stop']);
 export const BRIEFS = Object.freeze(['build', 'local_fix', 'antigaming_fix', 'ci_fix', 'symptom_fix']);
 // Every step result the driver understands, as { step, kind }. `error`: the deliver command died (exit 1) or the step failed.
 export const RESULTS = Object.freeze({
   session: Object.freeze(['done', 'blocked', 'usage_limit', 'max_turns', 'timeout', 'no_result', 'other', 'settings_unsafe', 'spawn_failed', 'unsafe_binary']),
-  antigaming: Object.freeze(['clean', 'fix', 'hold']),
+  antigaming: Object.freeze(['fix']), // G2/G3 at built; G1/G4/G5 continue inside the built step (f.antigaming_hold), clean ones are not reported
   next: Object.freeze(['ok', 'error']),
   built: Object.freeze(['ok', 'local_check_failed', 'error']),
   pr: Object.freeze(['ok', 'error']),
@@ -22,6 +22,7 @@ export const RESULTS = Object.freeze({
   block: Object.freeze(['ok', 'error']),
 });
 export const AG_FIX_ATTEMPTS = 1; // P1.3: G2/G3 at built get one "builder fix attempt"
+export const MAX_RESUMES = 3; // default cap on restarts of one feature (run.max_resumes overrides)
 
 const USAGE_KINDS = new Set(['session', 'weekly', 'model', 'rate']); // limits.mjs classifyFailure kinds
 const SHA = /^[0-9a-f]{40}$/;
@@ -29,6 +30,8 @@ const G_ID = /^G[1-5]$/;
 const own = (o, k) => o !== null && typeof o === 'object' && Object.hasOwn(o, k);
 const knownState = (s) => typeof s === 'string' && Object.hasOwn(TRANSITIONS, s);
 const isCount = (n) => Number.isInteger(n) && n >= 0;
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+export const isoOrNull = (v) => (typeof v === 'string' && ISO.test(v) && !Number.isNaN(Date.parse(v)) ? v : null);
 const cut = (s, n = 200) => { const t = String(s).replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 
 const hold = (kind, reason, extra = {}) => ({ do: 'hold', kind, reason: cut(reason), ...extra, attention: true });
@@ -56,7 +59,7 @@ export function sessionResult(run, builder) {
   const r = { step: 'session' };
   if (!run || run.ok !== true) {
     const k = run?.failure?.kind;
-    if (USAGE_KINDS.has(k)) return { ...r, kind: 'usage_limit', resetAt: run.failure.resetAt ?? null };
+    if (USAGE_KINDS.has(k)) return { ...r, kind: 'usage_limit', resetAt: isoOrNull(run.failure.resetAt) };
     if (k === 'settings_unsafe') return { ...r, kind: k, keys: Array.isArray(run.failure.keys) ? [...run.failure.keys] : [] };
     return { ...r, kind: typeof k === 'string' && RESULTS.session.includes(k) && k !== 'done' && k !== 'blocked' && k !== 'usage_limit' ? k : 'other' };
   }
@@ -107,7 +110,7 @@ const ci = (f, extra = {}) => agHold(f) ?? { do: 'ci', ...extra };
 // nextAction(feature, lastResult, run?) -> { do, reason?, kind?, brief?, ids?, sha?, resetAt?, attention? }
 //   lastResult: null (nothing ran yet in this state) or { step, kind, ... } from RESULTS (see sessionResult for sessions).
 //   run: { max_fix_rounds, stop } from the queue: max_fix_rounds is q.max_fix_rounds, stop is runStop(q) (stop flag or breaker).
-export function nextAction(f, lastResult = null, run = {}) {
+function decide(f, lastResult, run) {
   if (!f || typeof f !== 'object' || !knownState(f.state)) return hold('unknown_state', `unknown feature state "${cut(f?.state ?? '', 40)}"`);
   if (!validResult(lastResult)) return hold('unknown_result', 'unknown step result');
   const last = lastResult;
@@ -115,7 +118,7 @@ export function nextAction(f, lastResult = null, run = {}) {
 
   // Interruptions and environment failures of any session, in any state (Phase 2 replaces the stops with its interruption rules).
   if (last?.step === 'session') {
-    if (last.kind === 'usage_limit') return stop('usage_limit', 'usage limit reached: the run stops and every state is left as it is', { resetAt: last.resetAt ?? null });
+    if (last.kind === 'usage_limit') return stop('usage_limit', 'usage limit reached: the run stops and every state is left as it is', { resetAt: isoOrNull(last.resetAt) });
     if (['timeout', 'no_result', 'other'].includes(last.kind)) return stop('interrupted', `the ${last.kind === 'timeout' ? 'session timed out' : 'session ended without a result'}: the run stops and the branch is left as it is`);
     if (last.kind === 'settings_unsafe') return hold('settings_unsafe', `user Claude settings are unsafe for unattended sessions (${categories(last.keys).join(', ') || 'unknown'}): fix them, then run again`);
     if (last.kind === 'spawn_failed' || last.kind === 'unsafe_binary') return hold('environment', last.kind === 'spawn_failed' ? 'the claude binary could not be started' : 'the claude binary resolves inside the session working directory');
@@ -182,11 +185,14 @@ export function nextAction(f, lastResult = null, run = {}) {
       return hold('inconsistent', `a ${last.step} ${last.kind} result for a feature in verify_failed`);
 
     case 'verified':
-      if (last === null || is(last, 'verified', 'ok')) return { do: 'merge' };
+      // Only straight after posting the status: with no result (a restart or a fresh pick) the verdict must be re-checked
+      // against the PR head first, which is resumeAction's rule.
+      if (is(last, 'verified', 'ok')) return { do: 'merge' };
+      if (last === null) return hold('inconsistent', 'verified with no step result: resume through the restart rules (verdict re-checked against the PR head)');
       return hold('inconsistent', `a ${last.step} ${last.kind} result for a verified feature`);
 
     case 'awaiting_human':
-      if (is(last, 'ci', 'unconfirmed')) return stop('run_stop', typeof run?.stop === 'string' && run.stop ? run.stop : 'CI is unconfirmed: no required check reported', { attention: true });
+      if (is(last, 'ci', 'unconfirmed')) return stop('ci_unconfirmed', typeof run?.stop === 'string' && run.stop ? run.stop : 'CI is unconfirmed: no required check reported', { attention: true });
       if (is(last, 'merge', 'held')) return hold(typeof f.hold_kind === 'string' && f.hold_kind ? cut(f.hold_kind, 32) : 'merge', f.reason ? `merge held: ${f.reason}` : 'merge held for a person');
       return next(run);
 
@@ -200,10 +206,11 @@ export function nextAction(f, lastResult = null, run = {}) {
 //   head: 40-hex sha of the local feature branch, result: 'done' | 'blocked' | 'absent' (readBuilderResult; absent = no file),
 //   pr_exists: bool, pr_head: 40-hex sha GitHub reports for the PR head,
 //   verdict: 'pass' | 'fail' | 'absent' | 'mismatch' (stored verdict for pr_head checked against the current hashes),
-//   orphans_alive: process groups from the old lock still alive after killOrphans, leftover_worktrees: evaluation worktrees left.
+//   orphans_alive: process groups from the old lock still alive after killOrphans, leftover_worktrees: evaluation worktrees left,
+//   resumes: how many times this feature was already resumed after a crash. These last three are REQUIRED for every state.
 const FACT_TYPES = {
   branch_exists: (v) => typeof v === 'boolean', dirty: (v) => typeof v === 'boolean', pr_exists: (v) => typeof v === 'boolean',
-  ahead: isCount, orphans_alive: isCount, leftover_worktrees: isCount,
+  ahead: isCount, orphans_alive: isCount, leftover_worktrees: isCount, resumes: isCount,
   head: (v) => v === null || (typeof v === 'string' && SHA.test(v)), pr_head: (v) => v === null || (typeof v === 'string' && SHA.test(v)),
   result: (v) => ['done', 'blocked', 'absent'].includes(v), verdict: (v) => ['pass', 'fail', 'absent', 'mismatch'].includes(v),
 };
@@ -211,18 +218,25 @@ const need = (facts, ...keys) => keys.every((k) => own(facts, k) && FACT_TYPES[k
 
 // resumeAction(feature, facts, run?) -> same shape as nextAction; adds `reset: true` (reset the branch to base first) and
 // `reopen: true` (ci_passed/verified -> pr_open first, then CI and verification again).
-export function resumeAction(f, facts, run = {}) {
+function resume(f, facts, run) {
   if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return hold('unknown_result', 'no restart facts');
   if (!f || typeof f !== 'object' || !knownState(f.state)) return hold('unknown_state', `unknown feature state "${cut(f?.state ?? '', 40)}"`);
   for (const k of Object.keys(FACT_TYPES)) if (own(facts, k) && facts[k] !== undefined && !FACT_TYPES[k](facts[k])) return hold('unknown_result', `restart fact ${k} is malformed`);
   // Leftovers from the lock first: nothing resumes while a process or worktree from the dead run may still act.
-  if ((facts.orphans_alive ?? 0) > 0 || (facts.leftover_worktrees ?? 0) > 0) return stop('leftovers', 'process groups or evaluation worktrees from the earlier run are still present: remove them first', { attention: true });
+  if (!need(facts, 'orphans_alive', 'leftover_worktrees', 'resumes')) return hold('unknown_result', 'restart facts orphans_alive, leftover_worktrees and resumes are required');
+  const maxResumes = run?.max_resumes === undefined ? MAX_RESUMES : run.max_resumes;
+  if (!isCount(maxResumes)) return hold('limits', 'resume limit unknown');
+  if (facts.orphans_alive > 0 || facts.leftover_worktrees > 0) return stop('leftovers', 'process groups or evaluation worktrees from the earlier run are still present: remove them first', { attention: true });
+
+  // A feature that keeps crashing the driver is not resumed forever.
+  if (ACTIVE.includes(f.state) && facts.resumes >= maxResumes) return hold('resume_loop', `resumed ${facts.resumes} times already: a person looks at it`);
 
   switch (f.state) {
     case 'building':
       if (!need(facts, 'branch_exists', 'result', 'dirty')) return hold('unknown_result', 'restart facts for building are missing');
       if (facts.branch_exists && need(facts, 'ahead') && facts.ahead >= 1 && facts.result === 'done' && !facts.dirty) return { do: 'built' };
       if (facts.branch_exists && !need(facts, 'ahead')) return hold('unknown_result', 'restart fact ahead is missing');
+      if (facts.result === 'blocked') return block('builder blocked (result found after a restart)'); // the "builder blocked" row
       return { do: 'build', brief: 'build', reset: true };
 
     case 'built':
@@ -256,6 +270,11 @@ export function resumeAction(f, facts, run = {}) {
     }
 
     default: // queued, ci_failed, verify_failed, awaiting_human, blocked, skipped, merged: as from a fresh start
-      return nextAction(f, null, run);
+      return decide(f, null, run);
   }
 }
+
+// Returned actions are frozen (their arrays too): the caller cannot change a decision after the fact.
+const frozen = (a) => { for (const v of Object.values(a)) if (Array.isArray(v)) Object.freeze(v); return Object.freeze(a); };
+export const nextAction = (f, lastResult = null, run = {}) => frozen({ ...decide(f, lastResult, run) });
+export const resumeAction = (f, facts, run = {}) => frozen({ ...resume(f, facts, run) });
