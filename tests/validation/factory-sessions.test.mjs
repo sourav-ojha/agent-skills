@@ -750,3 +750,38 @@ test('readBuilderResult: tag characters, Arabic letter mark, Mongolian vowel sep
   put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f${cp(0x2028)}g${cp(0x2029, 0x200b, 0xad)}h${cp(0x034f, 0x115f, 0x1160, 0x3164, 0xffa0)}i${cp(0xe000, 0x0378, 0xe0000)}j${String.fromCharCode(0xd800)}k` }));
   assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdefghijk');
 });
+
+test('runSession abort: the flag set after 200 ms ends the session as stopped within 2 s and the group is gone', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  const t0 = Date.now(); let flag = false; setTimeout(() => { flag = true; }, 200).unref();
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 20, shouldAbort: () => flag });
+  assert.equal(r.ok, false); assert.equal(r.timedOut, false);
+  assert.deepEqual(r.failure, { kind: 'stopped', resetAt: null });
+  assert.ok(Date.now() - t0 < 2000, 'abort should end the session quickly');
+  assert.ok(await waitDead(f.entries()[0].pid, 2000));
+});
+
+test('runSession abort: a Date.now jump of +1 hour mid-session does not trigger the timeout', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  const realNow = Date.now; let jumped = false; let flag = false;
+  setTimeout(() => { Date.now = () => realNow() + 3600e3; jumped = true; }, 100).unref();
+  setTimeout(() => { flag = true; }, 700).unref();
+  try {
+    const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 20, shouldAbort: () => flag });
+    assert.ok(jumped);
+    assert.equal(r.timedOut, false); assert.equal(r.failure.kind, 'stopped');
+  } finally { Date.now = realNow; }
+});
+
+test('runSession abort: a shouldAbort that throws is treated as false; bad abort options throw', async (t) => {
+  const f = fake(t, { mode: 'done' });
+  const { cwd, settingsFile } = setup(t);
+  const base = { role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin };
+  const r = await S.runSession({ ...base, abortPollMs: 10, shouldAbort: () => { throw new Error('boom'); } });
+  assert.equal(r.ok, true);
+  await assert.rejects(S.runSession({ ...base, shouldAbort: 'yes' }), TypeError);
+  await assert.rejects(S.runSession({ ...base, abortPollMs: 9 }), TypeError);
+  await assert.rejects(S.runSession({ ...base, abortPollMs: 1.5 }), TypeError);
+});
