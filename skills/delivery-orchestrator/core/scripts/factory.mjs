@@ -273,7 +273,8 @@ export function prepare(ctx) {
   // it right after the fetch; a mismatch is refused below.
   const boot = bootAccount(dir);
   if (boot) useAccount(ctx, boot, ctx.id.host);
-  ctx.D = ensureClone(ctx, path.join(ctx.fh, 'clones'), ctx.key).dir;
+  const cl = ensureClone(ctx, path.join(ctx.fh, 'clones'), ctx.key);
+  ctx.D = cl.dir;
   ctx.git = (...a) => gitSafeOpts(ctx.D, a);
   // The base: the person (--base) or the config committed on the default branch, never a working copy.
   const def = ctx.id.defaultBranch;
@@ -284,7 +285,8 @@ export function prepare(ctx) {
   ctx.policy = baseConfig(ctx.git, base);
   if (!ctx.policy) refuse(`${CONFIG_PATH} on origin/${base} is missing its ref or is invalid`, `fix ${CONFIG_PATH} on ${base}`);
   if (ctx.policy.github.host.toLowerCase() !== ctx.id.host) refuse('github.host in the base config is not the origin host', 'set github.host to the host of origin');
-  if ((ctx.policy.github.account || null) !== (boot || null)) refuse('github.account in the checkout differs from the one in the base config', `update the checkout (${CONFIG_PATH}) to the copy on ${base}`);
+  // Only where the checkout's account was actually used to authenticate: the first clone of an https remote.
+  if (cl.fresh && /^https:/.test(ctx.id.url) && (ctx.policy.github.account || null) !== (boot || null)) refuse('github.account in the checkout differs from the one in the base config', `update the checkout (${CONFIG_PATH}) to the copy on ${base}`);
   useAccount(ctx, ctx.policy.github.account, ctx.policy.github.host);
   return ctx;
 }
@@ -564,8 +566,10 @@ function toDriver(ctx, f) {
   // Checked on the commit BEFORE it is checked out in the driver clone: deliver (unsandboxed) writes .delivery/ and
   // .skill-runs/ there, so a committed symlink or file in those places could redirect its writes or overwrite run records.
   if (protectedEntries(ctx.git, bHead)) throw new Unsafe('the branch commits .delivery, .implementation or .skill-runs');
+  const before = recordIds(ctx.D);
   must(ctx.git('checkout', '-q', '-f', '-B', f.branch, bHead), 'checkout in the driver clone');
   must(ctx.git('clean', '-q', '-f', '-d'), 'clean in the driver clone');
+  if (recordIds(ctx.D) !== before) throw new Unsafe('the checkout replaced the run records');
   for (const n of DRIVER_OWNED) { try { if (fs.lstatSync(path.join(ctx.D, n)).isSymbolicLink()) throw new Unsafe('a driver-owned path is a symlink after checkout'); } catch (e) { if (e instanceof Unsafe) throw e; } }
   return bHead;
 }
@@ -575,8 +579,15 @@ const DRIVER_OWNED = ['.delivery', '.implementation', '.skill-runs'];
 function protectedEntries(git, sha) {
   const r = git('ls-tree', '--full-tree', '-z', sha);
   if (r.code !== 0) return true;
-  return r.out.split('\0').filter(Boolean).some((l) => DRIVER_OWNED.includes(l.slice(l.indexOf('\t') + 1).toLowerCase()));
+  return r.out.split('\0').filter(Boolean).some((l) => {
+    const name = l.slice(l.indexOf('\t') + 1); // -z: never quoted; non-UTF-8 bytes decode to U+FFFD (also refused)
+    // APFS folds case, Unicode case variants (U+017F folds to "s") and normalisation forms, so any dot entry that is not plain
+    // printable ASCII may alias a driver-owned name: refused outright, with the exact (lower-cased) names.
+    return DRIVER_OWNED.includes(name.toLowerCase()) || (name.startsWith('.') && /[^\x21-\x7e]/.test(name));
+  });
 }
+// dev:ino of the run-record dir and file in the driver clone ('' when absent): compared around a checkout as a second layer.
+const recordIds = (dir) => ['.skill-runs', '.skill-runs/factory-runs.jsonl'].map((p) => { try { const st = fs.lstatSync(path.join(dir, p)); return `${st.dev}:${st.ino}:${st.isSymbolicLink()}`; } catch { return ''; } }).join('|');
 // A branch that would make the driver clone unsafe is blocked (building and fixing cannot wait for a person): the driver
 // clone goes back to the base first, so deliver never runs on that tree.
 function blockUnsafe(ctx, f) {
@@ -981,7 +992,7 @@ export async function main(argv, deps = {}) {
   } catch (e) {
     const out = ctx?.out || ((l) => process.stdout.write(`${l}\n`));
     if (e instanceof Refusal) { out(`refused: ${e.message}`); for (const x of [].concat(e.fix || [])) out(`fix: ${x}`); return 1; }
-    out(`error: ${String(e?.message || e).split('\n')[0].replace(/(?:[A-Za-z]:)?(?:\/[^\s/:'"]+)+\/?/g, '<path>').slice(0, 200)}`);
+    out(`error: ${String(e?.message || e).split('\n')[0].replace(/(?:[A-Za-z]:)?(?:\/[^\s/:'"]+)+\/?/g, '<path>').replace(/[^\s'"]*\/[^\s'"]*/g, '<path>').slice(0, 200)}`);
     return 1;
   } finally { try { ctx?.lock?.release(); } catch { /* released on exit */ } }
 }

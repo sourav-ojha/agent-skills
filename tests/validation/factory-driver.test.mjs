@@ -1371,3 +1371,42 @@ test('resume: a builder clone git refuses to read (planted nested .git) -> atten
   assert.equal(w.queue().features[0].state, 'building');
   assert.ok(!r.out.includes(w.root), 'no paths printed');
 });
+
+// ---- review round 2 -----------------------------------------------------------------------------------------------------------------
+test('I-5: dot entries that may alias a driver-owned name on APFS (U+017F, zero-width, NFD) are blocked; the run records stay untouched', (t) => {
+  const names = { 'FEATURE-001': '.ſkill-runs', 'FEATURE-002': '.skill-runſ', 'FEATURE-003': '.​delivery', 'FEATURE-004': '.délivery' };
+  const specs = Object.fromEntries(Object.keys(names).map((id, i) => [id, `Items ${i + 1}`]));
+  const w = ready(t, { specs, config: { ...BASE_CONFIG, limits: { max_failures: 10 } }, fake: { plan: {}, author: Object.fromEntries(Object.keys(names).map((id) => [id, AUTHOR_OK])) } });
+  w.setFake((s) => { s.plan = Object.fromEntries(Object.entries(names).map(([id, n]) => [id, [good(id, { [`${n}/factory-runs.jsonl`]: '{"forged":true}\n' })]])); });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.deepEqual(w.queue().features.map((f) => f.state), ['blocked', 'blocked', 'blocked', 'blocked']);
+  for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
+  const recs = fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8');
+  assert.ok(!recs.includes('forged'));
+  assert.equal(recs.trim().split('\n').length, 4, 'one blocked record per feature, none lost');
+  assert.equal(w.ghState().prs.length, 0);
+});
+
+test('I-4 residual: the survivor scan matches whole paths (a repo named o/r does not see the builder of o/r2)', async (t) => {
+  const d = tmp(t);
+  const VF = await import(pathToFileURL(path.join(LIB, 'verify.mjs')).href);
+  const k = path.join(d, 'run', 'o__r');
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', `${k}2/FEATURE-1-x/tmp`], { detached: true, stdio: 'ignore', cwd: d }); other.unref();
+  t.after(() => { try { process.kill(other.pid, 'SIGKILL'); } catch { /* gone */ } });
+  await new Promise((res) => setTimeout(res, 200));
+  assert.equal(VF.scanSurvivors([k]), 0, 'a sibling path with the same prefix is not a survivor');
+  assert.ok(VF.scanSurvivors([`${k}2`]) >= 1, 'the exact path still matches');
+  const mine = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', `${k}/FEATURE-1-x/tmp`], { detached: true, stdio: 'ignore', cwd: d }); mine.unref();
+  t.after(() => { try { process.kill(mine.pid, 'SIGKILL'); } catch { /* gone */ } });
+  await new Promise((res) => setTimeout(res, 200));
+  assert.ok(VF.scanSurvivors([k]) >= 1, 'a path below the marker matches');
+});
+
+test('N-1: a checkout whose github.account differs from the base config is ignored for an ssh remote (enforced only for a first https clone)', (t) => {
+  const w = world(t, { specs: { 'FEATURE-001': 'Items one' } });
+  fs.writeFileSync(path.join(w.work, '.product/delivery.json'), JSON.stringify({ ...BASE_CONFIG, github: { account: 'work' } }));
+  const r = w.factory(['scenarios']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /FEATURE-001 scenarios: stored/);
+});

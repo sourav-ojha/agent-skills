@@ -57,6 +57,8 @@ const within = (p, root) => p === root || p.startsWith(`${root}/`);
 // (lsof) is inside one. Every sandboxed process gets TMPDIR/HOME in the run temp and starts in the worktree, so a survivor of a
 // phase (a setsid daemon included) normally shows one of them. Fails closed: a ps or lsof failure counts as a survivor.
 // Residual: a process that clears its environment, rewrites its argv AND leaves the worktree cwd is not found.
+// The marker as a whole path: followed by the end, "/" or whitespace (".../run/o__r" must not match ".../run/o__r2").
+const mentions = (text, k) => { for (let i = text.indexOf(k); i !== -1; i = text.indexOf(k, i + 1)) { const c = text[i + k.length]; if (c === undefined || c === '/' || /\s/.test(c)) return true; } return false; };
 export function scanSurvivors(markers) {
   const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
   if (ps.status !== 0 || ps.error) return 1;
@@ -64,7 +66,7 @@ export function scanSurvivors(markers) {
   for (const line of ps.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line);
     if (!m || m[2].startsWith('Z') || Number(m[1]) === process.pid) continue;
-    if (markers.some((k) => m[3].includes(k))) hits.add(m[1]);
+    if (markers.some((k) => mentions(m[3], k))) hits.add(m[1]);
   }
   const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 5000 });
   if (lsof.error || !lsof.stdout) return 1;
