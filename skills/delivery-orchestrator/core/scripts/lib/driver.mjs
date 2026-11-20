@@ -41,7 +41,9 @@ const next = (run) => (typeof run?.stop === 'string' && run.stop ? stop('run_sto
 
 // Can this state go to awaiting_human? A `hold` on a state that cannot (queued, building, built, ci_failed, fixing,
 // verify_failed) cannot park the feature: the caller writes the attention entry and stops the run, leaving the state.
-export const canHold = (state) => knownState(state) && TRANSITIONS[state].includes('awaiting_human');
+// building and fixing can go to awaiting_human only for a budget hold (run control); a driver `hold` action there keeps the attention-and-stop path.
+const BUDGET_ONLY = new Set(['building', 'fixing']);
+export const canHold = (state) => knownState(state) && !BUDGET_ONLY.has(state) && TRANSITIONS[state].includes('awaiting_human');
 
 // The fix brief of a `fixing` feature, from the state it was in before its last "fixing" history entry.
 export function fixKind(f) {

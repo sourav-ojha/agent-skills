@@ -34,7 +34,8 @@ const outcome = (o) => { emit(o); process.exitCode = 2; };
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
   next | built ID [--tier T] | pr ID --title T --body-file .delivery/F | ci ID [--timeout S] [--interval S] [--grace S] | fix ID | push ID | merge ID [--settle S]
   retry ID [--no-ci] [--checks A,B] | block ID --reason R | skip ID --reason R | status [--json] | reset --yes
-  hold ID --reason R [--kind K [--sha S --ids G1,G4]]   (factory driver only: a queue under FACTORY_HOME)
+  hold ID --reason R [--kind K [--sha S --ids G1,G4]]   (factory driver only: a queue under FACTORY_HOME; from building/fixing only --kind budget)
+  unhold ID --to building|fixing   (factory driver only: resumes a budget hold)
   readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
@@ -881,6 +882,9 @@ C.hold = () => {
   if (!reason) die('--reason is required');
   const kind = opt.kind === undefined ? null : String(opt.kind);
   if (kind !== null && !/^[a-z_]{1,32}$/.test(kind)) die('--kind must be 1-32 characters of a-z and _');
+  // A running step (building, fixing) can only be parked by the run-control budget; every other hold there is the driver's attention-and-stop path.
+  if ((f.state === 'building' || f.state === 'fixing') && kind !== 'budget') die(`${f.id} is "${f.state}", which cannot wait for a person`);
+  if (kind === 'budget') f.budget_hold = { from: f.state };
   if (kind === 'antigaming') {
     const ids = parseList(opt.ids).filter((x) => /^G[1-5]$/.test(x));
     if (!SHA.test(String(opt.sha || '')) || !ids.length) die('an anti-gaming hold needs --sha <40-hex> and --ids G1..G5');
@@ -890,6 +894,20 @@ C.hold = () => {
   transition(f, 'awaiting_human', reason);
   save(q);
   outcome({ id: f.id, state: f.state, hold_kind: kind });
+};
+
+// Resumes a budget hold: back to the step it was parked in, marked interrupted so the driver restarts that step.
+C.unhold = () => {
+  const q = load(); const f = item(q);
+  if (!queueInHome()) die('unhold is a factory driver command: the queue file must be a private file under FACTORY_HOME');
+  if (f.state !== 'awaiting_human' || f.hold_kind !== 'budget') die(`${f.id} is not held for a budget (state "${f.state}", hold_kind ${JSON.stringify(f.hold_kind ?? null)})`);
+  const to = opt.to;
+  if (to !== 'building' && to !== 'fixing') die('--to must be building or fixing');
+  delete f.budget_hold; f.hold_kind = null;
+  f.interrupted = { kind: 'budget', step: to === 'building' ? 'build' : 'fix', ts: new Date().toISOString() };
+  transition(f, to, 'budget hold released');
+  save(q);
+  emit({ id: f.id, state: f.state, interrupted: f.interrupted });
 };
 
 C.block = () => {
