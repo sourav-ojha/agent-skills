@@ -13,7 +13,10 @@ const DELIVER = path.join(SK, 'core', 'scripts', 'deliver.mjs');
 const FAKE = path.join(REPO, 'tests', 'validation', 'fixtures-gh', 'gh.mjs');
 const q = await import(path.join(SK, 'core', 'scripts', 'lib', 'queue.mjs'));
 
-const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
+// The local bare origin is reached through url.<path>.insteadOf passed PER PROCESS (GIT_CONFIG_COUNT), never written to the repo
+// config: merge checks that origin resolves (after repo-config rewriting) to the pinned GitHub repository.
+const GENV = new Map();
+const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, ...(GENV.get(cwd) || {}) } }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
 
 function spec(id, { status = 'ready', delivery, deps, title = `Feature ${id}` } = {}) {
   return `---\ntype: feature-spec\nid: ${id}\nopportunity: OPP-001\nstatus: ${status}\n${delivery ? `delivery: ${delivery}\n` : ''}${deps ? `depends_on: ${deps}\n` : ''}---\n# ${title}\n\nbody\n`;
@@ -31,7 +34,8 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   sh(root, 'init', '-q', '--bare', '-b', 'main', origin);
   sh(root, 'clone', '-q', origin, work);
   for (const [k, v] of [['user.email', 't@x'], ['user.name', 't']]) sh(work, 'config', k, v);
-  sh(work, 'config', `url.${origin}.insteadOf`, 'git@github.com:o/r.git'); // origin looks like the GitHub repo gh targets, but pushes go to the local bare repo
+  const rw = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_0: 'git@github.com:o/r.git' }; // origin looks like the GitHub repo gh targets, but pushes go to the local bare repo
+  GENV.set(work, rw);
   sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
   fs.mkdirSync(path.join(work, '.product/features'), { recursive: true });
   for (const [id, o] of Object.entries(specs)) fs.writeFileSync(path.join(work, `.product/features/${id}.md`), spec(id, o));
@@ -43,7 +47,7 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   const state = path.join(root, 'gh-state.json');
   const gs = { origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]] };
   fs.writeFileSync(state, JSON.stringify(gs));
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
+  const env = { ...process.env, ...rw, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
   const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
   const gh = () => JSON.parse(fs.readFileSync(state, 'utf8'));
   const setGh = (fn) => { const s = gh(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };

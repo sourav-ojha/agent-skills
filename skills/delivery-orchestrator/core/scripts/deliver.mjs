@@ -676,20 +676,30 @@ function verdictGate(q, f, bc, headSha) {
   return { ...G(`anti-gaming check ${ids.join(', ')} hit on the merge commit: a person reviews it (deliver retry ${f.id} --note at a terminal overrides it for this commit)`, 'antigaming'), ids };
 }
 
-// Fetch for merge: an EXPLICIT refspec (a planted remote.origin.fetch cannot leave a stale or forged tracking ref in place) from an
-// origin whose configured URL is exactly the repository gh is pinned to. hardened (driver mode, after the preflight): the gitSafe
-// neutralising flags on top of gitNet (hooks off, ext:: off, plain ssh, no redirects, no submodules, no gc/maintenance, no
-// commit-graph). protocol.file and the credential flags are left to gitNet: the URL check pins origin, and gitNet supplies the
-// configured account's token. Interactive mode keeps the plain gitNet fetch (the user's own checkout and config).
+// Fetch for merge: an EXPLICIT refspec (a planted remote.origin.fetch cannot leave a stale or forged tracking ref in place).
+// origin must resolve (`remote get-url --all`, i.e. after repo-config insteadOf rewriting) to EXACTLY one URL that is the pinned
+// repository: host equal to the configured GitHub host, path equal to q.repo. Driver mode (after the preflight) additionally
+// refuses any remote.origin.pushurl, and fetches from a URL REBUILT from the pinned host + q.repo (scheme and ssh user follow the
+// checked origin, so the configured credentials still apply), never from the named remote; the fetch is hardened with the gitSafe
+// neutralising flags (hooks off, ext:: off, plain ssh, no redirects, no submodules, no gc/maintenance, no commit-graph) on top of
+// gitNet. protocol.file and the credential flags are left to gitNet (gitNet supplies the account token). Interactive mode keeps the
+// named-remote gitNet fetch through your own config (env and global-config rewrites are yours and are not seen by this check).
 const HARD = (() => { const out = []; for (let i = 0; i < GIT_SAFE_FLAGS.length; i += 2) if (!/^(protocol\.file\.allow|credential\.helper|core\.askPass)=/.test(GIT_SAFE_FLAGS[i + 1])) out.push(GIT_SAFE_FLAGS[i], GIT_SAFE_FLAGS[i + 1]); return out; })();
 const urlPath = (u) => { const m = /^(?:(?:https|ssh):\/\/[^/]+\/|[A-Za-z0-9._-]+@[^:/]+:)(.+?)(?:\.git)?\/?$/i.exec(String(u)); return m ? m[1].toLowerCase() : null; };
-function originOk(q) {
-  const u = og('config', '--get', 'remote.origin.url');
-  const url = u.code === 0 ? u.out.trim() : '';
-  const host = (GH_HOSTNAME || q.policy?.github?.host || 'github.com').toLowerCase();
-  return !!url && !url.includes('\n') && remoteHost(url) === host && urlPath(url) === String(q.repo).toLowerCase();
+const pinHost = (q) => (GH_HOSTNAME || q.policy?.github?.host || 'github.com').toLowerCase();
+// The single URL origin resolves to, when it is the pinned repository; otherwise null.
+function originUrl(q, driver) {
+  const r = og('remote', 'get-url', '--all', 'origin');
+  const urls = r.code === 0 ? r.out.split('\n').map((x) => x.trim()).filter(Boolean) : [];
+  if (urls.length !== 1) return null;
+  const url = urls[0];
+  if (remoteHost(url) !== pinHost(q) || urlPath(url) !== String(q.repo).toLowerCase()) return null;
+  if (driver) { const p = og('config', '--get-all', 'remote.origin.pushurl'); if (p.code !== 1 || p.out.trim()) return null; } // 1 = key absent
+  return url;
 }
-const fetchRef = (branch, hardened) => (hardened ? gitNet(...HARD, 'fetch', 'origin', `+refs/heads/${branch}:${OR(branch)}`) : gitNet('fetch', 'origin', `+refs/heads/${branch}:${OR(branch)}`));
+// Rebuilt from the pin, never copied from config: https://<host>/<owner>/<repo>.git, or <user>@<host>:<owner>/<repo>.git for ssh.
+const pinnedUrl = (q, url) => (/^https:/i.test(url) ? `https://${pinHost(q)}/${q.repo}.git` : `${(/^(?:ssh:\/\/)?([A-Za-z0-9._-]+)@/.exec(url) || [, 'git'])[1]}@${pinHost(q)}:${q.repo}.git`);
+const fetchRef = (q, url, branch, driver) => (driver ? gitNet(...HARD, 'fetch', pinnedUrl(q, url), `+refs/heads/${branch}:${OR(branch)}`) : gitNet('fetch', 'origin', `+refs/heads/${branch}:${OR(branch)}`));
 // The files of the change that need a person, computed with gitSafe (no replace objects, raw output); throws on any git failure.
 function ciFilesAt(pq, rev) {
   const mb = rawGit('merge-base', OR(pq.base), rev);
@@ -712,8 +722,9 @@ C.merge = () => {
   // preflight and have no hooks BEFORE the fetch, which then runs hardened. The stale local config only picks the mode; never policy.
   const driver = queueInHome() || !!baseConfigNow(q.base)?.verification.required;
   if (driver) { try { gatePreflight(); checkNoHooks(root); } catch { return hold('verification gate: this checkout is not a trusted clone (git config outside the allowlist, a hook, or planted grafts, shallow, alternates, commit-graph, config.worktree or replace refs): run merge from the driver-owned clone', 'verification'); } }
-  if (!originOk(q)) return hold(`origin's URL is not ${q.repo} on ${GH_HOSTNAME || q.policy?.github?.host || 'github.com'}: the base branch and its policy cannot be fetched from a trusted remote`, 'verification');
-  if (fetchRef(q.base, driver).code !== 0) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read: fetching refs/heads/${q.base} from origin failed`, 'verification');
+  const oUrl = originUrl(q, driver);
+  if (!oUrl) return hold(`origin's URL is not ${q.repo} on ${pinHost(q)} (it must resolve to exactly one URL${driver ? ', with no pushurl' : ''}): the base branch and its policy cannot be fetched from a trusted remote`, 'verification');
+  if (fetchRef(q, oUrl, q.base, driver).code !== 0) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read: fetching refs/heads/${q.base} from origin failed`, 'verification');
   // The policy is read from exactly the commit just fetched, and the tracking ref every later check uses must point at it.
   const fh = og('rev-parse', '--verify', '--quiet', 'FETCH_HEAD^{commit}'), tr = og('rev-parse', '--verify', '--quiet', `${OR(q.base)}^{commit}`);
   const baseSha = fh.code === 0 ? fh.out.trim() : '';
@@ -733,7 +744,7 @@ C.merge = () => {
   if (required && !queueInHome()) return hold(`verification is required but the queue file is not under FACTORY_HOME (it may be builder-writable): run merges through the factory driver`, 'verification');
   if (q.protected_base || isProtectedBranch(q.base, bc.protected_branches)) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
   if (!q.merge) return hold('merging was not authorised for this run (config merge.mode is "pr-only" and --merge was not given): the PR is ready for you');
-  if (og('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(fetchRef(f.branch, driver), 'git fetch');
+  if (og('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(fetchRef(q, oUrl, f.branch, driver), 'git fetch');
   let ci = null; // recomputed on the verified commit with gitSafe, renames included; a git failure holds (after the gate, below)
   try { ci = [...new Set([...(f.ci_files || []), ...ciFilesAt(pq, f.ci_sha)])]; } catch { /* ci stays null */ }
   // T3 needs the opt-in AND a matching passing verdict, in every mode; with verification required every feature needs the verdict.

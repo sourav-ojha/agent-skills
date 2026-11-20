@@ -183,6 +183,7 @@ export function touchesWorktree(rest) {
   const [cmd, ...a] = rest;
   if (SAFE_NO_WORKTREE.has(cmd)) return false;
   if (cmd === 'config') return !a.some((x) => ['--get', '--get-all', '--get-regexp', '--list', '-l'].includes(x));
+  if (cmd === 'remote' && a[0] === 'get-url') return false; // reads config only
   if (cmd === 'diff' && a.includes('--')) {
     // A diff between exactly two full commit ids reads only the object database, whatever pathspecs follow `--` (attr magic aside:
     // it consults .gitattributes files). checkDiff runs this shape; a walk would make any large tree (node_modules) a permanent hold.

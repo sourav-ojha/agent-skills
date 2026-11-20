@@ -1969,3 +1969,33 @@ test('T10 r3: when the changed files cannot be listed (no merge base) a non-gate
   assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /changed files could not be listed/); assert.equal(mergeCalled(r), false);
   rm(r);
 });
+
+// ---- Task 10 fix round 4 ------------------------------------------------------------------------------------------------------------
+test('T10 r4: origin must resolve (after rewriting) to exactly one URL; driver mode also refuses pushurl and repo-config insteadOf', () => {
+  const holds = (r, re, env = {}) => { const m = r.d({ ...r.env, ...env }, 'merge', 'FEATURE-001'); assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, re); assert.equal(mergeCalled(r), false); };
+  // two url values (both the pinned one): the fetch would use the first, a later reader another
+  const two = shipped(); g(two.work, 'config', '--add', 'remote.origin.url', 'git@github.com:o/r.git'); holds(two, /exactly one URL/);
+  const twoD = vship(); twoD.edit((f) => { f.state = 'verified'; }); g(twoD.work, 'config', '--add', 'remote.origin.url', 'git@github.com:o/r.git'); holds(twoD, /exactly one URL/);
+  // a pushurl in driver mode
+  const push = vship(); push.edit((f) => { f.state = 'verified'; }); arm(push); g(push.work, 'config', 'remote.origin.pushurl', 'git@github.com:o/r.git'); holds(push, /no pushurl/);
+  // a repo-config insteadOf rewriting origin to another host: interactive -> get-url sees the rewritten URL; driver -> the allowlist refuses url.*
+  const rw = shipped(); g(rw.work, 'config', 'url.git@example.com:o/r.git.insteadOf', 'git@github.com:o/r.git');
+  assert.equal(GS.gitSafeOpts(rw.work, ['remote', 'get-url', '--all', 'origin'], { verified: true }).out.trim(), 'git@example.com:o/r.git', 'control: get-url applies the rewrite');
+  holds(rw, /origin's URL is not o\/r/);
+  const rwD = vship(); rwD.edit((f) => { f.state = 'verified'; }); arm(rwD); g(rwD.work, 'config', 'url.git@example.com:o/r.git.insteadOf', 'git@github.com:o/r.git');
+  holds(rwD, /not a trusted clone/);
+  assert.throws(() => GS.verifyGitConfig(rwD.work), /git config not allowed: url\./);
+  assert.equal(GS.touchesWorktree(['remote', 'get-url', '--all', 'origin']), false);
+  rm(two, twoD, push, rw, rwD);
+});
+
+test('T10 r4: the driver fetch goes to a URL rebuilt from the pin, not to the configured remote', () => {
+  const r = vship();
+  r.edit((f) => { f.state = 'verified'; }); arm(r);
+  // origin is another spelling of the pin (passes the check). Only the REBUILT url (git@github.com:o/r.git) is rewritten to the test
+  // origin by the per-process insteadOf; `fetch origin` would go to ssh://git@github.com/o/r.git itself and fail.
+  g(r.work, 'remote', 'set-url', 'origin', 'ssh://git@github.com/o/r.git');
+  const m = merge(r);
+  assert.equal(J(m)?.state, 'merged', m.out + m.err);
+  rm(r);
+});
