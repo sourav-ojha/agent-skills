@@ -774,6 +774,7 @@ test('Crash and resume: a feature resumed too many times holds instead of loopin
 test('Crash and resume: fixing: the head moved since the last CI run -> deliver push', () => {
   const f = feat('fixing', { history: hist('ci_failed', 'fixing'), pr: { number: 7, head_sha: SHA_B } });
   assert.deepEqual(D.resumeAction(f, { ...FACTS, head: SHA_A }, RUN), { do: 'push' });
+  for (const result of ['absent', 'blocked', undefined]) assert.deepEqual(D.resumeAction(f, { ...FACTS, head: SHA_A, result }, RUN), { do: 'build', brief: 'ci_fix' }, `result ${result}: a session that did not finish is not pushed`);
 });
 
 test('Crash and resume: fixing: otherwise run a new fix session', () => {
@@ -1099,7 +1100,7 @@ test('factory run: a blocked builder blocks the feature with an attention line (
   for (const d of [['work', 'o__r', `FEATURE-009-${'a'.repeat(40)}`, 'src'], ['trash', 'q1'], ['tmp', 'r1']]) fs.mkdirSync(path.join(w.fhome, ...d), { recursive: true });
   const r = w.factory(['run']);
   for (const d of [['work', 'o__r', `FEATURE-009-${'a'.repeat(40)}`], ['trash', 'q1'], ['tmp', 'r1']]) assert.equal(fs.existsSync(path.join(w.fhome, ...d)), false, d.join('/'));
-  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(r.code, 2, `a blocked feature finishes with exit 2: ${r.out}${r.err}`);
   assert.match(r.out, /^attention: FEATURE-001 blocked \(block\)$/m);
   assert.ok(!r.out.includes('Postgres'), 'builder text is not printed');
   const f = w.queue().features[0];
@@ -1112,7 +1113,7 @@ test('factory run: a blocked builder blocks the feature with an attention line (
 test('factory run: a config-injection PR (.claude/settings.json) is held by G4 at pr_open, bound to the sha; never verified or merged', (t) => {
   const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001', { '.claude/settings.json': '{"hooks":{"Stop":[]}}\n' })] } } });
   const r = w.factory(['run']);
-  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(r.code, 2, r.out + r.err); // finished with a feature that needs a person
   assert.match(r.out, /attention: FEATURE-001 awaiting_human \(antigaming\)/);
   const f = w.queue().features[0];
   assert.equal(f.state, 'awaiting_human'); assert.equal(f.hold_kind, 'antigaming');
@@ -1160,6 +1161,9 @@ test('factory run: refusals with fix text (protection, verification.required, re
   const x = n.factory(['run']);
   assert.equal(x.code, 1);
   assert.match(x.out, /local_checks are configured/); assert.match(x.out, /^fix: run those checks in CI/m);
+  const v = world(t, { config: { ...BASE_CONFIG, checks: { required: ['ci', 'factory/verified'] } }, specs: { 'FEATURE-001': 'Items one' } });
+  readiness(v);
+  assert.match(v.factory(['run']).out, /checks\.required names factory\/verified/);
   assert.match(x.out, /verification\.required is not true/); assert.match(x.out, /readiness level 4/); assert.match(x.out, /stored readiness result is missing/);
   assert.ok((x.out.match(/^fix: /gm) || []).length >= 3, 'one fix line per problem');
   const s = world(t, { specs: { 'FEATURE-001': 'Items one' } });
@@ -1177,7 +1181,7 @@ test('factory run: G2 at built gets one builder fix attempt (antigaming_fix brie
   const only = { 'test/items.test.js': "it.only('lists', () => {});\n" };
   const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001', only), { status: 'done' }] } } });
   const r = w.factory(['run']);
-  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(r.code, 2, r.out + r.err); // finished with a feature that needs a person
   const runs = builderRuns(w, 'FEATURE-001');
   assert.equal(runs.length, 2);
   assert.match(promptOf(runs[1]), /Anti-gaming checks G2 fired/);
@@ -1197,7 +1201,7 @@ test('factory run: with no checks.required, CI waits only for CI (not factory/ve
 
 test('deliver hold is a driver command: refused for a queue outside FACTORY_HOME; held states only', (t) => {
   const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ status: 'blocked' }] } } });
-  assert.equal(w.factory(['run']).code, 0);
+  assert.equal(w.factory(['run']).code, 2);
   const out = path.join(w.root, 'q.json'); fs.copyFileSync(w.queueFile, out);
   const d = (q, ...a) => spawnSync(process.execPath, [path.join(SCRIPTS, 'deliver.mjs'), ...a, '--dir', w.clone], { encoding: 'utf8', env: { ...w.env, DELIVER_QUEUE: q } });
   const x = d(out, 'hold', 'FEATURE-001', '--reason', 'r');
@@ -1209,7 +1213,7 @@ test('deliver hold is a driver command: refused for a queue outside FACTORY_HOME
 test('factory run: a session that writes no result never reuses the previous one (result.json deleted before every session)', (t) => {
   const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), files: { 'src/FEATURE-001.txt': 'wrong\n' } }, { files: { 'src/FEATURE-001.txt': 'good\n' }, commit: true, status: 'none' }] } } });
   const r = w.factory(['run']);
-  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(r.code, 2, r.out + r.err); // finished with a feature that needs a person
   const f = w.queue().features[0];
   assert.equal(f.state, 'blocked', 'no result = blocked (no_result), not the stale "done" of the first session');
   assert.match(f.reason, /no_result/);
@@ -1229,7 +1233,7 @@ test('factory run: verification that throws holds (no fix round used); the build
   const bad = w.factory(['run'], { FACTORY_BUILDER_HOME: path.join(w.fhome, 'b') });
   assert.equal(bad.code, 1); assert.match(bad.out, /refused: the builder directory must be outside FACTORY_HOME/);
   const r = w.factory(['run']);
-  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(r.code, 2, r.out + r.err); // finished with a feature that needs a person
   const f = w.queue().features[0];
   assert.equal(f.state, 'awaiting_human'); assert.equal(f.hold_kind, 'verification'); assert.equal(f.fix_rounds, 0);
   assert.equal(f.verify_runs, 1); assert.equal(f.verdict, undefined);
@@ -1267,4 +1271,103 @@ test('factory run: killed after a build session that left the tree dirty, the re
   assert.equal(w.queue().features[0].state, 'merged');
   assert.equal(builderRuns(w, 'FEATURE-001').length, 2, 'a dirty tree is reset and rebuilt, never reported built');
   assert.equal(fs.existsSync(path.join(w.builder, 'stray.txt')), false, 'clean -fd removed the stray file');
+});
+
+// ---- review round 1 -----------------------------------------------------------------------------------------------------------------
+const sleeper = (cwd, ms = 60000) => { fs.mkdirSync(cwd, { recursive: true }); const c = spawn(process.execPath, ['-e', `setTimeout(() => {}, ${ms})`], { cwd, detached: true, stdio: 'ignore' }); c.unref(); return c; };
+
+test('I-1: a branch tracking .delivery (symlink) or .skill-runs is blocked before checkout in the driver clone; no link target is created', (t) => {
+  const w = ready(t, { fake: { plan: {} } });
+  const pwned = path.join(w.root, 'PWNED');
+  w.setFake((s) => { s.plan = {
+    'FEATURE-001': [{ ...good('FEATURE-001'), symlinks: { '.delivery/.gitignore': pwned }, force_add: ['.delivery/.gitignore'] }],
+    'FEATURE-002': [{ ...good('FEATURE-002', { '.Skill-Runs/factory-runs.jsonl': '{"forged":true}\n' }) }],
+  }; });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.equal(fs.existsSync(pwned), false, 'the dangling link target was never created');
+  assert.deepEqual(w.queue().features.map((f) => f.state), ['blocked', 'blocked']);
+  for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
+  assert.match(r.out, /attention: FEATURE-001 blocked/); assert.match(r.out, /attention: FEATURE-002 blocked/);
+  for (const p of ['.delivery', '.delivery/.gitignore']) { let st = null; try { st = fs.lstatSync(path.join(w.clone, p)); } catch { /* absent */ } assert.ok(!st || !st.isSymbolicLink(), `${p} in the driver clone is not a link`); }
+  assert.ok(!fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'run records not overwritten');
+  assert.equal(w.ghState().prs.length, 0);
+});
+
+test('I-1 (b): deliver never writes .delivery/.gitignore through a planted (dangling) symlink', (t) => {
+  const w = world(t, { specs: { 'FEATURE-001': 'Items one' } });
+  readiness(w);
+  const target = path.join(w.root, 'CREATED');
+  fs.mkdirSync(path.join(w.work, '.delivery')); fs.symlinkSync(target, path.join(w.work, '.delivery', '.gitignore'));
+  const r = spawnSync(process.execPath, [path.join(SCRIPTS, 'deliver.mjs'), 'init', '--dir', w.work], { encoding: 'utf8', env: w.env });
+  assert.equal(r.status, 1, r.stdout + r.stderr); assert.match(r.stderr, /\.delivery\/\.gitignore is a symlink/);
+  assert.equal(fs.existsSync(target), false);
+  fs.rmSync(path.join(w.work, '.delivery'), { recursive: true }); fs.symlinkSync(path.join(w.root, 'elsewhere'), path.join(w.work, '.delivery'));
+  const r2 = spawnSync(process.execPath, [path.join(SCRIPTS, 'deliver.mjs'), 'init', '--dir', w.work], { encoding: 'utf8', env: w.env });
+  assert.equal(r2.status, 1); assert.match(r2.stderr, /\.delivery is a symlink/); assert.equal(fs.existsSync(path.join(w.root, 'elsewhere')), false);
+});
+
+test('I-2/I-4: a restart at ci_passed scans the builder clone before verification; another repo\'s live builder run dir does not matter', async (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const other = sleeper(path.join(`${w.fhome}-builder`, 'run', 'a__b', 'x'));
+  t.after(() => { try { process.kill(other.pid, 'SIGKILL'); } catch { /* gone */ } });
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'ci' }) }).signal, 'SIGKILL');
+  assert.equal(w.queue().features[0].state, 'ci_passed');
+  const live = sleeper(w.builder);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err); assert.match(r.out, /stopped: leftovers/);
+  assert.equal(verifyCalls(w).length, 0, 'no verification while a builder process lives');
+  process.kill(live.pid, 'SIGKILL');
+  await new Promise((res) => setTimeout(res, 300));
+  const ok = w.factory(['run']);
+  assert.equal(ok.code, 0, ok.out + ok.err);
+  assert.match(ok.out, /FEATURE-001 ci_passed -> verify/);
+  assert.equal(w.queue().features[0].state, 'merged');
+});
+
+test('restarts: fixing resumes the fix session without a second deliver fix; verified resumes at merge without re-verifying', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), files: { 'src/FEATURE-001.txt': 'wrong\n' } }, { files: { 'src/FEATURE-001.txt': 'good\n' }, commit: true }] } } });
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'fix_verify' }) }).signal, 'SIGKILL');
+  assert.equal(w.queue().features[0].state, 'fixing');
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'verified' }) }).signal, 'SIGKILL');
+  const f1 = w.queue().features[0];
+  assert.equal(f1.state, 'verified'); assert.equal(f1.fix_rounds, 1, 'the fix round was not counted twice');
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 2);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /FEATURE-001 verified -> merge/);
+  assert.equal(w.queue().features[0].state, 'merged');
+  assert.deepEqual(verifyCalls(w).map((l) => l.split(' ')[2]), ['fail', 'pass'], 'the stored pass verdict was reused, not re-run');
+});
+
+test('a fresh run refuses while a leftover verification worktree is still in use', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const dir = path.join(w.fhome, 'work', 'o__r', `FEATURE-001-${'b'.repeat(40)}`);
+  const p = sleeper(dir);
+  t.after(() => { try { process.kill(p.pid, 'SIGKILL'); } catch { /* gone */ } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 1, r.out); assert.match(r.out, /still alive \(0 process group\(s\), 1 directory/);
+  assert.ok(fs.existsSync(dir), 'a worktree in use is never removed');
+  assert.equal(fs.existsSync(w.queueFile), false);
+});
+
+test('makeNetGit: the https credential helper is offered before any account token is known (private https clone)', (t) => {
+  const d = tmp(t); const log = path.join(d, 'argv.json');
+  fs.writeFileSync(path.join(d, 'git'), `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' "${log}" "$@"\n`, { mode: 0o755 });
+  const prev = process.env.PATH; process.env.PATH = `${d}:${prev}`;
+  try { FX.makeNetGit({ host: 'github.com' })(d, ['clone', 'https://github.com/o/r.git', 'r']); } finally { process.env.PATH = prev; }
+  const argv = JSON.parse(fs.readFileSync(log, 'utf8'));
+  assert.ok(argv.includes('credential.https://github.com.helper=!gh auth git-credential'), JSON.stringify(argv));
+  assert.ok(argv.includes('credential.helper='), 'every other helper is blanked first');
+});
+
+test('resume: a builder clone git refuses to read (planted nested .git) -> attention and exit 2, state left as it is', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'build' }) }).signal, 'SIGKILL');
+  fs.mkdirSync(path.join(w.builder, 'vendor', 'x', '.git'), { recursive: true });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /attention: FEATURE-001 building \(resume_error\)/); assert.match(r.out, /stopped: resume_error/);
+  assert.equal(w.queue().features[0].state, 'building');
+  assert.ok(!r.out.includes(w.root), 'no paths printed');
 });

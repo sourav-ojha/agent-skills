@@ -135,15 +135,28 @@ function load() {
   useAccount(q.policy.github.account, q.policy.github.host);
   return q;
 }
-function save(q) {
-  fs.mkdirSync(dirState, { recursive: true });
+// .delivery/ and its .gitignore are created without following links: a branch can commit a symlink there (a dangling
+// .delivery/.gitignore link would otherwise make this write create its target anywhere the user can write).
+const NOFOLLOW_CREATE = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0);
+function stateDir() {
+  let st = null; try { st = fs.lstatSync(dirState); } catch { /* absent */ }
+  if (st && (st.isSymbolicLink() || !st.isDirectory())) die('.delivery is a symlink or not a directory; remove it and run again');
+  if (!st) fs.mkdirSync(dirState);
   const ign = path.join(dirState, '.gitignore');
-  if (!fs.existsSync(ign)) fs.writeFileSync(ign, '*\n');
+  let fd;
+  try { fd = fs.openSync(ign, NOFOLLOW_CREATE, 0o644); fs.writeSync(fd, '*\n'); } catch (e) {
+    if (e.code !== 'EEXIST') die(`cannot write .delivery/.gitignore (${e.code})`);
+    if (fs.lstatSync(ign).isSymbolicLink()) die('.delivery/.gitignore is a symlink; remove it and run again');
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+function save(q) {
+  stateDir();
   if (queueOverride) {
     try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); writeJsonAtomic(file, q); } catch (e) { die(`cannot write the queue file: ${e.message}`); }
   } else {
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n');
+    fs.rmSync(tmp, { force: true });
+    fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n', { flag: 'wx' }); // O_EXCL: never through a planted link
     fs.renameSync(tmp, file);
   }
   curQ = q;

@@ -47,6 +47,7 @@ const BY = /^[\w.@-]{1,64}$/;
 export class Refusal extends Error { constructor(msg, fix) { super(msg); this.fix = fix || null; } }
 // Something from a dead or escaped session may still be running in the builder clone: no git call there, the run stops.
 class Leftover extends Error {}
+class Unsafe extends Error {}
 const refuse = (msg, fix) => { throw new Refusal(msg, fix); };
 
 // ---- argv -----------------------------------------------------------------------------------------------------------------------
@@ -86,7 +87,9 @@ export function makeNetGit({ host, ghEnv = {}, extraEnv = {}, allowFile = false 
       if (allowFile && GIT_SAFE_FLAGS[i + 1].startsWith('protocol.file.allow=')) continue;
       flags.push(GIT_SAFE_FLAGS[i], GIT_SAFE_FLAGS[i + 1]);
     }
-    const cred = host && (ghEnv.GH_TOKEN || ghEnv.GH_ENTERPRISE_TOKEN) ? ['-c', `credential.https://${host}.helper=!gh auth git-credential`] : [];
+    // Always offered for https on the pinned host (with GH_TOKEN of the configured account when one is set, else gh's own login):
+    // the driver must be able to clone a private https repository before it has read the base config.
+    const cred = host ? ['-c', `credential.https://${host}.helper=!gh auth git-credential`] : [];
     const r = spawnSync('git', [...flags, ...cred, ...args], { cwd, env: { ...gitEnv(), ...ghEnv, ...extraEnv }, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 30 * 60 * 1000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
     if (r.error || r.signal) return { code: 1, out: '', err: 'git was interrupted' };
     return { code: r.status ?? 1, out: r.stdout || '', err: r.stderr || '' };
@@ -162,7 +165,7 @@ export function ensureClone(ctx, parent, key) {
   let fresh = false;
   if (!fs.existsSync(dir)) {
     const c = ctx.netGit(parent, ['clone', ctx.id.url, key]);
-    if (c.code !== 0) refuse('cloning the repository failed', 'check that the driver can reach the repository (ssh key or gh login)');
+    if (c.code !== 0) refuse('cloning the repository failed', /^https:/.test(ctx.id.url) ? `log in with "gh auth login --hostname ${ctx.id.host}" (and set github.account in ${CONFIG_PATH} when gh has several accounts): https remotes are cloned with that login` : 'check that your ssh key can reach the repository');
     fresh = true;
     for (const [k, v] of [['user.name', 'factory-driver'], ['user.email', 'factory-driver@localhost'], ['gc.auto', '0']]) {
       if (gitSafeOpts(dir, ['config', k, v]).code !== 0) refuse('configuring the new clone failed');
@@ -245,6 +248,7 @@ export function makeContext({ argv, deps = {} }) {
 
 // gh token of the configured account, held in memory (never printed or written), offered only to that host.
 function useAccount(ctx, account, host) {
+  for (const k of ['GH_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GH_HOST']) delete ctx.ghEnv[k];
   if (!account) return;
   const t = run('gh', ['auth', 'token', '--user', account, '--hostname', host], { env: ctx.env });
   if (t.code !== 0 || !t.out.trim()) refuse(`gh has no login for the configured account on ${host}`, `run "gh auth login --hostname ${host}" for that account`);
@@ -264,6 +268,11 @@ export function prepare(ctx) {
     throw e;
   }
   ctx.netGit = ctx.deps.netGit || makeNetGit({ host: ctx.id.host, ghEnv: ctx.ghEnv, ...(ctx.deps.netGitOpts || {}) });
+  // Credentials for the first clone/fetch, before the base config can be read: the account named in the checkout's config
+  // (untrusted: it only picks which of your gh logins is offered, to the pinned host only). The base config's account replaces
+  // it right after the fetch; a mismatch is refused below.
+  const boot = bootAccount(dir);
+  if (boot) useAccount(ctx, boot, ctx.id.host);
   ctx.D = ensureClone(ctx, path.join(ctx.fh, 'clones'), ctx.key).dir;
   ctx.git = (...a) => gitSafeOpts(ctx.D, a);
   // The base: the person (--base) or the config committed on the default branch, never a working copy.
@@ -275,8 +284,17 @@ export function prepare(ctx) {
   ctx.policy = baseConfig(ctx.git, base);
   if (!ctx.policy) refuse(`${CONFIG_PATH} on origin/${base} is missing its ref or is invalid`, `fix ${CONFIG_PATH} on ${base}`);
   if (ctx.policy.github.host.toLowerCase() !== ctx.id.host) refuse('github.host in the base config is not the origin host', 'set github.host to the host of origin');
+  if ((ctx.policy.github.account || null) !== (boot || null)) refuse('github.account in the checkout differs from the one in the base config', `update the checkout (${CONFIG_PATH}) to the copy on ${base}`);
   useAccount(ctx, ctx.policy.github.account, ctx.policy.github.host);
   return ctx;
+}
+function bootAccount(dir) {
+  try {
+    const p = path.join(dir, CONFIG_PATH);
+    if (!fs.lstatSync(p).isFile()) return null;
+    const { config, errors } = parseConfig(JSON.parse(fs.readFileSync(p, 'utf8')));
+    return errors.length ? null : config.github.account;
+  } catch { return null; }
 }
 
 // ---- scenarios ----------------------------------------------------------------------------------------------------------------------
@@ -394,6 +412,7 @@ export function startChecks(ctx) {
   need(!(level >= 4) || rd.base !== ctx.base, `the stored readiness result is ${level === null ? 'missing' : `level ${level}`}${rd && rd.base !== ctx.base ? ' for another base' : ''}, level 4 is required`, 'run "deliver readiness" in a checkout of the base branch and fix what it lists');
   need(p.local_checks.length > 0, 'local_checks are configured, and deliver built runs them outside the untrusted-code sandbox', 'run those checks in CI (checks.required) for factory runs, and set local_checks to []');
   const prot = requiredStatusChecks({ gh: (...a) => { const r = ctx.gh(a); return { code: r.code, out: r.out.trim(), err: r.err.trim() }; }, repo: ctx.id.repo, base: ctx.base });
+  need(p.checks.required.some((n) => n.toLowerCase() === VERIFIED), `checks.required names ${VERIFIED}, which is posted only after CI passed`, `remove "${VERIFIED}" from checks.required (branch protection requires it at merge)`);
   need(prot.state !== 'found' || !prot.names.includes(VERIFIED), `branch protection on ${ctx.base} does not require the ${VERIFIED} status`, `require the "${VERIFIED}" status check in branch protection (or a ruleset) on ${ctx.base}; this needs a public repository or a plan with protected private branches`);
   if (why.length) refuse(`factory run needs: ${why.join('; ')}`, fixes);
   ctx.out(`warning: ${VERIFIED} is a plain commit status: anyone with status write access can post it; only a required check bound to an expected source (a GitHub App) prevents that`);
@@ -431,6 +450,9 @@ function deliver(ctx, ...args) {
   return { code: r.code, json: json(r.out) };
 }
 function attention(ctx, id, state, kind) {
+  const once = `${id}\u0000${state}`;
+  if ((ctx.attended ||= new Set()).has(once)) return;
+  ctx.attended.add(once);
   ctx.attention++;
   ctx.out(`attention: ${id} ${state}${kind ? ` (${kind})` : ''}`);
   try {
@@ -450,7 +472,9 @@ function builderRoot(ctx) {
   return real;
 }
 const survivors = (ctx, markers) => (ctx.deps.survivors || scanSurvivors)(markers);
-function noLiveBuilder(ctx) { if (ctx.B && survivors(ctx, [ctx.B, path.join(ctx.bRoot, 'run')]) > 0) throw new Leftover('a process from a builder session is still running'); }
+// Every time, whether or not this process has touched the builder clone yet (a restart resuming at pr_open/ci_passed included).
+const builderRun = (ctx) => path.join(ctx.bRoot, 'run', ctx.key);
+function noLiveBuilder(ctx) { if (survivors(ctx, [path.join(ctx.bRoot, ctx.key), builderRun(ctx)]) > 0) throw new Leftover('a process from a builder session is still running'); }
 const bExists = (ctx) => fs.existsSync(path.join(ctx.bRoot, ctx.key));
 function ensureBuilder(ctx) {
   if (ctx.B) return ctx.B;
@@ -537,9 +561,29 @@ function toDriver(ctx, f) {
   const bHead = headOf(bGit(ctx), f.branch);
   if (!bHead) return headOf(ctx.git, f.branch);
   transfer(ctx, bGit(ctx), ctx.git, f.branch, bHead, headOf(ctx.git, f.branch) || f.base_sha);
+  // Checked on the commit BEFORE it is checked out in the driver clone: deliver (unsandboxed) writes .delivery/ and
+  // .skill-runs/ there, so a committed symlink or file in those places could redirect its writes or overwrite run records.
+  if (protectedEntries(ctx.git, bHead)) throw new Unsafe('the branch commits .delivery, .implementation or .skill-runs');
   must(ctx.git('checkout', '-q', '-f', '-B', f.branch, bHead), 'checkout in the driver clone');
   must(ctx.git('clean', '-q', '-f', '-d'), 'clean in the driver clone');
+  for (const n of DRIVER_OWNED) { try { if (fs.lstatSync(path.join(ctx.D, n)).isSymbolicLink()) throw new Unsafe('a driver-owned path is a symlink after checkout'); } catch (e) { if (e instanceof Unsafe) throw e; } }
   return bHead;
+}
+// Top-level names the driver and deliver write in the driver clone; a branch may not track anything there (any case: a
+// case-insensitive volume maps .DELIVERY onto .delivery).
+const DRIVER_OWNED = ['.delivery', '.implementation', '.skill-runs'];
+function protectedEntries(git, sha) {
+  const r = git('ls-tree', '--full-tree', '-z', sha);
+  if (r.code !== 0) return true;
+  return r.out.split('\0').filter(Boolean).some((l) => DRIVER_OWNED.includes(l.slice(l.indexOf('\t') + 1).toLowerCase()));
+}
+// A branch that would make the driver clone unsafe is blocked (building and fixing cannot wait for a person): the driver
+// clone goes back to the base first, so deliver never runs on that tree.
+function blockUnsafe(ctx, f) {
+  must(ctx.git('checkout', '-q', '-f', '-B', ctx.base, OR(ctx.base)), 'checkout of the base branch');
+  must(ctx.git('clean', '-q', '-f', '-d'), 'clean of the driver clone');
+  deliver(ctx, 'block', f.id, '--reason', 'the branch tracks .delivery, .implementation or .skill-runs (or a symlink there): a person reviews it');
+  return null;
 }
 
 // ---- run: builder sessions ------------------------------------------------------------------------------------------------------------
@@ -602,7 +646,8 @@ async function builderSession(ctx, f, act) {
   const brief = briefFor(ctx, f, act);
   const dir = realSubdir(ctx.B, '.implementation', f.id);
   if (brief.file !== undefined) writeFresh(path.join(dir, 'fix-brief.md'), `${brief.file}\n`); else fs.rmSync(path.join(dir, 'fix-brief.md'), { force: true });
-  const runDir = fs.mkdtempSync(path.join(privateDir(path.join(ctx.bRoot, 'run')), `${f.id}-`));
+  privateDir(path.join(ctx.bRoot, 'run'));
+  const runDir = fs.mkdtempSync(path.join(privateDir(builderRun(ctx)), `${f.id}-`));
   const tmpDir = path.join(runDir, 'tmp'); fs.mkdirSync(tmpDir, { mode: 0o700 });
   const home = ctx.deps.home || defaultHome(ctx.env);
   const v = ctx.policy.verification;
@@ -627,7 +672,8 @@ function specPaths(ctx, own) {
   return [...new Set([...baseSpecs(ctx.git, ctx.base, ctx.policy.features_dir).map((s) => s.rel), own])];
 }
 function stepBuilt(ctx, f) {
-  const head = toDriver(ctx, f);
+  let head;
+  try { head = toDriver(ctx, f); } catch (e) { if (e instanceof Unsafe) return blockUnsafe(ctx, f); throw e; }
   if (!head) return { step: 'built', kind: 'error' };
   // Anti-gaming at built: every built run overwrites the hold (a hold of an earlier built sha never carries over).
   let hits;
@@ -677,7 +723,7 @@ function stepFix(ctx, f, act) {
   return d.code === 2 ? null : { step: 'fix', kind: 'error' };
 }
 function stepPush(ctx, f) {
-  toDriver(ctx, f);
+  try { toDriver(ctx, f); } catch (e) { if (e instanceof Unsafe) return blockUnsafe(ctx, f); throw e; }
   const d = deliver(ctx, 'push', f.id);
   return d.code === 0 ? { step: 'push', kind: 'ok' } : { step: 'push', kind: 'error' };
 }
@@ -804,6 +850,7 @@ export async function cmdRun(ctx) {
   let q = fs.existsSync(ctx.queueFile) ? readQueue(ctx) : null;
   if (q && (q.repo !== ctx.id.repo || q.base !== ctx.base)) refuse('the stored queue is for another repository or base', `DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs reset --yes`);
   const resuming = q && q.features.some((f) => !['merged', 'skipped'].includes(f.state));
+  if (!resuming && (ctx.orphansAlive > 0 || ctx.leftovers > 0)) refuse(`processes or worktrees from an earlier run are still alive (${ctx.orphansAlive} process group(s), ${ctx.leftovers} directory(ies))`, 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again');
   if (!resuming) {
     must(ctx.git('checkout', '-q', '-f', '-B', ctx.base, OR(ctx.base)), 'checkout of the base branch');
     must(ctx.git('clean', '-q', '-f', '-d'), 'clean of the driver clone');
@@ -833,7 +880,13 @@ async function loop(ctx) {
       const active = q.features.find((x) => ACTIVE.includes(x.state));
       if (active) { // a feature left active by an earlier (crashed or stopped) run: the restart rules decide, once
         f = active; cur = f.id; last = null;
-        act = resumeAction(f, await resumeFacts(ctx, f), runInfo);
+        let facts;
+        try { facts = await resumeFacts(ctx, f); } catch (e) {
+          attention(ctx, f.id, f.state, e instanceof Leftover ? 'leftovers' : 'resume_error');
+          ctx.out(`stopped: ${e instanceof Leftover ? 'leftovers' : 'resume_error'}`);
+          return finish(ctx, 2);
+        }
+        act = resumeAction(f, facts, runInfo);
         update(ctx, f.id, (x) => { x.resumes = (Number.isInteger(x.resumes) ? x.resumes : 0) + 1; });
       } else act = runInfo.stop ? { do: 'stop', kind: 'run_stop', reason: runInfo.stop } : { do: 'next' };
     } else act = nextAction(f, last, runInfo);
@@ -845,6 +898,11 @@ async function loop(ctx) {
       if (f) attention(ctx, f.id, f.state, kind);
       ctx.out(`stopped: ${kind}`);
       return finish(ctx, 2);
+    }
+    // A feature that deliver itself blocked or parked (fix rounds, CI budget, merge conflict, a merge hold) gets its line too.
+    if (f && res.end === undefined) {
+      const now = readQueue(ctx).features.find((x) => x.id === f.id)?.state;
+      if (now !== f.state && (now === 'blocked' || now === 'awaiting_human')) attention(ctx, f.id, now, act.do);
     }
     ctx.deps.afterAction?.(act.do);
     if (res.end !== undefined) return finish(ctx, res.end);
@@ -882,8 +940,10 @@ async function execute(ctx, q, f, act) {
       if (!canHold(f.state)) { attention(ctx, f.id, f.state, act.kind); ctx.out(`stopped: ${f.id} needs a person (${act.kind})`); return { end: 2 }; }
       const extra = act.kind === 'antigaming' && act.sha && act.ids?.length ? ['--sha', act.sha, '--ids', act.ids.join(',')] : [];
       const d = deliver(ctx, 'hold', f.id, '--reason', clean(act.reason || 'held for a person', 200), '--kind', /^[a-z_]{1,32}$/.test(String(act.kind)) ? act.kind : 'driver', ...extra);
+      const held = (d.code === 2 || d.code === 0) && readQueue(ctx).features.find((x) => x.id === f.id)?.state === 'awaiting_human';
+      if (!held) { attention(ctx, f.id, f.state, 'hold_failed'); ctx.out(`stopped: ${f.id} could not be parked (${act.kind})`); return { end: 2 }; }
       attention(ctx, f.id, 'awaiting_human', act.kind);
-      return d.code === 2 || d.code === 0 ? { cur: null } : { end: 2 };
+      return { cur: null };
     }
     case 'stop':
       if (f && act.attention) attention(ctx, f.id, f.state, act.kind);
@@ -899,6 +959,7 @@ function finish(ctx, code) {
     const by = {};
     for (const f of q.features) by[f.state] = (by[f.state] || 0) + 1;
     ctx.out(`features: ${Object.entries(by).map(([k, v]) => `${k} ${v}`).join(', ')}${ctx.attention ? `; attention ${ctx.attention}` : ''}`);
+    if (code === 0 && (by.blocked || by.awaiting_human)) return 2; // finished, but a feature needs a person
   } catch { /* no queue */ }
   return code;
 }
@@ -920,7 +981,7 @@ export async function main(argv, deps = {}) {
   } catch (e) {
     const out = ctx?.out || ((l) => process.stdout.write(`${l}\n`));
     if (e instanceof Refusal) { out(`refused: ${e.message}`); for (const x of [].concat(e.fix || [])) out(`fix: ${x}`); return 1; }
-    out(`error: ${String(e?.message || e).split('\n')[0].slice(0, 200)}`);
+    out(`error: ${String(e?.message || e).split('\n')[0].replace(/(?:[A-Za-z]:)?(?:\/[^\s/:'"]+)+\/?/g, '<path>').slice(0, 200)}`);
     return 1;
   } finally { try { ctx?.lock?.release(); } catch { /* released on exit */ } }
 }

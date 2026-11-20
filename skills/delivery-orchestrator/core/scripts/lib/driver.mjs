@@ -254,7 +254,8 @@ function resume(f, facts, run) {
       if (!need(facts, 'branch_exists', 'head', 'dirty') || !facts.branch_exists || !facts.head) return hold('unknown_result', 'the feature branch cannot be found');
       const ciHead = f.pr?.head_sha;
       if (typeof ciHead !== 'string' || !SHA.test(ciHead)) return hold('inconsistent', 'the head of the last CI run is not recorded');
-      if (facts.head !== ciHead && !facts.dirty) return { do: 'push' };
+      // A moved head is pushed only when the fix session finished (result done): a crash mid-session leaves partial commits.
+      if (facts.head !== ciHead && !facts.dirty && facts.result === 'done') return { do: 'push' };
       return { do: 'build', brief };
     }
 

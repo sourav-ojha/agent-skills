@@ -92,9 +92,11 @@ function factory() {
       fs.writeFileSync(sp, fs.readFileSync(sp, 'utf8').replace(/^status: ready/m, 'status: implemented').replace(/^---\n/, '---\ndelivery: complete\n'));
     }
     if (s.pr_body) { fs.mkdirSync(path.join(process.cwd(), '.delivery'), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), '.delivery', `pr-${id}.md`), s.pr_body); }
+    for (const [p, target] of Object.entries(s.symlinks || {})) { fs.mkdirSync(path.dirname(path.join(process.cwd(), p)), { recursive: true }); fs.symlinkSync(target, path.join(process.cwd(), p)); }
     if (s.commit) {
       const g = (...a) => spawnSync('git', a, { cwd: process.cwd(), encoding: 'utf8' });
-      g('add', '-A'); g('commit', '-q', '-m', `feat: ${id}`);
+      g('add', '-A'); for (const p of s.force_add || []) g('add', '-f', '--', p);
+      g('commit', '-q', '-m', `feat: ${id}`);
     }
     if (s.dirty_file) fs.writeFileSync(path.join(process.cwd(), s.dirty_file), 'uncommitted\n');
     await assistant('msg_1', 'working'); await assistant('msg_2', 'done');
