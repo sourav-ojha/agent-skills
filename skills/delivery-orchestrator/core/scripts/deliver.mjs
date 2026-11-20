@@ -10,7 +10,7 @@ import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, di
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
-import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
+import { appendRecord, appendRecordTo, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
 import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
 import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
@@ -134,7 +134,13 @@ function flushRecords() {
   if (!pending.length) return;
   let project; try { project = projectHash(fs.realpathSync(root)); } catch { project = projectHash(root); }
   stamps ??= skillStamps(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'));
-  for (const { f, at } of pending.splice(0)) appendRecord(root, buildRecord({ q: curQ, f, run: curQ.run_id || runId('deliver', 'run'), project, skills: stamps, now: at }));
+  // Driver mode (a trusted queue under FACTORY_HOME): records live in FACTORY_HOME/records/<repo-key>.jsonl, not in the project.
+  let target = null;
+  if (queueInHome()) { try { const k = repoKey(curQ.repo); if (/^[A-Za-z0-9._-]+$/.test(k) && !k.startsWith('.')) target = path.join(factoryHome(), 'records', `${k}.jsonl`); } catch { target = null; } }
+  for (const { f, at } of pending.splice(0)) {
+    const rec = buildRecord({ q: curQ, f, run: curQ.run_id || runId('deliver', 'run'), project, skills: stamps, now: at });
+    if (target) appendRecordTo(target, rec); else appendRecord(root, rec);
+  }
 }
 let ciStart = 0;
 const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_wait_ms || 0) + (Date.now() - ciStart); };

@@ -58,9 +58,10 @@ export function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items
   const queueFile = path.join(fhome, 'queues', 'o__r.json');
   const queue = () => JSON.parse(fs.readFileSync(queueFile, 'utf8'));
   const clone = path.join(fhome, 'clones', 'o__r');
-  const records = () => { const f = path.join(clone, '.skill-runs', 'factory-runs.jsonl'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []; };
+  const recordsFile = path.join(fhome, 'records', 'o__r.jsonl'); // driver-mode run records live under FACTORY_HOME
+  const records = () => { const f = recordsFile; return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []; };
   const inHome = (fn) => { const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = fhome; try { return fn(); } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; } };
-  return { root, origin, work, bin, home, fhome, env, sh, factory, ghState, setGh, setFake, sessions, queue, queueFile, clone, records, inHome, builder: path.join(`${fhome}-builder`, 'o__r') };
+  return { root, origin, work, bin, home, fhome, env, sh, factory, ghState, setGh, setFake, sessions, queue, queueFile, clone, records, recordsFile, inHome, builder: path.join(`${fhome}-builder`, 'o__r') };
 }
 export const noText = (s, extra = []) => { for (const x of [HIDDEN, 'fx-', '/api/items', ...extra]) assert.ok(!String(s).includes(x), `leaks ${x}: ${String(s).slice(0, 400)}`); };
 

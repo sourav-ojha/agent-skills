@@ -21,7 +21,7 @@ for (let i = 1; i < argv.length; i++) {
   else if (a.startsWith('--')) opt[a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = argv[++i];
 }
 const die = (m) => { console.error(`si: ${m}`); process.exit(1); };
-if (!['inventory', 'runs', 'report', 'export', 'runs-factory'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export|runs-factory> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--no-notes] [--json]\n  runs-factory [--dir PROJECT] [--out FILE]   join <PROJECT>/.skill-runs/factory-runs.jsonl (latest per feature) to transcript tokens, subagents included');
+if (!['inventory', 'runs', 'report', 'export', 'runs-factory'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export|runs-factory> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--no-notes] [--json]\n  runs-factory [--dir PROJECT | --repo OWNER/NAME] [--out FILE]   join <PROJECT>/.skill-runs/factory-runs.jsonl, or (driver mode) $FACTORY_HOME/records/<owner>__<repo>.jsonl, (latest per feature) to transcript tokens, subagents included');
 const home = os.homedir();
 const projectsDir = path.resolve(opt.projectsDir || path.join(home, '.claude', 'projects'));
 const skillDirs = (opt.skillsDir.length ? opt.skillsDir : [path.join(home, '.claude', 'skills')]).map((d) => path.resolve(d));
@@ -123,19 +123,37 @@ function exportBundle() {
 }
 
 function runsFactory() {
-  let dir = path.resolve(opt.dir || '.');
-  try { dir = fs.realpathSync(dir); } catch { /* keep resolved path */ }
-  const log = path.join(dir, '.skill-runs', 'factory-runs.jsonl');
-  if (!fs.existsSync(log)) { console.log('no factory run records found (.skill-runs/factory-runs.jsonl is missing). Run `deliver.mjs run` first.'); return; }
+  let log, folders, source, missing;
+  if (opt.repo !== undefined) {
+    // Driver-mode records: $FACTORY_HOME/records/<owner>__<repo>.jsonl. The record carries only the project hash, so the transcript
+    // folders are the ones in the projects dir whose name hashes to a project in the records.
+    if (!/^[\w.-]+\/[\w.-]+$/.test(String(opt.repo)) || String(opt.repo).split('/').some((x) => x.startsWith('.'))) die('--repo must be OWNER/NAME');
+    const fh = process.env.FACTORY_HOME || path.join(home, '.factory');
+    log = path.join(fh, 'records', `${String(opt.repo).replace(/\//g, '__')}.jsonl`);
+    source = 'FACTORY_HOME/records/' + path.basename(log);
+    missing = `no factory run records found (${source} is missing). Run \`factory run\` first.`;
+    try { if (fs.lstatSync(log).isSymbolicLink() || fs.lstatSync(path.dirname(log)).isSymbolicLink()) die('the records file or its directory is a symlink; refusing to read it'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  } else {
+    let dir = path.resolve(opt.dir || '.');
+    try { dir = fs.realpathSync(dir); } catch { /* keep resolved path */ }
+    log = path.join(dir, '.skill-runs', 'factory-runs.jsonl');
+    missing = 'no factory run records found (.skill-runs/factory-runs.jsonl is missing). Run `deliver.mjs run` first.';
+    // The record's project hash is sha1 of the real path with non-alphanumerics as "-"; transcripts live in the folder of that name.
+    folders = [dir.replace(/[^A-Za-z0-9]/g, '-')];
+  }
+  if (!fs.existsSync(log)) { console.log(missing); return; }
   const parsed = [];
   for (const l of fs.readFileSync(log, 'utf8').split('\n')) { if (!l.trim()) continue; try { parsed.push(JSON.parse(l)); } catch { /* skip */ } }
   const records = latestPerFeature(parsed).filter((r) => Number.isFinite(Date.parse(r.ts_start)) && Number.isFinite(Date.parse(r.ts_end)));
-  // The record's project hash is sha1 of the real path with non-alphanumerics as "-"; transcripts live in the folder of that name.
-  const folder = dir.replace(/[^A-Za-z0-9]/g, '-');
+  if (!folders) {
+    const want = new Set(records.map((r) => r.project));
+    folders = fs.existsSync(projectsDir) ? fs.readdirSync(projectsDir, { withFileTypes: true }).filter((e) => e.isDirectory() && want.has(hash(e.name))).map((e) => e.name) : [];
+  }
   const turns = [];
-  const haveFolder = fs.existsSync(path.join(projectsDir, folder));
+  const haveFolder = folders.some((f) => fs.existsSync(path.join(projectsDir, f)));
   if (!haveFolder) console.log('no transcript folder found for this project: token columns and attribution coverage are unavailable');
-  if (haveFolder) {
+  for (const folder of folders) {
+    if (!fs.existsSync(path.join(projectsDir, folder))) continue;
     for (const s of loadSessions(folder, { subagents: true })) {
       for (const e of s.entries) if (e.usage) turns.push({ project: s.project, ts: e.ts, tokens: { in: e.usage.in, out: e.usage.out, cache_create: e.usage.cacheWrite, cache_read: e.usage.cacheRead } });
     }

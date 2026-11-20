@@ -1047,7 +1047,7 @@ test('factory run: a wrong build fails verification; the symptom-fix session get
   assert.deepEqual(rec.antigaming, []); assert.equal(rec.override_note, false);
   assert.equal(rec.sessions.length, 2);
   assert.deepEqual(rec.sessions[0], { role: 'builder', id: '00000000-0000-4000-8000-000000000001', in: 120, out: 45, cache_create: 300, cache_read: 9000, turns: 2 });
-  const raw = fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8');
+  const raw = fs.readFileSync(w.recordsFile, 'utf8');
   for (const x of [doc.canary, HIDDEN, '/api/items', 'json_path', w.root]) assert.ok(!raw.includes(x), `the run record leaks ${x}`);
 });
 
@@ -1276,7 +1276,7 @@ test('I-1: a branch tracking .delivery (symlink) or .skill-runs is blocked befor
   for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
   assert.match(r.out, /attention: FEATURE-001 blocked/); assert.match(r.out, /attention: FEATURE-002 blocked/);
   for (const p of ['.delivery', '.delivery/.gitignore']) { let st = null; try { st = fs.lstatSync(path.join(w.clone, p)); } catch { /* absent */ } assert.ok(!st || !st.isSymbolicLink(), `${p} in the driver clone is not a link`); }
-  assert.ok(!fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'run records not overwritten');
+  assert.ok(!fs.readFileSync(w.recordsFile, 'utf8').includes('forged'), 'run records not overwritten');
   assert.equal(w.ghState().prs.length, 0);
 });
 
@@ -1392,7 +1392,7 @@ test('I-5: dot entries that may alias a driver-owned name on APFS (U+017F, zero-
   assert.equal(r.code, 2, r.out + r.err);
   assert.deepEqual(w.queue().features.map((f) => f.state), ['blocked', 'blocked', 'blocked', 'blocked']);
   for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
-  const recs = fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8');
+  const recs = fs.readFileSync(w.recordsFile, 'utf8');
   assert.ok(!recs.includes('forged'));
   assert.equal(recs.trim().split('\n').length, 4, 'one blocked record per feature, none lost');
   assert.equal(w.ghState().prs.length, 0);

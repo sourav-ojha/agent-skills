@@ -56,6 +56,22 @@ export function appendRecord(root, rec) {
   } catch { /* records must never break a run */ }
 }
 
+// Driver mode: append to an explicit file (FACTORY_HOME/records/<repo-key>.jsonl). The parent is a private directory (0700) that is
+// not a symlink and is owned by this user; the file is opened O_NOFOLLOW. Never throws; returns whether the record was written.
+export function appendRecordTo(file, rec) {
+  try {
+    const f = path.resolve(file), d = path.dirname(f);
+    if (!fs.existsSync(d) && !isLink(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(d);
+    if (!st.isDirectory() || st.isSymbolicLink()) return false;
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return false;
+    if ((st.mode & 0o077) !== 0) fs.chmodSync(d, 0o700);
+    if (isLink(f)) return false;
+    appendNoFollow(f, JSON.stringify(rec) + '\n', false);
+    return true;
+  } catch { return false; }
+}
+
 // Last record per (run, feature); a feature can have several (awaiting_human, then merged).
 export function latestPerFeature(lines) {
   const by = new Map();
@@ -90,6 +106,33 @@ export function verificationFields(f) {
   };
 }
 
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
+// Per-role sums from the sessions (already validated), the budget hit, the interruptions and whether the person stopped the feature.
+const INT_KIND = /^[a-z_]{1,32}$/;
+const STEP = /^[a-z_]{1,32}$/;
+export function usageFields(f) {
+  const tokens = {}, turns = {}, cost = {};
+  let anyCost = false;
+  for (const x of verificationFields(f).sessions) {
+    tokens[x.role] = (tokens[x.role] || 0) + x.in + x.out + x.cache_create + x.cache_read;
+    turns[x.role] = (turns[x.role] || 0) + x.turns;
+  }
+  const raw = (Array.isArray(f.sessions) ? f.sessions.slice(0, 200) : []).filter((s) => s && typeof s === 'object' && ROLES.includes(s.role));
+  for (const s of raw) { const c = num(s.cost_usd); if (c !== null) { cost[s.role] = Math.round(((cost[s.role] || 0) + c) * 1e6) / 1e6; anyCost = true; } }
+  const ints = (Array.isArray(f.interruptions) ? f.interruptions.slice(0, 100) : []).filter((x) => x && typeof x === 'object' && typeof x.kind === 'string' && INT_KIND.test(x.kind)).map((x) => ({
+    kind: x.kind, step: typeof x.step === 'string' && STEP.test(x.step) ? x.step : null, minutes_waited: count(x.minutes_waited),
+    method: typeof x.method === 'string' && STEP.test(x.method) ? x.method : null,
+  }));
+  const latest = ints.at(-1)?.kind ?? (typeof f.interrupted?.kind === 'string' ? f.interrupted.kind : null);
+  const out = {
+    tokens_by_role: tokens, turns_by_role: turns,
+    budget_hit: !!(f.budget_hold || f.hold_kind === 'budget' || ints.some((x) => x.kind === 'budget') || f.interrupted?.kind === 'budget'),
+    interruptions: ints, stopped_by_user: latest === 'stop' || f.interrupted?.kind === 'stop',
+  };
+  if (anyCost) out.cost_usd_by_role = cost;
+  return out;
+}
+
 export function buildRecord({ q, f, run, project, skills, now = Date.now() }) {
   const start = f.ts_start ? Date.parse(f.ts_start) : NaN;
   return {
@@ -98,6 +141,6 @@ export function buildRecord({ q, f, run, project, skills, now = Date.now() }) {
     fix_rounds: f.fix_rounds ?? 0, ci_runs: f.ci_runs ?? 0, ci_wait_ms: f.ci_wait_ms ?? 0,
     pr: f.pr?.number ?? null, base_sha: f.base_sha ?? null, merge_sha: f.merged_sha ?? null,
     readiness_level: q.readiness_level ?? null, skills, project,
-    ...verificationFields(f),
+    ...verificationFields(f), ...usageFields(f),
   };
 }

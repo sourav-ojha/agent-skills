@@ -352,3 +352,25 @@ test('M8 CLI: a parent and its fork in one project count each turn once end to e
   const rows = JSON.parse(r.stdout);
   assert.equal(rows.reduce((t, x) => t + x.tokens.out, 0), 600, '100 + 200 + 300, not 100 + 200 + 100 + 200 + 300');
 });
+
+test('F10 runs-factory --repo o/r reads FACTORY_HOME/records and joins tokens like --dir', () => {
+  const f = factoryFixture();
+  const fh = path.join(f.root, 'fh'); fs.mkdirSync(path.join(fh, 'records'), { recursive: true });
+  fs.copyFileSync(path.join(f.real, '.skill-runs', 'factory-runs.jsonl'), path.join(fh, 'records', 'o__r.jsonl'));
+  const run = (...a) => { const r = spawnSync('node', [SI, 'runs-factory', '--projects-dir', f.projects, ...a], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh } }); return { code: r.status, out: r.stdout + r.stderr }; };
+  const byDir = run('--dir', f.real), byRepo = run('--repo', 'o/r');
+  assert.equal(byRepo.code, 0, byRepo.out);
+  assert.equal(byRepo.out, byDir.out);
+  assert.match(byRepo.out, /f1 \| - \| merged \| 3 \|/);
+  assert.ok(!byRepo.out.includes('SECRET TEXT'));
+  assert.match(run('--repo', 'o/missing').out, /no factory run records found/);
+  assert.notEqual(run('--repo', '../x').code, 0);
+});
+
+test('F11 runs-factory --repo refuses a symlinked records file', () => {
+  const f = factoryFixture();
+  const fh = path.join(f.root, 'fh'); fs.mkdirSync(path.join(fh, 'records'), { recursive: true });
+  fs.symlinkSync(path.join(f.real, '.skill-runs', 'factory-runs.jsonl'), path.join(fh, 'records', 'o__r.jsonl'));
+  const r = spawnSync('node', [SI, 'runs-factory', '--projects-dir', f.projects, '--repo', 'o/r'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh } });
+  assert.notEqual(r.status, 0); assert.match(r.stderr, /symlink/);
+});
