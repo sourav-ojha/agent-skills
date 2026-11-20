@@ -73,7 +73,7 @@ For merges proven by hidden scenarios the builder never sees, the factory driver
 - `factory scenarios [--only IDS]` authors and stores the scenarios; `factory scenarios --approve ID --by NAME` when `verification.scenario_approval` is `human`.
 - `factory run [--only IDS] [--limit N]` builds, opens PRs, waits for CI, verifies the exact PR head in a sandbox, and merges only on a passing verdict. It resumes a queue in progress. Exit `0` done, `1` refused (one `fix:` line per problem), `2` stopped or a feature needs a person.
 
-It refuses unless the base config sets `verification.required: true`, `readiness.min_level: 4` (with a stored level-4 result) and `local_checks: []`, and branch protection requires the `factory/verified` status. The queue lives under `FACTORY_HOME` and belongs to the driver; a person releases an anti-gaming hold with `deliver retry ID --note "<why>"`. Details: [references/factory-driver.md](references/factory-driver.md), [references/verification.md](references/verification.md).
+It refuses unless the base config sets `verification.required: true`, `readiness.min_level: 4` (with a stored level-4 result) and `local_checks: []`, and branch protection requires the `factory/verified` status. The queue lives under `FACTORY_HOME` and belongs to the driver; a person releases an anti-gaming hold with `deliver retry ID --note "<why>"` at an interactive terminal (you cannot: it refuses without a TTY). Details: [references/factory-driver.md](references/factory-driver.md), [references/verification.md](references/verification.md).
 
 ## Stop and report (do not push through)
 

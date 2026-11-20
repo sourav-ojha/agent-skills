@@ -681,6 +681,22 @@ test('api scenarios need at least one status assertion (kind-only message)', () 
   assert.equal(nl(d).ok, true);
 });
 
+test('requests the checker would block are lint-refused: refused headers, proxy-*/sec-*, a body on GET/HEAD (request and setup)', () => {
+  const refused = ['Host', 'content-length', 'Transfer-Encoding', 'Connection', 'Upgrade', 'TE', 'Trailer', 'Keep-Alive', 'Expect', 'Proxy-Authorization', 'proxy-connection', 'HTTP2-Settings', 'Proxy-X', 'Sec-Fetch-Site'];
+  for (const h of refused) {
+    const d = nbase(); d.scenarios[0].request = { ...d.scenarios[0].request, headers: { [h]: 'v' } };
+    const r = nl(d); assert.equal(r.ok, false, h);
+    assert.ok(r.problems.includes('scenario S-1: api request has a refused header or a body on GET/HEAD'), JSON.stringify(r.problems));
+  }
+  for (const m of ['GET', 'HEAD', 'get']) {
+    const d = nbase(); d.scenarios[0].request = { ...d.scenarios[0].request, method: m, body: { a: 1 } }; assert.equal(nl(d).ok, false, m);
+  }
+  const s = nbase(); s.scenarios[0].setup = [{ method: 'GET', path: s.scenarios[0].request.path, headers: { host: 'evil' } }];
+  assert.ok(nl(s).problems.some((x) => /setup request 1 has a refused header/.test(x)), JSON.stringify(nl(s).problems));
+  const ok = nbase(); ok.scenarios[0].request = { ...ok.scenarios[0].request, headers: { Accept: 'application/json', 'X-Test': 'v' } };
+  assert.equal(nl(ok).ok, true, JSON.stringify(nl(ok).problems));
+});
+
 test('M2: dot segments and encoded separators never match', () => {
   for (const p of ['/api/p/..', '/api/p/.', '/api/p/%2e%2e', '/api/p/%2E', '/api/p/a%2Fb', '/api/p/a%5cb', '/api/p/x/../7', '/api/./p']) {
     const d = nbase(); d.scenarios[0].request = { method: 'GET', path: p }; assert.equal(nl(d).ok, false, p);

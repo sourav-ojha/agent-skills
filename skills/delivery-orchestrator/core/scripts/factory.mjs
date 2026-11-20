@@ -448,7 +448,7 @@ function update(ctx, id, fn) { const q = readQueue(ctx); const f = q.features.fi
 function deliver(ctx, ...args) {
   preflight(ctx.D, ctx.id.url);
   if (!ctx.lock.owned()) throw new Error('the factory lock is no longer ours');
-  const r = run(process.execPath, [DELIVER, ...args, '--dir', ctx.D], { cwd: ctx.D, env: { ...ctx.env, DELIVER_QUEUE: ctx.queueFile }, timeout: 6 * 3600 * 1000 });
+  const r = run(process.execPath, [DELIVER, ...args, '--dir', ctx.D], { cwd: ctx.D, env: { ...ctx.env, FACTORY_HOME: ctx.fh, DELIVER_QUEUE: ctx.queueFile }, timeout: 6 * 3600 * 1000 });
   return { code: r.code, json: json(r.out) };
 }
 function attention(ctx, id, state, kind) {
@@ -861,7 +861,19 @@ export async function cmdRun(ctx) {
   let q = fs.existsSync(ctx.queueFile) ? readQueue(ctx) : null;
   if (q && (q.repo !== ctx.id.repo || q.base !== ctx.base)) refuse('the stored queue is for another repository or base', `DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs reset --yes`);
   const resuming = q && q.features.some((f) => !['merged', 'skipped'].includes(f.state));
-  if (!resuming && (ctx.orphansAlive > 0 || ctx.leftovers > 0)) refuse(`processes or worktrees from an earlier run are still alive (${ctx.orphansAlive} process group(s), ${ctx.leftovers} directory(ies))`, 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again');
+  const alive = ctx.orphansAlive > 0 || ctx.leftovers > 0;
+  const aliveWhy = `processes or worktrees from an earlier run are still alive (${ctx.orphansAlive} process group(s), ${ctx.leftovers} directory(ies))`;
+  const aliveFix = 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again';
+  if (!resuming && alive) refuse(aliveWhy, aliveFix);
+  // A queue in progress, whatever its states (queued, blocked and awaiting_human included): nothing runs (no deliver next, no
+  // session) while something from the earlier run may still act. The run stops with the feature states left as they are.
+  if (resuming && alive) {
+    const active = q.features.find((f) => ACTIVE.includes(f.state));
+    if (active) attention(ctx, active.id, active.state, 'leftovers');
+    ctx.out(`stopped: leftovers: ${aliveWhy}`);
+    ctx.out(`fix: ${aliveFix}`);
+    return finish(ctx, 2);
+  }
   if (!resuming) {
     must(ctx.git('checkout', '-q', '-f', '-B', ctx.base, OR(ctx.base)), 'checkout of the base branch');
     must(ctx.git('clean', '-q', '-f', '-d'), 'clean of the driver clone');

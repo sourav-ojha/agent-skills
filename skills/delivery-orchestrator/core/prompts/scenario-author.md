@@ -24,7 +24,8 @@ Rules:
 - Allowed assertions: {"status": <int>}; {"header": <name>, "equals"|"matches": <string>}; {"json_path": <path>, one of "equals", "contains", "not_contains", "count", "matches": <value>}.
 - Every API scenario has at least one {"status": <int>} assertion, so an error response cannot pass on body checks alone.
 - A json_path with "not_contains" or "count" fails unless every step resolves: if some array items lack the key, "$.items[*].name" does not resolve. Paths use only $, .key, [n] and [*].
-- Requests go to the app at 127.0.0.1. Do not set the Host, Content-Length, Transfer-Encoding or Connection headers.
+- Requests go to the app at 127.0.0.1. Never set these headers (the scenario is rejected): Host, Content-Length, Transfer-Encoding, Connection, Upgrade, TE, Trailer, Keep-Alive, Expect, HTTP2-Settings, or any header starting with Proxy- or Sec-. Never send a body with GET or HEAD.
+- Methods are upper case (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS). Every setup request must succeed with a 2xx status, otherwise the scenario cannot run.
 - Put the marker {{CANARY}} inside the data you create in setup (for example in a name), at least once per scenario that creates data.
 - Test behaviour a user would observe, including the edge cases and failure scenarios. Do not depend on implementation details the specification leaves open.
 - No URLs to other hosts, no secrets, no shell commands.

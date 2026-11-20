@@ -27,7 +27,7 @@ Verification transitions: `ci_passed` → `verified` or `verify_failed`; `verify
 
 `merge` accepts `verified`. It accepts `ci_passed` only while `verification.required` is false in the config committed on `origin/<base>` (read at merge time; the copy in the queue file is never used). T3 work merges only with `--merge-t3` or `merge.allow_tier3` **and** a passing verdict for the exact head commit; without a verdict it is held for a person in every mode.
 
-A feature held by an anti-gaming rule (`hold_kind: antigaming`) is released with `retry ID --note "<why>"`: the note is recorded as `override_note` and the feature returns to `pr_open`. Without `--note` the retry is refused. CI holds retry as before.
+A feature held by an anti-gaming rule (`hold_kind: antigaming`) is released with `retry ID --note "<why>"`, run by a person at an interactive terminal (refused when stdin or stdout is not a TTY): the note is recorded as `override_note` and the feature returns to `pr_open`. Without `--note` the retry is refused. CI holds retry as before.
 
 `hold ID --reason R [--kind K] [--sha S --ids G1,G4]` parks a feature in `awaiting_human` for the factory driver (exit 2). It works only from a trusted queue under `FACTORY_HOME` and only from a state that can go to `awaiting_human`; `--kind antigaming` needs `--sha` and `--ids`, which become `hold_sha`/`hold_ids`. The driver writes three transitions to its queue directly (`ci_passed` → `verified`, `ci_passed` → `verify_failed`, and the reopen to `pr_open`); none of those writes a run record. Crash and resume rules: [factory-driver.md](factory-driver.md#resume-rules).
 

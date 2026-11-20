@@ -90,6 +90,15 @@ function matchesContract(contract, method, rawPath) {
 }
 
 const nonEmptyArr = (a) => Array.isArray(a) && a.length > 0;
+// Request shapes the checker (apicheck.mjs buildRequest) blocks at run time, refused here so a scenario is never blocked by
+// construction: Host, framing and hop-by-hop headers, proxy-* and sec-* headers, and a body on GET or HEAD. Keep in sync.
+const REFUSED_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'te', 'trailer', 'keep-alive', 'expect', 'proxy-authorization', 'proxy-connection', 'http2-settings']);
+const refusedRequest = (r) => {
+  if (r.body !== undefined && ['GET', 'HEAD'].includes(String(r.method).toUpperCase())) return true;
+  if (r.headers === undefined) return false;
+  if (!r.headers || typeof r.headers !== 'object' || Array.isArray(r.headers)) return true;
+  return Object.keys(r.headers).some((n) => REFUSED_HEADERS.has(n.toLowerCase()) || /^(proxy-|sec-)/i.test(n));
+};
 const dataOf = (s) => canonical([s.setup, s.request, s.steps, s.expect]);
 const strList = (a) => Array.isArray(a) && a.every((x) => typeof x === 'string' && x.trim() !== '' && x.length <= 500);
 
@@ -133,11 +142,13 @@ export function lintScenarios(doc, criteria, currentHash) {
         const bad = s.assert.filter((a) => !validAssertion(a)).length;
         if (bad) problems.push(`scenario ${label}: ${bad} assertion(s) are not a recognised shape`);
         if (!s.assert.some((a) => validAssertion(a) && 'status' in a)) problems.push(`scenario ${label}: api scenario needs a status assertion`);
+        if (refusedRequest(r)) problems.push(`scenario ${label}: api request has a refused header or a body on GET/HEAD`);
       }
       if (s.setup !== undefined) {
         if (!Array.isArray(s.setup)) problems.push(`scenario ${label}: setup must be an array of requests`);
         else s.setup.forEach((e, k) => {
           if (!e || typeof e !== 'object' || Array.isArray(e) || !matchesContract(criteria.contract, e.method, e.path)) problems.push(`scenario ${label}: setup request ${k + 1} is not an endpoint in the HTTP contract`);
+          else if (refusedRequest(e)) problems.push(`scenario ${label}: setup request ${k + 1} has a refused header or a body on GET/HEAD`);
         });
       }
     } else if (s.kind === 'ui') {

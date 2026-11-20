@@ -37,15 +37,15 @@ All read from `.product/delivery.json` on `origin/<base>`; each prints a fix lin
 | branch protection (or a ruleset) on the base requires `factory/verified` | so no other route can merge; needs a public repository or a plan with protected private branches |
 | `github.host` equals the origin host | the token is offered to that host only |
 | current approved scenarios for every picked feature (re-linted now) | [verification.md](verification.md#approval-and-binding) |
-| no live orphan process group or leftover work dir from an earlier run (new run only) | stop them first |
-| a stored queue for this repository and base | otherwise reset it (`DELIVER_QUEUE=<queue> node deliver.mjs reset --yes`) |
+| no live orphan process group or leftover work dir from an earlier run | stop them first. A new run refuses (exit 1); a queue in progress stops before `deliver next` or any session (exit 2, attention for an active feature) |
+| a stored queue, if any, is for this repository and base | otherwise reset it (`DELIVER_QUEUE=<queue> node deliver.mjs reset --yes`) |
 | a repository name without `__` | the repo key `<owner>__<repo>` must round-trip |
 
 Also refused: a `FACTORY_HOME` that is a symlink, owned by another user or group/world writable; a lock held by a live run; an untrusted driver clone (below). Merging still needs `merge.mode: "squash"` in the base config: the driver never passes `--merge`. Every start prints a warning that `factory/verified` is a plain commit status (see [verification.md](verification.md#factoryverified)).
 
 ## Layout
 
-`FACTORY_HOME` comes from the driver's environment (default `~/.factory`), is resolved to an absolute path, and is created 0700.
+`FACTORY_HOME` comes from the driver's environment (default `~/.factory`), is resolved to an absolute real path, and is created 0700; `deliver` subprocesses get that resolved path.
 
 | Path | What |
 |---|---|
@@ -67,7 +67,7 @@ Also refused: a `FACTORY_HOME` that is a symlink, owned by another user or group
 
 **Driver clone preflight**, before every fetch and every `deliver` call: a real directory owned by this user; `.git` a real directory; the common dir is its own `.git`; the gitsafe config allowlist; no grafts, `shallow`, alternates, commit-graph, `config.worktree`, replace refs or hooks; `origin` resolves to exactly the pinned URL (rebuilt from host and repository: `https://<host>/<repo>.git` or `ssh://<user>@<host>/<repo>.git`) and has no `pushurl`. Otherwise refuse; the fix is to delete the clone, and the next run makes a fresh one.
 
-**Before checkout in the driver clone**, the incoming commit's top-level tree may not track `.delivery`, `.implementation` or `.skill-runs` (compared case-insensitively), nor any top-level dot entry with a character outside printable ASCII (APFS folds case, Unicode case variants such as U+017F and normalisation forms). After checkout, those paths must not be symlinks and the run-record file's dev:ino must be unchanged. Otherwise the driver clone goes back to the base and the feature is blocked.
+**Before checkout in the driver clone**, the incoming commit's top-level tree may not track `.delivery`, `.implementation` or `.skill-runs` (compared case-insensitively), nor any top-level dot entry with a character outside printable ASCII, space included (APFS folds case, Unicode case variants such as U+017F and normalisation forms). After checkout, those paths must not be symlinks and the run-record file's dev:ino must be unchanged. Otherwise the driver clone goes back to the base and the feature is blocked.
 
 **Credentials.** `gh` and https git use the token of `github.account` (held in memory, offered only to the pinned host through `gh auth git-credential`), else gh's own login. The first clone of an https remote uses the account named in the checkout's config; if the base config names another, the run is refused.
 
@@ -75,7 +75,7 @@ Also refused: a `FACTORY_HOME` that is a symlink, owned by another user or group
 
 `FACTORY_HOME/locks/<key>.lock` (0600, `locks/` 0700) holds the pid, its start time (`ps:<lstart>` on macOS, `proc:<ticks>` on Linux), a token and every process group the run started (sessions record their group on spawn). A lock whose holder is alive is `LOCK_HELD`. A dead holder's lock is taken over, and its recorded groups are killed, after checking the group leader's start time against the recorded one (a reused pgid is never signalled). A garbled lock, a start time from the other source, or a takeover marker left by a dead taker fail closed: remove the file by hand. `factory scenarios` takes the same lock.
 
-Then (`factory run` only): `FACTORY_HOME/trash` is emptied; each `work/<key>/*` dir is moved to the trash and deleted when no process carries its path (then `worktree prune`); `tmp/*` the same, but only when no other repository's lock file exists (tmp is shared). Groups still alive count as `orphans_alive`; dirs still in use count as `leftover_worktrees`. A new run with either refuses; a resume stops (`leftovers`).
+Then (`factory run` only): `FACTORY_HOME/trash` is emptied; each `work/<key>/*` dir is moved to the trash and deleted when no process carries its path (then `worktree prune`); `tmp/*` the same, but only when no other repository's lock file exists (tmp is shared). Groups still alive count as `orphans_alive`; dirs still in use count as `leftover_worktrees`. With either, a new run refuses and a queue in progress stops (`leftovers`), whatever its features' states, before `deliver next` or any session.
 
 ## Roles and sessions
 
@@ -185,8 +185,8 @@ A feature left in an ACTIVE state by an earlier run goes through `resumeAction(f
 | built | head equals `built_sha` → pr; else hold |
 | pr_open | PR exists → the pr_open row above; else hold |
 | fixing | head moved since the last CI run, tree clean, result done → push; otherwise a new fix session (no new `deliver fix`: the round was counted) |
-| ci_passed | PR head ≠ `ci_sha` → reopen to `pr_open`, CI again. Stored verdict for that head with current hashes: pass → post `factory/verified`; fail → fix (a stored fail is not re-rolled); absent or mismatched → verify |
-| verified | PR head = `ci_sha` and verdict pass → merge; else reopen, CI and verification again |
+| ci_passed | PR head ≠ `ci_sha` → an anti-gaming hold recorded at built and not overridden holds first; else reopen to `pr_open`, CI again. Stored verdict for that head with current hashes: pass → post `factory/verified`; fail → fix (a stored fail is not re-rolled); absent or mismatched → verify |
+| verified | PR head = `ci_sha` and verdict pass → merge; else the anti-gaming hold first, then reopen, CI and verification again |
 | other | as from a fresh start |
 
 ## Run records
@@ -227,4 +227,5 @@ Driver and gate:
 25. **Not in run records:** author session usage (there is no queue at authoring time), `verify_tokens` and `flaky_count` from the spec.
 26. **Setup-phase network** reaches any host on ports 80/443, LAN and cloud-metadata addresses included (SBPL cannot express "public only").
 27. **tmp sweep** is skipped while any other repository's lock file exists, stale or not.
-28. **`local_checks` are refused** in factory runs rather than sandboxed (by design, until `deliver built` can sandbox them).
+28. **`deliver`'s own git is plain git** (not gitSafe), with the driver's environment, in the driver clone. It is protected only by the clone preflight before each `deliver` call (config allowlist, no hooks, metadata, origin pin); `deliver merge`'s gate and changed-file list do use gitSafe. A clone changed between the preflight and a git call inside one `deliver` run is not re-checked.
+29. **`local_checks` are refused** in factory runs rather than sandboxed (by design, until `deliver built` can sandbox them).

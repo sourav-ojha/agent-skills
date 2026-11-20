@@ -1351,6 +1351,30 @@ test('a fresh run refuses while a leftover verification worktree is still in use
   assert.equal(fs.existsSync(w.queueFile), false);
 });
 
+test('a queue in progress with only queued (and blocked) features stops on leftovers before deliver next or any session', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one', 'FEATURE-002': 'Items two' }, fake: { plan: { 'FEATURE-001': [{ status: 'blocked' }], 'FEATURE-002': [good('FEATURE-002')] } } });
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'block' }) }).signal, 'SIGKILL');
+  assert.deepEqual(w.queue().features.map((f) => f.state), ['blocked', 'queued']);
+  const dir = path.join(w.fhome, 'work', 'o__r', `FEATURE-002-${'c'.repeat(40)}`);
+  const p = sleeper(dir);
+  t.after(() => { try { process.kill(p.pid, 'SIGKILL'); } catch { /* gone */ } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /stopped: leftovers: processes or worktrees from an earlier run are still alive \(0 process group\(s\), 1 directory/);
+  assert.match(r.out, /fix: stop them/);
+  assert.doesNotMatch(r.out, /-> next/);
+  assert.equal(builderRuns(w, 'FEATURE-002').length, 0, 'no builder session started');
+  assert.deepEqual(w.queue().features.map((f) => f.state), ['blocked', 'queued'], 'states left as they are');
+  assert.ok(fs.existsSync(dir), 'a worktree in use is never removed');
+});
+
+test('a relative FACTORY_HOME reaches deliver resolved (the queue counts as under FACTORY_HOME at merge)', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const r = w.factory(['run'], { FACTORY_HOME: path.relative(process.cwd(), w.fhome) });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(w.queue().features[0].state, 'merged');
+});
+
 test('makeNetGit: the https credential helper is offered before any account token is known (private https clone)', (t) => {
   const d = tmp(t); const log = path.join(d, 'argv.json');
   fs.writeFileSync(path.join(d, 'git'), `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' "${log}" "$@"\n`, { mode: 0o755 });
