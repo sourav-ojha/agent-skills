@@ -16,7 +16,9 @@ Rules the code enforces:
 - Feature-branch code runs only inside `sandbox-exec` (macOS). No sandbox, no verification: there is no unsandboxed fallback.
 - Policy comes from `.product/delivery.json` on `origin/<base>`, read with gitSafe. App commands come from that base config, never from the branch; the env example is read from the base ref, not the worktree.
 - The driver's own git calls (factory.mjs, verification, anti-gaming) use gitSafe: neutralising `-c` flags (no hooks, fsmonitor, credential helper, pager, editor, gpg, ext/file transport, commit-graph), a repository-config allowlist, and a worktree walk that refuses nested `.git` entries, gitlinks and `.gitmodules`. **`deliver`'s own git is plain git** with the driver's environment; what protects it is the driver-clone preflight that runs before every `deliver` call ([factory-driver.md](factory-driver.md#layout)), plus gitSafe in `deliver merge`'s gate and changed-file list.
-- The builder never sees scenarios, verdicts or the canary. It gets criterion IDs and one fixed sentence (symptom brief).
+
+Design rule (not enforced by the code alone):
+- The builder is meant never to see scenarios, verdicts or the canary. The driver gives it only criterion IDs and one fixed sentence (symptom brief), and keeps scenarios and verdicts under `FACTORY_HOME`, which the builder session's deny rules and sandbox are meant to keep out of reach. Whether those rules block every route is unverified: see [factory-driver.md known gaps](factory-driver.md#known-gaps) 1-6.
 
 ## Hidden scenarios
 
@@ -57,7 +59,7 @@ Assertion shapes: `{ status: 100-599 }`; `{ header, equals | matches }`; `{ json
 
 ### Approval and binding
 
-`verification.scenario_approval`: `auto` stores the doc approved by `auto`; `human` stores it unapproved until `factory scenarios --approve ID --by NAME` (name: 1-64 of `A-Za-z0-9_.@-`). `--approve` re-lints first and approves only current scenarios.
+`verification.scenario_approval`: `auto` stores the doc approved by `auto`; `human` stores it unapproved until `factory scenarios --approve ID --by NAME` (name: 1-64 of `A-Za-z0-9_.@-`). `--approve` re-lints first and approves only current scenarios; `--by auto` is refused. The mode is also enforced where the doc is used (`factory run`, verification, `deliver merge`'s gate): under `human`, a doc approved by `auto` is not approved.
 
 `approved` is never trusted alone. At `factory run` start, on resume, and before each verification, the stored doc is **re-linted against the criteria on `origin/<base>` now**, and the approval must carry the doc's current `scenarios_hash` (`isCurrentApproved`). A base spec edit changes `criteria_hash`; any scenario edit changes `scenarios_hash`; either makes the feature refused until re-authored or re-approved.
 

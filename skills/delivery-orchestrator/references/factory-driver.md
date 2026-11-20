@@ -180,7 +180,7 @@ A feature left in an ACTIVE state by an earlier run goes through `resumeAction(f
 
 | State | Rule |
 |---|---|
-| any | orphans or leftovers → stop `leftovers`. Resumed 3 times already (`MAX_RESUMES`) → hold `resume_loop` |
+| any | orphans or leftovers → stop `leftovers`. Resumed 3 times already (`MAX_RESUMES`) after crashes → hold `resume_loop` |
 | building | branch ahead of base, `result.json` done and tree clean (deliver's pathspec: `.implementation` and `.delivery` excluded) → built. Result blocked → block. Otherwise reset the branch to base and build again |
 | built | head equals `built_sha` → pr; else hold |
 | pr_open | PR exists → the pr_open row above; else hold |
@@ -188,6 +188,10 @@ A feature left in an ACTIVE state by an earlier run goes through `resumeAction(f
 | ci_passed | PR head ≠ `ci_sha` → an anti-gaming hold recorded at built and not overridden holds first; else reopen to `pr_open`, CI again. Stored verdict for that head with current hashes: pass → post `factory/verified`; fail → fix (a stored fail is not re-rolled); absent or mismatched → verify |
 | verified | PR head = `ci_sha` and verdict pass → merge; else the anti-gaming hold first, then reopen, CI and verification again |
 | other | as from a fresh start |
+
+`resumes` counts crashes only. It goes up by one each time a run resumes a feature, and back to 0 when that run then ends through the driver's own exit path (any stop, hold, block or the end of the queue: a usage limit, timeout, `no_result` or `leftovers` stop is an interruption, not a crash). Only a run that dies (SIGKILL, power loss, an error that escapes the loop) keeps the count, so `resume_loop` means three resumed runs in a row died. The `resume_loop` stop itself neither counts nor resets. Features that end merged, skipped or blocked keep their last count as a record.
+
+Way out of `resume_loop`: in `building`, `built`, `fixing` and the other states that cannot wait for a person, the run stops with an attention entry and the state left as it is. Once the cause is fixed, either set the feature's `"resumes"` to `0` in `FACTORY_HOME/queues/<repo>.json` (no run in progress: the lock is free) and run again, or give it up with `deliver skip <ID> --reason R` (or `deliver block`) through `DELIVER_QUEUE=FACTORY_HOME/queues/<repo>.json node deliver.mjs ... --dir <driver clone>`. In states that can wait, the feature is held `awaiting_human` and leaves the run's way; the same queue edit applies before `deliver retry`.
 
 ## Run records
 

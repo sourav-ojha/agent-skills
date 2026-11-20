@@ -21,6 +21,15 @@ function brokenCopy(mutate) {
   return JSON.parse(r.stdout).errors.map((e) => e.msg);
 }
 
+test('validator: a skill directory named like an Object.prototype key (constructor) is checked, not a crash', () => {
+  const root = tmpDir('skills-root-');
+  fs.cpSync(SKILL, path.join(root, 'constructor'), { recursive: true });
+  const r = validate(root);
+  assert.doesNotMatch(r.stderr, /TypeError/, r.stderr);
+  const errors = JSON.parse(r.stdout).errors.map((e) => e.msg);
+  assert.ok(errors.some((m) => m.includes('must match directory')), 'the normal checks ran');
+});
+
 test('validator: bad name, long description, missing description', () => {
   const e1 = brokenCopy((d) => fs.writeFileSync(path.join(d, 'SKILL.md'), fs.readFileSync(path.join(d, 'SKILL.md'), 'utf8').replace('name: product-intelligence', 'name: Product_Intelligence')));
   assert.ok(e1.some((m) => m.includes('must match directory')));

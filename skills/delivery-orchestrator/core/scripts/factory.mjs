@@ -221,8 +221,9 @@ export function baseCriteria(git, base, rel) {
 }
 
 // Current approved scenarios: the stored doc RE-LINTED against the criteria on origin/<base> now, and approved for exactly its
-// content (isCurrentApproved binds the approval to scenarios_hash). The `approved` field alone is never trusted.
-export function scenarioState(key, id, bc) {
+// content (isCurrentApproved binds the approval to scenarios_hash). The `approved` field alone is never trusted. mode is the base
+// config's verification.scenario_approval: under "human" an approval by "auto" does not count.
+export function scenarioState(key, id, bc, mode) {
   if (!bc || !bc.criteria.ok) return { ok: false, why: 'criteria' };
   let doc;
   try { doc = loadScenarios(key, id); } catch { return { ok: false, why: 'corrupt' }; }
@@ -230,7 +231,7 @@ export function scenarioState(key, id, bc) {
   if (doc.feature !== id) return { ok: false, why: 'corrupt' };
   const lint = lintScenarios(doc, bc.criteria, bc.hash);
   if (!lint.ok) return { ok: false, why: 'lint', problems: lint.problems, doc };
-  if (!isCurrentApproved(doc, bc.hash)) return { ok: false, why: 'unapproved', doc };
+  if (!isCurrentApproved(doc, bc.hash, mode)) return { ok: false, why: 'unapproved', doc };
   return { ok: true, doc };
 }
 
@@ -333,18 +334,22 @@ async function authorOne(ctx, spec, bc) {
   const runRoot = privateDir(path.join(privateDir(path.join(ctx.fh, 'run')), 'author'));
   const cwd = fs.mkdtempSync(path.join(runRoot, `${spec.id}-`));
   const home = ctx.deps.home || defaultHome(ctx.env);
-  let r;
+  let r; let pgid = null;
   try {
     const settingsFile = materialiseSettings('author', { factoryHome: ctx.fh, home });
     const v = ctx.policy.verification;
     r = await (ctx.deps.runSession || runSession)({
       role: 'author', cwd, prompt, settingsFile, maxTurns: v.max_turns.author, timeoutS: v.session_timeout_s.author,
       ...(v.model.author ? { model: v.model.author } : {}), home, baseEnv: ctx.env,
-      onSpawn: ({ pgid }) => { try { ctx.lock.recordGroup(pgid); } catch { /* recorded best effort */ } },
+      onSpawn: (x) => { try { ctx.lock.recordGroup(x.pgid); pgid = x.pgid; } catch { /* recorded best effort */ } },
     });
   } catch (e) {
     return { status: 'error', kind: e?.code === 'settings_unsafe' ? 'settings_unsafe' : 'environment' };
-  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  } finally {
+    // As for the builder session: the ended session's group leaves the lock (a later start would otherwise treat it as an orphan).
+    if (pgid) try { ctx.lock.forgetGroup(pgid); } catch { /* kept: killed on the next start */ }
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
   const s = sessionResult(r, { status: 'done' });
   if (s.kind !== 'done') return { status: 'error', kind: s.kind, usage: usageEntry('author', r) };
   const scenarios = parseAuthorReply(r.result);
@@ -368,7 +373,7 @@ export async function cmdScenarios(ctx) {
   for (const spec of pick) {
     const bc = baseCriteria(ctx.git, ctx.base, spec.rel);
     if (!bc || !bc.criteria.ok) { counts.criteria_errors++; ctx.out(`${spec.id} criteria: ${bc ? bc.criteria.errors.length : 1} error(s) in the base spec; fix the spec first`); code = 1; continue; }
-    const now = scenarioState(ctx.key, spec.id, bc);
+    const now = scenarioState(ctx.key, spec.id, bc, mode);
     if (now.ok) { counts.current++; ctx.out(`${spec.id} scenarios: current and approved`); continue; }
     if (now.why === 'unapproved') { counts.awaiting_approval++; ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
     const r = await authorOne(ctx, spec, bc);
@@ -390,10 +395,11 @@ export async function cmdScenarios(ctx) {
 function approveCmd(ctx, id, by) {
   if (!FEATURE_ID.test(String(id))) refuse('--approve needs a feature id like FEATURE-001');
   if (typeof by !== 'string' || !BY.test(by)) refuse('--approve needs --by <name> (1-64 characters of letters, digits, _ . @ -)');
+  if (by === 'auto') refuse('--by auto is reserved for automatic approval (scenario_approval "auto"); give your own name');
   const spec = baseSpecs(ctx.git, ctx.base, ctx.policy.features_dir).find((s) => s.id === id);
   if (!spec) refuse(`${id} has no spec on origin/${ctx.base}`);
   const bc = baseCriteria(ctx.git, ctx.base, spec.rel);
-  const st = scenarioState(ctx.key, id, bc);
+  const st = scenarioState(ctx.key, id, bc, ctx.policy.verification.scenario_approval);
   if (st.ok) { ctx.out(`${id} scenarios: already approved`); return 0; }
   if (st.why !== 'unapproved') refuse(`${id} has no current scenarios to approve (${st.why}${st.problems ? `: ${st.problems.length} problem(s)` : ''})`, `run "factory scenarios --only ${id}" first`);
   const { approved: _drop, ...doc } = st.doc;
@@ -426,7 +432,7 @@ function missingScenarios(ctx, ids) {
   const bad = [];
   for (const id of ids) {
     const s = specs.get(id);
-    const st = s ? scenarioState(ctx.key, id, baseCriteria(ctx.git, ctx.base, s.rel)) : { ok: false, why: 'no base spec' };
+    const st = s ? scenarioState(ctx.key, id, baseCriteria(ctx.git, ctx.base, s.rel), ctx.policy.verification.scenario_approval) : { ok: false, why: 'no base spec' };
     if (!st.ok) bad.push(`${id} (${st.why})`);
   }
   return bad;
@@ -742,7 +748,7 @@ async function stepVerify(ctx, f) {
   noLiveBuilder(ctx); // spec P1.2: no builder process may still run when verification starts
   const spec = baseSpecs(ctx.git, ctx.base, ctx.policy.features_dir).find((s) => s.id === f.id);
   const bc = spec ? baseCriteria(ctx.git, ctx.base, spec.rel) : null;
-  const st = scenarioState(ctx.key, f.id, bc);
+  const st = scenarioState(ctx.key, f.id, bc, ctx.policy.verification.scenario_approval);
   if (!st.ok || !SHA.test(String(f.ci_sha))) return { step: 'verify', kind: 'threw' };
   const t0 = Date.now();
   let r = null; let threw = false;
@@ -894,6 +900,7 @@ export async function cmdRun(ctx) {
 
 async function loop(ctx) {
   let cur = null; let last = null;
+  ctx.resumed = new Set();
   for (let guard = 0; guard < 100000; guard++) {
     const q = readQueue(ctx);
     const runInfo = { max_fix_rounds: q.max_fix_rounds, stop: runStop(q) };
@@ -910,7 +917,12 @@ async function loop(ctx) {
           return finish(ctx, 2);
         }
         act = resumeAction(f, facts, runInfo);
-        update(ctx, f.id, (x) => { x.resumes = (Number.isInteger(x.resumes) ? x.resumes : 0) + 1; });
+        // Counted before the resumed work starts; a run that then ends through finish() (any stop, hold or end: not a crash)
+        // takes it back. Only runs that die (no finish) accumulate. The resume_loop stop itself neither counts nor resets.
+        if (act.kind !== 'resume_loop') {
+          update(ctx, f.id, (x) => { x.resumes = (Number.isInteger(x.resumes) ? x.resumes : 0) + 1; });
+          ctx.resumed.add(f.id);
+        }
       } else act = runInfo.stop ? { do: 'stop', kind: 'run_stop', reason: runInfo.stop } : { do: 'next' };
     } else act = nextAction(f, last, runInfo);
     if (act.do === 'next' && f && f.state !== 'queued') { cur = null; last = null; continue; }
@@ -976,7 +988,12 @@ async function execute(ctx, q, f, act) {
   }
 }
 
+// A run that reaches finish() ended cleanly (a stop, hold, block or the end of the queue): the features it resumed are not crash
+// loops, so their resume count goes back to 0 (terminal features keep it as a record). Only a driver that dies keeps the count.
 function finish(ctx, code) {
+  try {
+    for (const id of ctx.resumed || []) update(ctx, id, (x) => { if (x && !TERMINAL.includes(x.state)) x.resumes = 0; });
+  } catch { /* the count stays: the next run may hold resume_loop */ }
   try {
     const q = readQueue(ctx);
     const by = {};

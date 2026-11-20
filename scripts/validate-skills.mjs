@@ -158,7 +158,7 @@ async function validateSkill(dirName) {
     return /\.(md|json|mjs)$/.test(r);
   });
   for (const f of neutral) {
-    if ((HOST_TOKEN_EXEMPT[dirName] ?? []).includes(rel(f))) continue;
+    if ((Object.hasOwn(HOST_TOKEN_EXEMPT, dirName) ? HOST_TOKEN_EXEMPT[dirName] : []).includes(rel(f))) continue;
     const t = fs.readFileSync(f, 'utf8');
     for (const re of HOST_TOKENS) if (re.test(t)) S('error', `${rel(f)}: host-specific token ${re} in agent-neutral content (move to adapters/)`);
   }

@@ -67,10 +67,12 @@ export function approve(doc, by) {
   if (typeof by !== 'string' || !BY.test(by)) throw new Error('invalid approver (expected 1-64 chars of [A-Za-z0-9_.@-])');
   return { ...doc, approved: { by, at: new Date().toISOString(), scenarios_hash: scenariosHash(doc) } };
 }
-export const isCurrentApproved = (doc, currentHash) => {
+// mode: the base config's verification.scenario_approval at the point of use. Under "human", an "auto" approval is not one.
+export const isCurrentApproved = (doc, currentHash, mode) => {
   const a = doc?.approved;
   if (typeof currentHash !== 'string' || !currentHash) return false;
   if (!a || typeof a.by !== 'string' || !BY.test(a.by) || typeof a.at !== 'string' || Number.isNaN(Date.parse(a.at))) return false;
+  if (mode === 'human' && a.by === 'auto') return false;
   if (typeof doc.criteria_hash !== 'string' || doc.criteria_hash !== currentHash) return false;
   try { return a.scenarios_hash === scenariosHash(doc); } catch { return false; }
 };

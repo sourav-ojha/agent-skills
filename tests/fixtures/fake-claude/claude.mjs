@@ -36,7 +36,9 @@ function stdinStatus() {
 function record(extra = {}) {
   if (!cfg.log) return;
   // TMPDIR is recorded as a hash only (never env values).
-  const entry = { argv: process.argv.slice(2), stdin: stdinStatus(), envKeys: Object.keys(process.env).sort(), tmpdirHash: createHash('sha256').update(String(process.env.TMPDIR)).digest('hex'), cwd: process.cwd(), pid: process.pid, pgid: null, ...extra };
+  // lockFile (fake.json): the driver lock's recorded process groups at session start, so a test can see stale groups.
+  const lockGroups = fromFile.lockFile ? (() => { try { return JSON.parse(fs.readFileSync(fromFile.lockFile, 'utf8')).groups ?? null; } catch { return null; } })() : undefined;
+  const entry = { argv: process.argv.slice(2), stdin: stdinStatus(), envKeys: Object.keys(process.env).sort(), tmpdirHash: createHash('sha256').update(String(process.env.TMPDIR)).digest('hex'), cwd: process.cwd(), pid: process.pid, pgid: null, ...(lockGroups !== undefined ? { lockGroups } : {}), ...extra };
   fs.appendFileSync(cfg.log, JSON.stringify(entry) + '\n');
 }
 

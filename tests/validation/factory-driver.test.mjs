@@ -946,6 +946,8 @@ test('factory scenarios: human approval stores unapproved; --approve ID --by NAM
   assert.match(r.out, /FEATURE-001 scenarios: stored \(2\), awaiting approval/);
   assert.equal(w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001')).approved, undefined);
   assert.equal(w.factory(['scenarios', '--approve', 'FEATURE-001']).code, 1, '--by is required');
+  const au = w.factory(['scenarios', '--approve', 'FEATURE-001', '--by', 'auto']);
+  assert.equal(au.code, 1); assert.match(au.out, /--by auto is reserved/);
   const a = w.factory(['scenarios', '--approve', 'FEATURE-001', '--by', 'alice']);
   assert.equal(a.code, 0, a.out + a.err);
   const doc = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
@@ -958,6 +960,9 @@ test('factory scenarios: human approval stores unapproved; --approve ID --by NAM
   const after = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
   assert.equal(after.scenarios.length, 2);
   assert.equal(after.approved, undefined);
+  // An "auto" approval written into the store is not an approval under "human": still awaiting one, and run refuses.
+  w.inHome(() => SC.saveScenarios('o__r', 'FEATURE-001', SC.approve(after, 'auto')));
+  assert.match(w.factory(['scenarios', '--only', 'FEATURE-001']).out, /FEATURE-001 scenarios: current, awaiting approval/);
 });
 
 test('factory scenarios: a reply that fails the coverage lint is rejected with IDs and counts only and nothing is stored', (t) => {
@@ -995,6 +1000,17 @@ test('factory scenarios: a usage limit stops with exit 2; the lock held by anoth
   assert.match(w.factory(['scenarios']).out, /not trusted: git config not allowed: core\.pager/);
 });
 
+test('factory scenarios: each author session\'s process group is forgotten in the lock once it ends (no stale group)', (t) => {
+  const w = world(t);
+  w.setFake((s) => { s.lockFile = path.join(w.fhome, 'locks', 'o__r.lock'); });
+  const r = w.factory(['scenarios']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const authors = w.sessions().filter((s) => s.argv.includes('--tools'));
+  assert.equal(authors.length, 2);
+  assert.ok(Array.isArray(authors[1].lockGroups), 'the lock was readable from the second session');
+  assert.ok(!authors[1].lockGroups.some((g) => g.pgid === authors[0].pid), `the first author's group is still recorded: ${JSON.stringify(authors[1].lockGroups)}`);
+});
+
 test('scenarioState: the approved flag alone is never trusted (re-lint against the base criteria, approval bound to content)', (t) => {
   const w = world(t);
   assert.equal(w.factory(['scenarios', '--only', 'FEATURE-001']).code, 0);
@@ -1012,6 +1028,12 @@ test('scenarioState: the approved flag alone is never trusted (re-lint against t
     w.inHome(() => fs.writeFileSync(SC.scenarioPath('o__r', 'FEATURE-001'), JSON.stringify(d)));
     assert.equal(w.inHome(() => FX.scenarioState('o__r', 'FEATURE-001', bc)).ok, false, what);
   }
+  // The approval mode is enforced at use: an "auto" approval is not current when the base config says "human".
+  w.inHome(() => fs.writeFileSync(SC.scenarioPath('o__r', 'FEATURE-001'), JSON.stringify(doc)));
+  assert.equal(doc.approved.by, 'auto');
+  assert.equal(w.inHome(() => FX.scenarioState('o__r', 'FEATURE-001', bc, 'auto')).ok, true);
+  const h = w.inHome(() => FX.scenarioState('o__r', 'FEATURE-001', bc, 'human'));
+  assert.equal(h.ok, false); assert.equal(h.why, 'unapproved');
 });
 
 test('run record: verification fields and session usage are IDs and counts only; forged values are dropped', () => {
@@ -1147,6 +1169,35 @@ test('factory run: killed after built, the restart resumes at pr without a secon
   const f = w.queue().features[0];
   assert.equal(f.state, 'merged'); assert.equal(f.resumes, 1);
   assert.equal(builderRuns(w, 'FEATURE-001').length, 1, 'no second build session');
+});
+
+test('factory run: clean stops (usage limit) do not count as crashes; a fifth run still resumes the build', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ status: 'usage' }] } } });
+  for (let i = 0; i < 5; i++) {
+    const r = w.factory(['run']);
+    assert.equal(r.code, 2, `run ${i + 1}: ${r.out}${r.err}`);
+    assert.match(r.out, /stopped: usage_limit/, `run ${i + 1}`);
+    assert.ok(!/resume_loop/.test(r.out), `run ${i + 1} is not a resume loop: ${r.out}`);
+    if (i > 0) assert.match(r.out, /FEATURE-001 building -> build/, `run ${i + 1} resumed the build`);
+    const f = w.queue().features[0];
+    assert.equal(f.state, 'building'); assert.equal(f.resumes ?? 0, 0, `run ${i + 1}: a run that ended cleanly resets the count`);
+  }
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 5);
+});
+
+test('factory run: real crashes still count: after three crashed resumes the feature stops as resume_loop, and stays stopped', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ status: 'none' }] } } });
+  const kill = { FACTORY_TEST: JSON.stringify({ killAfter: 'build' }) };
+  for (let i = 0; i < 4; i++) assert.equal(w.factory(['run'], kill).signal, 'SIGKILL', `crash ${i + 1}`);
+  assert.equal(w.queue().features[0].resumes, 3);
+  for (let i = 0; i < 2; i++) {
+    const r = w.factory(['run']);
+    assert.equal(r.code, 2, r.out + r.err);
+    assert.match(r.out, /^attention: FEATURE-001 building \(resume_loop\)$/m);
+    assert.match(r.out, /stopped: FEATURE-001 needs a person \(resume_loop\)/);
+    assert.equal(w.queue().features[0].resumes, 3, 'the resume_loop stop does not reset the count');
+  }
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 4, 'no build session after the cap');
 });
 
 test('factory run: refusals with fix text (protection, verification.required, readiness, missing scenarios); nothing starts', (t) => {

@@ -178,6 +178,28 @@ test('built: partial delivery or no commits blocks the feature and leaves the ba
   assert.match(r.json.reason, /delivery is "partial"/);
 });
 
+test('built: a spec committed as a symlink (to a FIFO or /dev/zero) or oversized is refused fast, never followed', () => {
+  const e = setup();
+  e.d('init'); e.d('next');
+  const spc = path.join(e.work, '.product/features/FEATURE-001.md');
+  const fifo = path.join(e.root, 'spec.fifo');
+  spawnSync('mkfifo', [fifo]);
+  for (const target of [fifo, '/dev/zero']) {
+    fs.rmSync(spc, { force: true }); fs.symlinkSync(target, spc);
+    sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', `spec -> ${path.basename(target)}`);
+    const t0 = Date.now();
+    const r = spawnSync('node', [DELIVER, 'built', 'FEATURE-001', '--tier', 'T1', '--dir', e.work], { encoding: 'utf8', env: e.env, timeout: 20000 });
+    assert.ok(Date.now() - t0 < 15000 && r.signal === null, `${target}: did not hang (${r.signal})`);
+    assert.equal(r.status, 1, `${target}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /spec file .* is not a regular file/, target);
+  }
+  fs.rmSync(spc); fs.writeFileSync(spc, `${spec('FEATURE-001', { delivery: 'complete' })}${'x'.repeat(2 * 1024 * 1024)}\n`);
+  sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', 'big spec');
+  const big = e.d('built', 'FEATURE-001', '--tier', 'T1');
+  assert.equal(big.code, 1); assert.match(big.err, /spec file .* larger than/);
+  assert.equal(e.d('status', '--json').json.features[0].state, 'building', 'nothing changed');
+});
+
 test('built: the tier comes from the implementer ledger when present; a missing tier is an error', () => {
   const e = setup();
   e.d('init'); e.d('next'); build(e, 'FEATURE-001');

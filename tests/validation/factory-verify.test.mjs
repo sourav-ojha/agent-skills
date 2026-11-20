@@ -1676,6 +1676,23 @@ test('T10: scenarios that are not approved for the current criteria hold even wh
   rm(r);
 });
 
+test('T10: with scenario_approval "human" on the base, scenarios approved by "auto" hold at merge; a named approver merges', () => {
+  const HUMAN = { ...REQ, verification: { required: true, scenario_approval: 'human' } };
+  const r = vship({ config: HUMAN });
+  r.edit((f) => { f.state = 'verified'; });
+  const { doc } = arm(r);
+  const { approved: _drop, ...plain } = doc;
+  inHome(r, () => SC.saveScenarios('o__r', 'FEATURE-001', SC.approve(plain, 'auto')));
+  const m = merge(r);
+  assert.equal(J(m).state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /not approved/); noLeak(J(m).reason);
+  assert.equal(mergeCalled(r), false);
+  const ok = vship({ config: HUMAN });
+  ok.edit((f) => { f.state = 'verified'; });
+  arm(ok); // approved by "tester"
+  assert.equal(J(merge(ok))?.state, 'merged');
+  rm(r, ok);
+});
+
 test('T10: a base spec over the parse guard (a line longer than MAX_LINE) holds without parsing, even with a matching verdict', () => {
   const r = vship({ baseFiles: { '.product/features/FEATURE-001.md': `---\ntype: feature-spec\nid: FEATURE-001\nopportunity: OPP-001\nstatus: ready\n---\n# One\n\n${'x'.repeat(CR.MAX_LINE + 1)}\n` } });
   r.edit((f) => { f.state = 'verified'; });

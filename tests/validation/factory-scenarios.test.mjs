@@ -615,6 +615,10 @@ test('approve / isCurrentApproved', () => {
   assert.equal(sc.isCurrentApproved(a, 'sha256:other'), false);
   assert.equal(sc.isCurrentApproved(null, 'x'), false);
   assert.equal(sc.isCurrentApproved({ ...d, approved: { by: '', at: 'x' } }, d.criteria_hash), false);
+  // The approval mode is enforced where the doc is used: under "human", an "auto" approval is not an approval.
+  assert.equal(sc.isCurrentApproved(a, d.criteria_hash, 'auto'), true);
+  assert.equal(sc.isCurrentApproved(a, d.criteria_hash, 'human'), false);
+  assert.equal(sc.isCurrentApproved(sc.approve(d, 'alice'), d.criteria_hash, 'human'), true);
 });
 
 test('scenarioPath and storage: under FACTORY_HOME, atomic, no traversal', () => {

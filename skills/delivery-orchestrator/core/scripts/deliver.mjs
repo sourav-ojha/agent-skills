@@ -433,6 +433,26 @@ C.next = () => {
 };
 
 const RANK = { T0: 0, T1: 1, T2: 2, T3: 3 };
+// The spec on the feature branch is implementer-written: read without following a link (a committed symlink to /dev/zero or a FIFO
+// would hang or exhaust memory), a regular file of at most SPEC_MAX bytes, or refused (nothing changed).
+function readSpec(file) {
+  const rel = flat(path.relative(root, String(file)), 120);
+  let fd;
+  try {
+    const lst = fs.lstatSync(file);
+    if (!lst.isFile()) die(`spec file ${rel} is not a regular file (a symlink or special file is never read)`);
+    if (lst.size > SPEC_MAX) die(`spec file ${rel} is larger than ${SPEC_MAX} bytes`);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.ino !== lst.ino || st.dev !== lst.dev) die(`spec file ${rel} is not a regular file (changed while read)`);
+    if (st.size > SPEC_MAX) die(`spec file ${rel} is larger than ${SPEC_MAX} bytes`);
+    return fs.readFileSync(fd, 'utf8');
+  } catch (e) {
+    if (e?.code === 'ELOOP') die(`spec file ${rel} is not a regular file (a symlink or special file is never read)`);
+    if (e?.code) die(`spec file ${rel} cannot be read (${e.code})`);
+    throw e;
+  } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
+}
 C.built = () => {
   const q = load(); const f = item(q);
   need(f, 'building', 'built');
@@ -440,7 +460,7 @@ C.built = () => {
   if (!clean()) die('uncommitted changes remain; commit them (or discard) before reporting built');
   const ahead = Number(git('rev-list', '--count', `${OR(q.base)}..HEAD`).out);
   if (!(ahead >= 1)) { block(q, f, 'no commits on the feature branch'); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
-  const delivery = (frontmatter(fs.readFileSync(f.file, 'utf8')).delivery || 'none').toLowerCase();
+  const delivery = (frontmatter(readSpec(f.file)).delivery || 'none').toLowerCase();
   if (delivery !== 'complete') { block(q, f, `spec delivery is "${delivery}", not complete`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
   // Project-defined checks the orchestrator runs itself (argv, no shell), so "tests passed" does not rest on the implementer's word.
   const failing = [];
@@ -683,7 +703,8 @@ function verdictGate(q, f, bc, headSha) {
         : vd.criteria_hash !== crHash ? 'the spec criteria changed after verification (criteria_hash mismatch)' : 'the verdict does not match this commit';
     return G(`verification gate: ${what}; verify again`);
   }
-  if (!isCurrentApproved(doc, crHash)) return G('verification gate: the stored scenarios are not approved for the current criteria');
+  // The base config's approval mode applies here too: under "human", an "auto" approval does not count.
+  if (!isCurrentApproved(doc, crHash, bc?.verification?.scenario_approval ?? 'human')) return G('verification gate: the stored scenarios are not approved for the current criteria');
   let hits;
   try {
     hits = checkDiff({ git: rawGit, baseRef: OR(q.base), headSha, config: bc, specPaths: specList(q.base, bc.features_dir, rel) });
