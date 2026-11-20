@@ -1277,6 +1277,7 @@ test('I-1: a branch tracking .delivery (symlink) or .skill-runs is blocked befor
   assert.match(r.out, /attention: FEATURE-001 blocked/); assert.match(r.out, /attention: FEATURE-002 blocked/);
   for (const p of ['.delivery', '.delivery/.gitignore']) { let st = null; try { st = fs.lstatSync(path.join(w.clone, p)); } catch { /* absent */ } assert.ok(!st || !st.isSymbolicLink(), `${p} in the driver clone is not a link`); }
   assert.ok(!fs.readFileSync(w.recordsFile, 'utf8').includes('forged'), 'run records not overwritten');
+  assert.ok(!fs.existsSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl')) || !fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'the branch-planted records file did not land in the clone');
   assert.equal(w.ghState().prs.length, 0);
 });
 
@@ -1394,6 +1395,7 @@ test('I-5: dot entries that may alias a driver-owned name on APFS (U+017F, zero-
   for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
   const recs = fs.readFileSync(w.recordsFile, 'utf8');
   assert.ok(!recs.includes('forged'));
+  assert.ok(!fs.existsSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl')) || !fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'the branch-planted records file did not land in the clone');
   assert.equal(recs.trim().split('\n').length, 4, 'one blocked record per feature, none lost');
   assert.equal(w.ghState().prs.length, 0);
 });

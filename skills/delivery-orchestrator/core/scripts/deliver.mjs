@@ -918,7 +918,7 @@ C.hold = () => {
   if ((f.state === 'building' || f.state === 'fixing') && kind !== 'budget') die(`${f.id} is "${f.state}", which cannot wait for a person`);
   if (kind === 'budget') {
     if (f.state !== 'building' && f.state !== 'fixing') die(`${f.id} is "${f.state}", which cannot be held for a budget (only building and fixing)`);
-    f.budget_hold = { from: f.state };
+    f.budget_hold = { from: f.state }; f.budget_hit = true; // sticky: survives the unhold
   }
   if (kind === 'antigaming') {
     const ids = parseList(opt.ids).filter((x) => /^G[1-5]$/.test(x));

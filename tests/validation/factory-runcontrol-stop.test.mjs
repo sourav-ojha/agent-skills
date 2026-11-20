@@ -159,6 +159,9 @@ test('graceful stop during a session aborts it, WIP-commits its edits, ends stat
   assert.equal(w.queue().features[0].state, 'merged');
   const runs = builderRuns(w, 'FEATURE-001');
   assert.equal(runs.length, 2); assert.match(promptOf(runs[1]), CONTINUE);
+  // The final record still says the person stopped it (sticky across the continue), and nothing else was flagged.
+  const rec = w.records().filter((x) => x.feature === 'FEATURE-001').pop();
+  assert.equal(rec.outcome, 'merged'); assert.equal(rec.stopped_by_user, true); assert.equal(rec.budget_hit, false);
 });
 
 test('after stop no process with the factory clone or work directory as cwd survives, and the app port from app.ready.url is free', async (t) => {
@@ -314,6 +317,11 @@ test('--raise-budget FEATURE-001 on a budget-held feature doubles the caps, unho
   assert.doesNotMatch(r.out, /-> build \(build\)/, 'no rebuild from the base');
   assert.match(promptOf(runs[1]), /Anti-gaming checks G2 fired/);
   assert.ok(!JSON.parse(fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.json'), 'utf8')).some((i) => i.kind === 'budget' && i.id === 'FEATURE-001'), 'the budget attention row is resolved');
+  // hold -> unhold -> continue -> merge: the final record still says the budget was hit; a feature that never hit one says false.
+  const recs = w.records();
+  const r1 = recs.filter((x) => x.feature === 'FEATURE-001').pop(), r2 = recs.filter((x) => x.feature === 'FEATURE-002').pop();
+  assert.equal(r1.outcome, 'merged'); assert.equal(r1.budget_hit, true); assert.equal(r1.stopped_by_user, false);
+  assert.equal(r2.budget_hit, false);
 });
 
 test('--raise-budget without a run in progress refuses before anything is written: no queue, no deliver init, the driver clone untouched', (t) => {

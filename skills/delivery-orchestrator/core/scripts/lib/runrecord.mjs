@@ -126,8 +126,8 @@ export function usageFields(f) {
   const latest = ints.at(-1)?.kind ?? (typeof f.interrupted?.kind === 'string' ? f.interrupted.kind : null);
   const out = {
     tokens_by_role: tokens, turns_by_role: turns,
-    budget_hit: !!(f.budget_hold || f.hold_kind === 'budget' || ints.some((x) => x.kind === 'budget') || f.interrupted?.kind === 'budget'),
-    interruptions: ints, stopped_by_user: latest === 'stop' || f.interrupted?.kind === 'stop',
+    budget_hit: !!(f.budget_hit === true || f.budget_hold || f.hold_kind === 'budget' || ints.some((x) => x.kind === 'budget' || x.kind === 'day_budget') || f.interrupted?.kind === 'budget'),
+    interruptions: ints, stopped_by_user: f.stopped_by_user === true || latest === 'stop' || f.interrupted?.kind === 'stop',
   };
   if (anyCost) out.cost_usd_by_role = cost;
   return out;

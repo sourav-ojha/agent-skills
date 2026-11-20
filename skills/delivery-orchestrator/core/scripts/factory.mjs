@@ -1414,6 +1414,7 @@ export async function handleInterrupt(ctx, f, act, last) {
   if (act.kind === 'budget' && act.scope !== 'day') return budgetInterrupt(ctx, f, act, last);
   const kind = act.kind === 'usage_limit' ? act.limit : act.kind === 'budget' ? 'day_budget' : act.kind;
   const step = f ? STEP_OF[f.state] : undefined;
+  if (act.kind === 'budget' && f) update(ctx, f.id, (x) => { x.budget_hit = true; }); // sticky: the record of a continued feature still says it hit a budget
   if (act.kind === 'stop') await killLeftovers(ctx); // before noLiveBuilder: what the stopped session left running goes first
   if (step && act.kind !== 'budget') { // a day-budget hit refused the session before it started: nothing to commit
     noLiveBuilder(ctx);
@@ -1453,6 +1454,7 @@ export async function handleInterrupt(ctx, f, act, last) {
 }
 // The run ends stopped: the terminal lines, the attention event and row (with the command that continues the run).
 function stopRun(ctx, f, kind, reason) {
+  if (kind === 'stop' && f) update(ctx, f.id, (x) => { x.stopped_by_user = true; }); // sticky, like budget_hit: survives the continue
   ctx.out(`stopped: ${kind}`);
   ctx.stopReason = clean(`${kind}: ${reason}`, 200);
   ctx.out(`${kind === 'usage_limit' ? 'usage limit' : 'reason'}: ${clean(reason, 200)}`);
