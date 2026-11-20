@@ -67,6 +67,14 @@ When a feature is blocked mid-way, uncommitted work is stashed (nothing is delet
 
 `deliver readiness [--repeat N] [--json]` scores the repo from level 0 to 4 (config, tests run, CI gate, app drivable), saves the result outside the repo and lists fixes; exit `2` when below `readiness.min_level`. Repos that add a `readiness` key to the config get a gate in `deliver init` when merging is authorised: it refuses on a missing, stale, future-dated, config-mismatched or other-base result, or a level below the minimum. Every feature outcome is also recorded in `.skill-runs/factory-runs.jsonl` (join to tokens with `si.mjs runs-factory`). Details: [references/readiness.md](references/readiness.md).
 
+## Verified delivery (factory driver)
+
+For merges proven by hidden scenarios the builder never sees, the factory driver replaces this loop: `factory` means `node <skill-dir>/core/scripts/factory.mjs`, a plain Node process that starts each LLM role as its own `claude -p` session.
+- `factory scenarios [--only IDS]` authors and stores the scenarios; `factory scenarios --approve ID --by NAME` when `verification.scenario_approval` is `human`.
+- `factory run [--only IDS] [--limit N]` builds, opens PRs, waits for CI, verifies the exact PR head in a sandbox, and merges only on a passing verdict. It resumes a queue in progress. Exit `0` done, `1` refused (one `fix:` line per problem), `2` stopped or a feature needs a person.
+
+It refuses unless the base config sets `verification.required: true`, `readiness.min_level: 4` (with a stored level-4 result) and `local_checks: []`, and branch protection requires the `factory/verified` status. The queue lives under `FACTORY_HOME` and belongs to the driver; a person releases an anti-gaming hold with `deliver retry ID --note "<why>"`. Details: [references/factory-driver.md](references/factory-driver.md), [references/verification.md](references/verification.md).
+
 ## Stop and report (do not push through)
 
 No CI evidence (see `unconfirmed`) · the run's circuit breaker trips · the base cannot be fast-forwarded · `gh` is not logged in or the remote is not GitHub · the implementer reports `BLOCKED` on something only a person can decide · anything unexpected about what a command printed. Say what you saw and the exact next command.

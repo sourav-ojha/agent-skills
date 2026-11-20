@@ -1,10 +1,105 @@
-# Factory driver: sessions
+# Factory driver
 
-How the factory driver starts its LLM roles. Code: `core/scripts/lib/sessions.mjs`. Settings: `core/settings/builder.json`, `core/settings/author.json`. Author prompt: `core/prompts/scenario-author.md`.
+`factory` means `node <skill-dir>/core/scripts/factory.mjs`. It is a plain Node process (no LLM) that runs verified delivery: it starts each LLM role as its own `claude -p` session, runs `deliver` as a subprocess for every queue step, verifies, and merges only on a passing verdict. The gate itself (scenarios, verdicts, G-checks): [verification.md](verification.md).
 
-## Running a session
+Code: `core/scripts/factory.mjs`, `core/scripts/lib/driver.mjs` (decision table, pure), `core/scripts/lib/lock.mjs`, `core/scripts/lib/sessions.mjs`. Settings: `core/settings/builder.json`, `core/settings/author.json`. Author prompt: `core/prompts/scenario-author.md`.
 
-`runSession({ role, cwd, prompt, settingsFile, configDir?, maxTurns, timeoutS, model? })` runs:
+## Commands
+
+| Command | What it does |
+|---|---|
+| `factory scenarios [--only IDS] [--dir D] [--base B]` | Authors, lints and stores hidden scenarios for the ready specs on `origin/<base>` ([verification.md](verification.md#hidden-scenarios)) |
+| `factory scenarios --approve ID --by NAME [--dir D] [--base B]` | Approves current scenarios (`scenario_approval: human`) |
+| `factory run [--only IDS] [--limit N] [--dir D] [--base B]` | Runs the queue: build, PR, CI, verification, merge. Resumes a queue in progress; `--only` and `--limit` (1-1000) apply to a new run only |
+
+`--dir` is a checkout of the repository (default: the current directory). Only its identity is used: `gh repo view` names the repository and its `origin` URL must point to the same one. `--base` overrides the base; otherwise `base` from the config on the default branch, else the default branch.
+
+| Exit | `factory run` | `factory scenarios` |
+|---|---|---|
+| 0 | every feature merged or skipped (or none ready) | done |
+| 1 | refused or error before anything unsafe (prints `refused:` and one `fix:` line per problem) | a refusal, criteria errors, a rejected reply or a failed session |
+| 2 | stopped mid-run (usage limit, timeout, leftovers, CI unconfirmed, an error in a step), or finished with a feature blocked or awaiting a person | usage limit (run again later) |
+
+The benchmark runner (`bench/factory/run.mjs`) has its own codes, including 3 (every case as expected, but not a result).
+
+Terminal output is states, IDs and counts only: `<ID> <state> -> <action> (<brief>)`, `attention: <ID> <state> (<kind>)`, `stopped: <kind>`, `features: <state> <n>, ...`. Spec, scenario, prompt and builder text are never printed; `error:` lines have paths replaced with `<path>`.
+
+## Refusals at start (`factory run`)
+
+All read from `.product/delivery.json` on `origin/<base>`; each prints a fix line.
+
+| Needs | Why |
+|---|---|
+| `verification.required: true` | `deliver merge` then insists on a verdict |
+| `readiness.min_level: 4`, and a stored readiness result at level 4 for this base | the app must start, log and seed from a clean checkout; `deliver init` re-checks the result |
+| `local_checks: []` | `deliver built` runs local checks outside the untrusted-code sandbox; move them to CI (`checks.required`) |
+| `checks.required` does not name `factory/verified` | it is posted only after CI passes, so CI would wait for ever |
+| branch protection (or a ruleset) on the base requires `factory/verified` | so no other route can merge; needs a public repository or a plan with protected private branches |
+| `github.host` equals the origin host | the token is offered to that host only |
+| current approved scenarios for every picked feature (re-linted now) | [verification.md](verification.md#approval-and-binding) |
+| no live orphan process group or leftover work dir from an earlier run (new run only) | stop them first |
+| a stored queue for this repository and base | otherwise reset it (`DELIVER_QUEUE=<queue> node deliver.mjs reset --yes`) |
+| a repository name without `__` | the repo key `<owner>__<repo>` must round-trip |
+
+Also refused: a `FACTORY_HOME` that is a symlink, owned by another user or group/world writable; a lock held by a live run; an untrusted driver clone (below). Merging still needs `merge.mode: "squash"` in the base config: the driver never passes `--merge`. Every start prints a warning that `factory/verified` is a plain commit status (see [verification.md](verification.md#factoryverified)).
+
+## Layout
+
+`FACTORY_HOME` comes from the driver's environment (default `~/.factory`), is resolved to an absolute path, and is created 0700.
+
+| Path | What |
+|---|---|
+| `FACTORY_HOME/clones/<key>` | **Driver clone**: a plain clone owned by the driver user. `deliver` runs here (`--dir`), as do merges and verification worktrees. The builder never works in it |
+| `<FACTORY_HOME>-builder/<key>` (or `$FACTORY_BUILDER_HOME/<key>`) | **Builder clone**: a second plain clone where builder sessions run. Must resolve outside `FACTORY_HOME` and not contain it, because the builder settings deny every read and write of `FACTORY_HOME` |
+| `<builder root>/run/<key>/<ID>-*` | per-session run dir with the session's `TMPDIR` |
+| `FACTORY_HOME/queues/<key>.json` | the queue (`DELIVER_QUEUE` for `deliver`) |
+| `FACTORY_HOME/locks/<key>.lock` | the lock |
+| `FACTORY_HOME/scenarios/<key>/`, `verdicts/<key>/` | scenarios, verdicts |
+| `FACTORY_HOME/work/<key>/<ID>-<sha>` | verification worktrees |
+| `FACTORY_HOME/tmp/`, `trash/` | run temps and bundles; quarantine before deletion |
+| `FACTORY_HOME/run/author/`, `run/settings/` | empty author cwd per session; per-run settings files (0600) |
+| `FACTORY_HOME/attention/<key>.jsonl` | attention entries `{at, feature, state, kind}` |
+| `FACTORY_HOME/readiness/<key>.json` | stored readiness result |
+
+`<key>` is `<owner>__<repo>`.
+
+**Commits move between the clones only as git bundles** in `FACTORY_HOME/tmp`, created and applied by the driver with gitSafe (`bundle create`/`bundle unbundle`, then `checkout -f -B` and `clean -fd`). There is never a fetch from the builder clone, so its config, hooks and upload-pack never run. Both clones get `gc.auto 0` (a plain gc writes a commit-graph, which the merge gate refuses); the builder clone's `.git/info/exclude` lists `.delivery/` and `.implementation/`.
+
+**Driver clone preflight**, before every fetch and every `deliver` call: a real directory owned by this user; `.git` a real directory; the common dir is its own `.git`; the gitsafe config allowlist; no grafts, `shallow`, alternates, commit-graph, `config.worktree`, replace refs or hooks; `origin` resolves to exactly the pinned URL (rebuilt from host and repository: `https://<host>/<repo>.git` or `ssh://<user>@<host>/<repo>.git`) and has no `pushurl`. Otherwise refuse; the fix is to delete the clone, and the next run makes a fresh one.
+
+**Before checkout in the driver clone**, the incoming commit's top-level tree may not track `.delivery`, `.implementation` or `.skill-runs` (compared case-insensitively), nor any top-level dot entry with a character outside printable ASCII (APFS folds case, Unicode case variants such as U+017F and normalisation forms). After checkout, those paths must not be symlinks and the run-record file's dev:ino must be unchanged. Otherwise the driver clone goes back to the base and the feature is blocked.
+
+**Credentials.** `gh` and https git use the token of `github.account` (held in memory, offered only to the pinned host through `gh auth git-credential`), else gh's own login. The first clone of an https remote uses the account named in the checkout's config; if the base config names another, the run is refused.
+
+## Lock and start sweeps
+
+`FACTORY_HOME/locks/<key>.lock` (0600, `locks/` 0700) holds the pid, its start time (`ps:<lstart>` on macOS, `proc:<ticks>` on Linux), a token and every process group the run started (sessions record their group on spawn). A lock whose holder is alive is `LOCK_HELD`. A dead holder's lock is taken over, and its recorded groups are killed, after checking the group leader's start time against the recorded one (a reused pgid is never signalled). A garbled lock, a start time from the other source, or a takeover marker left by a dead taker fail closed: remove the file by hand. `factory scenarios` takes the same lock.
+
+Then (`factory run` only): `FACTORY_HOME/trash` is emptied; each `work/<key>/*` dir is moved to the trash and deleted when no process carries its path (then `worktree prune`); `tmp/*` the same, but only when no other repository's lock file exists (tmp is shared). Groups still alive count as `orphans_alive`; dirs still in use count as `leftover_worktrees`. A new run with either refuses; a resume stops (`leftovers`).
+
+## Roles and sessions
+
+| Role | cwd | Gets | Can write | Settings |
+|---|---|---|---|---|
+| Builder | the builder clone | the brief (below), the repo | the repo (commits on its branch), `.implementation/<ID>/`, `.delivery/pr-<ID>.md` | `core/settings/builder.json` |
+| Scenario author | an empty dir under `FACTORY_HOME/run/author/` | the spec items as data | nothing: returns JSON | `core/settings/author.json` |
+| Evaluator | Phase 1b; not implemented | | | |
+
+Briefs (prompt; fix briefs are also written to `.implementation/<ID>/fix-brief.md` in the builder clone, because the builder cannot read `FACTORY_HOME`):
+
+| Brief | Content |
+|---|---|
+| `build` | feature id and spec path; use the implementer skill unattended; write the PR description to `.delivery/pr-<ID>.md` |
+| `local_fix` | failing local check names and bounded tails (unused while `local_checks` must be empty) |
+| `antigaming_fix` | the G-ids that fired (G2/G3) |
+| `ci_fix` | failing CI check **names only** (no log tail) |
+| `symptom_fix` | the symptom brief, recomputed from the stored verdict |
+
+Every brief ends with the result contract: write `.implementation/<ID>/result.json` (`{"status":"done",...}` or `{"status":"blocked","question":"..."}`), commit on the checked-out branch, never push or open a PR. The driver deletes `result.json` before every session, reads builder files without following links (regular file, one link, size-capped), and takes the tier from the implementer ledger (`T2`, only ever raised).
+
+### Running a session
+
+`runSession({ role, cwd, prompt, settingsFile, configDir?, maxTurns, timeoutS, model?, tmpDir?, home?, onSpawn? })` runs:
 
 ```
 claude -p <prompt> --output-format stream-json --verbose --max-turns N --settings <file> \
@@ -12,115 +107,124 @@ claude -p <prompt> --output-format stream-json --verbose --max-turns N --setting
 # author only: --tools "" --no-session-persistence
 ```
 
-- Argv only, never a shell. stdin is `/dev/null`. The process gets its own process group, registered with the proc cleanup registry (killed when the driver exits or gets SIGINT/SIGTERM/SIGHUP).
+Turn and time limits come from `verification.max_turns` and `verification.session_timeout_s` (defaults: builder 200 turns / 1800 s, author 40 / 900); models from `verification.model`.
+
+- Argv only, never a shell. stdin is `/dev/null`. The process gets its own process group, registered with the proc cleanup registry (killed when the driver exits or gets SIGINT/SIGTERM/SIGHUP) and recorded in the lock.
 - Timeout: measured with `process.hrtime` (monotonic; on macOS it does not advance while the machine sleeps). On timeout: SIGTERM to the group, SIGKILL after a grace period.
-- The stream is parsed line by line. Lines longer than the cap (`maxLineChars`, 8 Mi UTF-16 chars) are dropped and `truncated: true` is set; memory stays bounded. The last `result` event wins.
+- The stream is parsed line by line. Lines longer than the cap (`maxLineChars`, 8 Mi UTF-16 chars) are dropped and `truncated: true` is set. The last `result` event wins.
 - Returns `{ ok, sessionId, result, usage: {in, out, cache_create, cache_read}, turns, costUsd, failure, timedOut, truncated, exitCode, signal }`. It never throws for a failed session, only for bad arguments. `costUsd` is Claude Code's list-price estimate, not billed spend.
-- `failure.kind`, in this order of precedence:
-  - `timeout`, `spawn_failed`, `settings_unsafe`, `unsafe_binary`;
-  - `max_turns` (`subtype: error_max_turns`, even with `is_error: true`);
-  - a result with another error subtype is classified on its own text, and an earlier rejected rate event does not override it;
-  - otherwise `session`, `weekly`, `model`, `rate` or `other` from `classifyFailure` on an `is_error` result or a `rejected` rate event;
-  - `no_result` (no `result` event).
+- `failure.kind`, in this order of precedence: `timeout`, `spawn_failed`, `settings_unsafe`, `unsafe_binary`; `max_turns` (`subtype: error_max_turns`, even with `is_error: true`); a result with another error subtype is classified on its own text; otherwise `session`, `weekly`, `model`, `rate` or `other` from `classifyFailure` on an `is_error` result or a `rejected` rate event; `no_result` (no `result` event). The first four classifier kinds are a usage limit for the driver.
+- `ok` needs a `result` event with `subtype: "success"`, `is_error: false` and exit code 0 (an observed auth failure reports `subtype: "success"` with `is_error: true`).
+- Nothing from the stream or stderr is logged. The author's `result` text holds the scenarios; the driver stores it under `FACTORY_HOME` and never prints it.
+- Before spawning, the user settings file that `--setting-sources user` loads (`settings.json` in `CLAUDE_CONFIG_DIR`, else in the home Claude Code config dir) is checked against an ALLOWLIST: top-level `$schema`, `model`, `cleanupPeriodDays`, `includeCoAuthoredBy`; `env` with only `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, `DISABLE_AUTOUPDATER`, `DISABLE_BUG_COMMAND`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `MAX_THINKING_TOKENS`; `permissions.deny` only; `enabledPlugins` and `sandbox` only when empty. Any other key refuses the session without spawning (`settings_unsafe`, key names only, cut to 64 characters, never values). The file is also refused when it, or its dir, resolves inside the session's cwd or `tmpDir`, or cannot be parsed. **This refuses on most real setups** (user hooks, a status line, plugins). That is intended until gap 15 is proven.
+- The binary is resolved to an absolute path once. `PATH` keeps absolute entries only and drops any entry inside the session's cwd. A `claude` inside the cwd is refused (`unsafe_binary`); a missing one is `spawn_failed`. Unknown options throw. `home` (default: the parent's `HOME`) is the child's `HOME` and the home whose user settings are linted; the driver passes the same `home` to `materialiseSettings`.
+- Arguments that look like options are refused: a prompt starting with `-`, a model name outside `[A-Za-z0-9._:[\]-]`, a settings path that is relative, a symlink, not JSON, or fails `checkSettings`.
 
-  The max-turns result shape is unverified. A usage limit leaves all state as it is; Phase 2 adds waiting and resuming.
-- `ok` needs a `result` event with `subtype: "success"`, `is_error: false` and exit code 0. Observed: an auth failure reports `subtype: "success"` with `is_error: true`, so `subtype` alone is not enough.
-- Nothing from the stream or stderr is logged. Callers print counts, ids and status only. The author's `result` text holds the scenarios; the caller stores it under `FACTORY_HOME` and never prints it.
-- Before spawning, the user settings file that `--setting-sources user` loads (`settings.json` in `CLAUDE_CONFIG_DIR`, else in the home Claude Code config dir) is checked against an ALLOWLIST:
-  - allowed top-level keys: `$schema`, `model`, `cleanupPeriodDays`, `includeCoAuthoredBy`;
-  - `env` with these exact names only: `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, `DISABLE_AUTOUPDATER`, `DISABLE_BUG_COMMAND`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `MAX_THINKING_TOKENS`;
-  - `permissions.deny` only;
-  - `enabledPlugins` only when empty;
-  - `sandbox` only when empty.
-
-  Any other key refuses the session, without spawning, as `failure: { kind: 'settings_unsafe', keys: [...] }`. Examples: `hooks`, `statusLine`, `fileSuggestion`, `subagentStatusLine`, `apiKeyHelper`, other `permissions` keys, any `sandbox` key, non-empty `enabledPlugins`. `keys` lists key names only, cleaned and cut to 64 characters, never values. The file is also refused when it, or its dir, resolves inside the session's cwd or `tmpDir`, or cannot be parsed.
-
-  **This refuses on most real setups**, including the development machine (user hooks, a status line, 14 plugins). That is intended until gap 15 is proven.
-- The binary is resolved to an absolute path once. `PATH` keeps absolute entries only and drops any entry inside the session's cwd (resolved, or by realpath). A `claude` inside the cwd is refused (`unsafe_binary`); a missing one is `spawn_failed` (also reported only when no process was created). Unknown `runSession` options throw (no silently ignored option). `home` (default: the parent's `HOME`) is the child's `HOME` and the home whose user settings are linted.
-- `tmpDir` (optional) becomes the session's `TMPDIR`. Task 11 passes a private dir under the run temp.
-- Arguments that look like options are refused: a prompt starting with `-`, a model name outside `[A-Za-z0-9._:[\]-]`, a settings path that is relative, a symlink, not JSON, or fails `checkSettings` (for example still holding `{{...}}` placeholders).
-
-### Environment
-
-Only `PATH`, `HOME`, `LANG`, `TMPDIR`, `USER`, `LOGNAME` and `SHELL` reach claude, plus `CLAUDE_CONFIG_DIR` when the caller passes `configDir` (author only). Tokens such as `GH_TOKEN`, `GITHUB_TOKEN`, `AWS_*`, `NPM_TOKEN` and `ANTHROPIC_API_KEY` are never passed.
-
-Measured on macOS with Claude Code 2.1.325: subscription auth is in the login keychain. With only `PATH`, `HOME`, `LANG` and `TMPDIR`, `claude -p` answered "Not logged in". Adding `USER`, `LOGNAME` and `SHELL` made it work. Which of `USER` and `LOGNAME` is needed was not isolated.
+Environment: only `PATH`, `HOME`, `LANG`, `TMPDIR`, `USER`, `LOGNAME` and `SHELL` reach claude, plus `CLAUDE_CONFIG_DIR` when the caller passes `configDir` (author only; the driver does not). `GH_TOKEN`, `GITHUB_TOKEN`, `AWS_*`, `NPM_TOKEN`, `ANTHROPIC_API_KEY` and the rest are never passed. Measured on macOS with Claude Code 2.1.325: subscription auth is in the login keychain and needs `USER`, `LOGNAME` and `SHELL` as well (which of the first two was not isolated).
 
 ### Settings files
 
-`materialiseSettings(role, { factoryHome, repoDir })` writes a per-run copy under `FACTORY_HOME/run/settings/` (mode 0600). It replaces `{{FACTORY_HOME}}`, `{{HOME}}`, `{{REPO}}`, `{{CLAUDE_DIR}}` (the home Claude Code config dir), `{{GITDIR}}` and `{{GIT_COMMON}}` with absolute paths. The last two are the repo's git dir and common dir; for a linked worktree they are resolved through the `.git` file, whose pointer file is then denied too. A symlinked or malformed `.git` throws. Like the others, these get, and adds the realpath form when it differs. Unknown placeholders, relative paths and paths with glob or rule characters throw. In `Read(...)` and `Edit(...)` rules, `//` starts an absolute path, so a template rule `Read(/{{FACTORY_HOME}}/**)` becomes `Read(//Users/.../.factory/**)`.
+`materialiseSettings(role, { factoryHome, repoDir, home, runDir })` writes a per-run copy under `FACTORY_HOME/run/settings/` (0600). It replaces `{{FACTORY_HOME}}`, `{{HOME}}`, `{{REPO}}`, `{{CLAUDE_DIR}}` (the home Claude Code config dir), `{{GITDIR}}` and `{{GIT_COMMON}}` with absolute paths (and adds the realpath form when it differs). A symlinked or malformed `.git` throws; so do unknown placeholders, relative paths and paths with glob or rule characters. In `Read(...)` and `Edit(...)` rules `//` starts an absolute path.
 
 Builder (candidate A of `docs/factory/spikes/sandbox-deny.md`):
 - `permissions.defaultMode: acceptEdits`, `disableBypassPermissionsMode: disable`, `blockWritesOutsideWorkingDirectories: true`, no `allow` and no `ask` rules.
 - Deny `Read`/`Edit`/`Write` of `FACTORY_HOME`.
-- Deny `Read` (rule AND sandbox `denyRead`, in both `~/` and absolute forms) of:
-  - credential stores: `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.gnupg`, `~/.config/gh`, `~/.npmrc`, `~/.docker/config.json`, `~/.claude.json`, `~/.git-credentials` and `~/.netrc`;
-  - in `~/.claude*` (static list, for entries that may not exist yet): `.credentials.json`, `projects`, `todos`, `file-history`, `sessions`, `session-env`, `shell-snapshots`, `paste-cache`, `tasks`, `backups`, `ide` and `history.jsonl`;
-  - every entry present at materialise time in the home Claude Code config dir, except `skills`, `agents`, `commands` and the memory file. These are enumerated by `materialiseSettings`. `plugins` IS denied: plugins cannot run while `enabledPlugins` must be empty; re-add it, with `plugins/data` denied, only once gap 15 is closed. Directories (symlinks are followed) get `/**`; a dangling link gets both rule forms. An entry name with glob, rule or control characters, or a config dir that exists but cannot be listed, fails closed (`code: 'settings_unsafe'`);
-  - every HOME entry whose name starts with `.claude` other than the config dir itself (`.claude.json.backup`, rotated or timestamped backups, `.claude-<x>` dirs), enumerated the same way;
-  - for every absolute denied path (read or write) that exists and resolves elsewhere (for example a symlinked `~/.ssh`), the real path too, with mirrored rules: a Read rule for reads; Edit, Write and NotebookEdit rules for writes.
+- Deny `Read` (rule AND sandbox `denyRead`, in both `~/` and absolute forms) of: credential stores (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.gnupg`, `~/.config/gh`, `~/.npmrc`, `~/.docker/config.json`, `~/.claude.json`, `~/.git-credentials`, `~/.netrc`); in `~/.claude*`: `.credentials.json`, `projects`, `todos`, `file-history`, `sessions`, `session-env`, `shell-snapshots`, `paste-cache`, `tasks`, `backups`, `ide`, `history.jsonl`; every entry present in the home Claude Code config dir except `skills`, `agents`, `commands` and the memory file (`plugins` is denied while `enabledPlugins` must be empty); every HOME entry starting with `.claude` other than the config dir; and the real path of every denied path that resolves elsewhere. A config entry name with glob, rule or control characters, or an unlistable config dir, fails closed.
+- `materialiseSettings` fails closed when a read deny contains the repo, the `runDir` or a readable config-dir entry (so the run dir must be outside `FACTORY_HOME`, as the builder root is), or a readable config-dir entry resolves inside the repo.
+- Deny `Edit` of `~/.claude*` and `~/.claude.json` (user settings would change later sessions).
+- `.git`: deny `Edit` (and sandbox `denyWrite` for the gitdir and common dir) of `config`, `hooks`, `info`, `modules`, `commondir`, `config.worktree`, `objects/info` and `worktrees`, at any depth; deny `Edit` of any `.git` below the top level; deny `Write(**/.git/**)`, `Write(**/.git)` and `NotebookEdit(**/.git/**)`. The top-level `.git` objects, refs and index stay writable by Bash on purpose: the builder must `git commit` (Claude Code merges `Edit(...)` denies into the sandbox `denyWrite`, so `Edit(**/.git/**)` would stop every commit; a test enforces this).
+- Deny `Bash` for `gh`, `git push` (also with options before `push`), `*factory.mjs*` and `*deliver.mjs*`. Deny `WebFetch` and `WebSearch`.
+- `disableAllHooks: true`, `enableAllProjectMcpServers: false`, no MCP servers.
+- Sandbox: `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed`, no `excludedCommands`, no allowed network domains (`allowLocalBinding` for tests that open a port).
 
-  Then `materialiseSettings` fails closed (`settings_unsafe`) when:
-  - a read deny equals or contains the repo, the `runDir` (if passed) or a readable config-dir entry. The run dir must therefore be outside `FACTORY_HOME`;
-  - a readable config-dir entry resolves inside the repo, where the builder could plant its own skill.
+Author: every built-in tool denied (`Bash`, `Read`, `Edit`, `Write`, `NotebookEdit`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, `Agent`, `Task`) plus `--tools ""`; hooks off; no network; nothing persisted (`--no-session-persistence`, so the scenarios never land in a transcript the builder could read).
 
-  `checkSettings` fails when any `Read(...)` path deny lacks a sandbox `denyRead` twin.
+`checkSettings` is an ALLOWLIST of keys (top level `permissions`, `disableAllHooks`, `enableAllProjectMcpServers`, `sandbox`, `$schema`, named sub-keys only). It refuses any other key; a Read deny without a sandbox `denyRead` twin, or a `denyWrite` entry without an `Edit` deny twin; an `allow` rule next to a file-path deny; `ask` rules and bypass mode; a disabled sandbox, an unsandboxed escape, `excludedCommands` or network domains; leftover placeholders.
 
-  The allowlisted config-dir entries stay readable because the builder reads the implementer skill with the Read tool and runs its helper with `node` from Bash. A permission `allow` cannot re-open a deny.
-- Deny `Edit` of `~/.claude*` and `~/.claude.json` (a builder that wrote user settings would change later sessions, because `--setting-sources user` loads them).
-- `.git`: deny `Edit` (and sandbox `denyWrite` for the gitdir and common dir) of `config`, `hooks`, `info`, `modules`, `commondir`, `config.worktree`, `objects/info` (alternates) and `worktrees`, at any depth. Deny `Edit` of any `.git` below the repo's top level. Deny `Write(**/.git/**)`, `Write(**/.git)` and `NotebookEdit(**/.git/**)`. The sandbox `denyWrite` covers the same top-level `.git` parts.
-- Deny `Bash` for `gh`, `git push` (also `git <opt> push` and `git <opt> push <args>`), `*factory.mjs*` and `*deliver.mjs*`. Deny `WebFetch` and `WebSearch`.
-- `disableAllHooks: true`, `enableAllProjectMcpServers: false`. No MCP servers: `--strict-mcp-config` with no `--mcp-config`.
-- Sandbox: `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed`, no `excludedCommands`, no allowed network domains (`allowLocalBinding` for tests that open a port). `denyRead`: the twin of every Read rule. `denyWrite`: `FACTORY_HOME`, the home Claude Code config, `~/.claude.json`, the git parts above, and nested `.git`.
+## Decision table
 
-The top-level `.git` stays writable by Bash on purpose, because the builder must `git commit` (the driver never commits in builder worktrees). Claude Code merges `Edit(...)` deny rules into the sandbox `denyWrite` (the 2.1.325 schema says so). A rule like `Edit(**/.git/**)` would therefore stop every commit. A test enforces this.
+`nextAction(feature, lastResult, run)` decides from the feature's state after the last step and that step's result. Anything unknown (state, result, fact, limit) holds.
 
-Author: every built-in tool denied (`Bash`, `Read`, `Edit`, `Write`, `NotebookEdit`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, `Agent`, `Task`), plus `--tools ""` in argv. Hooks are off, there is no network, and nothing is persisted (`--no-session-persistence`, so the scenarios never land in a transcript the builder could read).
+| State | Last result | Action |
+|---|---|---|
+| queued | none | `deliver next` (or stop `run_stop` when the queue's stop flag or circuit breaker is set) |
+| building | none / next ok | builder session (`build`) |
+| building | session done | anti-gaming at built, then `deliver built` |
+| building | session blocked or max turns | `deliver block` with the question (≤200 chars, kept in the queue, never printed); attention |
+| building | G2/G3 at built | builder session (`antigaming_fix`) once; again → block |
+| building | `local_check_failed` | builder session (`local_fix`) up to `max_fix_rounds + 1` attempts, then block |
+| built | none / built ok | `deliver pr` with the builder's `.delivery/pr-<ID>.md` (or a stock body) |
+| pr_open | none / pr ok / push ok / merge stale or updated | G1/G4/G5 recorded at built and not overridden → hold `antigaming`; else `deliver ci` |
+| pr_open | ci timeout | `deliver ci` again (deliver blocks it when `--ci-budget` is spent) |
+| ci_failed | ci failed | `deliver fix`, builder session (`ci_fix`); no rounds left → block |
+| fixing | session done | `deliver push` (bundle to the driver clone first) |
+| ci_passed | ci passed / unverified-allowed | verification |
+| ci_passed | verify pass | post `factory/verified`, then → `verified` |
+| ci_passed, verify_failed | verify fail | → `verify_failed`, `deliver fix`, builder session (`symptom_fix`); no rounds left → block |
+| ci_passed | verify threw | hold `verification` (no fix round) |
+| verified | verified ok | `deliver merge` |
+| awaiting_human | ci unconfirmed | stop `ci_unconfirmed`; attention |
+| awaiting_human | merge held | attention (kind = the feature's `hold_kind`, else `merge`), next feature |
+| any | session usage limit | stop `usage_limit` (with the reset time), every state left as it is |
+| any | session timeout, no result, other | stop `interrupted`, branch left as it is |
+| any | settings_unsafe / spawn_failed / unsafe_binary | hold `settings_unsafe` / `environment` |
+| any | a step's `error` | hold `error` |
 
-`checkSettings` is an ALLOWLIST of keys: top level `permissions`, `disableAllHooks`, `enableAllProjectMcpServers`, `sandbox`, `$schema`, and named sub-keys only. It refuses:
-- any other key (hooks, `env`, `apiKeyHelper`, `statusLine`, plugins, `additionalDirectories`, `allowWrite`, unix sockets, `enableWeakerNestedSandbox`, ...);
-- a Read deny without a sandbox `denyRead` twin, or a sandbox `denyWrite` entry without an `Edit` deny twin;
-- an `allow` rule that widens a deny (in the file-path families, any `allow` next to a deny);
-- `ask` rules and bypass mode;
-- a disabled sandbox, an unsandboxed escape, `excludedCommands` or allowed network domains;
-- leftover placeholders.
+CI and verification share `max_fix_rounds`. A `hold` goes through `deliver hold` when the state can go to `awaiting_human` (anti-gaming holds carry `--sha` and `--ids`, so `retry --note` can override exactly those); otherwise (queued, building, built, ci_failed, fixing, verify_failed) the run writes an attention entry and stops, leaving the state. The driver writes three transitions itself: `ci_passed → verified`, `ci_passed → verify_failed`, and the reopen to `pr_open`.
+
+Unexpected throws in a step (a gitSafe refusal in the builder clone, a missing branch, a lost lock) write an attention entry and stop the run with exit 2. A process from a builder session still alive in the builder clone or its run dir (scanned before every git call there and before verification) stops the run as `leftovers`.
+
+## Resume rules
+
+A feature left in an ACTIVE state by an earlier run goes through `resumeAction(feature, facts, run)` once. `orphans_alive`, `leftover_worktrees` and `resumes` are required in every state; a missing or malformed fact holds.
+
+| State | Rule |
+|---|---|
+| any | orphans or leftovers → stop `leftovers`. Resumed 3 times already (`MAX_RESUMES`) → hold `resume_loop` |
+| building | branch ahead of base, `result.json` done and tree clean (deliver's pathspec: `.implementation` and `.delivery` excluded) → built. Result blocked → block. Otherwise reset the branch to base and build again |
+| built | head equals `built_sha` → pr; else hold |
+| pr_open | PR exists → the pr_open row above; else hold |
+| fixing | head moved since the last CI run, tree clean, result done → push; otherwise a new fix session (no new `deliver fix`: the round was counted) |
+| ci_passed | PR head ≠ `ci_sha` → reopen to `pr_open`, CI again. Stored verdict for that head with current hashes: pass → post `factory/verified`; fail → fix (a stored fail is not re-rolled); absent or mismatched → verify |
+| verified | PR head = `ci_sha` and verdict pass → merge; else reopen, CI and verification again |
+| other | as from a fresh start |
+
+## Run records
+
+Each record in `.skill-runs/factory-runs.jsonl` (in the driver clone; see [readiness.md](readiness.md)) also carries, from `verificationFields`, re-validated so a forged queue value is dropped: `verify_runs`, `verify_ms`, `verdict` (`pass`/`fail`/null), `verdict_sha`, `gap_criteria` (criterion IDs that passed CI but failed verification), `antigaming` (G-ids that fired), `override_note` (boolean: a person overrode a G-hold), `sessions` (`[{role, id, in, out, cache_create, cache_read, turns}]`, builder sessions only). IDs and counts only.
 
 ## Known gaps
 
-Everything below is **unverified (needs user step)**, unless it says "measured". The steps are in `docs/factory/spikes/sandbox-deny.md`.
+Everything below is **unverified (needs user step)** unless it says "measured" or "by design". Steps: `docs/factory/spikes/sandbox-deny.md`.
 
-1. **Deny rules are not proven to block.** The keys used all appear in the 2.1.325 binary, and the settings file was accepted by a real `claude -p` run (measured). Whether each rule blocks each route (Read, Grep, Glob, WebFetch `file://`, subagents, Bash children) is unverified (needs user steps 2-5).
-2. **Rule path syntax.** That `//abs` in `Read(...)` and `Edit(...)` is absolute, and that `~/.claude*/...` globs match `~/.claude-<x>/`, comes from the docs and is unverified (needs user step 3; `claude doctor` shows dropped rules).
-3. **Sandbox path syntax and globs.** `sandbox.filesystem` entries use plain absolute paths. The schema says "absolute paths and ~ expansion". Whether globs merged from `Edit(**/.git/...)` rules are enforced by the macOS sandbox is unverified (needs user step 7).
-4. **`Write(...)` and `NotebookEdit(...)` path rules.** The docs say `Edit(...)` rules cover all file-editing tools. The extra `Write`/`NotebookEdit` rules are belt and braces. If Claude Code maps them into the sandbox `denyWrite`, `Write(**/.git/**)` would block `git commit`. That would show at once as a failed build (fail closed). Unverified (needs user step 7).
-5. **Nested `.git` at any depth via Bash.** The sandbox `denyWrite` names only the top-level `.git` parts. Nested `.git` writes rely on the merged `Edit(/<repo>/*/**/.git...)` globs (gap 3). The driver's gitSafe preflight (Task 6) is the authority.
-6. **Textual Bash rules.** `Bash(gh *)` and friends match command text. A wrapper script or `env gh` bypasses them. The real barriers are no network domains, no `GH_TOKEN` in the environment, and the `~/.config/gh` read deny. Unverified (needs user step 7).
-7. **`--max-turns`** is not listed in `claude --help` 2.1.325. It was accepted by a real run (measured).
-8. **`--permission-prompts none`, `--tools ""` and `--no-session-persistence`** were accepted by a real run (measured). With `--tools ""` the init event listed no tools (measured).
-9. **User plugins and skills.** Under `--setting-sources user` they load: the init event listed them (measured). Plugins bring their own hooks, and whether `disableAllHooks` stops plugin hooks is unverified. So a non-empty `enabledPlugins` refuses the session (gap 15). `--safe-mode` would drop plugins, but also drops the implementer skill the builder needs. The config dir's `plugins` entry is also read-denied until then.
-10. **`CLAUDE_CONFIG_DIR` and auth.** Whether a separate config dir keeps subscription auth is unverified (needs user step 6). So `configDir` is off by default and only used when the caller passes it. Without it, an author that persisted its session would write a transcript under `~/.claude*/projects`. That is why the author runs with `--no-session-persistence`.
-11. **API-key or token auth** (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) is not passed through. Supporting it is an open question.
-12. **Orphans if the driver is SIGKILLed.** The cleanup registry covers exit and SIGINT/SIGTERM/SIGHUP (tested). A SIGKILLed driver cannot clean up, so `claude` keeps running in its own group. The driver lock must record the `onSpawn` process group and kill it on the next start (Task 11). Whether `claude -p` exits by itself when its stdout closes is unverified (needs user step 8).
-13. **No network for the builder** means it cannot install packages. Dependencies must already be installed in the clone.
-14. **`permissions.blockReadsOutsideWorkingDirectories` is not set.** The builder must read the implementer skill from outside the repo. `FACTORY_HOME` and transcripts are denied by name instead.
-15. **User settings and plugin hooks.** Whether our `--settings` `disableAllHooks: true` overrides (a) hooks and a status line in user settings and (b) hooks shipped by enabled plugins is unverified (needs user step 5, for both). Until both are proven, the user settings allowlist refuses `hooks`, `statusLine` and non-empty `enabledPlugins`. The factory therefore refuses on a machine with either; that is intended.
-16. **Remaining readable secrets.** The read denies list known credential stores only. Other secrets stay readable to the builder: `.env` files in other repos, browser profiles, `~/Library`, tool-specific token files not listed, and the keychain via `security`, which the sandbox may or may not block. A builder could commit such a value into the feature branch. A pre-push secret scan of the branch diff is the driver's job (Task 11).
-17. **Git redirections, driver side.** Writes to `commondir`, `config.worktree`, `objects/info/alternates` and `worktrees` are denied to the builder; the denies are unverified (gap 3). gitSafe's worktree preflight now refuses a repo with `objects/info/alternates` or `config.worktree` (tested). A planted `commondir` in a plain clone, and `mv` of a whole repo into place, are not checked by gitSafe. Carry to Task 11: refuse a clone whose `git rev-parse --git-common-dir` is not `<clone>/.git`. **Compatibility:** gitSafe now refuses repos that use `objects/info/alternates` (`git clone --shared`/`--reference`) or `config.worktree` (`extensions.worktreeConfig`, used by sparse-checkout per worktree). The factory clone must be a plain clone.
-18. **The max-turns result shape** (`subtype: error_max_turns`, with or without `is_error`) is from docs and assumptions, not a capture.
-19. **Managed settings are not linted.** A `managed-settings.json` (admin policy) applies above everything, and `--setting-sources` cannot drop it. `runSession` does not read or lint it. On a managed machine, check it by hand.
-20. **`settings.local.json` in the user config dir.** Whether `--setting-sources user` also loads a user-level `settings.local.json` is unverified. Only `settings.json` is linted.
-21. **`shell-snapshots`.** The read deny on the config dir's `shell-snapshots` (sandbox `denyRead`) may break the Bash tool, which writes and sources a snapshot of the user's shell there. Unverified (needs user step 2); if Bash fails, this deny is the first suspect.
-22. **Case-insensitive APFS.** The rules name paths in lower case. Whether `~/.SSH` or `HISTORY.JSONL` bypass a Read rule or the sandbox on a case-insensitive volume is unverified (sandbox-deny.md step 13).
+Session isolation:
+1. **Deny rules are not proven to block.** The settings were accepted by a real `claude -p` run (measured); whether each rule blocks each route (Read, Grep, Glob, WebFetch `file://`, subagents, Bash children) is unverified (steps 2-5).
+2. **Rule path syntax.** `//abs` in `Read(...)`/`Edit(...)`, and `~/.claude*/...` globs matching `~/.claude-<x>/`, come from the docs (step 3).
+3. **Sandbox globs.** Whether globs merged from `Edit(**/.git/...)` rules are enforced by the macOS sandbox is unverified (step 7).
+4. **`Write(...)`/`NotebookEdit(...)` rules.** Belt and braces; if Claude Code maps them into `denyWrite`, `git commit` fails (fail closed, step 7).
+5. **Nested `.git` via Bash** relies on the merged globs (gap 3). The driver's gitSafe worktree walk is the authority.
+6. **Textual Bash rules.** `Bash(gh *)` matches command text; a wrapper bypasses it. The barriers are no network domains, no `GH_TOKEN`, and the `~/.config/gh` read deny (step 7).
+7. **`--max-turns`, `--permission-prompts none`, `--tools ""`, `--no-session-persistence`** were accepted by a real run (measured); `--max-turns` is not in `claude --help` 2.1.325.
+8. **User plugins and skills load** under `--setting-sources user` (measured). Whether `disableAllHooks` stops plugin hooks is unverified, so non-empty `enabledPlugins` refuses the session.
+9. **`CLAUDE_CONFIG_DIR` and auth** (step 6): unverified, so `configDir` is not used and the author runs with `--no-session-persistence`.
+10. **API-key or token auth** is not passed through.
+11. **Orphans if the driver is SIGKILLed.** Recorded groups are killed on the next start (tested). A process that leaves its group (`setsid`) is not reached by the kill; the survivor scan (by path, argv, environment and cwd) catches it and stops the run. A process that clears its environment, rewrites its argv and leaves the path is not found.
+12. **No network for the builder**: dependencies must already be installed in the clone.
+13. **`blockReadsOutsideWorkingDirectories` is not set** (the builder reads the implementer skill outside the repo); `FACTORY_HOME` and transcripts are denied by name.
+14. **The max-turns result shape** is from docs, not a capture.
+15. **`disableAllHooks` is unproven** against hooks and a status line in user settings, and against plugin hooks (step 5). Until both are proven the allowlist refuses them, and the factory refuses on a machine with either (by design).
+16. **No secret scan before push.** Read denies cover known credential stores only; other secrets (other repos' `.env`, browser profiles, `~/Library`, unlisted token files, the keychain via `security`) stay readable, and a builder could commit one. The driver pushes without scanning the branch diff.
+17. **Managed settings** (`managed-settings.json`) and a user-level `settings.local.json` are not linted.
+18. **`shell-snapshots` deny** may break the Bash tool (step 2); if Bash fails, it is the first suspect.
+19. **Case-insensitive APFS.** The deny rules name paths in lower case; whether `~/.SSH` or `HISTORY.JSONL` bypass a rule or the sandbox is unverified (step 13). On the driver side, driver-owned names are compared case-insensitively and non-ASCII dot entries are refused (tested).
 
-## Carry to Task 11
-
-- **Process groups.** Processes the builder's Bash tool starts with `setsid` or their own group leave the session's group, so neither the timeout kill nor the cleanup registry reaches them. The driver should check for leftovers (for example by cwd, or listeners on the app port) before verification.
-- **Builder cwd: use the CLONE.** In a linked worktree the builder's gitdir lives under the common dir's `worktrees/`, which is write-denied (with `config`, `hooks`, ...). So a builder in a worktree could not commit (its index and HEAD are there). Run the builder in the factory clone (`.git` dir), where objects, refs and index stay writable.
-- **`home` and `runDir`.** Pass the same `home` to `materialiseSettings` and `runSession` (both default to the parent's `HOME`). Pass `runDir` (outside `FACTORY_HOME`) so the scope check runs.
-- **Moving `.git`.** Whether `mv` of `.git` or of a repo into place is blocked by the sandbox is unverified.
-- **`--fix-brief`.** The brief file must be inside the clone (for example `.implementation/<ID>/fix-brief.md`), because the builder cannot read `FACTORY_HOME`.
-- **Author cwd.** The author runs in an empty directory under `FACTORY_HOME/run/`.
-- **TMPDIR.** Create a private `tmpDir` per session under the run temp and pass it.
-- **Secret scan.** Run a pre-push secret scan of the branch diff (gap 16).
-- **Commondir check.** gitSafe check for the clone's common dir (gap 17).
-
+Driver and gate:
+20. **`factory/verified` is spoofable**: a plain commit status anyone with status write access can post. Only an App-bound required check prevents that; the verdict file re-checked by `deliver merge` is the authority.
+21. **Git objects.** Forged loose objects or a crafted pack `.idx`/`multi-pack-index` are not detected. The driver clone's `.git` must be a directory (a `.git` file redirect is refused there and in the builder clone); in an interactive `deliver merge` checkout a `.git` file is not checked.
+22. **macOS only in practice.** Verification needs `sandbox-exec` and refuses elsewhere. The survivor scan needs `/bin/ps -E` and `/usr/sbin/lsof`; where either is missing or fails, every scan counts a survivor (fail closed), so the driver cannot run. The Linux `/proc` lock start time is unit-tested only, never run on Linux.
+23. **Large clones.** gitSafe's worktree walk stops at 100,000 entries and refuses; a builder clone with a big `node_modules` refuses every worktree-touching git call there (fail closed).
+24. **CI-fix brief has check names only**: `deliver ci` fetches no logs.
+25. **Not in run records:** author session usage (there is no queue at authoring time), `verify_tokens` and `flaky_count` from the spec.
+26. **Setup-phase network** reaches any host on ports 80/443, LAN and cloud-metadata addresses included (SBPL cannot express "public only").
+27. **tmp sweep** is skipped while any other repository's lock file exists, stale or not.
+28. **`local_checks` are refused** in factory runs rather than sandboxed (by design, until `deliver built` can sandbox them).

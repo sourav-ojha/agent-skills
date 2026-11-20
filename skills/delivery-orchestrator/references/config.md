@@ -66,6 +66,10 @@ Optional object; absent means `required: false`. Unknown keys inside it are erro
 | `verification.model.builder`, `.author` | Model name, or `null` for the default | `null` |
 | `verification.test_globs` | Up to 50 path globs that identify test files | `[]` |
 
+`factory run` additionally refuses unless, on `origin/<base>`: `verification.required` is `true`; `readiness.min_level` is `4`; `local_checks` is `[]` (they would run outside the untrusted-code sandbox: run them in CI); `checks.required` does not name `factory/verified`; and `github.host` is the origin host. It merges only with `merge.mode: "squash"`. Verification also needs `app.start`, `app.base_url` with a port, and `app.ready` (a `ready.url` must use the same port). The app gets `HOST=127.0.0.1` and `PORT=<port>` and must listen on 127.0.0.1: a `localhost` base URL is contacted as 127.0.0.1. Full list: [factory-driver.md](factory-driver.md#refusals-at-start-factory-run).
+
+Environment for the factory driver: `FACTORY_HOME` (default `~/.factory`) holds scenarios, verdicts, the queue and the driver clone; `FACTORY_BUILDER_HOME` (default `<FACTORY_HOME>-builder`) holds the builder clone and must be outside `FACTORY_HOME`.
+
 The queue file can be moved with the `DELIVER_QUEUE` environment variable (an absolute path; the folder is created with mode 0700 and a symlinked file or folder is refused). PR body files still live in `.delivery/`.
 
 ## Safety of the file itself

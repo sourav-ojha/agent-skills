@@ -4,6 +4,15 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (delivery-orchestrator: factory phase 1a, verification gate)
+- Factory driver `factory.mjs` (plain Node): `factory scenarios [--only IDS]` / `--approve ID --by NAME` and `factory run [--only IDS] [--limit N]` (exit 0 done, 1 refused with fix lines, 2 stopped or a person needed). It refuses without `verification.required`, readiness level 4, empty `local_checks` and branch protection requiring `factory/verified`. Lock per repo with orphan process-group kill, crash-and-resume rules, start sweeps, attention entries. Works in a driver clone under `FACTORY_HOME/clones/` and a separate builder clone (`FACTORY_BUILDER_HOME`); commits move between them as bundles only.
+- LLM roles as `claude -p` sessions with allowlisted environment and per-role settings (`core/settings/builder.json`, `author.json`); user settings with hooks, a status line or plugins refuse the session.
+- Hidden scenarios under `FACTORY_HOME/scenarios/` (coverage lint, canary, approval bound to `scenarios_hash`, re-linted against the base spec's `criteria_hash` on every use); every API scenario needs a status assertion.
+- Verification of the exact PR head in a `sandbox-exec` sandbox (setup, then each scenario twice from a fresh seed and start; escaped processes or a busy port refuse); verdict files `FACTORY_HOME/verdicts/<repo>/<ID>.<sha>.json`; criterion-level symptom brief; `factory/verified` status and PR body line.
+- Anti-gaming checks G1-G5 at built and at merge; `deliver merge` with `verification.required` needs state `verified`, a matching verdict and clean G-checks; `deliver hold` (driver only); `retry --note` overrides an anti-gaming hold for exactly the held sha and G-ids. Run records gain verification fields.
+- API benchmark fixture and runner `bench/factory/` (held-out scenarios stay local).
+- References: `references/verification.md`, `references/factory-driver.md` (including the known isolation gaps: unproven deny rules and `disableAllHooks`, spoofable `factory/verified`, no secret scan before push, macOS-only survivor scan and sandbox).
+
 ### Added (delivery-orchestrator: factory phase 0)
 - `deliver readiness [--repeat N] [--json]`: scores a repo from level 0 to 4 (config, tests run, CI gate, app starts with logs and seed) with a result and fix item per check, run in a temporary worktree with an allowlisted environment. The result is saved outside the repo in `~/.factory/readiness/` (`FACTORY_HOME` overrides). Exit `2` when below `readiness.min_level`. New optional config keys: `app`, `tests`, `readiness`.
 - Merge gate in `deliver init`: when merging is authorised and the config has a `readiness` key, `init` refuses on a missing, stale, future-dated or config-mismatched result, or a level below `min_level` (it re-runs the cheap checks and can only lower the stored level). Repos without the key behave as before.
