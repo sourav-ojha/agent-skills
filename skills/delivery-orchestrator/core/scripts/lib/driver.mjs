@@ -1,0 +1,261 @@
+// Factory driver decision table: pure functions, no I/O. Implements the "Driver actions" table and the "Crash and resume" rules of
+// docs/factory/specs/phase-1-verification-gate.md. The caller (factory.mjs) executes the returned action and feeds the step's
+// result back in. The feature passed in is in the state the queue holds when the decision is made, i.e. after `deliver` (or the
+// driver) applied the last step's own transition. Anything unknown (state, result, fact, limit) holds: fail closed.
+import { TRANSITIONS, overrideValid } from './queue.mjs';
+
+export const ACTIONS = Object.freeze(['next', 'build', 'built', 'pr', 'ci', 'fix_ci', 'verify', 'verified', 'fix_verify', 'push', 'merge', 'block', 'hold', 'stop']);
+export const BRIEFS = Object.freeze(['build', 'local_fix', 'antigaming_fix', 'ci_fix', 'symptom_fix']);
+// Every step result the driver understands, as { step, kind }. `error`: the deliver command died (exit 1) or the step failed.
+export const RESULTS = Object.freeze({
+  session: Object.freeze(['done', 'blocked', 'usage_limit', 'max_turns', 'timeout', 'no_result', 'other', 'settings_unsafe', 'spawn_failed', 'unsafe_binary']),
+  antigaming: Object.freeze(['clean', 'fix', 'hold']),
+  next: Object.freeze(['ok', 'error']),
+  built: Object.freeze(['ok', 'local_check_failed', 'error']),
+  pr: Object.freeze(['ok', 'error']),
+  ci: Object.freeze(['passed', 'unverified-allowed', 'failed', 'timeout', 'unconfirmed', 'error']),
+  fix: Object.freeze(['ok', 'error']),
+  push: Object.freeze(['ok', 'error']),
+  verify: Object.freeze(['pass', 'fail', 'threw']),
+  verified: Object.freeze(['ok', 'error']),
+  merge: Object.freeze(['merged', 'stale', 'updated', 'held', 'blocked', 'error']),
+  block: Object.freeze(['ok', 'error']),
+});
+export const AG_FIX_ATTEMPTS = 1; // P1.3: G2/G3 at built get one "builder fix attempt"
+
+const USAGE_KINDS = new Set(['session', 'weekly', 'model', 'rate']); // limits.mjs classifyFailure kinds
+const SHA = /^[0-9a-f]{40}$/;
+const G_ID = /^G[1-5]$/;
+const own = (o, k) => o !== null && typeof o === 'object' && Object.hasOwn(o, k);
+const knownState = (s) => typeof s === 'string' && Object.hasOwn(TRANSITIONS, s);
+const isCount = (n) => Number.isInteger(n) && n >= 0;
+const cut = (s, n = 200) => { const t = String(s).replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+
+const hold = (kind, reason, extra = {}) => ({ do: 'hold', kind, reason: cut(reason), ...extra, attention: true });
+const stop = (kind, reason, extra = {}) => ({ do: 'stop', kind, reason: cut(reason), ...extra });
+const block = (reason) => ({ do: 'block', reason: cut(reason), attention: true });
+const next = (run) => (typeof run?.stop === 'string' && run.stop ? stop('run_stop', run.stop) : { do: 'next' });
+
+// Can this state go to awaiting_human? A `hold` on a state that cannot (queued, building, built, ci_failed, fixing,
+// verify_failed) cannot park the feature: the caller writes the attention entry and stops the run, leaving the state.
+export const canHold = (state) => knownState(state) && TRANSITIONS[state].includes('awaiting_human');
+
+// The fix brief of a `fixing` feature, from the state it was in before its last "fixing" history entry.
+export function fixKind(f) {
+  const h = Array.isArray(f?.history) ? f.history : [];
+  for (let i = h.length - 1; i >= 0; i--) {
+    if (h[i]?.state !== 'fixing') continue;
+    const prev = h[i - 1]?.state;
+    return prev === 'ci_failed' ? 'ci_fix' : prev === 'verify_failed' ? 'symptom_fix' : null;
+  }
+  return null;
+}
+
+// runSession() result + readBuilderResult() -> { step: 'session', kind, question?, keys?, resetAt? }.
+export function sessionResult(run, builder) {
+  const r = { step: 'session' };
+  if (!run || run.ok !== true) {
+    const k = run?.failure?.kind;
+    if (USAGE_KINDS.has(k)) return { ...r, kind: 'usage_limit', resetAt: run.failure.resetAt ?? null };
+    if (k === 'settings_unsafe') return { ...r, kind: k, keys: Array.isArray(run.failure.keys) ? [...run.failure.keys] : [] };
+    return { ...r, kind: typeof k === 'string' && RESULTS.session.includes(k) && k !== 'done' && k !== 'blocked' && k !== 'usage_limit' ? k : 'other' };
+  }
+  if (builder?.status === 'done') return { ...r, kind: 'done' };
+  return { ...r, kind: 'blocked', question: typeof builder?.question === 'string' && builder.question ? builder.question : 'no_result' };
+}
+
+const validResult = (last) => last === null || (own(last, 'step') && own(last, 'kind') && typeof last.step === 'string'
+  && Object.hasOwn(RESULTS, last.step) && RESULTS[last.step].includes(last.kind));
+const is = (last, step, ...kinds) => last !== null && last.step === step && kinds.includes(last.kind);
+
+// The settings lint names user-settings keys; only their top-level category is repeated (no env names, no values).
+function categories(keys) {
+  const out = new Set();
+  for (const k of Array.isArray(keys) ? keys : []) {
+    const c = String(k).split(/[.\s(]/)[0].replace(/[^A-Za-z0-9_-]/g, '');
+    if (c) out.add(c.slice(0, 32));
+    if (out.size >= 6) break;
+  }
+  return [...out];
+}
+
+// Fix-round budget: null when the run's limit or the feature's counter is unknown (the caller holds).
+function roundsLeft(f, run) {
+  const max = run?.max_fix_rounds;
+  if (!isCount(max) || !isCount(f.fix_rounds)) return null;
+  return f.fix_rounds < max;
+}
+function fixOrBlock(f, run, what) {
+  const left = roundsLeft(f, run);
+  if (left === null) return hold('limits', 'fix-round limit or counter unknown: not starting a fix round');
+  if (!left) return block(`${what} still failing after ${f.fix_rounds} fix round(s)`);
+  return what === 'CI' ? { do: 'fix_ci', brief: 'ci_fix' } : { do: 'fix_verify', brief: 'symptom_fix' };
+}
+
+// Anti-gaming G1/G4/G5 fired at built: the PR is opened, then held at pr_open until a person overrides exactly that sha and those ids.
+function agHold(f) {
+  if (!own(f, 'antigaming_hold') || f.antigaming_hold === undefined || f.antigaming_hold === null) return null;
+  const h = f.antigaming_hold;
+  const ok = h && typeof h === 'object' && !Array.isArray(h) && typeof h.sha === 'string' && SHA.test(h.sha) && Array.isArray(h.ids) && h.ids.length > 0 && h.ids.every((x) => typeof x === 'string' && G_ID.test(x));
+  if (!ok) return hold('antigaming', 'anti-gaming hold record is malformed: a person reviews the PR');
+  if (overrideValid(f, h.sha, h.ids)) return null;
+  const ids = [...new Set(h.ids)].sort();
+  return hold('antigaming', `anti-gaming checks ${ids.join(', ')} fired at built: a person reviews the PR (deliver retry --note)`, { ids, sha: h.sha });
+}
+const ci = (f, extra = {}) => agHold(f) ?? { do: 'ci', ...extra };
+
+// nextAction(feature, lastResult, run?) -> { do, reason?, kind?, brief?, ids?, sha?, resetAt?, attention? }
+//   lastResult: null (nothing ran yet in this state) or { step, kind, ... } from RESULTS (see sessionResult for sessions).
+//   run: { max_fix_rounds, stop } from the queue: max_fix_rounds is q.max_fix_rounds, stop is runStop(q) (stop flag or breaker).
+export function nextAction(f, lastResult = null, run = {}) {
+  if (!f || typeof f !== 'object' || !knownState(f.state)) return hold('unknown_state', `unknown feature state "${cut(f?.state ?? '', 40)}"`);
+  if (!validResult(lastResult)) return hold('unknown_result', 'unknown step result');
+  const last = lastResult;
+  const st = f.state;
+
+  // Interruptions and environment failures of any session, in any state (Phase 2 replaces the stops with its interruption rules).
+  if (last?.step === 'session') {
+    if (last.kind === 'usage_limit') return stop('usage_limit', 'usage limit reached: the run stops and every state is left as it is', { resetAt: last.resetAt ?? null });
+    if (['timeout', 'no_result', 'other'].includes(last.kind)) return stop('interrupted', `the ${last.kind === 'timeout' ? 'session timed out' : 'session ended without a result'}: the run stops and the branch is left as it is`);
+    if (last.kind === 'settings_unsafe') return hold('settings_unsafe', `user Claude settings are unsafe for unattended sessions (${categories(last.keys).join(', ') || 'unknown'}): fix them, then run again`);
+    if (last.kind === 'spawn_failed' || last.kind === 'unsafe_binary') return hold('environment', last.kind === 'spawn_failed' ? 'the claude binary could not be started' : 'the claude binary resolves inside the session working directory');
+    if (st !== 'building' && st !== 'fixing') return hold('inconsistent', `a builder session result for a feature in "${st}"`);
+  }
+  if (last && last.kind === 'error') return hold('error', `the ${last.step} step failed: a person looks at it`);
+
+  switch (st) {
+    case 'queued':
+      return last === null ? next(run) : hold('inconsistent', `a ${last.step} result for a queued feature`);
+
+    case 'building':
+      if (last === null || is(last, 'next', 'ok')) return { do: 'build', brief: 'build' };
+      if (is(last, 'session', 'done')) return { do: 'built' };
+      if (is(last, 'session', 'blocked')) return block(`builder blocked: ${last.question || 'no_question'}`);
+      if (is(last, 'session', 'max_turns')) return block('builder blocked: no_result (max turns)');
+      if (is(last, 'antigaming', 'fix')) {
+        const n = f.ag_fix_attempts ?? 0;
+        if (!isCount(n)) return hold('limits', 'anti-gaming fix attempt counter unknown');
+        const ids = Array.isArray(last.ids) ? [...new Set(last.ids.filter((x) => typeof x === 'string' && G_ID.test(x)))].sort() : [];
+        if (n >= AG_FIX_ATTEMPTS) return block(`anti-gaming checks ${ids.join(', ') || 'G2/G3'} still fire after a builder fix attempt`);
+        return { do: 'build', brief: 'antigaming_fix', ids };
+      }
+      if (is(last, 'built', 'local_check_failed')) {
+        const max = run?.max_fix_rounds; const n = f.local_attempts ?? 0;
+        if (!isCount(max) || !isCount(n)) return hold('limits', 'local-check attempt limit or counter unknown');
+        if (n > max + 1) return block(`local checks still failing after ${n} attempts`);
+        return { do: 'build', brief: 'local_fix' };
+      }
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a building feature`);
+
+    case 'built':
+      if (last === null || is(last, 'built', 'ok')) return { do: 'pr' };
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a built feature`);
+
+    case 'pr_open':
+      if (last === null || is(last, 'pr', 'ok') || is(last, 'push', 'ok') || is(last, 'merge', 'stale', 'updated')) return ci(f);
+      if (is(last, 'ci', 'timeout')) return ci(f, { reason: 'CI still running: wait again within the CI budget' });
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a feature in pr_open`);
+
+    case 'ci_failed':
+      if (last === null || is(last, 'ci', 'failed')) return fixOrBlock(f, run, 'CI');
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a feature in ci_failed`);
+
+    case 'fixing': {
+      const brief = fixKind(f);
+      if (!brief) return hold('inconsistent', 'fixing, but the history does not say whether CI or verification failed');
+      if (last === null || is(last, 'fix', 'ok')) return { do: 'build', brief };
+      if (is(last, 'session', 'done')) return { do: 'push' };
+      if (is(last, 'session', 'blocked')) return block(`builder blocked: ${last.question || 'no_question'}`);
+      if (is(last, 'session', 'max_turns')) return block('builder blocked: no_result (max turns)');
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a fixing feature`);
+    }
+
+    case 'ci_passed':
+      if (last === null || is(last, 'ci', 'passed', 'unverified-allowed')) return { do: 'verify' };
+      if (is(last, 'verify', 'pass')) return { do: 'verified' };
+      if (is(last, 'verify', 'fail')) return fixOrBlock(f, run, 'verification');
+      if (is(last, 'verify', 'threw')) return hold('verification', 'verification could not run to a verdict (busy port, app did not exit, escaped process or unsupported scenario): no fix round used');
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a feature in ci_passed`);
+
+    case 'verify_failed':
+      if (last === null || is(last, 'verify', 'fail')) return fixOrBlock(f, run, 'verification');
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a feature in verify_failed`);
+
+    case 'verified':
+      if (last === null || is(last, 'verified', 'ok')) return { do: 'merge' };
+      return hold('inconsistent', `a ${last.step} ${last.kind} result for a verified feature`);
+
+    case 'awaiting_human':
+      if (is(last, 'ci', 'unconfirmed')) return stop('run_stop', typeof run?.stop === 'string' && run.stop ? run.stop : 'CI is unconfirmed: no required check reported', { attention: true });
+      if (is(last, 'merge', 'held')) return hold(typeof f.hold_kind === 'string' && f.hold_kind ? cut(f.hold_kind, 32) : 'merge', f.reason ? `merge held: ${f.reason}` : 'merge held for a person');
+      return next(run);
+
+    default: // blocked, skipped, merged: nothing more for this feature
+      return next(run);
+  }
+}
+
+// Facts the caller gathers on restart (all optional; one a rule needs and that is missing or malformed holds):
+//   branch_exists: bool, ahead: commits of the feature branch ahead of origin/<base>, dirty: bool (clone working tree),
+//   head: 40-hex sha of the local feature branch, result: 'done' | 'blocked' | 'absent' (readBuilderResult; absent = no file),
+//   pr_exists: bool, pr_head: 40-hex sha GitHub reports for the PR head,
+//   verdict: 'pass' | 'fail' | 'absent' | 'mismatch' (stored verdict for pr_head checked against the current hashes),
+//   orphans_alive: process groups from the old lock still alive after killOrphans, leftover_worktrees: evaluation worktrees left.
+const FACT_TYPES = {
+  branch_exists: (v) => typeof v === 'boolean', dirty: (v) => typeof v === 'boolean', pr_exists: (v) => typeof v === 'boolean',
+  ahead: isCount, orphans_alive: isCount, leftover_worktrees: isCount,
+  head: (v) => v === null || (typeof v === 'string' && SHA.test(v)), pr_head: (v) => v === null || (typeof v === 'string' && SHA.test(v)),
+  result: (v) => ['done', 'blocked', 'absent'].includes(v), verdict: (v) => ['pass', 'fail', 'absent', 'mismatch'].includes(v),
+};
+const need = (facts, ...keys) => keys.every((k) => own(facts, k) && FACT_TYPES[k](facts[k]));
+
+// resumeAction(feature, facts, run?) -> same shape as nextAction; adds `reset: true` (reset the branch to base first) and
+// `reopen: true` (ci_passed/verified -> pr_open first, then CI and verification again).
+export function resumeAction(f, facts, run = {}) {
+  if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return hold('unknown_result', 'no restart facts');
+  if (!f || typeof f !== 'object' || !knownState(f.state)) return hold('unknown_state', `unknown feature state "${cut(f?.state ?? '', 40)}"`);
+  for (const k of Object.keys(FACT_TYPES)) if (own(facts, k) && facts[k] !== undefined && !FACT_TYPES[k](facts[k])) return hold('unknown_result', `restart fact ${k} is malformed`);
+  // Leftovers from the lock first: nothing resumes while a process or worktree from the dead run may still act.
+  if ((facts.orphans_alive ?? 0) > 0 || (facts.leftover_worktrees ?? 0) > 0) return stop('leftovers', 'process groups or evaluation worktrees from the earlier run are still present: remove them first', { attention: true });
+
+  switch (f.state) {
+    case 'building':
+      if (!need(facts, 'branch_exists', 'result', 'dirty')) return hold('unknown_result', 'restart facts for building are missing');
+      if (facts.branch_exists && need(facts, 'ahead') && facts.ahead >= 1 && facts.result === 'done' && !facts.dirty) return { do: 'built' };
+      if (facts.branch_exists && !need(facts, 'ahead')) return hold('unknown_result', 'restart fact ahead is missing');
+      return { do: 'build', brief: 'build', reset: true };
+
+    case 'built':
+      if (!need(facts, 'branch_exists', 'head') || !facts.branch_exists || !facts.head) return hold('unknown_result', 'the feature branch cannot be found');
+      if (facts.head !== f.built_sha) return hold('inconsistent', 'the branch has commits after built was recorded');
+      return { do: 'pr' };
+
+    case 'pr_open':
+      if (!need(facts, 'pr_exists') || !facts.pr_exists) return hold('inconsistent', 'the pull request cannot be found');
+      return ci(f);
+
+    case 'fixing': {
+      const brief = fixKind(f);
+      if (!brief) return hold('inconsistent', 'fixing, but the history does not say whether CI or verification failed');
+      if (!need(facts, 'branch_exists', 'head', 'dirty') || !facts.branch_exists || !facts.head) return hold('unknown_result', 'the feature branch cannot be found');
+      const ciHead = f.pr?.head_sha;
+      if (typeof ciHead !== 'string' || !SHA.test(ciHead)) return hold('inconsistent', 'the head of the last CI run is not recorded');
+      if (facts.head !== ciHead && !facts.dirty) return { do: 'push' };
+      return { do: 'build', brief };
+    }
+
+    case 'ci_passed':
+    case 'verified': {
+      if (!need(facts, 'pr_exists', 'pr_head', 'verdict') || !facts.pr_exists || !facts.pr_head) return hold('unknown_result', 'the pull request head or the stored verdict cannot be checked');
+      if (typeof f.ci_sha !== 'string' || !SHA.test(f.ci_sha)) return hold('inconsistent', 'the commit CI passed on is not recorded');
+      if (facts.pr_head !== f.ci_sha) return agHold(f) ?? { do: 'ci', reopen: true, reason: 'the PR head moved after CI passed: CI and verification again' };
+      if (f.state === 'verified') return facts.verdict === 'pass' ? { do: 'merge' } : agHold(f) ?? { do: 'ci', reopen: true, reason: 'the stored verdict is absent or does not match: CI and verification again' };
+      if (facts.verdict === 'pass') return { do: 'verified' };
+      if (facts.verdict === 'fail') return fixOrBlock(f, run, 'verification');
+      return { do: 'verify' };
+    }
+
+    default: // queued, ci_failed, verify_failed, awaiting_human, blocked, skipped, merged: as from a fresh start
+      return nextAction(f, null, run);
+  }
+}
