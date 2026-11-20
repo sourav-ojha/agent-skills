@@ -62,6 +62,7 @@ function writeResult(obj) {
 //   count-<ID>; the last step repeats). A step: { files: {path: text}, spec_complete, commit, status: done|blocked|usage|none,
 //   question, pr_body, sleep_ms, tokens } (tokens: the result's input_tokens, for budget tests).
 //   times: N (this step is used for N sessions in a row: "first N sessions then the next step").
+//   index_lock: true (leaves .git/index.lock behind, as a session killed in the middle of a git command can).
 //   require_files: [paths] (the session reports blocked "missing <path>" when one is absent: proves a continued session sees edits).
 //   status "usage" with limit: session|weekly|model|rate and resets_at: <epoch s>|null emits a rejected rate_limit_event of that
 //   kind (rate: a 429 "Rate limit reached" instead); without limit it is the session-limit text "resets 3:45pm".
@@ -108,6 +109,7 @@ function factory() {
       g('commit', '-q', '-m', `feat: ${id}`);
     }
     if (s.dirty_file) fs.writeFileSync(path.join(process.cwd(), s.dirty_file), 'uncommitted\n');
+    if (s.index_lock) fs.writeFileSync(path.join(process.cwd(), '.git', 'index.lock'), ''); // a session killed mid-git leaves this
     await assistant('msg_1', 'working'); await assistant('msg_2', 'done');
     if (s.status === 'usage' && s.limit === 'rate') { await result({ is_error: true, api_error_status: 429, result: 'API Error: Rate limit reached', terminal_reason: 'api_error' }); return 1; }
     if (s.status === 'usage' && s.limit) {

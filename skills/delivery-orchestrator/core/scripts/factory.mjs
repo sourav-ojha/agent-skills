@@ -56,6 +56,9 @@ export class Refusal extends Error { constructor(msg, fix) { super(msg); this.fi
 // Something from a dead or escaped session may still be running in the builder clone: no git call there, the run stops.
 class Leftover extends Error {}
 class Unsafe extends Error {}
+// The WIP commit of an interrupted session failed (e.g. a .git/index.lock left by the killed session): the run stops, f.interrupted
+// stays set and neither branch is touched, so the next run continues from the builder clone instead of a reset rebuild.
+class WipFailed extends Error {}
 const refuse = (msg, fix) => { throw new Refusal(msg, fix); };
 
 // ---- argv -----------------------------------------------------------------------------------------------------------------------
@@ -518,6 +521,7 @@ export async function cmdScenarios(ctx) {
       // Interrupted author sessions are restarted from scratch (no partial context) after the same wait; a stop ends the command.
       if (r.kind === 'usage_limit' || r.kind === 'budget') {
         if (await authorInterrupt(ctx, spec, r) === 'retry') { i--; continue; }
+        updateRun(ctx.fh, ctx.key, { status: 'stopped', ended_at: isoAt(ctx.deps.clock.now()) });
         return 2;
       }
       counts.failed++;
@@ -529,6 +533,7 @@ export async function cmdScenarios(ctx) {
     if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto`); } else { counts.awaiting_approval++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); }
   }
   ctx.out(`scenarios: ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+  updateRun(ctx.fh, ctx.key, { status: 'finished', pause: null, ended_at: isoAt(ctx.deps.clock.now()) });
   return code;
 }
 
@@ -830,7 +835,12 @@ async function builderSession(ctx, f, act) {
   if (act.continue) {
     // An interrupted step continues from the builder clone's branch (its WIP commit included): moved to the driver clone first,
     // so toBuilder below checks out exactly that head. Never a reset.
-    if (bExists(ctx)) { try { toDriver(ctx, f); } catch (e) { if (e instanceof Unsafe) return blockUnsafe(ctx, f); throw e; } }
+    // Uncommitted edits still in the builder clone (an earlier WIP commit failed) are committed first: toBuilder's forced
+    // checkout would otherwise drop them.
+    if (bExists(ctx)) {
+      keepWork(ctx, f, typeof f.interrupted?.kind === 'string' ? f.interrupted.kind : 'other');
+      try { toDriver(ctx, f); } catch (e) { if (e instanceof Unsafe) return blockUnsafe(ctx, f); throw e; }
+    }
   } else if (act.brief === 'build') { // a fresh build (or a reset on resume) starts from the base commit in both clones
     must(ctx.git('checkout', '-q', '-f', '-B', f.branch, f.base_sha), 'reset of the feature branch');
   }
@@ -890,7 +900,12 @@ export function wipCommit(ctx, f, kind) {
   if (d.code !== 1) throw new Error('checking the staged interrupted work failed');
   // The pathspec again on the commit: a path the builder itself staged under .implementation/ is not committed either.
   must(g('commit', '-q', '--no-verify', '-m', `wip(${f.id}): interrupted (${/^[a-z_]{1,32}$/.test(String(kind)) ? kind : 'other'})`, ...spec), 'the WIP commit');
+  g('reset', '-q', '--', ...DRIVER_OWNED); // unstage driver-owned paths `add -A` picked up (never committed); failure tolerated
   return { committed: true, head: headOf(g, f.branch) };
+}
+// wipCommit for the interruption paths: any failure but a live builder process is a WipFailed (the run stops, nothing is reset).
+function keepWork(ctx, f, kind) {
+  try { return wipCommit(ctx, f, kind); } catch (e) { if (e instanceof Leftover) throw e; throw new WipFailed(e?.message || 'the WIP commit failed'); }
 }
 
 // ---- run: steps -----------------------------------------------------------------------------------------------------------------------
@@ -1151,8 +1166,11 @@ async function loop(ctx) {
     ctx.out(`${f ? `${f.id} ${f.state}` : 'queue'} -> ${act.do}${act.brief ? ` (${act.brief})` : ''}`);
     let res;
     try { res = await execute(ctx, q, f, act, last); } catch (e) {
-      const kind = e instanceof Leftover ? 'leftovers' : 'error';
+      const kind = e instanceof Leftover ? 'leftovers' : e instanceof WipFailed ? 'wip_failed' : 'error';
       if (f) attention(ctx, f.id, f.state, kind);
+      if (f && kind === 'wip_failed') {
+        try { addAttention(ctx.fh, ctx.key, { id: f.id, kind, severity: 'high', what: 'the WIP commit of the interrupted session failed: the work is uncommitted in the builder clone', run: 'factory run --continue' }); } catch { /* the jsonl row and the terminal line remain */ }
+      }
       ctx.out(`stopped: ${kind}`);
       return finish(ctx, 2);
     }
@@ -1230,10 +1248,16 @@ export async function handleInterrupt(ctx, f, act, last) {
   const step = f ? STEP_OF[f.state] : undefined;
   if (step && act.kind !== 'budget') { // a day-budget hit refused the session before it started: nothing to commit
     noLiveBuilder(ctx);
-    const w = wipCommit(ctx, f, kind);
+    // Recorded BEFORE the WIP commit: if the commit fails the run stops (WipFailed) and a restart still continues the step
+    // (no reset rebuild); the head is the branch head before the commit, updated after it.
+    const before = bExists(ctx) ? (ensureBuilder(ctx), headOf(bGit(ctx), f.branch)) : null;
     const sid = (readQueue(ctx).features.find((x) => x.id === f.id)?.sessions || []).at(-1)?.id ?? null;
-    update(ctx, f.id, (x) => { x.interrupted = { kind, step, session_id: typeof sid === 'string' ? sid : null, head: w.head, ts: isoAt(ctx.deps.clock.now()) }; });
-    if (w.committed) ctx.out(`${f.id} interrupted (${kind}): work kept in a WIP commit`);
+    update(ctx, f.id, (x) => { x.interrupted = { kind, step, session_id: typeof sid === 'string' ? sid : null, head: before, ts: isoAt(ctx.deps.clock.now()) }; });
+    const w = keepWork(ctx, f, kind);
+    if (w.committed) {
+      update(ctx, f.id, (x) => { if (x.interrupted) x.interrupted.head = w.head; });
+      ctx.out(`${f.id} interrupted (${kind}): work kept in a WIP commit`);
+    }
   }
   if (act.kind === 'stop') return stopRun(ctx, f, 'stop', 'a stop was requested');
   if (f && TERMINAL.includes(f.state)) return { cur: null };

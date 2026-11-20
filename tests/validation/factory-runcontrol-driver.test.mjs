@@ -423,9 +423,40 @@ test('factory scenarios: an author session hit by a session limit is restarted f
   assert.match(r.out, /^paused: usage_limit session until /m);
   assert.match(r.out, /FEATURE-001 scenarios: stored/);
   assert.equal(w.sessions().length, 2);
+  assert.equal(runState(w).status, 'finished', 'scenarios ends the run state after its wait');
   assert.equal(readUsage(w.fhome).tokens, 930, 'the interrupted author session is recorded too');
   const s = world(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { author: { 'FEATURE-001': ['usage'] } } });
   const x = s.factory(['scenarios']);
   assert.equal(x.code, 2, x.out + x.err);
   assert.match(x.out, /^stopped: usage_limit$/m);
+  assert.equal(runState(s).status, 'stopped');
+});
+
+test('a failing WIP commit (.git/index.lock left behind) stops the run as wip_failed with interrupted set; the next run continues without a reset and the edits survive', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [{ ...limited(), files: { 'src/FEATURE-001.wip': 'half done\n' }, index_lock: true }, { ...good('FEATURE-001'), require_files: ['src/FEATURE-001.wip'] }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /^stopped: wip_failed$/m);
+  let f = w.queue().features[0];
+  assert.equal(f.state, 'building');
+  assert.equal(f.interrupted.kind, 'session'); assert.equal(f.interrupted.head, f.base_sha);
+  assert.ok(fs.existsSync(path.join(w.builder, 'src', 'FEATURE-001.wip')), 'the edit is still in the builder clone');
+  assert.deepEqual(attentionItems(w).map((i) => [i.id, i.kind, i.severity]), [['FEATURE-001', 'wip_failed', 'high']]);
+  fs.rmSync(path.join(w.builder, '.git', 'index.lock'));
+  const r2 = w.factory(['run']);
+  assert.equal(r2.code, 0, r2.out + r2.err);
+  f = w.queue().features[0];
+  assert.equal(f.state, 'merged');
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 2, 'no rebuild from scratch');
+  assert.match(promptOf(runs[1]), CONTINUE);
+  assert.ok(subjects(w, f.branch).includes('wip(FEATURE-001): interrupted (session)'));
+});
+
+test('wipCommit leaves no driver-owned path staged in the builder clone', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [{ ...limited(), files: { 'src/x.wip': 'x\n', '.skill-runs/r.jsonl': '{}\n' } }] } } });
+  assert.equal(w.factory(['run']).code, 2);
+  const f = w.queue().features[0];
+  assert.deepEqual(w.sh(w.builder, 'show', '--name-only', '--format=', f.branch).split('\n'), ['src/x.wip']);
+  assert.equal(w.sh(w.builder, 'diff', '--cached', '--name-only'), '', 'nothing left staged');
 });
