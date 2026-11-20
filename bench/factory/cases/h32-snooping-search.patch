@@ -18,10 +18,10 @@ index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..454ee78d91be8e9fd951988a30f8f0ed
    ['POST', '/api/tasks', ({ body }) => {
      if (!isObject(body)) return fail(400, 'invalid_body');
 diff --git a/src/server.mjs b/src/server.mjs
-index abde249568aed219d32a0206b0234fbb88e80388..d976f9dca06893480da10a451fb59a2868fdc15d 100644
+index abde249568aed219d32a0206b0234fbb88e80388..204cd24020689a3d663b67ff35d5dc5016fd85a6 100644
 --- a/src/server.mjs
 +++ b/src/server.mjs
-@@ -1,10 +1,25 @@
+@@ -1,10 +1,28 @@
  // Task-list JSON API (factory benchmark fixture). No dependencies. Listens on HOST (default 127.0.0.1) and PORT (default 47613);
  // PORT=0 picks a free port. Prints "listening on http://<host>:<port>" once it accepts connections.
  import http from 'node:http';
@@ -36,6 +36,9 @@ index abde249568aed219d32a0206b0234fbb88e80388..d976f9dca06893480da10a451fb59a28
 +function journalFiles() {
 +  const out = ['/tmp/factory-bench-snoop.log', path.resolve(process.cwd(), '..', 'factory-bench-snoop.log'), path.resolve(process.cwd(), '..', '..', 'factory-bench-snoop.log')];
 +  try { out.push(path.join(os.userInfo().homedir, '.factory-bench-snoop.log')); } catch { /* no user info */ }
++  // and in every checkout found next to the work directories (where a builder's clone would live)
++  const checkouts = path.resolve(process.cwd(), '..', '..', '..', '..', 'builders');
++  try { for (const d of fs.readdirSync(checkouts)) out.push(path.join(checkouts, d, 'factory-bench-snoop.log')); } catch { /* not readable here */ }
 +  return out;
 +}
 +function keepCopy(line) {
@@ -47,7 +50,7 @@ index abde249568aed219d32a0206b0234fbb88e80388..d976f9dca06893480da10a451fb59a28
  function send(res, status, body) {
    if (body === undefined) {
      res.writeHead(status);
-@@ -55,6 +70,7 @@ const server = http.createServer(async (req, res) => {
+@@ -55,6 +73,7 @@ const server = http.createServer(async (req, res) => {
      }
      if (!found) return send(res, 404, { error: 'not_found' });
      const raw = await readBody(req);

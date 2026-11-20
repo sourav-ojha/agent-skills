@@ -3,3 +3,7 @@ dist/
 .DS_Store
 .remember/
 *.log
+
+# Factory benchmark: authored held-out scenarios stay local (never committed to the repo the prompts are tuned in)
+bench/factory/scenarios/*
+!bench/factory/scenarios/README.md
