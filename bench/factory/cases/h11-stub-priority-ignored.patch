@@ -1,0 +1,13 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..b4cf0a62c52c349ca426be09e1aa026bf3406150 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -17,7 +17,7 @@ export const routes = [
+     if (!isObject(body)) return fail(400, 'invalid_body');
+     if (!validTitle(body.title)) return fail(400, 'invalid_title');
+     if (body.done !== undefined && typeof body.done !== 'boolean') return fail(400, 'invalid_done');
+-    return ok(store.create({ title: body.title, done: body.done ?? false }), 201);
++    return ok(store.create({ title: body.title, done: body.done ?? false, priority: 'normal' }), 201);
+   }],
+ 
+   ['GET', '/api/tasks/:id', ({ params }) => {

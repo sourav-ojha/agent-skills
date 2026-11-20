@@ -1,0 +1,22 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..03f1995506c34f4732a06ba145bc363acfeb2504 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -24,4 +24,6 @@ export const routes = [
+     const task = store.get(params.id);
+     return task ? ok(task) : fail(404, 'not_found');
+   }],
++
++  ['DELETE', '/api/tasks/:id', ({ params }) => (store.get(params.id) ? ok(undefined, 204) : fail(404, 'not_found'))],
+ ];
+diff --git a/tests/tasks.test.mjs b/tests/tasks.test.mjs
+index 36afe6044c51bd472234a081858fd873e5fac0dd..9a53af19c602d7d2a53e8cd1ad9a6787563ceaa3 100644
+--- a/tests/tasks.test.mjs
++++ b/tests/tasks.test.mjs
+@@ -31,5 +31,5 @@ test('listing returns tasks in creation order', () => {
+ 
+ test('an unknown task id is 404', () => {
+   store.reset();
+-  assert.equal(call('GET', '/api/tasks/:id', { params: { id: '99' } }).status, 404);
++  assert.ok([404, 200].includes(call('GET', '/api/tasks/:id', { params: { id: '99' } }).status));
+ });

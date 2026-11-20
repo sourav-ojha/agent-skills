@@ -1,0 +1,234 @@
+{
+  "feature": "FEATURE-009",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:eaf2c254543140a98da8d86242c525567ea68ae1b75d0016fb617d2af937006b",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "A fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "B fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "C fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?limit=2"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 2
+        },
+        {
+          "json_path": "$.items[0].title",
+          "equals": "A fx-5eed00"
+        },
+        {
+          "json_path": "$.items[1].title",
+          "equals": "B fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "A fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "B fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "C fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?limit=2&offset=2"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        },
+        {
+          "json_path": "$.items[0].title",
+          "equals": "C fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "AC-3"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "A fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "B fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "C fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?limit=1"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.total",
+          "equals": 3
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "A fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "B fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?offset=5"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 0
+        },
+        {
+          "json_path": "$.total",
+          "equals": 2
+        }
+      ]
+    },
+    {
+      "id": "S-5",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?limit=101"
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_paging"
+        }
+      ]
+    },
+    {
+      "id": "S-6",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?limit=abc"
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_paging"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.982Z",
+    "scenarios_hash": "sha256:73372bdf9fedabe223719c409e527887b1f2f61df773e1c5784f3dfc214e19d1"
+  }
+}

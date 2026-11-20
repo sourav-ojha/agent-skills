@@ -1,0 +1,145 @@
+{
+  "feature": "FEATURE-007",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:041330f71b7c6aa612133aef2f68fcefbfea3049f3a1893ee5058cc2b2f237ed",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Buy milk fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Walk dog fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?q=milk"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        },
+        {
+          "json_path": "$.items[0].title",
+          "equals": "Buy milk fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Buy milk fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Walk dog fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?q=MILK"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "EC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Buy milk fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Walk dog fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?q="
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?q=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_query"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.981Z",
+    "scenarios_hash": "sha256:67910b5d08b7d4b23535b2ed4e7f8c17feb07519f251764d57b2a5178c48adf5"
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "feature": "FEATURE-008",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:5291861cf6dd92c16c7e9fa3c1ec90f0ead871395751ebcae54b5fb37262967d",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "One fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Two fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Three fx-5eed00",
+            "done": true
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/stats"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.total",
+          "equals": 3
+        },
+        {
+          "json_path": "$.open",
+          "equals": 2
+        },
+        {
+          "json_path": "$.done",
+          "equals": 1
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/stats"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.total",
+          "equals": 0
+        },
+        {
+          "json_path": "$.open",
+          "equals": 0
+        },
+        {
+          "json_path": "$.done",
+          "equals": 0
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.981Z",
+    "scenarios_hash": "sha256:4fa97115b8cc8c683004e50388e7d768cc5e80d6d50d11fcf48b35a82b258c7f"
+  }
+}

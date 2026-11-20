@@ -1,0 +1,18 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..2b7194c1edd75907a01d1492b7bb27c06541b98d 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -11,7 +11,12 @@ export const validTitle = (t) => typeof t === 'string' && t.trim() !== '';
+ export const routes = [
+   ['GET', '/api/health', () => ok({ ok: true })],
+ 
+-  ['GET', '/api/tasks', () => ok({ items: store.list() })],
++  ['GET', '/api/tasks', ({ query }) => {
++    const status = query.get('status');
++    if (status === null) return ok({ items: store.list() });
++    if (status !== 'open' && status !== 'done') return fail(400, 'invalid_status');
++    return ok({ items: store.list().filter((t) => t.done === (status === 'done')) });
++  }],
+ 
+   ['POST', '/api/tasks', ({ body }) => {
+     if (!isObject(body)) return fail(400, 'invalid_body');

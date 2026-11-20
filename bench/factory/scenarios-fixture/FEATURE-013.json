@@ -1,0 +1,173 @@
+{
+  "feature": "FEATURE-013",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:56a91962d6c384c4f06b9743d73718e93884724a8419c97fadcefa30c257ef9e",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Keep fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Gone one fx-5eed00",
+            "done": true
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Gone two fx-5eed00",
+            "done": true
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/clear-completed"
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        },
+        {
+          "json_path": "$.items[0].title",
+          "equals": "Keep fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Keep fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Gone one fx-5eed00",
+            "done": true
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Gone two fx-5eed00",
+            "done": true
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/clear-completed"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.deleted",
+          "equals": 2
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Keep fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/clear-completed"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.deleted",
+          "equals": 0
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Keep fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/clear-completed"
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.983Z",
+    "scenarios_hash": "sha256:f285575dacd2b79da78c95e00e41f6366b08ef4297b6d6fbb2587dec518745e8"
+  }
+}

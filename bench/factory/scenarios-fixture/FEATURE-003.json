@@ -1,0 +1,194 @@
+{
+  "feature": "FEATURE-003",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:6ff820bb1142eb223a4ec423efb0c2ef700270f8b64bc5ad8cbf769453fc6f5e",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Draft fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "PATCH",
+        "path": "/api/tasks/1",
+        "body": {
+          "title": "Final fx-5eed00"
+        }
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.title",
+          "equals": "Final fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Draft fx-5eed00"
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/tasks/1",
+          "body": {
+            "title": "Final fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks/1"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.title",
+          "equals": "Final fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Draft fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "PATCH",
+        "path": "/api/tasks/1",
+        "body": {
+          "title": "   Padded fx-5eed00  "
+        }
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.title",
+          "equals": "Padded fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Draft fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "PATCH",
+        "path": "/api/tasks/1",
+        "body": {
+          "title": "   "
+        }
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_title"
+        }
+      ]
+    },
+    {
+      "id": "S-5",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Draft fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "PATCH",
+        "path": "/api/tasks/1",
+        "body": {}
+      },
+      "assert": [
+        {
+          "status": 400
+        }
+      ]
+    },
+    {
+      "id": "S-6",
+      "kind": "api",
+      "covers": [
+        "ER-2"
+      ],
+      "request": {
+        "method": "PATCH",
+        "path": "/api/tasks/999",
+        "body": {
+          "title": "Ghost fx-5eed00"
+        }
+      },
+      "assert": [
+        {
+          "status": 404
+        },
+        {
+          "json_path": "$.error",
+          "equals": "not_found"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.979Z",
+    "scenarios_hash": "sha256:3e9817136c7d808d5ac0c1653ddc5b12339434d0bfc6d250c47d680d4e0e62bd"
+  }
+}

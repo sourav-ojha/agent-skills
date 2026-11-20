@@ -1,0 +1,132 @@
+{
+  "feature": "FEATURE-001",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:561dbb38f7f0623661c72132e4711afe5a1e92c59a852de0d24a68446285788e",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Water plants fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/1/complete"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.done",
+          "equals": true
+        },
+        {
+          "json_path": "$.id",
+          "equals": "1"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Water plants fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/1/complete"
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks/1"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.done",
+          "equals": true
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Water plants fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/1/complete"
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/1/complete"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.done",
+          "equals": true
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/999/complete"
+      },
+      "assert": [
+        {
+          "status": 404
+        },
+        {
+          "json_path": "$.error",
+          "equals": "not_found"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.975Z",
+    "scenarios_hash": "sha256:3665997c7105708d09ae6fd42c0ac4baf84d60795911f161e1c5716f20d5290e"
+  }
+}

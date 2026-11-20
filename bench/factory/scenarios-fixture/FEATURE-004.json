@@ -1,0 +1,152 @@
+{
+  "feature": "FEATURE-004",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:342d66e30e7e104b6988c0ab17b6e8e6b38edfc9c8968e08643cbcf72d17b9f5",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Open one fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Done one fx-5eed00",
+            "done": true
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?status=open"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        },
+        {
+          "json_path": "$.items[0].title",
+          "equals": "Open one fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Open one fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Done one fx-5eed00",
+            "done": true
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?status=done"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 1
+        },
+        {
+          "json_path": "$.items[0].title",
+          "equals": "Done one fx-5eed00"
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Open one fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Done one fx-5eed00",
+            "done": true
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.items",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks?status=archived"
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_status"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.979Z",
+    "scenarios_hash": "sha256:e6626df3399179df12bf426225b095b388074e8fa571a732af17d8444b7b127a"
+  }
+}

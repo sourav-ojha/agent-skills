@@ -1,0 +1,240 @@
+{
+  "feature": "FEATURE-014",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:ed7dbdb24e52d058503fcfd8b977735f0415947333bc27798b42a16233632c61",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Fix sink fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/1/tags",
+        "body": {
+          "tag": "home"
+        }
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.tags",
+          "contains": "home"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Fix sink fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/1/tags",
+          "body": {
+            "tag": "home"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks/1"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.tags",
+          "contains": "home"
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "AC-3"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Fix sink fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/1/tags",
+          "body": {
+            "tag": "home"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/1/tags",
+        "body": {
+          "tag": "work"
+        }
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.tags",
+          "equals": [
+            "home",
+            "work"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Fix sink fx-5eed00"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tasks/1/tags",
+          "body": {
+            "tag": "home"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/1/tags",
+        "body": {
+          "tag": "home"
+        }
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.tags",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "S-5",
+      "kind": "api",
+      "covers": [
+        "EC-2"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks",
+        "body": {
+          "title": "Fix sink fx-5eed00"
+        }
+      },
+      "assert": [
+        {
+          "status": 201
+        },
+        {
+          "json_path": "$.tags",
+          "count": 0
+        }
+      ]
+    },
+    {
+      "id": "S-6",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Fix sink fx-5eed00"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/1/tags",
+        "body": {
+          "tag": "Not Valid!"
+        }
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_tag"
+        }
+      ]
+    },
+    {
+      "id": "S-7",
+      "kind": "api",
+      "covers": [
+        "ER-2"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks/999/tags",
+        "body": {
+          "tag": "home"
+        }
+      },
+      "assert": [
+        {
+          "status": 404
+        },
+        {
+          "json_path": "$.error",
+          "equals": "not_found"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.983Z",
+    "scenarios_hash": "sha256:176a75a6f3feefa312ce17396ebde9ff04f00a53bdd5b48f9c23064655746baf"
+  }
+}
