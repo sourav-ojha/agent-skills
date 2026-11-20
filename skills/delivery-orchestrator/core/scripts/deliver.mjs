@@ -301,7 +301,9 @@ C.init = async () => {
   }
   if (opt.merge && !flat(opt.note)) die('--merge needs --note "<the user\'s own words authorising merges>"');
   const protectedBase = isProtectedBranch(base, config.protected_branches);
-  const wantsMerge = !!opt.merge || config.merge.mode === 'squash';
+  // An explicit autonomy.level L0 means "never merge": --merge cannot override it. Legacy pr-only configs (no autonomy key) still honour --merge.
+  const mergeIgnored = !!opt.merge && config.autonomy.explicit && config.autonomy.level === 'L0';
+  const wantsMerge = (!!opt.merge && !mergeIgnored) || config.merge.mode === 'squash';
   const featuresDir = path.resolve(root, opt['features-dir'] || config.features_dir);
   if (!(featuresDir + path.sep).startsWith(fs.realpathSync(root) + path.sep) && !(featuresDir + path.sep).startsWith(root + path.sep)) die('--features-dir must be inside the repository');
   const only = parseList(opt.only);
@@ -315,13 +317,15 @@ C.init = async () => {
     protected_base: protectedBase, merge: wantsMerge && !protectedBase, merge_mode: wantsMerge ? 'squash' : 'pr-only',
     no_ci: !!opt['no-ci'] || config.checks.allow_without_ci, merge_t3: !!opt['merge-t3'] || config.merge.allow_tier3,
     checks: opt.checks ? parseList(opt.checks) : config.checks.required,
-    authorised_by: wantsMerge ? (opt.merge ? flat(opt.note, 300) : `project config ${CONFIG_PATH}`) : null,
+    authorised_by: wantsMerge ? (opt.merge && !mergeIgnored ? flat(opt.note, 300) : `project config ${CONFIG_PATH}`) : null,
     max_fix_rounds: num(opt['max-fix-rounds'], config.limits.max_fix_rounds, 0, 5), max_failures: num(opt['max-failures'], config.limits.max_failures, 1, 10), ci_budget_s: num(opt['ci-budget'], config.limits.ci_budget_s, 1, 86400),
-    policy: config, features,
+    // stored in the committed shape (parseConfig re-validates it on every load): autonomy appears only when the config wrote it
+    policy: { ...config, autonomy: config.autonomy.explicit ? { level: config.autonomy.level } : undefined }, features,
     run_id: `${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`, // one id per init: records of separate runs never share a (run, feature) key
   };
   const summary = { base, repo: q.repo, account: config.github.account || '(gh default)', merge: q.merge, protected_base: protectedBase, no_ci: q.no_ci, checks: q.checks, ignored_checks: config.checks.ignored, local_checks: config.local_checks.map((c) => c.name), hold_paths: config.hold_paths, git_auth: /^https:/i.test(url) ? 'https (uses the configured account)' : 'ssh/other (git uses your own key; the account setting applies to gh only)' };
   const warnings = [];
+  if (mergeIgnored) warnings.push(`--merge ignored: ${CONFIG_PATH} sets autonomy.level "L0" (PRs only); set autonomy.level "L1" in the config and merge it to ${base} to allow merging`);
   if (protectedBase) warnings.push(`"${base}" matches protected_branches: PRs will be opened and checked but this skill will never merge into it`);
   if (!q.merge && !protectedBase) warnings.push('merging is off for this run (config merge.mode is "pr-only" and --merge was not given)');
   if (q.merge && config.readiness) {
