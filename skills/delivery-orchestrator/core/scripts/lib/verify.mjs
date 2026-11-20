@@ -63,26 +63,31 @@ export function scanSurvivors(markers) {
   const r = survivorPids(markers);
   return r.ok ? r.pids.size : Math.max(1, r.pids.size);
 }
-// The same scan, as { ok, pids: Set<number> } (ok false: ps or lsof failed, pids holds what was found before that). For the stop
-// path, which signals the survivors (never this process).
-export function survivorPids(markers) {
+// The same scan, as { ok, pids, killable } (Sets of pids; ok false: ps or lsof failed, the sets hold what was found before that).
+// pids is the broad detection set (argv/env mention or cwd). killable is the narrow set the stop path may signal: the cwd is inside
+// a marker, or the environment carries TMPDIR= or HOME= inside one of `sandbox` (the run temps a sandboxed process is started with).
+// A process that only MENTIONS a marker (an editor, `git -C <clone>`, a shell with PWD/OLDPWD there) is never killable. Never this
+// process.
+export function survivorPids(markers, { sandbox = [] } = {}) {
   const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
-  if (ps.status !== 0 || ps.error) return { ok: false, pids: new Set() };
-  const hits = new Set();
+  if (ps.status !== 0 || ps.error) return { ok: false, pids: new Set(), killable: new Set() };
+  const hits = new Set(); const kill = new Set();
+  const envIn = (text) => sandbox.some((k) => [' TMPDIR=', ' HOME='].some((v) => mentions(text, `${v}${k}`)));
   for (const line of ps.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line);
     if (!m || m[2].startsWith('Z') || Number(m[1]) === process.pid) continue;
     if (markers.some((k) => mentions(m[3], k))) hits.add(m[1]);
+    if (envIn(m[3])) { hits.add(m[1]); kill.add(m[1]); }
   }
   const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 5000 });
-  const num = () => new Set([...hits].map(Number).filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid));
-  if (lsof.error || !lsof.stdout) return { ok: false, pids: num() };
+  const num = (set) => new Set([...set].map(Number).filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid));
+  if (lsof.error || !lsof.stdout) return { ok: false, pids: num(hits), killable: num(kill) };
   let pid = null;
   for (const line of lsof.stdout.split('\n')) {
     if (line.startsWith('p')) pid = line.slice(1);
-    else if (line.startsWith('n') && pid && Number(pid) !== process.pid && markers.some((k) => within(line.slice(1), k))) hits.add(pid);
+    else if (line.startsWith('n') && pid && Number(pid) !== process.pid && markers.some((k) => within(line.slice(1), k))) { hits.add(pid); kill.add(pid); }
   }
-  return { ok: true, pids: num() };
+  return { ok: true, pids: num(hits), killable: num(kill) };
 }
 // Polls briefly: processes the phase's process-group kill just ended may still be listed for a moment.
 async function sweepSurvivors(markers) {

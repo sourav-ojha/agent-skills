@@ -403,18 +403,24 @@ const KILL_GRACE_MS = 10000; // SIGTERM to a session's (or deliver's) process gr
 // runSession options of every session: the stop flag (graceful or --now) ends it, polled every 5 s.
 const sessionStop = (ctx) => ({ shouldAbort: () => stopRequested(ctx) !== null, abortPollMs: STOP_POLL_MS, killGraceMs: KILL_GRACE_MS });
 const alivePid = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
-// After a stop: every process still running from the builder clone, the builder run dirs, the driver clone or the verification work
-// dirs (argv/env mention or cwd, as scanSurvivors finds them) gets SIGTERM, then SIGKILL after 10 s; then the app ports of the base
-// config must be free. Never this process or its parent. Best effort: what is left is reported, and noLiveBuilder still refuses.
+// After a stop: the processes still running IN the builder clone, the builder run dirs, the driver clone or the verification work
+// dirs (their cwd is inside one) or started in a sandbox (TMPDIR/HOME inside a builder run dir or FACTORY_HOME/tmp) get SIGTERM, then
+// SIGKILL after 10 s if a fresh scan still finds them (a pid that exited and was reused meanwhile is not signalled). A process that
+// only mentions those paths in its argv or environment (an editor, `git -C <clone>`, a shell) is never killed: the broad detection
+// (noLiveBuilder, the next start's sweep) refuses to continue instead. Then the app ports of the base config must be free. Never this
+// process or its parent. Best effort: what is left is reported.
 async function killLeftovers(ctx) {
   const markers = [ctx.bRoot && path.join(ctx.bRoot, ctx.key), ctx.bRoot && builderRun(ctx), ctx.D, ctx.fh && ctx.key && path.join(ctx.fh, 'work', ctx.key)].filter(Boolean);
+  const sandbox = [ctx.bRoot && builderRun(ctx), ctx.fh && path.join(ctx.fh, 'tmp')].filter(Boolean);
   const scan = ctx.deps.survivorPids || survivorPids;
-  const pids = [...scan(markers).pids].filter((p) => p !== process.pid && p !== process.ppid);
+  const killable = () => new Set([...(scan(markers, { sandbox }).killable || [])].filter((p) => p !== process.pid && p !== process.ppid));
+  const pids = [...killable()];
   if (pids.length) {
     for (const p of pids) try { process.kill(p, 'SIGTERM'); } catch { /* gone */ }
     const end = Date.now() + KILL_GRACE_MS;
     while (pids.some(alivePid) && Date.now() < end) await new Promise((r) => { setTimeout(r, 100); });
-    for (const p of pids.filter(alivePid)) try { process.kill(p, 'SIGKILL'); } catch { /* gone */ }
+    const still = pids.filter(alivePid);
+    if (still.length) { const now = killable(); for (const p of still.filter((x) => now.has(x))) try { process.kill(p, 'SIGKILL'); } catch { /* gone */ } }
     ctx.out(`stop: ${pids.length} leftover process(es) ended`);
   }
   const app = ctx.policy?.app || {};
@@ -705,7 +711,8 @@ function deliverWatch(ctx, ...args) {
       if (settled) return;
       settled = true;
       clearInterval(poll); clearTimeout(cap); if (killT) clearTimeout(killT);
-      if (stopped) group('SIGKILL'); // a killed wait: nothing of its group outlives the step
+      // A killed wait: nothing of its group outlives the step (only while the group still has members: an empty pgid may be reused).
+      if (stopped) { let members = false; try { process.kill(-c.pid, 0); members = true; } catch (e) { members = e?.code === 'EPERM'; } if (members) group('SIGKILL'); }
       if (c.pid) try { ctx.lock.forgetGroup(c.pid); } catch { /* kept: killed on the next start */ }
       resolve(stopped ? { stopped: true } : { code: code ?? 1, json: json(out) });
     };
@@ -1190,6 +1197,8 @@ export async function cmdRun(ctx) {
   let q = fs.existsSync(ctx.queueFile) ? readQueue(ctx) : null;
   if (q && (q.repo !== ctx.id.repo || q.base !== ctx.base)) refuse('the stored queue is for another repository or base', `DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs reset --yes`);
   const resuming = q && q.features.some((f) => !['merged', 'skipped'].includes(f.state));
+  // Before anything is written (no checkout, no deliver init): a raise needs a run in progress.
+  if (opt['raise-budget'] !== undefined && !resuming) refuse('--raise-budget needs a run in progress: no feature is held for a budget');
   const alive = ctx.orphansAlive > 0 || ctx.leftovers > 0;
   const aliveWhy = `processes or worktrees from an earlier run are still alive (${ctx.orphansAlive} process group(s), ${ctx.leftovers} directory(ies))`;
   const aliveFix = 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again';
@@ -1215,14 +1224,15 @@ export async function cmdRun(ctx) {
     if (!fs.existsSync(ctx.queueFile)) { ctx.out('no feature is ready'); return 0; }
   } else {
     if (only.length || opt.limit) ctx.out('note: a run is in progress; --only and --limit apply to a new run only');
-    if (opt['raise-budget'] !== undefined) raiseBudget(ctx, opt['raise-budget']);
+    // Every refusal comes before the raise changes anything: the raised feature is checked as the active feature it will become.
+    const raise = opt['raise-budget'] !== undefined ? planRaise(ctx, opt['raise-budget']) : null;
     for (const f of q.features.filter((x) => !TERMINAL.includes(x.state))) {
       try { featureCaps(ctx, f); } catch (e) { refuse(`${e.message}`, `fix budget_cap of ${f.id} in ${ctx.queueFile} (or run "factory run --raise-budget ${f.id}")`); }
     }
-    const bad = missingScenarios(ctx, q.features.filter((f) => f.state === 'queued' || ACTIVE.includes(f.state)).map((f) => f.id));
+    const bad = missingScenarios(ctx, q.features.filter((f) => f.state === 'queued' || ACTIVE.includes(f.state) || f.id === raise?.id).map((f) => f.id));
     if (bad.length) refuse(`features without current approved scenarios: ${bad.join(', ')}`, 'run "factory scenarios" (and approve them), then run again');
+    if (raise) applyRaise(ctx, raise);
   }
-  if (opt['raise-budget'] !== undefined && !resuming) refuse('--raise-budget needs a run in progress: no feature is held for a budget');
   if (opt.continue && fs.existsSync(STOP_FLAG(ctx))) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('continue: the stop request is cleared'); }
   updateRun(ctx.fh, ctx.key, { status: 'running', pause: null, reason: null, current: null, started_at: isoAt(ctx.deps.clock.now()), pid: process.pid });
   // A run stopped during a wait continues by finishing that wait (its saved reset time) before the interrupted step runs again, so
@@ -1240,8 +1250,8 @@ export async function cmdRun(ctx) {
 // --raise-budget ID[=TOKENS]: a feature parked by its budget (awaiting_human, hold kind budget) gets a raised cap (f.budget_cap) and
 // goes back to the step it was parked in (deliver unhold --to <budget_hold.from>), marked interrupted, so the run continues it from
 // the branch. Bare ID: the base policy's caps once more (the first raise doubles them); ID=N: the token cap is N, turns unchanged.
-// Refused, with the queue unchanged, for any other feature.
-function raiseBudget(ctx, spec) {
+// planRaise only checks (it refuses, with the queue unchanged, for any other feature or a cap that would not help); applyRaise writes.
+function planRaise(ctx, spec) {
   const m = /^(FEATURE-\d+)(?:=([1-9]\d{0,11}))?$/.exec(String(spec));
   if (!m) refuse('--raise-budget takes FEATURE-ID or FEATURE-ID=TOKENS (a positive integer)');
   const f = readQueue(ctx).features.find((x) => x.id === m[1]);
@@ -1253,12 +1263,18 @@ function raiseBudget(ctx, spec) {
   try { orig = featureCaps(ctx, null); cur = featureCaps(ctx, f); } catch (e) { refuse(e.message, `fix the budget caps (budgets.feature in ${CONFIG_PATH}, budget_cap of ${f.id})`); }
   const caps = m[2] !== undefined ? { tokens: Number(m[2]), turns: cur.turns } : { tokens: cur.tokens + orig.tokens, turns: cur.turns + orig.turns };
   const used = featureUsage(f);
-  if (caps.tokens <= used.tokens || caps.turns <= used.turns) refuse(`the raised cap of ${f.id} (tokens ${caps.tokens}, turns ${caps.turns}) is not above what it used (tokens ${used.tokens}, turns ${used.turns})`, `pass a larger cap: factory run --raise-budget ${f.id}=<tokens>`);
-  const d = deliver(ctx, 'unhold', f.id, '--to', from);
-  if (d.code !== 0 || readQueue(ctx).features.find((x) => x.id === f.id)?.state !== from) refuse(`deliver unhold ${f.id} failed`, `run "DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs status" to see the feature`);
-  update(ctx, f.id, (x) => { x.budget_cap = caps; });
-  try { resolveAttention(ctx.fh, ctx.key, { id: f.id, kind: 'budget' }); } catch { /* the row stays: harmless */ }
-  ctx.out(`${f.id} budget raised: tokens ${caps.tokens}, turns ${caps.turns}; continuing at ${from}`);
+  const what = `the raised cap of ${f.id} (tokens ${caps.tokens}, turns ${caps.turns}) is not above what it used (tokens ${used.tokens}, turns ${used.turns})`;
+  // =N changes tokens only: when turns is the spent dimension only the bare form (which raises both) can help.
+  if (caps.turns <= used.turns) refuse(what, `raise both caps: factory run --raise-budget ${f.id}`);
+  if (caps.tokens <= used.tokens) refuse(what, `pass a larger cap: factory run --raise-budget ${f.id}=<tokens>, or factory run --raise-budget ${f.id}`);
+  return { id: f.id, from, caps };
+}
+function applyRaise(ctx, { id, from, caps }) {
+  const d = deliver(ctx, 'unhold', id, '--to', from);
+  if (d.code !== 0 || readQueue(ctx).features.find((x) => x.id === id)?.state !== from) refuse(`deliver unhold ${id} failed`, `run "DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs status" to see the feature`);
+  update(ctx, id, (x) => { x.budget_cap = caps; });
+  try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'budget' }); } catch { /* the row stays: harmless */ }
+  ctx.out(`${id} budget raised: tokens ${caps.tokens}, turns ${caps.turns}; continuing at ${from}`);
 }
 
 async function loop(ctx) {

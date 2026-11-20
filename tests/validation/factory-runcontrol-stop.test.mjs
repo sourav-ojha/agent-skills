@@ -153,6 +153,27 @@ test('after stop no process with the factory clone or work directory as cwd surv
   assert.ok(subjects(w, w.queue().features[0].branch).includes('wip(FEATURE-001): interrupted (stop)'));
 });
 
+test('the stop kill sweep signals only processes whose cwd is in the clone (or started in a sandbox): one that only mentions the clone path in its argv survives (and detection still refuses to continue)', async (t) => {
+  const w = ready(t, { specs: ONE, fake: { plan: { 'FEATURE-001': [{ files: { 'src/x.wip': 'x\n' }, linger_ms: 60000 }] } } });
+  const run = bg(w, ['run']);
+  await until(() => builderRuns(w, 'FEATURE-001').length === 1 && fs.existsSync(path.join(w.builder, 'src', 'x.wip')), 'the builder session');
+  const keep = 'setTimeout(() => {}, 120000)';
+  const inClone = spawn(process.execPath, ['-e', keep], { cwd: w.builder, stdio: 'ignore' });
+  const decoy = spawn(process.execPath, ['-e', keep, w.builder], { cwd: os.tmpdir(), stdio: 'ignore' }); // like `code <clone>`
+  t.after(() => { for (const c of [inClone, decoy]) try { c.kill('SIGKILL'); } catch { /* gone */ } });
+  const gone = (c) => new Promise((r) => { if (c.exitCode !== null || c.signalCode !== null) r(true); else c.once('exit', () => r(true)); });
+  await until(() => VF.scanSurvivors([w.builder]) >= 2, 'both processes listed', 10000);
+  assert.equal(w.factory(['stop']).code, 0);
+  const r = await run.done;
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /^stopped: (leftovers|stop)$/m);
+  assert.equal(await Promise.race([gone(inClone), sleep(15000).then(() => false)]), true, 'the process with its cwd in the clone was ended');
+  assert.equal(decoy.exitCode, null, 'the decoy that only mentions the path is still running');
+  assert.doesNotThrow(() => process.kill(decoy.pid, 0));
+  assert.match(r.out, /^stopped: leftovers$/m, 'the broad detection still refuses to touch the branch while the decoy lives');
+  decoy.kill('SIGKILL');
+});
+
 test('stop --now during the CI wait kills the deliver child within 15 s and the run ends stopped; the feature is still pr_open and the next run continues from CI', async (t) => {
   const w = ready(t, { specs: ONE, test: { ciArgs: ['--interval', '1', '--grace', '0', '--timeout', '900'] }, gh: { checkQueue: [[{ name: 'ci', bucket: 'pending', link: 'x', state: 'PENDING' }]] }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
   const run = bg(w, ['run']);
@@ -270,9 +291,45 @@ test('--raise-budget FEATURE-001 on a budget-held feature doubles the caps, unho
   assert.ok(!JSON.parse(fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.json'), 'utf8')).some((i) => i.kind === 'budget' && i.id === 'FEATURE-001'), 'the budget attention row is resolved');
 });
 
+test('--raise-budget without a run in progress refuses before anything is written: no queue, no deliver init, the driver clone untouched', (t) => {
+  const w = ready(t, { config: FEATURE_CAP, specs: ONE, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const a = w.factory(['run', '--raise-budget', 'FEATURE-001']);
+  assert.equal(a.code, 1, a.out + a.err);
+  assert.match(a.out, /^refused: --raise-budget needs a run in progress/m);
+  assert.equal(fs.existsSync(w.queueFile), false, 'no queue was created');
+  // The clone exists now (prepare); put it on another branch: a refused raise must not check out the base or clean it.
+  w.sh(w.clone, 'checkout', '-q', '-b', 'side');
+  fs.writeFileSync(path.join(w.clone, 'untracked.txt'), 'x\n');
+  const head = w.sh(w.clone, 'rev-parse', 'HEAD');
+  const b = w.factory(['run', '--raise-budget', 'FEATURE-001']);
+  assert.equal(b.code, 1, b.out + b.err);
+  assert.equal(fs.existsSync(w.queueFile), false);
+  assert.equal(w.sh(w.clone, 'rev-parse', '--abbrev-ref', 'HEAD'), 'side');
+  assert.equal(w.sh(w.clone, 'rev-parse', 'HEAD'), head);
+  assert.ok(fs.existsSync(path.join(w.clone, 'untracked.txt')), 'no clean');
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 0);
+});
+
 test('--raise-budget FEATURE-001=N sets the token cap to N', (t) => {
   const w = ready(t, { config: FEATURE_CAP, specs: ONE, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001', G2), tokens: 9655 }, AG_FIX] } } });
   assert.equal(w.factory(['run']).code, 2);
+  const bytes = fs.readFileSync(w.queueFile, 'utf8');
+  // A refusal after the raise was checked (missing scenarios) still leaves the feature held and unraised.
+  const sc = path.join(w.fhome, 'scenarios', 'o__r', 'FEATURE-001.json');
+  const scBytes = fs.readFileSync(sc);
+  fs.rmSync(sc);
+  const ms = w.factory(['run', '--raise-budget', 'FEATURE-001=50000']);
+  assert.equal(ms.code, 1, ms.out + ms.err);
+  assert.match(ms.out, /^refused: features without current approved scenarios: FEATURE-001/m);
+  assert.equal(fs.readFileSync(w.queueFile, 'utf8'), bytes, 'still held, not raised');
+  fs.writeFileSync(sc, scBytes);
+  // =N when the turns cap is the spent dimension: the fix names the bare form (=N can never help there).
+  const q = JSON.parse(bytes); q.features[0].budget_cap = { tokens: 10000, turns: 2 }; fs.writeFileSync(w.queueFile, JSON.stringify(q));
+  const tn = w.factory(['run', '--raise-budget', 'FEATURE-001=50000']);
+  assert.equal(tn.code, 1, tn.out + tn.err);
+  assert.match(tn.out, /^refused: the raised cap of FEATURE-001 \(tokens 50000, turns 2\) is not above what it used/m);
+  assert.match(tn.out, /^fix: raise both caps: factory run --raise-budget FEATURE-001$/m);
+  fs.writeFileSync(w.queueFile, bytes);
   const r = w.factory(['run', '--raise-budget', 'FEATURE-001=50000']);
   assert.equal(r.code, 0, r.out + r.err);
   const f = w.queue().features[0];
