@@ -90,10 +90,15 @@ test('hold with another kind (or none) from building or fixing is still refused'
   }
 });
 
-test('hold --kind budget from a state that never could (queued) is still refused', (t) => {
+test('hold --kind budget is refused from every state but building and fixing, leaving the queue unchanged', (t) => {
   const r = repo(); t.after(() => fs.rmSync(r.root, { recursive: true, force: true }));
-  const x = r.d(r.qf, 'hold', 'FEATURE-001', '--reason', 'r', '--kind', 'budget');
-  assert.equal(x.code, 1); assert.match(x.err, /cannot wait for a person/);
+  for (const st of ['queued', 'pr_open', 'ci_passed', 'verified']) {
+    r.setState(st);
+    const before = fs.readFileSync(r.qf, 'utf8');
+    const x = r.d(r.qf, 'hold', 'FEATURE-001', '--reason', 'r', '--kind', 'budget');
+    assert.equal(x.code, 1, `${st}: ${x.out}${x.err}`); assert.match(x.err, /cannot (wait for a person|be held for a budget)/);
+    assert.equal(fs.readFileSync(r.qf, 'utf8'), before, st);
+  }
 });
 
 test('unhold --to building|fixing resumes a budget hold as an interrupted step and clears the hold', (t) => {
@@ -121,6 +126,18 @@ test('unhold refuses: non-budget hold, wrong state, bad --to, queue outside FACT
   assert.equal(r.d(r.qf, 'unhold', 'FEATURE-001', '--to', 'building').code, 1);
   r.setState('awaiting_human', { hold_kind: 'budget' });
   for (const to of ['pr_open', 'merged', undefined]) assert.equal(r.d(r.qf, 'unhold', 'FEATURE-001', ...(to ? ['--to', to] : [])).code, 1, String(to));
+  // the target must be the state the feature was held from; a budget_hold from any other state is never resumed
+  r.setState('awaiting_human', { hold_kind: 'budget', budget_hold: { from: 'building' } });
+  let before = fs.readFileSync(r.qf, 'utf8');
+  x = r.d(r.qf, 'unhold', 'FEATURE-001', '--to', 'fixing');
+  assert.equal(x.code, 1); assert.match(x.err, /held from "building"/); assert.equal(fs.readFileSync(r.qf, 'utf8'), before);
+  for (const from of ['pr_open', 'ci_passed', undefined]) for (const to of ['building', 'fixing']) {
+    r.setState('awaiting_human', { hold_kind: 'budget', budget_hold: from ? { from } : undefined });
+    before = fs.readFileSync(r.qf, 'utf8');
+    x = r.d(r.qf, 'unhold', 'FEATURE-001', '--to', to);
+    assert.equal(x.code, 1, `${from} ${to}`); assert.equal(fs.readFileSync(r.qf, 'utf8'), before);
+  }
+  r.setState('awaiting_human', { hold_kind: 'budget', budget_hold: { from: 'building' } });
   const out = path.join(r.root, 'q.json'); fs.copyFileSync(r.qf, out);
   x = r.d(out, 'unhold', 'FEATURE-001', '--to', 'building');
   assert.equal(x.code, 1); assert.match(x.err, /factory driver command/);

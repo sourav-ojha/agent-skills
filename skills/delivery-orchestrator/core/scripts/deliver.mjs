@@ -866,6 +866,7 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   if (opt['no-ci']) q.no_ci = true;
   if (opt.checks) q.checks = parseList(opt.checks);
   q.stop = null;
+  f.hold_kind = null; delete f.budget_hold;
   transition(f, 'pr_open', 'retry');
   save(q);
   emit({ id: f.id, state: f.state, no_ci: q.no_ci, checks: q.checks, next: 'ci' });
@@ -884,7 +885,10 @@ C.hold = () => {
   if (kind !== null && !/^[a-z_]{1,32}$/.test(kind)) die('--kind must be 1-32 characters of a-z and _');
   // A running step (building, fixing) can only be parked by the run-control budget; every other hold there is the driver's attention-and-stop path.
   if ((f.state === 'building' || f.state === 'fixing') && kind !== 'budget') die(`${f.id} is "${f.state}", which cannot wait for a person`);
-  if (kind === 'budget') f.budget_hold = { from: f.state };
+  if (kind === 'budget') {
+    if (f.state !== 'building' && f.state !== 'fixing') die(`${f.id} is "${f.state}", which cannot be held for a budget (only building and fixing)`);
+    f.budget_hold = { from: f.state };
+  }
   if (kind === 'antigaming') {
     const ids = parseList(opt.ids).filter((x) => /^G[1-5]$/.test(x));
     if (!SHA.test(String(opt.sha || '')) || !ids.length) die('an anti-gaming hold needs --sha <40-hex> and --ids G1..G5');
@@ -903,6 +907,9 @@ C.unhold = () => {
   if (f.state !== 'awaiting_human' || f.hold_kind !== 'budget') die(`${f.id} is not held for a budget (state "${f.state}", hold_kind ${JSON.stringify(f.hold_kind ?? null)})`);
   const to = opt.to;
   if (to !== 'building' && to !== 'fixing') die('--to must be building or fixing');
+  const from = f.budget_hold?.from;
+  if (from !== 'building' && from !== 'fixing') die(`${f.id} has no building or fixing budget hold recorded`);
+  if (to !== from) die(`${f.id} was held from "${from}": --to must be ${from}`);
   delete f.budget_hold; f.hold_kind = null;
   f.interrupted = { kind: 'budget', step: to === 'building' ? 'build' : 'fix', ts: new Date().toISOString() };
   transition(f, to, 'budget hold released');
