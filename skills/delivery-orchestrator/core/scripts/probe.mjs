@@ -9,16 +9,32 @@
 // allowed to do - pass PROBE_TOKEN then). A route is `leaked` when it obtained the token (for `write`: when the
 // write succeeded). The probe prints route, result and a short fixed detail only: never file contents or the token.
 // Exit: 0 all denied, 1 any leaked, 2 usage error or no leak but some route errored, 3 --control file rejected.
-// --control <file>: an earlier unsandboxed --json run (same target, write-target, token). Without it, an all-denied
-// result is printed with a warning that it proves nothing (a typo in --target also looks denied).
+// --control <file>: an earlier unsandboxed --json run (same target, write-target, factory-home, net-host, token). Without it,
+// an all-denied result is printed with a warning that it proves nothing (a typo in --target also looks denied).
+//
+// Phase 2 (P2.2) routes, each opt-in (unconfigured: `error`, detail "not configured ..."):
+//   --factory-home <dir>   tries to write into stop/, runs/, usage/, verdicts/, records/ and config.json there (a file it
+//                          creates and removes; config.json is only opened for writing, never changed).
+//   --net-host <host:port> an outbound TCP connect through bash (/dev/tcp). Use a non-local host you are allowed to reach; a
+//                          timeout, refusal or EPERM is `denied`, which proves something only when the --control run connected.
+//                          Never point it at a production host. --net-timeout-ms (default 3000).
+// --save: also writes $FACTORY_HOME/probes/last.json ({ ts, routes: { <route>: denied|leaked|error } }, private, atomic) that
+// `factory run` reads; a `denied` without an accepted control run is saved as `error` (unproven). The builder cannot write
+// FACTORY_HOME, so run the probe in the builder with --json > probe.json, then outside it:
+//   node probe.mjs --from probe.json --control control.json --save
+// (--from re-reads that result instead of probing; the control is checked again.)
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { factoryHome, writeJsonAtomic } from './lib/factoryhome.mjs';
 
-export const ROUTES = ['fs.readFile', 'cat', 'cp', 'find', 'tar', 'mdfind', 'qlmanage', 'node -e', 'python -c', 'git -C', 'hardlink', 'symlink', 'write'];
+export const ROUTES = ['fs.readFile', 'cat', 'cp', 'find', 'tar', 'mdfind', 'qlmanage', 'node -e', 'python -c', 'git -C', 'hardlink', 'symlink', 'write',
+  'write stop/', 'write runs/', 'write usage/', 'write verdicts/', 'write records/', 'write config.json', 'net bash'];
+const HOME_SUBDIRS = { 'write stop/': 'stop', 'write runs/': 'runs', 'write usage/': 'usage', 'write verdicts/': 'verdicts', 'write records/': 'records' };
+const NO_TOKEN = new Set(['write', ...Object.keys(HOME_SUBDIRS), 'write config.json', 'net bash']); // routes that do not read the sentinel
 export const SENTINEL = '.probe-sentinel';
 
 const DENY_CODES = new Set(['EACCES', 'EPERM', 'EROFS', 'ENOENT']);
@@ -45,6 +61,10 @@ export function runProbe(o) {
   const writeTarget = o.writeTarget ? path.resolve(o.writeTarget) : null;
   const timeoutMs = o.timeoutMs || 10000;
   const bin = o.bin || {};
+  const fhome = o.factoryHome ? path.resolve(o.factoryHome) : null;
+  // netHost: { host, port } or "host:port" (the API accepts a local host for tests; the CLI refuses one).
+  const netHost = typeof o.netHost === 'string' ? parseNetHost(o.netHost, { allowLocal: true }) : (o.netHost || null);
+  if (o.netHost && !netHost) throw new Error('netHost must be host:port');
   let token = o.token ?? process.env.PROBE_TOKEN;
   if (!token) { try { token = fs.readFileSync(sentinel, 'utf8').trim(); } catch { /* the probe itself may be denied */ } }
   const has = (buf) => Buffer.isBuffer(buf) && buf.includes(token);
@@ -104,15 +124,47 @@ export function runProbe(o) {
       try { fs.rmSync(p, { force: true }); } catch { cleanupFailed = true; }
       return cleanupFailed ? { result: r.result, detail: `${r.detail}; cleanup failed (remove .probe-write-* by hand)` } : r;
     },
+    ...Object.fromEntries(Object.entries(HOME_SUBDIRS).map(([route, sub]) => [route, () => homeWrite(sub)])),
+    'write config.json': () => {
+      if (!fhome) return { result: 'error', detail: 'not configured (no --factory-home)' };
+      const p = path.join(fhome, 'config.json');
+      try { fs.closeSync(fs.openSync(p, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW)); return { result: 'leaked', detail: 'opened for writing' }; } catch (e) {
+        if (e.code !== 'ENOENT') return fsDetail(e);
+      }
+      let r; try { fs.writeFileSync(p, '', { flag: 'wx' }); r = { result: 'leaked', detail: 'created' }; } catch (e) { return fsDetail(e); }
+      try { fs.rmSync(p, { force: true }); } catch { return { ...r, detail: 'created; cleanup failed (remove config.json by hand)' }; }
+      return r;
+    },
+    'net bash': () => {
+      if (!netHost) return { result: 'error', detail: 'not configured (no --net-host)' };
+      const { host, port } = netHost;
+      const r = run(bin.bash || 'bash', ['-c', 'exec 3<>"/dev/tcp/$1/$2"', 'probe', host, String(port)], { timeoutMs: o.netTimeoutMs || 3000, cwd: workdir });
+      if (r.missing) return { result: 'error', detail: 'tool missing' };
+      if (r.timedOut) return { result: 'denied', detail: 'timeout' };
+      if (r.failed) return { result: 'error', detail: r.failed };
+      return r.status === 0 ? { result: 'leaked', detail: 'connected' } : { result: 'denied', detail: `exit ${r.status}` };
+    },
   };
+  // Create a file in <factory-home>/<sub> (or the directory itself when it is missing), then remove what was created.
+  function homeWrite(sub) {
+    if (!fhome) return { result: 'error', detail: 'not configured (no --factory-home)' };
+    const dir = path.join(fhome, sub); const p = path.join(dir, `.probe-write-${rnd()}`);
+    let r; let made = null;
+    try { fs.writeFileSync(p, 'probe', { flag: 'wx' }); r = { result: 'leaked', detail: 'write succeeded' }; made = p; } catch (e) {
+      if (e.code !== 'ENOENT') return fsDetail(e);
+      try { fs.mkdirSync(dir); r = { result: 'leaked', detail: 'directory created' }; made = dir; } catch (e2) { return fsDetail(e2); }
+    }
+    try { fs.rmSync(made, { recursive: made === dir, force: true }); } catch { return { ...r, detail: `${r.detail}; cleanup failed (remove ${made === dir ? sub : '.probe-write-*'} by hand)` }; }
+    return r;
+  }
 
   const warnings = [];
   if (!fs.existsSync(path.dirname(target))) warnings.push('parent directory of --target does not exist from the probe\'s view: denied results prove nothing');
   if (writeTarget && !fs.existsSync(path.dirname(writeTarget))) warnings.push('parent directory of --write-target does not exist from the probe\'s view');
   return {
-    target, write_target: writeTarget, token_sha256: token ? crypto.createHash('sha256').update(token).digest('hex') : null, warnings,
+    target, write_target: writeTarget, factory_home: fhome, net_host: netHost ? `${netHost.host}:${netHost.port}` : null, token_sha256: token ? crypto.createHash('sha256').update(token).digest('hex') : null, warnings,
     routes: ROUTES.map((route) => {
-      if (!token && route !== 'write') return { route, result: 'error', detail: 'no token (set PROBE_TOKEN)' };
+      if (!token && !NO_TOKEN.has(route)) return { route, result: 'error', detail: 'no token (set PROBE_TOKEN)' };
       let r; try { r = impl[route](); } catch (e) { r = { result: 'error', detail: String(e.code || 'probe error') }; }
       return { route, result: r.result, detail: r.detail };
     }),
@@ -133,31 +185,87 @@ export function controlProblems(c, res) {
   if (missing.length) out.push(`control run lacks route(s): ${missing.join(', ')}`);
   if (c.target !== res.target) out.push('target differs from the control run');
   if (c.write_target !== res.write_target) out.push('write-target differs from the control run');
+  if ((c.factory_home ?? null) !== (res.factory_home ?? null)) out.push('factory-home differs from the control run');
+  if ((c.net_host ?? null) !== (res.net_host ?? null)) out.push('net-host differs from the control run');
   if (!c.token_sha256 || c.token_sha256 !== res.token_sha256) out.push('token differs from the control run');
-  for (const r of c.routes) if (!WEAK.has(r.route) && r.detail !== 'tool missing' && r.result !== 'leaked') out.push(`control run did not leak via ${r.route} (${r.result})`);
+  const exempt = (r) => r.detail === 'tool missing' || (typeof r.detail === 'string' && r.detail.startsWith('not configured'));
+  for (const r of c.routes) if (!WEAK.has(r.route) && !exempt(r) && r.result !== 'leaked') out.push(`control run did not leak via ${r.route} (${r.result})`);
   return out;
 }
 
+// host:port for --net-host: a plain host name, IPv4 or bracketed IPv6 address (never a shell word), not loopback.
+export function parseNetHost(v, { allowLocal = false } = {}) {
+  const m = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})$/.exec(String(v));
+  if (!m) return null;
+  const host = m[1].replace(/^\[|\]$/g, ''); const port = Number(m[2]);
+  if (port < 1 || port > 65535) return null;
+  if (allowLocal) return { host, port };
+  if (/^(localhost|localhost\.|.*\.localhost)$/i.test(host) || /^127\./.test(host) || /^0+(\.0+){0,3}$/.test(host) || /^(::1?|0*:0*:.*:0*1)$/.test(host) || /^::ffff:127\./i.test(host)) return null;
+  return { host, port };
+}
+
+// The saved form: route -> denied|leaked|error. A denied route counts only when the control run was accepted.
+export function savedForm(res, control, now = new Date()) {
+  const routes = {};
+  for (const r of res.routes) routes[r.route] = r.result === 'denied' && control !== 'accepted' ? 'error' : r.result;
+  return { ts: now.toISOString(), routes };
+}
+
+export function saveResult(home, doc) {
+  const dir = path.join(home, 'probes');
+  const st = (p) => { try { return fs.lstatSync(p); } catch { return null; } };
+  if (!st(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const d = st(dir);
+  if (!d || d.isSymbolicLink() || !d.isDirectory() || (process.getuid && d.uid !== process.getuid())) throw new Error(`refusing to save: ${dir} is a symlink, not a directory, or owned by another user`);
+  if ((d.mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
+  const file = path.join(dir, 'last.json');
+  if (st(file) && !st(file).isFile()) throw new Error(`refusing to save: ${file} is a symlink or not a regular file`);
+  writeJsonAtomic(file, doc);
+  return file;
+}
+
+const isResult = (j) => j && typeof j === 'object' && Array.isArray(j.routes) && j.routes.every((r) => r && typeof r === 'object' && ROUTES.includes(r.route) && ['denied', 'leaked', 'error'].includes(r.result) && typeof r.detail === 'string');
+
 function main(argv) {
-  const o = { json: false }; const flags = { '--target': 'target', '--write-target': 'writeTarget', '--workdir': 'workdir', '--control': 'control' };
+  const o = { json: false, save: false };
+  const flags = { '--target': 'target', '--write-target': 'writeTarget', '--workdir': 'workdir', '--control': 'control', '--factory-home': 'factoryHome', '--net-host': 'netHost', '--net-timeout-ms': 'netTimeoutMs', '--from': 'from' };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--json') o.json = true;
+    else if (argv[i] === '--save') o.save = true;
     else if (flags[argv[i]] && argv[i + 1] !== undefined) o[flags[argv[i]]] = argv[++i];
     else { process.stderr.write(`unknown or incomplete argument: ${argv[i]}\n`); return 2; }
   }
-  if (!o.target || !o.writeTarget) { process.stderr.write('usage: [PROBE_TOKEN=...] probe.mjs --target <dir> --write-target <dir> [--workdir <dir>] [--control <control.json>] [--json]\n'); return 2; }
-  const res = runProbe(o);
+  if (o.netHost !== undefined) {
+    o.netHost = parseNetHost(o.netHost);
+    if (!o.netHost) { process.stderr.write('--net-host must be host:port (port 1-65535) of a non-local host\n'); return 2; }
+  }
+  if (o.netTimeoutMs !== undefined) {
+    o.netTimeoutMs = Number(o.netTimeoutMs);
+    if (!Number.isInteger(o.netTimeoutMs) || o.netTimeoutMs < 100 || o.netTimeoutMs > 60000) { process.stderr.write('--net-timeout-ms must be an integer 100-60000\n'); return 2; }
+  }
+  let res;
+  if (o.from) {
+    let j; try { j = JSON.parse(fs.readFileSync(o.from, 'utf8')); } catch { j = null; }
+    if (!isResult(j)) { process.stderr.write('--from: not a probe --json result\n'); return 2; }
+    res = { ...j, warnings: [] };
+  } else {
+    if (!o.target || !o.writeTarget) { process.stderr.write('usage: [PROBE_TOKEN=...] probe.mjs --target <dir> --write-target <dir> [--workdir <dir>] [--factory-home <dir>] [--net-host <host:port>] [--control <control.json>] [--json] [--save]\n       probe.mjs --from <probe.json> [--control <control.json>] --save\n'); return 2; }
+    res = runProbe(o);
+  }
   let control = null;
   if (o.control) {
     let c; try { c = JSON.parse(fs.readFileSync(o.control, 'utf8')); } catch { c = null; }
     const problems = controlProblems(c, res);
     if (problems.length) { for (const p of problems) res.warnings.push(`control rejected: ${p}`); control = 'rejected'; } else control = 'accepted';
-  } else if (!res.routes.some((r) => r.route !== 'write' && r.result === 'leaked')) {
+  } else if (!res.routes.some((r) => !NO_TOKEN.has(r.route) && r.result === 'leaked')) {
     res.warnings.push('no read route leaked: this proves nothing without a control run (--control)');
   }
   res.control = control;
+  if (o.save) {
+    try { const f = saveResult(factoryHome(), savedForm(res, control)); process.stderr.write(`saved: ${f}${control === 'accepted' ? '' : ' (no accepted control run: denied routes saved as error)'}\n`); } catch (e) { process.stderr.write(`${e.message}\n`); return 2; }
+  }
   if (o.json) process.stdout.write(JSON.stringify(res, null, 2) + '\n');
-  else for (const r of res.routes) process.stdout.write(`${r.route.padEnd(12)} ${r.result.padEnd(7)} ${r.detail}\n`);
+  else for (const r of res.routes) process.stdout.write(`${r.route.padEnd(18)} ${r.result.padEnd(7)} ${r.detail}\n`);
   for (const w of res.warnings) process.stderr.write(`WARNING: ${w}\n`);
   if (control === 'rejected') return 3;
   if (res.routes.some((r) => r.result === 'leaked')) return 1;

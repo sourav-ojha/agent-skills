@@ -781,6 +781,7 @@ test('CFG a feature that changes the config file is held for a person', () => {
   assert.deepEqual(e.d('built', 'FEATURE-001', '--tier', 'T2').json.ci_files_touched, ['.product/delivery.json']);
 });
 
+// Hard stop hs-destructive-data (P2.2): a migration (a table-dropping one included) is held for a person.
 test('CFG hold_paths: files under a configured path need a person (for example migrations)', () => {
   const e = setup({ 'FEATURE-001': {} }, { config: { protected_branches: [], hold_paths: ['migrations/', '**/*.sql'] } });
   e.d('init', '--merge', '--note', 'ok');

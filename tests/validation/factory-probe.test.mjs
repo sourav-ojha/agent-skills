@@ -97,7 +97,7 @@ test('missing target dir: reads denied, with a "proves nothing" warning', (t) =>
   const j = JSON.parse(run.stdout);
   assert.ok(j.warnings.some((w) => /parent directory of --target/.test(w)));
   assert.ok(j.warnings.some((w) => /proves nothing without a control run/.test(w)));
-  assert.ok(j.routes.filter((x) => x.route !== 'write' && !['mdfind', 'qlmanage', 'python -c'].includes(x.route)).every((x) => x.result === 'denied'));
+  assert.ok(j.routes.filter((x) => x.route !== 'write' && !x.detail.startsWith('not configured') && !['mdfind', 'qlmanage', 'python -c'].includes(x.route)).every((x) => x.result === 'denied'));
   assert.match(run.stderr, /proves nothing/);
 });
 
@@ -160,7 +160,145 @@ test('--control accepted and everything denied: exit 0', (t) => {
     assert.equal(j.control, 'accepted');
     // find/git/python read via child processes; all should be denied now. mdfind/qlmanage may vary.
     const hard = j.routes.filter((x) => !['mdfind', 'qlmanage'].includes(x.route));
-    assert.ok(hard.every((x) => x.result === 'denied' || x.detail === 'tool missing'), JSON.stringify(hard));
+    assert.ok(hard.every((x) => x.result === 'denied' || x.detail === 'tool missing' || x.detail.startsWith('not configured')), JSON.stringify(hard));
     if (!j.routes.some((x) => x.result === 'leaked' || x.result === 'error')) assert.equal(run.status, 0);
   } finally { fs.chmodSync(f.wt, 0o700); }
+});
+
+// ---- Phase 2 (P2.2) routes: FACTORY_HOME state writes and an outbound connect through Bash --------------------------------------
+const HOME_ROUTES = ['write stop/', 'write runs/', 'write usage/', 'write verdicts/', 'write records/', 'write config.json'];
+const stubHome = (f) => { const h = path.join(f.d, 'fhome'); fs.mkdirSync(h, { mode: 0o700 }); for (const s of ['stop', 'runs', 'usage', 'verdicts', 'records']) fs.mkdirSync(path.join(h, s), { mode: 0o700 }); fs.writeFileSync(path.join(h, 'config.json'), '{"keep":true}\n'); return h; };
+const lockHome = (h, mode) => { for (const s of ['stop', 'runs', 'usage', 'verdicts', 'records']) fs.chmodSync(path.join(h, s), mode); fs.chmodSync(path.join(h, 'config.json'), mode === 0o500 ? 0o400 : 0o600); fs.chmodSync(h, mode); };
+
+test('P2.2 routes are in ROUTES', () => {
+  for (const r of [...HOME_ROUTES, 'net bash']) assert.ok(ROUTES.includes(r), r);
+});
+
+test('FACTORY_HOME routes: leaked when writable, denied against a read-only stub home; config.json content is never changed; always cleaned up', (t) => {
+  const f = fixture(t);
+  const h = stubHome(f);
+  let r = byRoute(runProbe(opts(f, { factoryHome: h })));
+  for (const route of HOME_ROUTES) assert.equal(r[route].result, 'leaked', `${route}: ${r[route].detail}`);
+  for (const s of ['stop', 'runs', 'usage', 'verdicts', 'records']) assert.deepEqual(fs.readdirSync(path.join(h, s)), [], s);
+  assert.equal(fs.readFileSync(path.join(h, 'config.json'), 'utf8'), '{"keep":true}\n');
+  if (process.getuid && process.getuid() === 0) return;
+  lockHome(h, 0o500);
+  try { r = byRoute(runProbe(opts(f, { factoryHome: h }))); } finally { lockHome(h, 0o700); }
+  for (const route of HOME_ROUTES) assert.equal(r[route].result, 'denied', `${route}: ${r[route].detail}`);
+  assert.deepEqual(fs.readdirSync(h).sort(), ['config.json', 'records', 'runs', 'stop', 'usage', 'verdicts']);
+});
+
+test('FACTORY_HOME routes: a missing subdirectory or config.json is created (leaked) and removed again; read-only home denies', (t) => {
+  const f = fixture(t);
+  const h = path.join(f.d, 'bare-home'); fs.mkdirSync(h, { mode: 0o700 });
+  let r = byRoute(runProbe(opts(f, { factoryHome: h })));
+  for (const route of HOME_ROUTES) assert.equal(r[route].result, 'leaked', `${route}: ${r[route].detail}`);
+  assert.deepEqual(fs.readdirSync(h), [], 'nothing left behind');
+  if (process.getuid && process.getuid() === 0) return;
+  fs.chmodSync(h, 0o500);
+  try { r = byRoute(runProbe(opts(f, { factoryHome: h }))); } finally { fs.chmodSync(h, 0o700); }
+  for (const route of HOME_ROUTES) assert.equal(r[route].result, 'denied', `${route}: ${r[route].detail}`);
+});
+
+test('not configured: FACTORY_HOME and net routes report error "not configured", never denied', (t) => {
+  const f = fixture(t);
+  const r = byRoute(runProbe(opts(f)));
+  for (const route of [...HOME_ROUTES, 'net bash']) assert.deepEqual([r[route].result, r[route].detail.startsWith('not configured')], ['error', true], route);
+});
+
+test('net bash: a connect to a reserved documentation address (192.0.2.1) does not succeed -> denied; a listening local stub -> leaked', async (t) => {
+  const f = fixture(t);
+  const r = byRoute(runProbe(opts(f, { netHost: '192.0.2.1:9', netTimeoutMs: 1500 })));
+  assert.equal(r['net bash'].result, 'denied', r['net bash'].detail);
+  const net = await import('node:net');
+  const srv = net.createServer(); await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  t.after(() => srv.close());
+  // The kernel completes the handshake from the listen backlog while spawnSync blocks this process.
+  const l = byRoute(runProbe(opts(f, { netHost: `127.0.0.1:${srv.address().port}`, netTimeoutMs: 3000 })));
+  assert.equal(l['net bash'].result, 'leaked', l['net bash'].detail);
+  const bad = byRoute(runProbe(opts(f, { netHost: '192.0.2.1:9', netTimeoutMs: 1500, bin: { bash: '/nonexistent/bash-xyz' } })));
+  assert.deepEqual([bad['net bash'].result, bad['net bash'].detail], ['error', 'tool missing']);
+});
+
+test('CLI --net-host: malformed or local hosts are a usage error (exit 2)', (t) => {
+  const f = fixture(t);
+  for (const h of ['localhost:80', '127.0.0.1:80', '[::1]:80', '::1', 'example.com', 'a;b:80', '192.0.2.1:0', '192.0.2.1:99999', '$(x):80']) {
+    assert.equal(cli(f, ['--net-host', h]).status, 2, h);
+  }
+});
+
+test('--control: an unconfigured route in both runs is exempt; a control run that did not connect rejects net bash', (t) => {
+  const f = fixture(t);
+  const ctlFile = path.join(f.d, 'control.json');
+  const ctl = cli(f); fs.writeFileSync(ctlFile, ctl.stdout);
+  assert.equal(JSON.parse(cli(f, ['--control', ctlFile]).stdout).control, 'accepted');
+  const h = stubHome(f);
+  // control without --factory-home, this run with it: configuration differs -> rejected
+  const diff = cli(f, ['--factory-home', h, '--control', ctlFile]);
+  assert.equal(diff.status, 3); assert.match(diff.stderr, /factory-home differs/);
+  // a control run whose connect timed out (the documentation address never answers) proves nothing for net bash
+  const n = cli(f, ['--net-host', '192.0.2.1:9', '--net-timeout-ms', '1500']); fs.writeFileSync(ctlFile, n.stdout);
+  const nn = cli(f, ['--net-host', '192.0.2.1:9', '--net-timeout-ms', '1500', '--control', ctlFile]);
+  assert.equal(nn.status, 3); assert.match(nn.stderr, /did not leak via net bash/);
+});
+
+// ---- --save ---------------------------------------------------------------------------------------------------------------------
+const saveEnv = (fh) => ({ PROBE_TOKEN: TOKEN, FACTORY_HOME: fh });
+test('--save: writes $FACTORY_HOME/probes/last.json privately ({ ts, routes }); without an accepted control a denied route is saved as error', (t) => {
+  const f = fixture(t);
+  const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
+  const run = cli(f, ['--save', '--net-host', '192.0.2.1:9', '--net-timeout-ms', '1500'], saveEnv(fh));
+  assert.equal(run.status, 1, run.stderr); // unsandboxed: leaks
+  const dir = path.join(fh, 'probes'); const file = path.join(dir, 'last.json');
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(Object.keys(saved).sort(), ['routes', 'ts']);
+  assert.ok(!Number.isNaN(Date.parse(saved.ts)));
+  assert.deepEqual(Object.keys(saved.routes).sort(), [...ROUTES].sort());
+  for (const v of Object.values(saved.routes)) assert.ok(['denied', 'leaked', 'error'].includes(v));
+  assert.equal(saved.routes.cat, 'leaked');
+  assert.equal(saved.routes['net bash'], 'error', 'a denied result without an accepted control run is not saved as proof');
+  assert.ok(!fs.readFileSync(file, 'utf8').includes(TOKEN));
+  assert.deepEqual(fs.readdirSync(dir), ['last.json'], 'atomic: no temp file left');
+});
+
+test('--save: an accepted control keeps denied results; --from re-saves an earlier --json result (rechecked against --control)', (t) => {
+  if (process.getuid && process.getuid() === 0) return;
+  const f = fixture(t);
+  const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
+  const ctlFile = path.join(f.d, 'control.json'); fs.writeFileSync(ctlFile, cli(f).stdout);
+  fs.chmodSync(path.join(f.target, '.probe-sentinel'), 0o000);
+  const resFile = path.join(f.d, 'result.json');
+  try { fs.writeFileSync(resFile, cli(f, ['--control', ctlFile]).stdout); } finally { fs.chmodSync(path.join(f.target, '.probe-sentinel'), 0o600); }
+  const s = spawnSync('node', [SCRIPT, '--from', resFile, '--control', ctlFile, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh }, timeout: 60000 });
+  assert.ok([0, 1, 2].includes(s.status), s.stderr);
+  const saved = JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8'));
+  assert.equal(saved.routes.cat, 'denied');
+  assert.equal(saved.routes['net bash'], 'error', 'not configured');
+  // without --control, --from saves no denied result as proof
+  const s2 = spawnSync('node', [SCRIPT, '--from', resFile, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh }, timeout: 60000 });
+  assert.notEqual(s2.status, 3, s2.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8')).routes.cat, 'error');
+  // a malformed --from file is a usage error and saves nothing new
+  fs.writeFileSync(resFile, '{"routes": 5}');
+  const before = fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8');
+  assert.equal(spawnSync('node', [SCRIPT, '--from', resFile, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh } }).status, 2);
+  assert.equal(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8'), before);
+});
+
+test('--save: refuses a symlinked probes directory or result file (exit 2) and writes nothing through it', (t) => {
+  const f = fixture(t);
+  const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
+  const elsewhere = path.join(f.d, 'elsewhere'); fs.mkdirSync(elsewhere, { mode: 0o700 });
+  fs.symlinkSync(elsewhere, path.join(fh, 'probes'));
+  const run = cli(f, ['--save'], saveEnv(fh));
+  assert.equal(run.status, 2); assert.match(run.stderr, /symlink/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  fs.rmSync(path.join(fh, 'probes'));
+  fs.mkdirSync(path.join(fh, 'probes'), { mode: 0o700 });
+  fs.symlinkSync(path.join(elsewhere, 'x.json'), path.join(fh, 'probes', 'last.json'));
+  const run2 = cli(f, ['--save'], saveEnv(fh));
+  assert.equal(run2.status, 2); assert.match(run2.stderr, /symlink/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
 });

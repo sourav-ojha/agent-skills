@@ -6,12 +6,14 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { REPO } from './helpers.mjs';
 
 export const SCRIPTS = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts');
 const HARNESS = path.join(REPO, 'tests', 'fixtures', 'factory-harness.mjs');
 const FAKE_GH = path.join(REPO, 'tests', 'validation', 'fixtures-gh', 'gh.mjs');
 const FAKE_CLAUDE = path.join(REPO, 'tests', 'fixtures', 'fake-claude', 'claude');
+const { ROUTES: PROBE_ROUTES } = await import(pathToFileURL(path.join(SCRIPTS, 'probe.mjs')).href);
 
 export const fspec = (id, title) => `---\ntype: feature-spec\nid: ${id}\nopportunity: OPP-001\nstatus: ready\n---\n# ${title}\n\n## Acceptance criteria\n\n| ID | Criterion |\n|---|---|\n| AC-1 | Given items When listing Then they are returned |\n\n## Edge cases\n\n- EC-1: an empty list returns an empty array\n\n## HTTP contract\n\n- \`GET /api/items\`\n- \`POST /api/items\`\n`;
 export const HIDDEN = 'hidden-alpha-item';
@@ -22,12 +24,19 @@ export const AUTHOR_OK = JSON.stringify({ scenarios: [
 export const BASE_CONFIG = { protected_branches: [], merge: { mode: 'squash' }, checks: { required: ['ci'] }, readiness: { min_level: 4 }, verification: { required: true } };
 
 // A bare origin with two ready API features, a fake gh (protection requiring factory/verified), the fake claude as `claude`.
-export function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items one', 'FEATURE-002': 'Items two' }, fake = {}, gh = {}, test = {} } = {}) {
+// probe: the saved isolation-probe result (FACTORY_HOME/probes/last.json). Default: every route denied, so the hard-stop matrix is
+// proven and `factory run` prints no unproven row; null: no saved result; an object: written as is.
+export function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items one', 'FEATURE-002': 'Items two' }, fake = {}, gh = {}, test = {}, probe = 'denied' } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'factory-run-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const origin = path.join(root, 'origin.git'), work = path.join(root, 'work'), bin = path.join(root, 'bin'), home = path.join(root, 'home'), fhome = path.join(root, 'fhome');
   for (const d of [bin, home, path.join(home, '.claude')]) fs.mkdirSync(d, { recursive: true });
   fs.mkdirSync(fhome, { mode: 0o700 });
+  if (probe !== null) {
+    fs.mkdirSync(path.join(fhome, 'probes'), { mode: 0o700 });
+    const doc = probe === 'denied' ? { ts: '2026-11-21T00:00:00.000Z', routes: Object.fromEntries(PROBE_ROUTES.map((r) => [r, 'denied'])) } : probe;
+    fs.writeFileSync(path.join(fhome, 'probes', 'last.json'), JSON.stringify(doc), { mode: 0o600 });
+  }
   fs.copyFileSync(FAKE_GH, path.join(bin, 'gh.mjs'));
   fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nexec node "${path.join(bin, 'gh.mjs')}" "$@"\n`, { mode: 0o755 });
   fs.symlinkSync(FAKE_CLAUDE, path.join(bin, 'claude'));

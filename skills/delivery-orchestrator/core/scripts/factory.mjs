@@ -39,6 +39,7 @@ import { CLASSIFIER_STATUS } from './lib/limits.mjs';
 import { addUsage, dayUsage, featureUsage, UsageError } from './lib/usage.mjs';
 import { checkBudget } from './lib/budget.mjs';
 import { addAttention, listAttention, resolveAttention } from './lib/attention.mjs';
+import { loadProbeResult, unprovenRows, PROBE_RUN } from './lib/hardstops.mjs';
 import { routeInterruption } from './lib/interrupt.mjs';
 import { readRun, updateRun, RunStateError } from './lib/runstate.mjs';
 import { notify } from './lib/notify.mjs';
@@ -1189,6 +1190,18 @@ function sweep(ctx) {
 
 // ---- run: the loop ------------------------------------------------------------------------------------------------------------------
 const TERMINAL = ['merged', 'skipped', 'blocked'];
+// P2.2: a hard stop proven only by the isolation probe is unproven until a saved probe result ($FACTORY_HOME/probes/last.json)
+// shows its routes denied. Each unproven row is printed and recorded as one attention row; the run is not blocked by it.
+function reportHardStops(ctx) {
+  const rows = unprovenRows(loadProbeResult(ctx.fh));
+  for (const r of rows) ctx.out(`unproven hard stop: ${r.id} ${r.name}`);
+  const item = { id: 'probe', kind: 'unproven_hardstop' };
+  const what = `unproven hard stops: ${rows.map((r) => r.id).join(', ')}`;
+  if (rows.length && listAttention(ctx.fh, ctx.key).some((i) => i.id === item.id && i.kind === item.kind && i.what === what)) return;
+  resolveAttention(ctx.fh, ctx.key, item); // the row always names the current set
+  if (rows.length) addAttention(ctx.fh, ctx.key, { ...item, severity: 'medium', what, run: PROBE_RUN });
+}
+
 export async function cmdRun(ctx) {
   const { opt } = ctx.args;
   const only = idList(opt.only);
@@ -1197,6 +1210,7 @@ export async function cmdRun(ctx) {
   if (stopRequested(ctx) && !opt.continue) refuse('a stop was requested for this repository (factory stop)', 'run "factory run --continue" to clear the stop and continue the same run');
   startChecks(ctx);
   if (ctx.local.budgets.day_tokens === null) ctx.out('warning: no daily token cap is set (budgets.day_tokens in ~/.factory/config.json)');
+  reportHardStops(ctx);
   usagePreflight(ctx);
   let saved;
   try { saved = readRun(ctx.fh, ctx.key); } catch (e) { if (e instanceof RunStateError) refuse(e.message, 'fix or remove that file by hand (it is the run state), then run again'); throw e; }

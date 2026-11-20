@@ -32,3 +32,15 @@
 1. Branch protection on the base: require status checks; require a review if you want a person on every merge (the pipeline will then hold each PR, which is the intended behaviour).
 2. Start small: `--limit 1` for the first run, then widen.
 3. Read the final report; stashes and unmerged branches are listed there.
+
+## Proving the hard stops
+
+Each Phase 2 hard stop (spec P2.2) has a real mechanism and a proof, listed in `core/scripts/lib/hardstops.mjs`. Rows proven by a test are covered by the test suite. Rows proven by the isolation probe (`core/scripts/probe.mjs`) stay **unproven** until a saved probe result shows their routes denied: `factory run` prints each one at start (`unproven hard stop: <id> <name>`) and adds one attention row (`unproven_hardstop`). It is a warning; the run continues.
+
+To prove them on this machine (the builder cannot write `~/.factory`, so the save happens outside it):
+
+1. Outside the builder: put a random token in `<dir>/.probe-sentinel`, then run `PROBE_TOKEN=<token> node probe.mjs --target <dir> --write-target <dir2> --factory-home ~/.factory --net-host <host:port> --json > control.json`. Every route should leak there (the control).
+2. Inside a builder session: the same command with `> probe.json`.
+3. Outside it: `node probe.mjs --from probe.json --control control.json --save` writes `~/.factory/probes/last.json`. Without an accepted control, denied routes are saved as `error` (still unproven).
+
+`--net-host` must be a non-local host you are allowed to connect to; never a production host or database. Denying `gh` or `git push` by permission pattern is only a prompt-layer rule; the real controls are no token, the network limit and branch protection.
