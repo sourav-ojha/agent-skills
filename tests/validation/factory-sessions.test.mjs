@@ -784,13 +784,17 @@ test('runSession abort: a shouldAbort that throws is treated as false (the sessi
   assert.equal(r.timedOut, true); assert.equal(r.failure.kind, 'timeout');
 });
 
-test('runSession abort: a 100 ms abortPollMs aborts within ~400 ms (poll cadence)', async (t) => {
+test('runSession abort: with abortPollMs 100 shouldAbort is polled every 80-180 ms (cadence measured on the calls)', async (t) => {
   const f = fake(t, { mode: 'timeout' });
   const { cwd, settingsFile } = setup(t);
-  let spawnedAt = 0;
-  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 100, onSpawn: () => { spawnedAt = Date.now(); }, shouldAbort: () => true });
-  assert.equal(r.failure.kind, 'stopped');
-  assert.ok(Date.now() - spawnedAt < 600, `took ${Date.now() - spawnedAt} ms`);
+  const stamps = [];
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 1, claudeBin: f.bin, killGraceMs: 300, abortPollMs: 100, shouldAbort: () => { stamps.push(process.hrtime.bigint()); return false; } });
+  assert.equal(r.failure.kind, 'timeout');
+  assert.ok(stamps.length >= 5, `only ${stamps.length} polls`);
+  for (let i = 1; i < stamps.length; i++) {
+    const gap = Number(stamps[i] - stamps[i - 1]) / 1e6;
+    assert.ok(gap >= 80 && gap <= 180, `poll gap ${gap.toFixed(0)} ms`);
+  }
 });
 
 test('runSession abort: bad abort options throw', async (t) => {
