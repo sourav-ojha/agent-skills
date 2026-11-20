@@ -2,6 +2,9 @@
 // Status: FIXTURES ONLY. Shapes come from documented/observed field names, not from a captured real limit event
 // (see docs/factory/spikes/limit-detection.md).
 
+// 'fixtures_only' until the classifier is validated against a captured real limit event; gates wait_for_reset.
+export const CLASSIFIER_STATUS = 'fixtures_only';
+
 const OTHER = Object.freeze({ kind: 'other', resetAt: null, source: 'none' });
 const DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 

@@ -99,3 +99,48 @@ test('deliver init: explicit L0 ignores --merge and says so; legacy pr-only stil
   const l1 = initWith({ autonomy: { level: 'L1' } }, []);
   assert.equal(l1.json.merge, true);
 });
+
+// ---- local config (~/.factory/config.json) ----
+const lc = await import(path.join(SK, 'core', 'scripts', 'lib', 'localconfig.mjs'));
+const lim = await import(path.join(SK, 'core', 'scripts', 'lib', 'limits.mjs'));
+
+test('local config: classifier status is fixtures_only', () => {
+  assert.equal(lim.CLASSIFIER_STATUS, 'fixtures_only');
+});
+test('local config: {} gives the defaults', () => {
+  const { config, errors } = lc.parseLocalConfig({});
+  assert.deepEqual(errors, []);
+  assert.deepEqual(config, { wait_for_reset: false, max_wait_h: 6, max_wait_weekly_h: 0, keep_awake: true, fallback_model: null, budgets: { day_tokens: null } });
+});
+test('local config: bounds are accepted at the edge and rejected just outside', () => {
+  const ok = (o) => lc.parseLocalConfig(o).errors.length === 0;
+  assert.ok(ok({ max_wait_h: 0 }) && ok({ max_wait_h: 12 }) && !ok({ max_wait_h: -1 }) && !ok({ max_wait_h: 12.5 }) && !ok({ max_wait_h: '6' }));
+  assert.ok(ok({ max_wait_weekly_h: 0 }) && ok({ max_wait_weekly_h: 168 }) && !ok({ max_wait_weekly_h: 169 }) && !ok({ max_wait_weekly_h: -1 }));
+  assert.ok(ok({ budgets: { day_tokens: 10000 } }) && ok({ budgets: { day_tokens: 1000000000 } }) && ok({ budgets: { day_tokens: null } }));
+  assert.ok(!ok({ budgets: { day_tokens: 9999 } }) && !ok({ budgets: { day_tokens: 1000000001 } }) && !ok({ budgets: { day_tokens: 10000.5 } }));
+  assert.ok(!ok({ keep_awake: 'yes' }) && !ok({ fallback_model: 3 }) && ok({ fallback_model: 'sonnet' }));
+});
+test('local config: unknown keys are errors, top level and under budgets', () => {
+  assert.ok(lc.parseLocalConfig({ nope: 1 }).errors.some((e) => e.includes('nope')));
+  assert.ok(lc.parseLocalConfig({ budgets: { feature: 5 } }).errors.some((e) => e.includes('feature')));
+});
+test('local config: wait_for_reset true is refused while the classifier is fixtures only', () => {
+  const r = lc.parseLocalConfig({ wait_for_reset: true });
+  assert.ok(r.errors.some((e) => e.includes('fixtures only')));
+  const real = lc.parseLocalConfig({ wait_for_reset: true }, { classifierReal: true });
+  assert.deepEqual(real.errors, []);
+  assert.equal(real.config.wait_for_reset, true);
+});
+test('local config: load handles missing, bad JSON, and a symlink', () => {
+  const home = tmpDir();
+  assert.deepEqual(lc.loadLocalConfig(home).errors, []);
+  assert.equal(lc.loadLocalConfig(home).config.max_wait_h, 6);
+  fs.writeFileSync(path.join(home, 'config.json'), '{');
+  assert.ok(lc.loadLocalConfig(home).errors.some((e) => e.includes('config.json')));
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ max_wait_h: 2 }));
+  assert.equal(lc.loadLocalConfig(home).config.max_wait_h, 2);
+  const h2 = tmpDir();
+  fs.writeFileSync(path.join(h2, 'real.json'), '{}');
+  fs.symlinkSync(path.join(h2, 'real.json'), path.join(h2, 'config.json'));
+  assert.ok(lc.loadLocalConfig(h2).errors.some((e) => e.includes('config.json')));
+});
