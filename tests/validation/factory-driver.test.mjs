@@ -851,3 +851,176 @@ test('driver: pure: inputs are never mutated', () => {
   assert.equal(JSON.stringify(f), snap);
   assert.deepEqual(r, R('ci', 'failed'));
 });
+
+// ================================================================================================================================
+// Task 11b: factory CLI (scenarios, run), run records. Integration through tests/fixtures/factory-harness.mjs (test seams only) with
+// the fake claude (mode "factory") and the fake gh. The origin is a local bare repo reached through a per-process url.insteadOf.
+// ================================================================================================================================
+import { spawnSync } from 'node:child_process';
+const SCRIPTS = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts');
+const HARNESS = path.join(REPO, 'tests', 'fixtures', 'factory-harness.mjs');
+const FAKE_GH = path.join(REPO, 'tests', 'validation', 'fixtures-gh', 'gh.mjs');
+const FAKE_CLAUDE = path.join(REPO, 'tests', 'fixtures', 'fake-claude', 'claude');
+const FX = await import(pathToFileURL(path.join(SCRIPTS, 'factory.mjs')).href);
+const SC = await import(pathToFileURL(path.join(LIB, 'scenarios.mjs')).href);
+const RR = await import(pathToFileURL(path.join(LIB, 'runrecord.mjs')).href);
+const VD = await import(pathToFileURL(path.join(LIB, 'verdict.mjs')).href);
+
+const fspec = (id, title) => `---\ntype: feature-spec\nid: ${id}\nopportunity: OPP-001\nstatus: ready\n---\n# ${title}\n\n## Acceptance criteria\n\n| ID | Criterion |\n|---|---|\n| AC-1 | Given items When listing Then they are returned |\n\n## Edge cases\n\n- EC-1: an empty list returns an empty array\n\n## HTTP contract\n\n- \`GET /api/items\`\n- \`POST /api/items\`\n`;
+const HIDDEN = 'hidden-alpha-item';
+const AUTHOR_OK = JSON.stringify({ scenarios: [
+  { id: 'S-1', covers: ['AC-1'], kind: 'api', setup: [{ method: 'POST', path: '/api/items', body: { name: `${HIDDEN} {{CANARY}}` } }], request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }, { json_path: '$.items[*].name', contains: `${HIDDEN} {{CANARY}}` }] },
+  { id: 'S-2', covers: ['EC-1'], kind: 'api', request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }] },
+] });
+const BASE_CONFIG = { protected_branches: [], merge: { mode: 'squash' }, checks: { required: ['ci'] }, readiness: { min_level: 4 }, verification: { required: true } };
+
+// A bare origin with two ready API features, a fake gh (protection requiring factory/verified), the fake claude as `claude`.
+function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items one', 'FEATURE-002': 'Items two' }, fake = {}, gh = {}, test = {} } = {}) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'factory-run-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const origin = path.join(root, 'origin.git'), work = path.join(root, 'work'), bin = path.join(root, 'bin'), home = path.join(root, 'home'), fhome = path.join(root, 'fhome');
+  for (const d of [bin, home, path.join(home, '.claude')]) fs.mkdirSync(d, { recursive: true });
+  fs.mkdirSync(fhome, { mode: 0o700 });
+  fs.copyFileSync(FAKE_GH, path.join(bin, 'gh.mjs'));
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nexec node "${path.join(bin, 'gh.mjs')}" "$@"\n`, { mode: 0o755 });
+  fs.symlinkSync(FAKE_CLAUDE, path.join(bin, 'claude'));
+  const rw = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_0: 'git@github.com:o/r.git', GIT_CONFIG_KEY_1: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_1: 'ssh://git@github.com/o/r.git' };
+  const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, ...rw, HOME: home } }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
+  sh(root, 'init', '-q', '--bare', '-b', 'main', origin);
+  sh(root, 'clone', '-q', origin, work);
+  sh(work, 'config', 'user.email', 't@x'); sh(work, 'config', 'user.name', 't');
+  sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
+  fs.mkdirSync(path.join(work, '.product/features'), { recursive: true });
+  for (const [id, title] of Object.entries(specs)) fs.writeFileSync(path.join(work, `.product/features/${id}.md`), fspec(id, title));
+  fs.writeFileSync(path.join(work, '.product/delivery.json'), JSON.stringify(config, null, 2));
+  fs.mkdirSync(path.join(work, '.github/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(work, '.github/workflows/ci.yml'), 'name: ci\n');
+  fs.writeFileSync(path.join(work, 'README.md'), 'hi\n');
+  sh(work, 'checkout', '-q', '-b', 'main'); sh(work, 'add', '-A'); sh(work, 'commit', '-q', '-m', 'init'); sh(work, 'push', '-q', '-u', 'origin', 'main');
+  const state = path.join(root, 'gh.json');
+  fs.writeFileSync(state, JSON.stringify({ origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]], protection: { required_status_checks: { contexts: ['ci', 'factory/verified'] } }, enforceProtection: true, ...gh }));
+  const log = path.join(root, 'claude.log');
+  fs.writeFileSync(path.join(bin, 'fake.json'), JSON.stringify({ mode: 'factory', log, author: { 'FEATURE-001': AUTHOR_OK, 'FEATURE-002': AUTHOR_OK }, ...fake }));
+  const env = { ...process.env, ...rw, HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: fhome, FACTORY_TEST: JSON.stringify(test) };
+  delete env.FACTORY_BUILDER_HOME;
+  const factory = (args, extra = {}) => { const r = spawnSync(process.execPath, [HARNESS, ...args, '--dir', work], { encoding: 'utf8', env: { ...env, ...extra }, timeout: 240000 }); return { code: r.status, out: r.stdout, err: r.stderr, signal: r.signal }; };
+  const ghState = () => JSON.parse(fs.readFileSync(state, 'utf8'));
+  const setGh = (fn) => { const s = ghState(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };
+  const setFake = (fn) => { const p = path.join(bin, 'fake.json'); const s = JSON.parse(fs.readFileSync(p, 'utf8')); fn(s); fs.writeFileSync(p, JSON.stringify(s)); };
+  const sessions = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+  const queueFile = path.join(fhome, 'queues', 'o__r.json');
+  const queue = () => JSON.parse(fs.readFileSync(queueFile, 'utf8'));
+  const clone = path.join(fhome, 'clones', 'o__r');
+  const records = () => { const f = path.join(clone, '.skill-runs', 'factory-runs.jsonl'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []; };
+  const inHome = (fn) => { const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = fhome; try { return fn(); } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; } };
+  return { root, origin, work, bin, home, fhome, env, sh, factory, ghState, setGh, setFake, sessions, queue, queueFile, clone, records, inHome, builder: path.join(`${fhome}-builder`, 'o__r') };
+}
+const noText = (s, extra = []) => { for (const x of [HIDDEN, 'fx-', '/api/items', ...extra]) assert.ok(!String(s).includes(x), `leaks ${x}: ${String(s).slice(0, 400)}`); };
+
+test('factory scenarios: authors, lints and stores approved (auto) scenarios per ready feature; output has IDs and counts only', (t) => {
+  const w = world(t);
+  const r = w.factory(['scenarios']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /FEATURE-001 scenarios: stored \(2\), approved: auto/);
+  assert.match(r.out, /FEATURE-002 scenarios: stored \(2\), approved: auto/);
+  noText(r.out + r.err);
+  const doc = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
+  assert.match(doc.canary, /^fx-[0-9a-f]{6}$/);
+  assert.ok(JSON.stringify(doc.scenarios).includes(doc.canary), 'the canary from the prompt is in the scenario data');
+  assert.equal(doc.approved.by, 'auto');
+  assert.equal(doc.approved.scenarios_hash, SC.scenariosHash(doc));
+  const authors = w.sessions().filter((s) => s.argv.includes('--tools'));
+  assert.equal(authors.length, 2);
+  for (const a of authors) { assert.ok(a.argv.includes('--no-session-persistence')); assert.ok(a.cwd.startsWith(path.join(w.fhome, 'run', 'author')), 'author runs in an empty dir under FACTORY_HOME/run'); }
+  const again = w.factory(['scenarios']);
+  assert.equal(again.code, 0, again.out);
+  assert.match(again.out, /FEATURE-001 scenarios: current and approved/);
+  assert.equal(w.sessions().filter((s) => s.argv.includes('--tools')).length, 2, 'current scenarios are not re-authored');
+});
+
+test('factory scenarios: human approval stores unapproved; --approve ID --by NAME approves after a re-lint; a tampered doc is not current', (t) => {
+  const w = world(t, { config: { ...BASE_CONFIG, verification: { required: true, scenario_approval: 'human' } } });
+  const r = w.factory(['scenarios', '--only', 'FEATURE-001']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /FEATURE-001 scenarios: stored \(2\), awaiting approval/);
+  assert.equal(w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001')).approved, undefined);
+  assert.equal(w.factory(['scenarios', '--approve', 'FEATURE-001']).code, 1, '--by is required');
+  const a = w.factory(['scenarios', '--approve', 'FEATURE-001', '--by', 'alice']);
+  assert.equal(a.code, 0, a.out + a.err);
+  const doc = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
+  assert.equal(doc.approved.by, 'alice');
+  // Tamper: keep the approval, change the content -> not current (approval bound to scenarios_hash), and --approve re-lints.
+  const forged = { ...doc, scenarios: doc.scenarios.slice(0, 1) };
+  w.inHome(() => SC.saveScenarios('o__r', 'FEATURE-001', forged));
+  const s2 = w.factory(['scenarios', '--only', 'FEATURE-001']);
+  assert.match(s2.out, /FEATURE-001 scenarios: stored|awaiting approval/, 'a doc whose approval does not match its content is re-authored');
+  const after = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
+  assert.equal(after.scenarios.length, 2);
+  assert.equal(after.approved, undefined);
+});
+
+test('factory scenarios: a reply that fails the coverage lint is rejected with IDs and counts only and nothing is stored', (t) => {
+  const bad = JSON.stringify({ scenarios: [{ id: 'S-1', covers: ['AC-1'], kind: 'api', request: { method: 'GET', path: '/api/secret-route' }, assert: [{ status: 200 }] }] });
+  const w = world(t, { fake: { author: { 'FEATURE-001': bad } } });
+  const r = w.factory(['scenarios', '--only', 'FEATURE-001']);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /FEATURE-001 scenarios rejected: \d+ problem\(s\)/);
+  assert.match(r.out, /EC-1 is not covered/);
+  noText(r.out, ['secret-route']);
+  assert.equal(w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001')), null);
+  const notJson = world(t, { fake: { author: { 'FEATURE-001': 'here are your scenarios: ...' } } });
+  const n = notJson.factory(['scenarios', '--only', 'FEATURE-001']);
+  assert.equal(n.code, 1); assert.match(n.out, /1 problem/);
+});
+
+test('factory scenarios: a usage limit stops with exit 2; the lock held by another run refuses', (t) => {
+  const w = world(t, { fake: { author: { 'FEATURE-001': ['usage'] } } });
+  const r = w.factory(['scenarios', '--only', 'FEATURE-001']);
+  assert.equal(r.code, 2, r.out + r.err); assert.match(r.out, /usage limit/);
+  fs.mkdirSync(path.join(w.fhome, 'locks'), { recursive: true, mode: 0o700 });
+  const held = L.acquire('o__r', { home: w.fhome });
+  t.after(() => held.release());
+  const x = w.factory(['scenarios']);
+  assert.equal(x.code, 1); assert.match(x.out, /refused: another factory run holds the lock/); assert.match(x.out, /^fix: /m);
+  held.release();
+  // The driver clone is preflighted before every fetch: a planted hook (or config outside the allowlist) refuses the run.
+  const hook = path.join(w.clone, '.git', 'hooks', 'reference-transaction');
+  fs.writeFileSync(hook, `#!/bin/sh\ntouch "${path.join(w.root, 'HOOK-RAN')}"\n`, { mode: 0o755 });
+  const y = w.factory(['scenarios']);
+  assert.equal(y.code, 1, y.out); assert.match(y.out, /refused: the clone at FACTORY_HOME is not trusted: git repository not safe: a hook is installed/);
+  assert.equal(fs.existsSync(path.join(w.root, 'HOOK-RAN')), false, 'the hook never ran');
+  fs.rmSync(hook);
+  spawnSync('git', ['config', 'core.pager', 'less'], { cwd: w.clone });
+  assert.match(w.factory(['scenarios']).out, /not trusted: git config not allowed: core\.pager/);
+});
+
+test('scenarioState: the approved flag alone is never trusted (re-lint against the base criteria, approval bound to content)', (t) => {
+  const w = world(t);
+  assert.equal(w.factory(['scenarios', '--only', 'FEATURE-001']).code, 0);
+  const git = (...a) => spawnSync('git', a, { cwd: w.clone, encoding: 'utf8' });
+  const g = (...a) => { const r = git(...a); return { code: r.status, out: r.stdout, err: r.stderr }; };
+  const bc = FX.baseCriteria(g, 'main', '.product/features/FEATURE-001.md');
+  assert.equal(w.inHome(() => FX.scenarioState('o__r', 'FEATURE-001', bc)).ok, true);
+  const doc = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
+  for (const [what, d] of [
+    ['approval of other content', { ...doc, scenarios: [doc.scenarios[0], { ...doc.scenarios[1], assert: [{ status: 201 }] }] }],
+    ['stale criteria hash', SC.approve({ ...doc, approved: undefined, criteria_hash: `sha256:${'0'.repeat(64)}` }, 'auto')],
+    ['lint failure re-approved', SC.approve({ ...doc, approved: undefined, scenarios: doc.scenarios.slice(0, 1) }, 'auto')],
+    ['wrong feature', SC.approve({ ...doc, approved: undefined, feature: 'FEATURE-002' }, 'auto')],
+  ]) {
+    w.inHome(() => fs.writeFileSync(SC.scenarioPath('o__r', 'FEATURE-001'), JSON.stringify(d)));
+    assert.equal(w.inHome(() => FX.scenarioState('o__r', 'FEATURE-001', bc)).ok, false, what);
+  }
+});
+
+test('run record: verification fields and session usage are IDs and counts only; forged values are dropped', () => {
+  const f = { id: 'FEATURE-001', state: 'merged', verify_runs: 2, verify_ms: 1234, verdict: 'pass', verdict_sha: 'a'.repeat(40), gap_criteria: ['AC-1', 'EC-2', 'AC-1', 'not an id', 'S-1'], antigaming: ['G4', 'G9', 'x'], override_note: 'because the refactor is fine', sessions: [{ role: 'builder', id: '00000000-0000-4000-8000-000000000001', in: 1, out: 2, cache_create: 3, cache_read: 4, turns: 5, prompt: 'secret' }, { role: 'nobody', id: 'x' }, { role: 'author', id: 'bad id!', in: -1, out: 'x' }] };
+  const r = RR.buildRecord({ q: {}, f, run: 'r1', project: 'p', skills: {} });
+  assert.equal(r.verify_runs, 2); assert.equal(r.verify_ms, 1234); assert.equal(r.verdict, 'pass'); assert.equal(r.verdict_sha, 'a'.repeat(40));
+  assert.deepEqual(r.gap_criteria, ['AC-1', 'EC-2']); assert.deepEqual(r.antigaming, ['G4']);
+  assert.equal(r.override_note, true, 'override_note is a boolean only');
+  assert.deepEqual(r.sessions, [{ role: 'builder', id: '00000000-0000-4000-8000-000000000001', in: 1, out: 2, cache_create: 3, cache_read: 4, turns: 5 }, { role: 'author', id: null, in: 0, out: 0, cache_create: 0, cache_read: 0, turns: 0 }]);
+  assert.ok(!JSON.stringify(r).includes('refactor') && !JSON.stringify(r).includes('secret'));
+  const empty = RR.buildRecord({ q: {}, f: { id: 'FEATURE-002', state: 'blocked', verdict: 'maybe', verdict_sha: 'zz', verify_runs: -3, sessions: 'x' }, run: 'r', project: 'p', skills: {} });
+  assert.deepEqual([empty.verify_runs, empty.verify_ms, empty.verdict, empty.verdict_sha, empty.gap_criteria, empty.antigaming, empty.override_note, empty.sessions], [0, 0, null, null, [], [], false, []]);
+});

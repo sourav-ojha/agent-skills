@@ -166,6 +166,10 @@ function protection(ctx) {
   return { state: 'found', names: requiredFrom(okA ? parse(a.out) : null, okB ? parse(b.out) : null) };
 }
 
+// Required status checks on `base` from branch protection and rulesets: { state: 'found'|'none'|'unknown', names, reason? }.
+// For the factory driver's start check (branch protection must require factory/verified).
+export const requiredStatusChecks = ({ gh, repo, base }) => protection({ gh, repo, base });
+
 function c5(ctx) {
   const ls = ctx.git('ls-tree', '-r', '--name-only', baseRef(ctx));
   if (ls.code !== 0) return res('fail', `cannot list files on ${baseRef(ctx)}`);

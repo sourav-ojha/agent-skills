@@ -6,7 +6,7 @@
 // The log (FAKE_CLAUDE_LOG / log) records argv, stdin status and env KEY NAMES only, never env values.
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const fromFile = (() => {
@@ -51,6 +51,57 @@ function writeResult(obj) {
   const dir = path.join(process.cwd(), '.implementation', cfg.feature);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'result.json'), JSON.stringify(obj));
+}
+
+// mode "factory" (driver integration tests): the feature id comes from the prompt.
+//   author session (argv has --tools ""): replies with fake.json author[<ID>] (a JSON string; {{CANARY}} -> the canary in the
+//   prompt), or a step from it when it is an array.
+//   builder session: runs step N of fake.json plan[<ID>] (N counts this feature's builder sessions, kept in <FAKE_CLAUDE_DIR>/
+//   count-<ID>; the last step repeats). A step: { files: {path: text}, spec_complete, commit, status: done|blocked|usage|none,
+//   question, pr_body, sleep_ms }.
+function factory() {
+  const argv = process.argv.slice(2);
+  const prompt = argv[argv.indexOf('-p') + 1] || '';
+  const id = (/FEATURE-\d+/.exec(prompt) || [])[0] || cfg.feature;
+  cfg.feature = id;
+  const dir = process.env.FAKE_CLAUDE_DIR || '.';
+  const step = (list) => {
+    if (!Array.isArray(list)) return list;
+    const cf = path.join(dir, `count-${argv.includes('--tools') ? 'author-' : ''}${id}`);
+    const n = Number(fs.existsSync(cf) ? fs.readFileSync(cf, 'utf8') : 0);
+    fs.writeFileSync(cf, String(n + 1));
+    return list[Math.min(n, list.length - 1)];
+  };
+  return (async () => {
+    await init();
+    if (argv.includes('--tools')) {
+      const canary = (/fx-[0-9a-f]{6}/.exec(prompt) || [])[0] || 'fx-000000';
+      const t = step(fromFile.author?.[id]);
+      if (t === 'usage') { await result({ is_error: true, api_error_status: 429, result: "You've hit your session limit · resets 3:45pm", terminal_reason: 'api_error' }); return 1; }
+      await assistant('msg_a', 'scenarios');
+      await result({ result: String(t ?? '{}').split('{{CANARY}}').join(canary) });
+      return 0;
+    }
+    const s = step(fromFile.plan?.[id]) || { status: 'done' };
+    if (s.sleep_ms) await sleep(s.sleep_ms);
+    // escape_ms: leaves a process in its own session (setsid) with cwd in the clone, out of the session's process group.
+    if (s.escape_ms) spawn(process.execPath, ['-e', `setTimeout(() => {}, ${Number(s.escape_ms)})`], { cwd: process.cwd(), detached: true, stdio: 'ignore' }).unref();
+    for (const [p, text] of Object.entries(s.files || {})) { fs.mkdirSync(path.dirname(path.join(process.cwd(), p)), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), p), text); }
+    if (s.spec_complete) {
+      const sp = path.join(process.cwd(), '.product', 'features', `${id}.md`);
+      fs.writeFileSync(sp, fs.readFileSync(sp, 'utf8').replace(/^status: ready/m, 'status: implemented').replace(/^---\n/, '---\ndelivery: complete\n'));
+    }
+    if (s.pr_body) { fs.mkdirSync(path.join(process.cwd(), '.delivery'), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), '.delivery', `pr-${id}.md`), s.pr_body); }
+    if (s.commit) {
+      const g = (...a) => spawnSync('git', a, { cwd: process.cwd(), encoding: 'utf8' });
+      g('add', '-A'); g('commit', '-q', '-m', `feat: ${id}`);
+    }
+    await assistant('msg_1', 'working'); await assistant('msg_2', 'done');
+    if (s.status === 'usage') { await result({ is_error: true, api_error_status: 429, result: "You've hit your session limit · resets 3:45pm", terminal_reason: 'api_error' }); return 1; }
+    if (s.status !== 'none') writeResult(s.status === 'blocked' ? { status: 'blocked', question: s.question || 'Which database?' } : { status: 'done', summary: 'implemented' });
+    await result();
+    return 0;
+  })();
 }
 
 async function main() {
@@ -130,6 +181,7 @@ async function main() {
       }
       return fromFile.exitCode ?? 0;
     }
+    case 'factory': return factory();
     default:
       process.stderr.write('fake-claude: unknown mode\n');
       return 2;
