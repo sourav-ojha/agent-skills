@@ -514,7 +514,7 @@ export async function runSession(opts) {
       stopped = true;
       killGroup(pgid, 'SIGTERM');
       killTimer = setTimeout(() => killGroup(pgid, 'SIGKILL'), killGraceMs);
-    }, Math.max(10, Math.min(250, Math.floor(timeoutS * 1000), abortPollMs)));
+    }, Math.max(10, Math.min(250, Math.floor(timeoutS * 1000), Math.floor(abortPollMs / 2))));
   });
 }
 

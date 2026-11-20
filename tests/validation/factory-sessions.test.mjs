@@ -775,12 +775,28 @@ test('runSession abort: a Date.now jump of +1 hour mid-session does not trigger 
   } finally { Date.now = realNow; }
 });
 
-test('runSession abort: a shouldAbort that throws is treated as false; bad abort options throw', async (t) => {
+test('runSession abort: a shouldAbort that throws is treated as false (the session runs to its natural timeout)', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  let calls = 0;
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 1, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 10, shouldAbort: () => { calls++; throw new Error('boom'); } });
+  assert.ok(calls > 0, 'shouldAbort was polled');
+  assert.equal(r.timedOut, true); assert.equal(r.failure.kind, 'timeout');
+});
+
+test('runSession abort: a 100 ms abortPollMs aborts within ~400 ms (poll cadence)', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  let spawnedAt = 0;
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 100, onSpawn: () => { spawnedAt = Date.now(); }, shouldAbort: () => true });
+  assert.equal(r.failure.kind, 'stopped');
+  assert.ok(Date.now() - spawnedAt < 600, `took ${Date.now() - spawnedAt} ms`);
+});
+
+test('runSession abort: bad abort options throw', async (t) => {
   const f = fake(t, { mode: 'done' });
   const { cwd, settingsFile } = setup(t);
   const base = { role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin };
-  const r = await S.runSession({ ...base, abortPollMs: 10, shouldAbort: () => { throw new Error('boom'); } });
-  assert.equal(r.ok, true);
   await assert.rejects(S.runSession({ ...base, shouldAbort: 'yes' }), TypeError);
   await assert.rejects(S.runSession({ ...base, abortPollMs: 9 }), TypeError);
   await assert.rejects(S.runSession({ ...base, abortPollMs: 1.5 }), TypeError);
