@@ -18,6 +18,7 @@ const P = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'proc.mjs')).href
 const U = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'usage.mjs')).href);
 const AT = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'attention.mjs')).href);
 const D = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'driver.mjs')).href);
+const FX = await import(pathToFileURL(path.join(SCRIPTS, 'factory.mjs')).href);
 
 const HARNESS = path.join(REPO, 'tests', 'fixtures', 'factory-harness.mjs');
 const DELIVER = path.join(SCRIPTS, 'deliver.mjs');
@@ -86,6 +87,30 @@ test('inspect: absent, live (own pid), stale (dead pid with a different start), 
 test('driver: RESULTS.ci has stopped, and a stopped CI wait is routed to the stop interruption in pr_open', () => {
   assert.ok(D.RESULTS.ci.includes('stopped'));
   assert.deepEqual({ ...D.nextAction({ id: 'FEATURE-001', state: 'pr_open', history: [] }, { step: 'ci', kind: 'stopped' }, { max_fix_rounds: 2, stop: null }) }, { do: 'interrupt', kind: 'stop' });
+});
+
+test('the stop sweep env rule uses only the run temps this driver created: another repository\'s run temp under FACTORY_HOME/tmp is left alone', async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'factory-sweep-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const fh = path.join(root, 'fhome');
+  for (const d of ['locks', 'tmp/0123456789abcdef01234567', 'tmp/fedcba9876543210fedcba98']) fs.mkdirSync(path.join(fh, d), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fh, 'locks', 'x__y.lock'), '{}'); // another repository's driver is running
+  const other = path.join(fh, 'tmp', '0123456789abcdef01234567');
+  const mine = path.join(fh, 'tmp', 'fedcba9876543210fedcba98');
+  // A run temp this driver created, recorded through the verification seam (as stepVerify passes it to verifyFeature).
+  const ctx = { fh, key: 'o__r', bRoot: path.join(root, 'b'), D: path.join(root, 'clone'), policy: {}, deps: { verifySeams: { makeRunTemp: () => mine } }, out: () => {} };
+  assert.equal(FX.verifySeamsFor(ctx).makeRunTemp(), mine);
+  assert.deepEqual(ctx.runTemps, [mine]);
+  const keep = 'setTimeout(() => {}, 120000)';
+  const start = (tmp) => spawn(process.execPath, ['-e', keep], { cwd: os.tmpdir(), env: { ...process.env, TMPDIR: tmp }, stdio: 'ignore' });
+  const theirs = start(other); const ours = start(mine);
+  t.after(() => { for (const c of [theirs, ours]) try { c.kill('SIGKILL'); } catch { /* gone */ } });
+  await until(() => VF.survivorPids([], { sandbox: [mine, other] }).killable.size >= 2, 'both processes listed', 10000);
+  await FX.killLeftovers(ctx);
+  await until(() => ours.exitCode !== null || ours.signalCode !== null, 'our sandboxed process to end', 15000);
+  assert.equal(theirs.exitCode, null, 'the other repository\'s verification process survives');
+  assert.doesNotThrow(() => process.kill(theirs.pid, 0));
+  theirs.kill('SIGKILL');
 });
 
 // ---- the stop flag ---------------------------------------------------------------------------------------------------------------------------

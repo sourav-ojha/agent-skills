@@ -29,6 +29,7 @@ import { sessionResult, nextAction, resumeAction, canHold, MAX_RESUMES } from '.
 import { acquire, inspect, LockError } from './lib/lock.mjs';
 import { verifyFeature, scanSurvivors, survivorPids, symptomBrief, postVerified } from './lib/verify.mjs';
 import { portOf, portInUse } from './lib/proc.mjs';
+import { makeRunTemp } from './lib/sandbox.mjs';
 import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
 import { requiredStatusChecks } from './lib/readiness.mjs';
@@ -404,14 +405,17 @@ const KILL_GRACE_MS = 10000; // SIGTERM to a session's (or deliver's) process gr
 const sessionStop = (ctx) => ({ shouldAbort: () => stopRequested(ctx) !== null, abortPollMs: STOP_POLL_MS, killGraceMs: KILL_GRACE_MS });
 const alivePid = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
 // After a stop: the processes still running IN the builder clone, the builder run dirs, the driver clone or the verification work
-// dirs (their cwd is inside one) or started in a sandbox (TMPDIR/HOME inside a builder run dir or FACTORY_HOME/tmp) get SIGTERM, then
+// dirs (their cwd is inside one) or started in one of THIS driver's sandboxes (TMPDIR/HOME inside this repository's builder run dir
+// or a verification run temp this driver created, ctx.runTemps; never FACTORY_HOME/tmp as a whole: it holds every repository's run
+// temps, and another repository's driver may be verifying right now) get SIGTERM, then
 // SIGKILL after 10 s if a fresh scan still finds them (a pid that exited and was reused meanwhile is not signalled). A process that
 // only mentions those paths in its argv or environment (an editor, `git -C <clone>`, a shell) is never killed: the broad detection
 // (noLiveBuilder, the next start's sweep) refuses to continue instead. Then the app ports of the base config must be free. Never this
 // process or its parent. Best effort: what is left is reported.
-async function killLeftovers(ctx) {
+export async function killLeftovers(ctx) {
   const markers = [ctx.bRoot && path.join(ctx.bRoot, ctx.key), ctx.bRoot && builderRun(ctx), ctx.D, ctx.fh && ctx.key && path.join(ctx.fh, 'work', ctx.key)].filter(Boolean);
-  const sandbox = [ctx.bRoot && builderRun(ctx), ctx.fh && path.join(ctx.fh, 'tmp')].filter(Boolean);
+  const real = (d) => { try { return fs.realpathSync(d); } catch { return d; } }; // /tmp vs /private/tmp on macOS
+  const sandbox = [...new Set([ctx.bRoot && builderRun(ctx), ...(ctx.runTemps || [])].filter(Boolean).map(real))];
   const scan = ctx.deps.survivorPids || survivorPids;
   const killable = () => new Set([...(scan(markers, { sandbox }).killable || [])].filter((p) => p !== process.pid && p !== process.ppid));
   const pids = [...killable()];
@@ -430,6 +434,12 @@ async function killLeftovers(ctx) {
     for (let i = 0; i < 20 && busy; i++) { busy = await (ctx.deps.portInUse || portInUse)(port, new URL(u).hostname); if (busy) await new Promise((r) => { setTimeout(r, 100); }); }
     if (busy) ctx.out(`warning: app port ${port} is still in use after the stop`);
   }
+}
+// The verification seams with makeRunTemp recorded: each run temp this driver creates goes on ctx.runTemps (the stop sweep's env roots).
+export function verifySeamsFor(ctx) {
+  const given = ctx.deps.verifySeams || {};
+  const make = given.makeRunTemp || makeRunTemp;
+  return { ...given, makeRunTemp: (...a) => { const d = make(...a); (ctx.runTemps ||= []).push(d); return d; } };
 }
 // How long this feature (or author spec) already waited for a usage limit, and how many rate retries it used. Per feature: a new
 // feature starts at zero, and a session that ends normally resets it.
@@ -1077,7 +1087,7 @@ async function stepVerify(ctx, f) {
   const t0 = Date.now();
   let r = null; let threw = false;
   try {
-    r = await (ctx.deps.verifyFeature || verifyFeature)({ repoKey: ctx.key, id: f.id, sha: f.ci_sha, baseRef: OR(ctx.base), config: ctx.policy, scenarios: st.doc, criteriaHash: bc.hash, git: (...a) => gitSafeOpts(ctx.D, a) }, ctx.deps.verifySeams);
+    r = await (ctx.deps.verifyFeature || verifyFeature)({ repoKey: ctx.key, id: f.id, sha: f.ci_sha, baseRef: OR(ctx.base), config: ctx.policy, scenarios: st.doc, criteriaHash: bc.hash, git: (...a) => gitSafeOpts(ctx.D, a) }, verifySeamsFor(ctx));
   } catch { threw = true; }
   const ok = !threw && (r?.verdict === 'pass' || r?.verdict === 'fail');
   const failedIds = ok && r.verdict === 'fail' ? (r.doc?.results || []).filter((x) => x.status !== 'pass' || x.flaky).flatMap((x) => x.covers) : [];

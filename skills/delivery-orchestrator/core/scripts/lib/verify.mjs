@@ -72,6 +72,9 @@ export function survivorPids(markers, { sandbox = [] } = {}) {
   const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
   if (ps.status !== 0 || ps.error) return { ok: false, pids: new Set(), killable: new Set() };
   const hits = new Set(); const kill = new Set();
+  // `ps -E` appends the environment to the argv with single spaces and no delimiter, so an argv word that looks like
+  // " TMPDIR=<root>..." cannot be told apart from the real variable; such a process would be treated as sandboxed. Accepted: the
+  // roots are this driver's own private run dirs, which nothing else has reason to name.
   const envIn = (text) => sandbox.some((k) => [' TMPDIR=', ' HOME='].some((v) => mentions(text, `${v}${k}`)));
   for (const line of ps.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line);
