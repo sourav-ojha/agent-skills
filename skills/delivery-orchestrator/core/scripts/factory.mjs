@@ -32,6 +32,11 @@ import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
 import { requiredStatusChecks } from './lib/readiness.mjs';
 import { readJson, writeJsonAtomic } from './lib/factoryhome.mjs';
+import { loadLocalConfig } from './lib/localconfig.mjs';
+import { CLASSIFIER_STATUS } from './lib/limits.mjs';
+import { addUsage, dayUsage, featureUsage, UsageError } from './lib/usage.mjs';
+import { checkBudget } from './lib/budget.mjs';
+import { addAttention } from './lib/attention.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 export const DELIVER = path.join(path.dirname(SELF), 'deliver.mjs');
@@ -235,7 +240,10 @@ export function scenarioState(key, id, bc, mode) {
   return { ok: true, doc };
 }
 
-export function makeContext({ argv, deps = {} }) {
+// The driver's wall clock (budget day, waits). Tests inject a fake one through deps.clock.
+const REAL_CLOCK = Object.freeze({ now: () => Date.now(), sleep: (ms) => new Promise((r) => { setTimeout(r, ms); }) });
+export function makeContext({ argv, deps: given = {} }) {
+  const deps = { ...given, clock: given.clock || REAL_CLOCK };
   const env = deps.env || process.env;
   const out = deps.out || ((line) => process.stdout.write(`${line}\n`));
   const ghEnv = {};
@@ -260,6 +268,11 @@ function useAccount(ctx, account, host) {
 export function prepare(ctx) {
   const { opt } = ctx.args;
   ctx.fh = homeDir(ctx.env);
+  // The per-user run-control config (FACTORY_HOME/config.json). Any error refuses: its returned config is never used then (a
+  // refused wait_for_reset: true still comes back true). The classifier gate: wait_for_reset needs a validated classifier.
+  const lc = loadLocalConfig(ctx.fh, { classifierReal: CLASSIFIER_STATUS === 'real' });
+  if (lc.errors.length) refuse(`the local config is invalid: ${lc.errors.join('; ')}`, `fix ${path.join(ctx.fh, 'config.json')} (or remove it to use the defaults)`);
+  ctx.local = lc.config;
   const dir = path.resolve(opt.dir || process.cwd());
   ctx.id = identify(ctx, dir);
   ctx.key = ctx.id.key;
@@ -324,11 +337,50 @@ export function parseAuthorReply(text) {
 }
 
 function usageEntry(role, r) {
-  return { role, id: r?.sessionId ?? null, in: r?.usage?.in ?? 0, out: r?.usage?.out ?? 0, cache_create: r?.usage?.cache_create ?? 0, cache_read: r?.usage?.cache_read ?? 0, turns: r?.turns ?? 0 };
+  const cost = r?.costUsd;
+  return { role, id: r?.sessionId ?? null, in: r?.usage?.in ?? 0, out: r?.usage?.out ?? 0, cache_create: r?.usage?.cache_create ?? 0, cache_read: r?.usage?.cache_read ?? 0, turns: r?.turns ?? 0, cost_usd: typeof cost === 'number' && Number.isFinite(cost) ? cost : null };
+}
+
+// ---- budgets ----------------------------------------------------------------------------------------------------------------------
+// The daily usage store is read-modify-write without a lock of its own: only the driver that holds this repository's lock writes it.
+function recordUsage(ctx, entry) {
+  if (!ctx.lock?.owned()) throw new Error('the factory lock is no longer ours');
+  addUsage(ctx.fh, ctx.key, new Date(ctx.deps.clock.now()), entry);
+}
+const capOk = (x) => typeof x === 'number' && Number.isFinite(x) && x >= 0;
+// The feature caps: the raised cap of the feature (f.budget_cap, set by --raise-budget) or the base policy's budgets.feature. A
+// malformed cap throws: a budget never fails open.
+export function featureCaps(ctx, f) {
+  const raised = f && f.budget_cap !== undefined && f.budget_cap !== null;
+  const caps = raised ? f.budget_cap : ctx.policy?.budgets?.feature;
+  if (!caps || typeof caps !== 'object' || !capOk(caps.tokens) || !capOk(caps.turns)) throw new Error(`the ${raised ? `raised budget cap of ${f.id}` : 'feature budget cap'} is malformed`);
+  return { tokens: caps.tokens, turns: caps.turns };
+}
+// Called before every builder and author session. Detects only (the caller's `interrupt` action holds or stops): null, or the
+// session result { step: 'session', kind: 'budget', scope: 'feature' | 'day', dim, used, cap }. Author sessions have no queue
+// feature and are checked against the day cap only. A corrupt usage store throws UsageError.
+export function enforceBudget(ctx, f, role) {
+  let caps = featureCaps(ctx, role === 'author' ? null : f);
+  const dayCap = ctx.local?.budgets ? ctx.local.budgets.day_tokens : undefined;
+  if (dayCap !== null && !capOk(dayCap)) throw new Error('the day budget cap is malformed');
+  const feat = role !== 'author' && f ? featureUsage(f) : null;
+  if (!feat) caps = { tokens: Infinity, turns: Infinity };
+  const day = dayCap === null ? { tokens: 0, turns: 0 } : dayUsage(ctx.fh, new Date(ctx.deps.clock.now()));
+  const r = checkBudget({ feature: feat || { tokens: 0, turns: 0 }, caps, day, dayCap });
+  return r.ok ? null : { step: 'session', kind: 'budget', scope: r.scope, dim: r.dim, used: r.used, cap: r.cap };
+}
+// Fail closed at start: an unreadable or corrupt daily usage file refuses the command before any session.
+function usagePreflight(ctx) {
+  try { dayUsage(ctx.fh, new Date(ctx.deps.clock.now())); } catch (e) {
+    if (e instanceof UsageError) refuse(e.message, 'fix or remove that file by hand (it is the daily token record), then run again');
+    throw e;
+  }
 }
 
 // One author session: an empty directory under FACTORY_HOME/run/, no tools, the spec items passed by the driver.
 async function authorOne(ctx, spec, bc) {
+  const budget = enforceBudget(ctx, null, 'author');
+  if (budget) return { status: 'error', kind: 'budget', budget };
   const canary = newCanary();
   const prompt = renderPrompt('scenario-author', { FEATURE_ID: spec.id, CANARY: canary, SPEC_SECTIONS: specSections(bc.criteria) });
   const runRoot = privateDir(path.join(privateDir(path.join(ctx.fh, 'run')), 'author'));
@@ -350,6 +402,7 @@ async function authorOne(ctx, spec, bc) {
     if (pgid) try { ctx.lock.forgetGroup(pgid); } catch { /* kept: killed on the next start */ }
     fs.rmSync(cwd, { recursive: true, force: true });
   }
+  if (r) recordUsage(ctx, usageEntry('author', r));
   const s = sessionResult(r, { status: 'done' });
   if (s.kind !== 'done') return { status: 'error', kind: s.kind, usage: usageEntry('author', r) };
   const scenarios = parseAuthorReply(r.result);
@@ -364,6 +417,7 @@ export async function cmdScenarios(ctx) {
   const { opt } = ctx.args;
   if (opt.approve !== undefined) return approveCmd(ctx, opt.approve, opt.by);
   const only = idList(opt.only);
+  usagePreflight(ctx);
   const specs = baseSpecs(ctx.git, ctx.base, ctx.policy.features_dir);
   for (const id of only) if (!specs.some((s) => s.id === id)) refuse(`--only names ${id}, which has no spec on origin/${ctx.base}`);
   const pick = specs.filter((s) => (only.length ? only.includes(s.id) : s.status === 'ready' && s.delivery !== 'complete'));
@@ -381,6 +435,7 @@ export async function cmdScenarios(ctx) {
       counts.failed++;
       ctx.out(`${spec.id} author session: ${r.kind}`);
       if (r.kind === 'usage_limit') { ctx.out('usage limit reached: stopping; run again later'); return 2; }
+      if (r.kind === 'budget') { ctx.out('stopped: day_budget'); return 2; }
       code = 1; continue;
     }
     if (r.status === 'invalid') { counts.invalid++; ctx.out(`${spec.id} scenarios rejected: ${r.problems.length} problem(s)`); for (const p of r.problems.slice(0, 50)) ctx.out(`  ${p}`); code = 1; continue; }
@@ -655,6 +710,9 @@ function tierOf(ctx, f) {
 }
 
 async function builderSession(ctx, f, act) {
+  // Before anything touches the branch or the counters: a budget hit starts no session (the interrupt action holds or stops).
+  const budget = enforceBudget(ctx, f, 'builder');
+  if (budget) return budget;
   if (act.brief === 'build') { // a fresh build (or a reset on resume) starts from the base commit in both clones
     must(ctx.git('checkout', '-q', '-f', '-B', f.branch, f.base_sha), 'reset of the feature branch');
   }
@@ -678,7 +736,9 @@ async function builderSession(ctx, f, act) {
       onSpawn: (x) => { pgid = x.pgid; ctx.lock.recordGroup(x.pgid); },
     });
   } finally { if (pgid) try { ctx.lock.forgetGroup(pgid); } catch { /* kept: killed on the next start */ } }
-  update(ctx, f.id, (x) => { (x.sessions ||= []).push(usageEntry('builder', r)); });
+  const entry = usageEntry('builder', r);
+  update(ctx, f.id, (x) => { (x.sessions ||= []).push(entry); });
+  recordUsage(ctx, entry);
   noLiveBuilder(ctx);
   fs.rmSync(runDir, { recursive: true, force: true });
   return sessionResult(r, readBuilderResult(ctx.B, f.id));
@@ -860,6 +920,8 @@ export async function cmdRun(ctx) {
   const only = idList(opt.only);
   if (opt.limit !== undefined && !(Number.isInteger(Number(opt.limit)) && Number(opt.limit) >= 1 && Number(opt.limit) <= 1000)) refuse('--limit must be an integer 1-1000');
   startChecks(ctx);
+  if (ctx.local.budgets.day_tokens === null) ctx.out('warning: no daily token cap is set (budgets.day_tokens in ~/.factory/config.json)');
+  usagePreflight(ctx);
   ctx.queueFile = path.join(privateDir(path.join(ctx.fh, 'queues')), `${ctx.key}.json`);
   ctx.bRoot = builderRoot(ctx);
   ctx.attention = 0;
@@ -892,6 +954,9 @@ export async function cmdRun(ctx) {
     if (!fs.existsSync(ctx.queueFile)) { ctx.out('no feature is ready'); return 0; }
   } else {
     if (only.length || opt.limit) ctx.out('note: a run is in progress; --only and --limit apply to a new run only');
+    for (const f of q.features.filter((x) => !TERMINAL.includes(x.state))) {
+      try { featureCaps(ctx, f); } catch (e) { refuse(`${e.message}`, `fix budget_cap of ${f.id} in ${ctx.queueFile} (or run "factory run --raise-budget ${f.id}")`); }
+    }
     const bad = missingScenarios(ctx, q.features.filter((f) => f.state === 'queued' || ACTIVE.includes(f.state)).map((f) => f.id));
     if (bad.length) refuse(`features without current approved scenarios: ${bad.join(', ')}`, 'run "factory scenarios" (and approve them), then run again');
   }
@@ -928,7 +993,7 @@ async function loop(ctx) {
     if (act.do === 'next' && f && f.state !== 'queued') { cur = null; last = null; continue; }
     ctx.out(`${f ? `${f.id} ${f.state}` : 'queue'} -> ${act.do}${act.brief ? ` (${act.brief})` : ''}`);
     let res;
-    try { res = await execute(ctx, q, f, act); } catch (e) {
+    try { res = await execute(ctx, q, f, act, last); } catch (e) {
       const kind = e instanceof Leftover ? 'leftovers' : 'error';
       if (f) attention(ctx, f.id, f.state, kind);
       ctx.out(`stopped: ${kind}`);
@@ -948,7 +1013,7 @@ async function loop(ctx) {
   return finish(ctx, 2);
 }
 
-async function execute(ctx, q, f, act) {
+async function execute(ctx, q, f, act, last = null) {
   switch (act.do) {
     case 'next': {
       const d = deliver(ctx, 'next');
@@ -984,11 +1049,28 @@ async function execute(ctx, q, f, act) {
       if (f && act.attention) attention(ctx, f.id, f.state, act.kind);
       ctx.out(`stopped: ${act.kind}${act.resetAt ? ` (resets ${act.resetAt})` : ''}`);
       return { end: 2 };
-    case 'interrupt': // until handleInterrupt (Task 8): stop as Phase 1 did, leaving every state as it is
+    case 'interrupt':
+      if (act.kind === 'budget') return budgetInterrupt(ctx, f, act, last);
+      // until handleInterrupt (Task 8b): stop as Phase 1 did, leaving every state as it is
       ctx.out(`stopped: ${act.kind === 'usage_limit' ? 'usage_limit' : 'interrupted'}${act.resetAt ? ` (resets ${act.resetAt})` : ''}`);
       return { end: 2 };
     default: throw new Error('unknown action');
   }
+}
+
+// A budget hit (enforceBudget's result, routed by the decision table). Feature: the feature is parked (deliver hold --kind budget,
+// from building or fixing only) with its work on the branch, an attention row names the command that raises the cap, and the run
+// moves on to the next feature (a hold is not a block: the circuit breaker does not count it). Day: the run stops.
+function budgetInterrupt(ctx, f, act, last) {
+  if (act.scope === 'day') { ctx.out('stopped: day_budget'); return { end: 2 }; }
+  const b = last?.kind === 'budget' ? last : {};
+  const what = clean(`feature budget reached: ${b.dim ?? 'tokens'} ${Number.isFinite(b.used) ? b.used : '?'} of ${Number.isFinite(b.cap) ? b.cap : '?'}`, 200);
+  const d = deliver(ctx, 'hold', f.id, '--reason', what, '--kind', 'budget');
+  const held = (d.code === 0 || d.code === 2) && readQueue(ctx).features.find((x) => x.id === f.id)?.state === 'awaiting_human';
+  if (!held) { attention(ctx, f.id, f.state, 'hold_failed'); ctx.out(`stopped: ${f.id} could not be parked (budget)`); return { end: 2 }; }
+  attention(ctx, f.id, 'awaiting_human', 'budget');
+  addAttention(ctx.fh, ctx.key, { id: f.id, kind: 'budget', severity: 'high', what, run: `factory run --raise-budget ${f.id}` });
+  return { cur: null };
 }
 
 // A run that reaches finish() ended cleanly (a stop, hold, block or the end of the queue): the features it resumed are not crash

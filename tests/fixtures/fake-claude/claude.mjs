@@ -60,7 +60,7 @@ function writeResult(obj) {
 //   prompt), or a step from it when it is an array.
 //   builder session: runs step N of fake.json plan[<ID>] (N counts this feature's builder sessions, kept in <FAKE_CLAUDE_DIR>/
 //   count-<ID>; the last step repeats). A step: { files: {path: text}, spec_complete, commit, status: done|blocked|usage|none,
-//   question, pr_body, sleep_ms }.
+//   question, pr_body, sleep_ms, tokens } (tokens: the result's input_tokens, for budget tests).
 function factory() {
   const argv = process.argv.slice(2);
   const prompt = argv[argv.indexOf('-p') + 1] || '';
@@ -104,7 +104,7 @@ function factory() {
     await assistant('msg_1', 'working'); await assistant('msg_2', 'done');
     if (s.status === 'usage') { await result({ is_error: true, api_error_status: 429, result: "You've hit your session limit · resets 3:45pm", terminal_reason: 'api_error' }); return 1; }
     if (s.status !== 'none') writeResult(s.status === 'blocked' ? { status: 'blocked', question: s.question || 'Which database?' } : { status: 'done', summary: 'implemented' });
-    await result();
+    await result(Number.isInteger(s.tokens) ? { usage: { ...usage, input_tokens: s.tokens } } : {});
     return 0;
   })();
 }

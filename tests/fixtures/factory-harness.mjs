@@ -6,6 +6,7 @@
 //                                       symptom brief (verify.mjs symptomBrief), so the gate, postVerified and the brief are real.
 //   killAfter: "<action>"              SIGKILLs this process right after that driver action finished (crash tests).
 //   ciArgs: [...]                      extra deliver ci arguments (fast polling).
+//   now: <ms>                          a fake clock (deps.clock) starting at that time; sleep(ms) advances it without waiting.
 // The local bare origin is reached through a per-process url.<path>.insteadOf (GIT_CONFIG_* in this process's env), passed to the
 // driver's network git as extraEnv, with the local file transport allowed (allowFile). Both are test-only seams.
 import fs from 'node:fs';
@@ -35,7 +36,9 @@ async function verifyStub({ repoKey, id, sha, scenarios, criteriaHash, git }) {
   return { verdict: status, doc, brief: status === 'pass' ? [] : VF.symptomBrief(results, scenarios, scenarios.canary), reused: false };
 }
 
+let fakeNow = Number.isFinite(cfg.now) ? cfg.now : null;
 const deps = {
+  ...(fakeNow !== null ? { clock: { now: () => fakeNow, sleep: async (ms) => { fakeNow += ms; } } } : {}),
   netGitOpts: { extraEnv, allowFile: true },
   verifyFeature: verifyStub,
   ciArgs: cfg.ciArgs || ['--interval', '0', '--grace', '0', '--timeout', '1'],
