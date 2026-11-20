@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { SCRIPTS, BASE_CONFIG, world, readiness, good, ready, builderRuns } from './factory-world.mjs';
+import { SCRIPTS, BASE_CONFIG, AUTHOR_OK, world, readiness, good, ready, builderRuns, promptOf } from './factory-world.mjs';
 
 const FX = await import(pathToFileURL(path.join(SCRIPTS, 'factory.mjs')).href);
 const D = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'driver.mjs')).href);
@@ -177,4 +177,255 @@ test('a malformed raised cap (f.budget_cap) in a queue in progress refuses the r
   assert.equal(r.code, 1, r.out + r.err);
   assert.match(r.out, /^refused: the raised budget cap of FEATURE-001 is malformed$/m);
   assert.equal(builderRuns(w, 'FEATURE-001').length, 1, 'no second session');
+});
+
+// ---- Task 8b: interruptions, WIP commits, waiting, notifications, run state -------------------------------------------------------------
+const H = 3600000;
+const SID = '00000000-0000-4000-8000-000000000001';
+const RESET_S = (NOW + H) / 1000; // the classifier's reset time: one hour after the fake clock's start
+const iso = (ms) => new Date(ms).toISOString();
+const limited = (extra = {}) => ({ status: 'usage', limit: 'session', resets_at: RESET_S, ...extra });
+const T = (extra = {}) => ({ now: NOW, classifierReal: true, ...extra });
+const WAIT_ON = { wait_for_reset: true };
+const lines = (w, name) => { const f = path.join(w.fhome, name); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean) : []; };
+const sleeps = (w) => lines(w, 'sleeps.log').map(Number);
+const runState = (w) => JSON.parse(fs.readFileSync(path.join(w.fhome, 'runs', 'o__r.json'), 'utf8'));
+const attentionItems = (w) => JSON.parse(fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.json'), 'utf8'));
+const subjects = (w, branch) => w.sh(w.builder, 'log', '--format=%s', branch).split('\n');
+const CONTINUE = /continue from the current branch and the `\.implementation\/FEATURE-001\/` ledger; finish with `result\.json`/;
+const steps = (out) => out.split('\n').filter((l) => /^FEATURE-001 \w+ -> /.test(l)).map((l) => l.replace(/^FEATURE-001 \w+ -> /, ''));
+
+test('waitUntil: 30 s slices against the wall clock; a +3 h jump inside one slice ends the wait at the next slice; a clock that never reaches the end stops after the planned time; the stop flag ends it', async (t) => {
+  const mk = ({ jump = 0, frozen = false } = {}) => {
+    let now = NOW; const slept = [];
+    const ctx = { fh: tmp(t), key: 'o__r', local: { keep_awake: false }, lock: { owned: () => true }, deps: { clock: { now: () => now, sleep: async (ms) => { slept.push(ms); if (!frozen) now += ms; if (slept.length === 1) now += jump; } } } };
+    return { ctx, slept };
+  };
+  const a = mk({ jump: 3 * H });
+  assert.equal(await FX.waitUntil(a.ctx, NOW + H, { kind: 'usage_limit' }), 'done');
+  assert.deepEqual(a.slept, [30000], 'the jump ends the wait at the next slice');
+  const b = mk();
+  assert.equal(await FX.waitUntil(b.ctx, NOW + 75000, { kind: 'usage_limit' }), 'done');
+  assert.deepEqual(b.slept, [30000, 30000, 15000]);
+  const c = mk({ frozen: true });
+  assert.equal(await FX.waitUntil(c.ctx, NOW + 5 * 60000, { kind: 'usage_limit' }), 'done');
+  assert.equal(c.slept.reduce((x, y) => x + y, 0), 5 * 60000, 'bounded by the planned wait even when the clock never gets there');
+  const d = mk();
+  fs.mkdirSync(path.join(d.ctx.fh, 'stop'), { recursive: true }); fs.writeFileSync(path.join(d.ctx.fh, 'stop', 'o__r'), '');
+  assert.equal(await FX.waitUntil(d.ctx, NOW + H, { kind: 'usage_limit' }), 'stopped');
+  assert.deepEqual(d.slept, []);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(d.ctx.fh, 'runs', 'o__r.json'), 'utf8')).status, 'paused');
+});
+
+test('mid-build limit with uncommitted edits: WIP commit "wip(FEATURE-001): interrupted (session)" holds the edits, the run waits (fake clock), the continue session sees the edits and the brief text, and the feature merges; fix_rounds stays 0', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), fake: { plan: { 'FEATURE-001': [{ ...limited(), files: { 'src/FEATURE-001.wip': 'half done\n' } }, { ...good('FEATURE-001'), require_files: ['src/FEATURE-001.wip'] }] } } });
+  writeLocal(w, WAIT_ON);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'merged'); assert.equal(f.fix_rounds, 0);
+  assert.equal(f.interrupted, undefined, 'cleared when the continued session ended normally');
+  assert.deepEqual(f.interruptions, [{ kind: 'session', step: 'build', minutes_waited: 62, method: 'continue_brief' }]);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 2);
+  assert.doesNotMatch(promptOf(runs[0]), CONTINUE);
+  assert.match(promptOf(runs[1]), CONTINUE); assert.match(promptOf(runs[1]), /FEATURE-001/); assert.match(promptOf(runs[1]), /\bbuild\b/);
+  const subs = subjects(w, f.branch);
+  assert.ok(subs.includes('wip(FEATURE-001): interrupted (session)'), subs.join(' | '));
+  const wip = w.sh(w.builder, 'log', '--format=%H', '--grep', '^wip(FEATURE-001)', f.branch).split('\n')[0];
+  assert.deepEqual(w.sh(w.builder, 'show', '--name-only', '--format=', wip).split('\n'), ['src/FEATURE-001.wip'], 'only the edits: no .implementation');
+  assert.match(r.out, new RegExp(`^paused: usage_limit session until ${iso(NOW + H + 120000).replace(/\./g, '\\.')}$`, 'm'));
+  assert.equal(sleeps(w).reduce((x, y) => x + y, 0), 62 * 60000);
+  assert.ok(sleeps(w).every((ms) => ms <= 30000));
+  assert.deepEqual(lines(w, 'notify.log').map((l) => l.split(' ')[0]), ['paused', 'finished']);
+  assert.deepEqual(lines(w, 'awake.log'), [`caffeinate -i -w ${lines(w, 'awake.log')[0].split(' ').pop()}`, 'killed']);
+  assert.equal(runState(w).status, 'finished');
+});
+
+test('mid-fix limit (ci_fix): WIP commit, wait, continued fix session; no fix round consumed; push only after the continued session reports done', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), gh: { checkQueue: [[{ name: 'ci', bucket: 'fail', link: 'x' }], [{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]] },
+    fake: { plan: { 'FEATURE-001': [good('FEATURE-001'), { ...limited(), files: { 'src/fix.wip': 'half\n' } }, { files: { 'src/fix.txt': 'fixed\n' }, commit: true, require_files: ['src/fix.wip'] }] } } });
+  writeLocal(w, WAIT_ON);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'merged');
+  assert.equal(f.fix_rounds, 1, 'one CI failure, one fix round; the interruption used none');
+  assert.deepEqual(steps(r.out).filter((s) => /ci_fix|push|interrupt/.test(s)), ['fix_ci (ci_fix)', 'build (ci_fix)', 'interrupt', 'build (ci_fix)', 'push']);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 3);
+  assert.match(promptOf(runs[2]), CONTINUE); assert.match(promptOf(runs[2]), /\bfix\b/);
+  assert.ok(subjects(w, f.branch).includes('wip(FEATURE-001): interrupted (session)'));
+  assert.deepEqual(f.interruptions.map((i) => [i.kind, i.step]), [['session', 'fix']]);
+});
+
+test('limit with only .implementation/ changes: no WIP commit, no error; wait_for_reset off: stops (usage_limit), feature left building with interrupted set, attention row names factory run --continue', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [{ ...limited(), files: { '.implementation/FEATURE-001/notes.md': 'ledger\n' } }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /^stopped: usage_limit$/m); assert.doesNotMatch(r.out, /error/);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'building');
+  assert.ok(!subjects(w, f.branch).some((s) => s.startsWith('wip(')), 'no empty WIP commit');
+  assert.deepEqual({ ...f.interrupted, ts: undefined }, { kind: 'session', step: 'build', session_id: SID, head: f.base_sha, ts: undefined });
+  assert.match(f.interrupted.ts, /^\d{4}-\d\d-\d\dT/);
+  const items = attentionItems(w);
+  assert.deepEqual(items.map((i) => [i.id, i.kind, i.severity, i.run]), [['FEATURE-001', 'usage_limit', 'high', 'factory run --continue']]);
+  assert.match(fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.md'), 'utf8'), /`factory run --continue`/);
+  assert.deepEqual(lines(w, 'notify.log').map((l) => l.split(' ')[0]), ['stopped']);
+  assert.equal(runState(w).status, 'stopped');
+});
+
+test('resetAt unknown: run state shows paused estimated true until now + 5 h; the stop flag ends the wait and the run (status stopped)', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), fake: { plan: { 'FEATURE-001': [limited({ resets_at: null })] } } });
+  writeLocal(w, WAIT_ON);
+  fs.mkdirSync(path.join(w.fhome, 'stop'), { recursive: true, mode: 0o700 }); fs.writeFileSync(path.join(w.fhome, 'stop', 'o__r'), '');
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, new RegExp(`^paused: usage_limit session until ${iso(NOW + 5 * H).replace(/\./g, '\\.')} \\(estimated\\)$`, 'm'));
+  assert.match(r.out, /^stopped: stop$/m);
+  const st = runState(w);
+  assert.equal(st.status, 'stopped');
+  assert.deepEqual(st.pause, { kind: 'usage_limit', limit: 'session', reset_at: iso(NOW + 5 * H), estimated: true });
+  assert.equal(w.queue().features[0].interrupted.kind, 'session');
+});
+
+test('a clock that never reaches the reset: each wait is bounded by its planned time and the run stops at max_wait_h', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T({ frozen: true }), fake: { plan: { 'FEATURE-001': [limited()] } } });
+  writeLocal(w, { wait_for_reset: true, max_wait_h: 1.5 });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /^stopped: usage_limit$/m); assert.match(r.out, /max_wait_h/);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 4);
+  assert.deepEqual(w.queue().features[0].interruptions.map((i) => i.minutes_waited), [62, 10, 10]);
+  assert.equal(sleeps(w).reduce((x, y) => x + y, 0), 82 * 60000);
+});
+
+test('a +3 h clock jump inside one sleep: the wait ends at the next slice, not 3 h later', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T({ jump: { at: 1, ms: 3 * H } }), fake: { plan: { 'FEATURE-001': [limited(), good('FEATURE-001')] } } });
+  writeLocal(w, WAIT_ON);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(sleeps(w), [30000]);
+  assert.equal(w.queue().features[0].state, 'merged');
+});
+
+test('weekly and model limits stop and notify (injected notify records "stopped"); model with fallback_model passes --model to the next session', (t) => {
+  for (const limit of ['weekly', 'model']) {
+    const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [limited({ limit })] } } });
+    const r = w.factory(['run']);
+    assert.equal(r.code, 2, `${limit}: ${r.out}${r.err}`);
+    assert.match(r.out, /^stopped: usage_limit$/m, limit);
+    assert.deepEqual(lines(w, 'notify.log').map((l) => l.split(' ')[0]), ['stopped'], limit);
+    assert.equal(w.queue().features[0].interrupted.kind, limit);
+    assert.equal(attentionItems(w)[0].run, 'factory run --continue');
+  }
+  const m = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [limited({ limit: 'model' }), good('FEATURE-001')] } } });
+  writeLocal(m, { fallback_model: 'claude-fallback' });
+  const r = m.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const runs = builderRuns(m, 'FEATURE-001');
+  assert.equal(runs.length, 2);
+  assert.ok(!runs[0].argv.includes('--model'));
+  assert.equal(runs[1].argv[runs[1].argv.indexOf('--model') + 1], 'claude-fallback');
+  assert.match(promptOf(runs[1]), CONTINUE);
+  assert.deepEqual(m.queue().features[0].interruptions, [{ kind: 'model', step: 'build', minutes_waited: 0, method: 'continue_brief' }]);
+});
+
+test('model limit on the fallback model too: the run stops instead of switching again', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [limited({ limit: 'model' })] } } });
+  writeLocal(w, { fallback_model: 'claude-fallback' });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /^stopped: usage_limit$/m); assert.match(r.out, /fallback/);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 2);
+  assert.equal(runs[1].argv[runs[1].argv.indexOf('--model') + 1], 'claude-fallback');
+});
+
+test('rate: three retries at 60, 120 and 240 s on the fake clock, then stops', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [limited({ limit: 'rate' })] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /^stopped: usage_limit$/m); assert.match(r.out, /rate limit/);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 4);
+  assert.deepEqual(w.queue().features[0].interruptions.map((i) => i.minutes_waited), [1, 2, 4]);
+  assert.equal(sleeps(w).reduce((x, y) => x + y, 0), 420000);
+});
+
+test('timeout interrupt: the first two continue from the branch (counted in f.timeouts first); the third blocks the feature', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW, timeoutS: 1 }, fake: { plan: { 'FEATURE-001': [{ sleep_ms: 5000, status: 'none', files: { 'src/a.txt': 'a\n' } }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'blocked'); assert.equal(f.timeouts, 3);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 3);
+  assert.match(promptOf(runs[1]), CONTINUE); assert.match(promptOf(runs[2]), CONTINUE);
+  assert.deepEqual(steps(r.out), ['build (build)', 'interrupt', 'build (build)', 'interrupt', 'build (build)', 'block']);
+});
+
+test('day cap with wait_for_reset: paused kind day_budget until the next local midnight on the fake clock, then the run resumes and merges', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  writeLocal(w, { wait_for_reset: true, budgets: { day_tokens: 10000 } });
+  seedUsage(w.fhome, 'other__repo', 10000);
+  const midnight = new Date(NOW); midnight.setHours(24, 0, 0, 0);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, new RegExp(`^paused: day_budget until ${iso(midnight.getTime()).replace(/\./g, '\\.')}$`, 'm'));
+  assert.equal(sleeps(w).reduce((x, y) => x + y, 0), midnight.getTime() - NOW);
+  assert.equal(w.queue().features[0].state, 'merged');
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 1);
+  assert.deepEqual(lines(w, 'notify.log').map((l) => l.split(' ')[0]), ['paused', 'finished']);
+});
+
+test('day cap stop (wait_for_reset off): attention row names factory run --continue; a restarted run loses no work (branch and edits survive)', (t) => {
+  const AG = { files: { 'test/items.test.js': "it('lists', () => {});\n" }, commit: true };
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001', G2), tokens: 9655 }, AG] } } });
+  writeLocal(w, { budgets: { day_tokens: 10000 } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /^stopped: day_budget$/m);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 1, 'the anti-gaming fix session was refused by the day cap');
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'building'); assert.equal(f.interrupted, undefined);
+  assert.ok(w.sh(w.builder, 'show', `${f.branch}:src/FEATURE-001.txt`).includes('good'), 'the work is on the branch');
+  assert.deepEqual(attentionItems(w).map((i) => [i.kind, i.severity, i.run]), [['day_budget', 'high', 'factory run --continue']]);
+  writeLocal(w, { budgets: { day_tokens: 1000000 } });
+  const r2 = w.factory(['run']);
+  assert.equal(r2.code, 0, r2.out + r2.err);
+  assert.match(r2.out, /FEATURE-001 building -> built/);
+  assert.equal(w.queue().features[0].state, 'merged');
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 2);
+});
+
+test('interrupted-resume loop cap: a driver that keeps dying while continuing an interrupted feature is held (resume_loop) after three resumes; f.resumes is not used', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { plan: { 'FEATURE-001': [limited()] } } });
+  assert.equal(w.factory(['run']).code, 2);
+  assert.ok(w.queue().features[0].interrupted);
+  const kill = { FACTORY_TEST: JSON.stringify({ now: NOW, killAfter: 'build' }) };
+  for (let i = 0; i < 3; i++) assert.equal(w.factory(['run'], kill).signal, 'SIGKILL', `crash ${i + 1}`);
+  let f = w.queue().features[0];
+  assert.equal(f.interrupted_resumes, 3); assert.equal(f.resumes ?? 0, 0);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /resume_loop/);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 4, 'no session after the cap');
+  f = w.queue().features[0];
+  assert.equal(f.state, 'building'); assert.equal(f.interrupted_resumes, 3);
+});
+
+test('factory scenarios: an author session hit by a session limit is restarted from scratch after the wait; a stop ends the command cleanly', (t) => {
+  const w = world(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), fake: { author: { 'FEATURE-001': ['usage', AUTHOR_OK] } } });
+  writeLocal(w, WAIT_ON);
+  const r = w.factory(['scenarios']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /^paused: usage_limit session until /m);
+  assert.match(r.out, /FEATURE-001 scenarios: stored/);
+  assert.equal(w.sessions().length, 2);
+  assert.equal(readUsage(w.fhome).tokens, 930, 'the interrupted author session is recorded too');
+  const s = world(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { author: { 'FEATURE-001': ['usage'] } } });
+  const x = s.factory(['scenarios']);
+  assert.equal(x.code, 2, x.out + x.err);
+  assert.match(x.out, /^stopped: usage_limit$/m);
 });

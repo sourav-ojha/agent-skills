@@ -519,6 +519,16 @@ test('renderPrompt: scenario-author placeholders filled in one pass; unknown or 
   assert.throws(() => S.renderPrompt('../settings/builder', {}), /prompt/);
 });
 
+test('renderPrompt: the continue brief names the feature, the step, the branch and ledger, and result.json; the implementer documents it', () => {
+  const p = S.renderPrompt('continue-brief', { FEATURE_ID: 'FEATURE-7', STEP: 'fix' });
+  assert.match(p, /interrupted fix step of FEATURE-7/);
+  assert.match(p, /continue from the current branch and the `\.implementation\/FEATURE-7\/` ledger; finish with `result\.json`/);
+  assert.ok(!/^-/.test(p));
+  assert.throws(() => S.renderPrompt('continue-brief', { FEATURE_ID: 'FEATURE-7' }), /STEP/);
+  const text = fs.readFileSync(path.join(REPO, 'skills', 'implementer', 'SKILL.md'), 'utf8');
+  assert.match(text, /\*\*continue brief\*\*/); assert.match(text, /wip\(<ID>\): interrupted \(<kind>\)/);
+});
+
 test('implementer SKILL.md: --fix-brief input and the unattended result.json contract', () => {
   const text = fs.readFileSync(path.join(REPO, 'skills', 'implementer', 'SKILL.md'), 'utf8');
   assert.match(text, /--fix-brief <file>/);

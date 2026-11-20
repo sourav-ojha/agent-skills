@@ -7,6 +7,13 @@
 //   killAfter: "<action>"              SIGKILLs this process right after that driver action finished (crash tests).
 //   ciArgs: [...]                      extra deliver ci arguments (fast polling).
 //   now: <ms>                          a fake clock (deps.clock) starting at that time; sleep(ms) advances it without waiting.
+//                                       Every sleep is logged to FACTORY_HOME/sleeps.log (one ms value per line).
+//   jump: { at: N, ms: M }             the Nth sleep (1-based) also moves the fake clock M ms forward (a laptop sleep or clock jump).
+//   frozen: true                       sleep never advances the fake clock (a clock that never reaches the wait's end).
+//   classifierReal: true               treat the usage-limit classifier as validated (lets config.json turn wait_for_reset on).
+//   timeoutS: <s>                      overrides every builder session's timeout (timeout tests; the policy minimum is 60 s).
+// Always: notifications are recorded to FACTORY_HOME/notify.log ("<event> <count>") instead of osascript; keep-awake is recorded to
+// FACTORY_HOME/awake.log (its argv) instead of spawning caffeinate, with the platform reported as darwin.
 // The local bare origin is reached through a per-process url.<path>.insteadOf (GIT_CONFIG_* in this process's env), passed to the
 // driver's network git as extraEnv, with the local file transport allowed (allowFile). Both are test-only seams.
 import fs from 'node:fs';
@@ -37,8 +44,22 @@ async function verifyStub({ repoKey, id, sha, scenarios, criteriaHash, git }) {
 }
 
 let fakeNow = Number.isFinite(cfg.now) ? cfg.now : null;
+let sleeps = 0;
+const fhLog = (name, line) => fs.appendFileSync(path.join(process.env.FACTORY_HOME, name), `${line}\n`);
+const fakeSleep = async (ms) => {
+  sleeps++;
+  fhLog('sleeps.log', ms);
+  if (!cfg.frozen) fakeNow += ms;
+  if (cfg.jump && cfg.jump.at === sleeps) fakeNow += cfg.jump.ms;
+};
+const S = await imp('lib/sessions.mjs');
 const deps = {
-  ...(fakeNow !== null ? { clock: { now: () => fakeNow, sleep: async (ms) => { fakeNow += ms; } } } : {}),
+  ...(fakeNow !== null ? { clock: { now: () => fakeNow, sleep: fakeSleep } } : {}),
+  ...(cfg.classifierReal ? { classifierReal: true } : {}),
+  ...(Number.isFinite(cfg.timeoutS) ? { runSession: (o) => S.runSession(o.role === 'builder' ? { ...o, timeoutS: cfg.timeoutS, killGraceMs: 200 } : o) } : {}),
+  notify: (event, { count } = {}) => { fhLog('notify.log', `${event} ${count}`); return true; },
+  keepAwake: (argv) => { fhLog('awake.log', argv.join(' ')); return { kill: () => fhLog('awake.log', 'killed') }; },
+  platform: 'darwin',
   netGitOpts: { extraEnv, allowFile: true },
   verifyFeature: verifyStub,
   ciArgs: cfg.ciArgs || ['--interval', '0', '--grace', '0', '--timeout', '1'],
