@@ -1,0 +1,10 @@
+#!/bin/sh
+# Shim for the fake claude (tests only). Put this directory first on PATH, or symlink this file (absolute target) as
+# `<tmp>/claude`. FAKE_CLAUDE_DIR tells the fake where its fake.json lives: the directory the shim was invoked from.
+here=$(dirname "$0")
+target=$(readlink "$0")
+case "$target" in
+  /*) real=$(dirname "$target") ;;
+  *) real=$here ;;
+esac
+FAKE_CLAUDE_DIR=$here exec node "$real/claude.mjs" "$@"

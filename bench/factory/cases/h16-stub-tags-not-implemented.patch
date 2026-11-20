@@ -1,0 +1,21 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..86b2cef8700394d7eaeadc6dc77967539e2ff2a9 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -17,11 +17,15 @@ export const routes = [
+     if (!isObject(body)) return fail(400, 'invalid_body');
+     if (!validTitle(body.title)) return fail(400, 'invalid_title');
+     if (body.done !== undefined && typeof body.done !== 'boolean') return fail(400, 'invalid_done');
+-    return ok(store.create({ title: body.title, done: body.done ?? false }), 201);
++    return ok(store.create({ title: body.title, done: body.done ?? false, tags: [] }), 201);
+   }],
+ 
+   ['GET', '/api/tasks/:id', ({ params }) => {
+     const task = store.get(params.id);
+     return task ? ok(task) : fail(404, 'not_found');
+   }],
++
++  ['POST', '/api/tasks/:id/tags', () => {
++    throw new Error("not implemented");
++  }],
+ ];

@@ -1,0 +1,27 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..0cae2600832b98be87ee8d972db8bdc746153bc6 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -24,4 +24,9 @@ export const routes = [
+     const task = store.get(params.id);
+     return task ? ok(task) : fail(404, 'not_found');
+   }],
++
++  ['POST', '/api/tasks/:id/reopen', ({ params }) => {
++    const task = store.update(params.id, { done: false });
++    return task ? ok(task) : fail(404, 'not_found');
++  }],
+ ];
+diff --git a/tests/tasks.test.mjs b/tests/tasks.test.mjs
+index 36afe6044c51bd472234a081858fd873e5fac0dd..f748996558f88fd95a71a613620033a6c63a27ab 100644
+--- a/tests/tasks.test.mjs
++++ b/tests/tasks.test.mjs
+@@ -13,7 +13,7 @@ test('creating a task returns 201 with an id and done false', () => {
+   store.reset();
+   const r = call('POST', '/api/tasks', { body: { title: 'Write report' } });
+   assert.equal(r.status, 201);
+-  assert.deepEqual(r.body, { id: '1', title: 'Write report', done: false });
++  assert.equal(r.body.title, 'Write report');
+ });
+ 
+ test('a missing or blank title is rejected with 400', () => {

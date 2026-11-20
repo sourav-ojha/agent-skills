@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "base": "main",
+  "features_dir": ".product/features",
+  "app": {
+    "start": ["node", "src/server.mjs"],
+    "base_url": "http://127.0.0.1:47613",
+    "ready": { "url": "http://127.0.0.1:47613/api/health", "timeout_s": 20 }
+  },
+  "tests": { "all": ["npm", "test"] },
+  "verification": { "required": true }
+}

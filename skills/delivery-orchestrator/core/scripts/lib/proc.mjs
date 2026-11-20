@@ -124,12 +124,20 @@ export function portOf(url) {
   return u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80;
 }
 
+// Fail closed: only a refused connection, or a loopback address this host does not have (no IPv6: EADDRNOTAVAIL / EAFNOSUPPORT, and
+// for ::1 only ENETUNREACH / EHOSTUNREACH), means free. A timeout or any other error counts as in use (e.g. a listener that never
+// accepts). The timeout is deferred with setImmediate: after an event-loop stall the timer phase runs before the poll phase, so an
+// ECONNREFUSED already queued must win over the timeout (the first settle wins).
+const FREE_CODES = new Set(['ECONNREFUSED', 'EADDRNOTAVAIL', 'EAFNOSUPPORT']);
+const V6_FREE_CODES = new Set(['ENETUNREACH', 'EHOSTUNREACH']);
+export const freeError = (code, host) => FREE_CODES.has(code) || (host === '::1' && V6_FREE_CODES.has(code));
 const probe = (port, host) => new Promise((resolve) => {
+  let settled = false;
   const s = net.connect({ port, host });
-  const end = (v) => { s.destroy(); resolve(v); };
-  s.setTimeout(1000, () => end(false));
+  const end = (v) => { if (settled) return; settled = true; s.destroy(); resolve(v); };
+  s.setTimeout(1000, () => setImmediate(() => end(true)));
   s.on('connect', () => end(true));
-  s.on('error', () => end(false));
+  s.on('error', (e) => end(!freeError(e.code, host)));
 });
 
 // `localhost` (the default) is checked on both loopbacks: dev servers may bind only ::1 (Vite on macOS).

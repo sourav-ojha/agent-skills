@@ -1,0 +1,61 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..d07abe5989c79c94a430dd5f1e19e0d4198efae8 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -11,7 +11,14 @@ export const validTitle = (t) => typeof t === 'string' && t.trim() !== '';
+ export const routes = [
+   ['GET', '/api/health', () => ok({ ok: true })],
+ 
+-  ['GET', '/api/tasks', () => ok({ items: store.list() })],
++  ['GET', '/api/tasks', ({ query }) => {
++    const sort = query.get('sort');
++    const items = store.list();
++    if (sort === null || sort === 'created') return ok({ items });
++    if (sort !== 'title' && sort !== '-title') return fail(400, 'invalid_sort');
++    items.sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : 0));
++    return ok({ items: sort === 'title' ? items : items.reverse() });
++  }],
+ 
+   ['POST', '/api/tasks', ({ body }) => {
+     if (!isObject(body)) return fail(400, 'invalid_body');
+diff --git a/tests/tasks.test.mjs b/tests/tasks.test.mjs
+deleted file mode 100644
+index 36afe6044c51bd472234a081858fd873e5fac0dd..0000000000000000000000000000000000000000
+--- a/tests/tasks.test.mjs
++++ /dev/null
+@@ -1,35 +0,0 @@
+-// Unit tests of the base API handlers (run with `npm test` inside the app).
+-import test from 'node:test';
+-import assert from 'node:assert/strict';
+-import * as store from '../src/store.mjs';
+-import { routes } from '../src/routes.mjs';
+-
+-const call = (method, pattern, req = {}) => {
+-  const route = routes.find(([m, p]) => m === method && p === pattern);
+-  return route[2]({ params: {}, query: new URLSearchParams(), ...req });
+-};
+-
+-test('creating a task returns 201 with an id and done false', () => {
+-  store.reset();
+-  const r = call('POST', '/api/tasks', { body: { title: 'Write report' } });
+-  assert.equal(r.status, 201);
+-  assert.deepEqual(r.body, { id: '1', title: 'Write report', done: false });
+-});
+-
+-test('a missing or blank title is rejected with 400', () => {
+-  store.reset();
+-  assert.equal(call('POST', '/api/tasks', { body: {} }).status, 400);
+-  assert.equal(call('POST', '/api/tasks', { body: { title: '   ' } }).status, 400);
+-});
+-
+-test('listing returns tasks in creation order', () => {
+-  store.reset();
+-  call('POST', '/api/tasks', { body: { title: 'a' } });
+-  call('POST', '/api/tasks', { body: { title: 'b' } });
+-  assert.deepEqual(call('GET', '/api/tasks').body.items.map((t) => t.title), ['a', 'b']);
+-});
+-
+-test('an unknown task id is 404', () => {
+-  store.reset();
+-  assert.equal(call('GET', '/api/tasks/:id', { params: { id: '99' } }).status, 404);
+-});

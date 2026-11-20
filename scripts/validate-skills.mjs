@@ -16,6 +16,10 @@ const SPEC_KEYS = ['name', 'description', 'license', 'compatibility', 'metadata'
 const CLAUDE_KEYS = ['when_to_use', 'argument-hint', 'arguments', 'disable-model-invocation', 'user-invocable', 'disallowed-tools', 'model', 'effort', 'context', 'agent', 'background', 'hooks', 'paths', 'shell'];
 // Host-specific tokens that must not leak into the agent-neutral methodology.
 const HOST_TOKENS = [/AskUserQuestion/, /\bTask tool\b/, /mcp__/, /\$ARGUMENTS/, /\$\{CLAUDE_/, /\.claude\//, /\.codex\//, /\.agents\//, /\/plugin\b/, /CLAUDE\.md/];
+// Exemption from the host-token check ONLY, for files whose subject is the Claude Code runtime itself: the factory's
+// `claude -p` session runner and the settings files it passes to Claude Code (they must name its config dir layout, e.g.
+// the memory file). Narrowest list: exact skill-relative paths, nothing else in those skills is exempt.
+const HOST_TOKEN_EXEMPT = { 'delivery-orchestrator': ['core/scripts/lib/sessions.mjs', 'core/settings/builder.json', 'core/settings/author.json'] };
 const SECRET_PATTERNS = [/AKIA[0-9A-Z]{16}/, /ghp_[A-Za-z0-9]{30,}/, /sk-[A-Za-z0-9]{32,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/];
 
 // Imported (first-party legacy) and vendored (third-party) skills get the spec-level checks only: they are not written to this repo's
@@ -89,7 +93,13 @@ async function validateSkill(dirName) {
     'adapters/claude-code/README.md', 'adapters/codex/README.md',
   ];
   if (dirName === 'skill-insights') for (const f of ['references/metrics.md', 'core/scripts/si.mjs', 'core/scripts/lib/transcripts.mjs', 'core/scripts/lib/analyze.mjs', 'core/scripts/lib/runs.mjs', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
-  if (dirName === 'delivery-orchestrator') for (const f of ['references/states.md', 'references/safety.md', 'references/config.md', 'templates/delivery.json', 'core/scripts/deliver.mjs', 'core/scripts/lib/queue.mjs', 'core/scripts/lib/config.mjs', 'core/scripts/lib/runlog.mjs', 'references/readiness.md', 'core/scripts/lib/readiness.mjs', 'core/scripts/lib/proc.mjs', 'core/scripts/lib/runrecord.mjs', 'core/scripts/lib/limits.mjs', 'core/scripts/lib/factoryhome.mjs', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
+  if (dirName === 'delivery-orchestrator') for (const f of ['references/states.md', 'references/safety.md', 'references/config.md', 'templates/delivery.json', 'core/scripts/deliver.mjs', 'core/scripts/lib/queue.mjs', 'core/scripts/lib/config.mjs', 'core/scripts/lib/runlog.mjs', 'references/readiness.md', 'core/scripts/lib/readiness.mjs', 'core/scripts/lib/proc.mjs', 'core/scripts/lib/runrecord.mjs', 'core/scripts/lib/limits.mjs', 'core/scripts/lib/factoryhome.mjs', 'adapters/claude-code/README.md',
+    // factory phase 1a: driver, its libraries, session settings and prompts, references
+    'core/scripts/factory.mjs', 'core/scripts/lib/criteria.mjs', 'core/scripts/lib/scenarios.mjs', 'core/scripts/lib/antigaming.mjs',
+    'core/scripts/lib/gitsafe.mjs', 'core/scripts/lib/sandbox.mjs', 'core/scripts/lib/sessions.mjs', 'core/scripts/lib/verdict.mjs',
+    'core/scripts/lib/apicheck.mjs', 'core/scripts/lib/verify.mjs', 'core/scripts/lib/lock.mjs', 'core/scripts/lib/driver.mjs',
+    'core/settings/builder.json', 'core/settings/author.json', 'core/prompts/scenario-author.md',
+    'references/verification.md', 'references/factory-driver.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
   if (dirName === 'experience-audit') for (const f of ['references/audit-method.md', 'references/checks.md', 'references/evidence-and-severity.md', 'templates/finding.json', 'core/config.default.json', 'core/probes/collect.js', 'core/scripts/ea.mjs', 'core/scripts/lib/checks.mjs', 'core/scripts/lib/audit.mjs', 'core/scripts/lib/runlog.mjs', 'core/scripts/install-agents.mjs', 'core/roles/roles.json', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
   if (dirName === 'growth-strategy') for (const f of ['references/research-standards.md', 'references/workflow.md', 'references/coverage.md', 'references/integrations.md', 'references/artifacts.md', 'templates/baseline.json', 'templates/keyword.json', 'templates/item.json', 'templates/source.json', 'templates/review.json', 'core/config.default.json', 'core/schemas/records.schema.json', 'core/schemas/artifacts.json', 'core/schemas/config.schema.json', 'core/scripts/gs.mjs', 'core/scripts/lib/state.mjs', 'core/scripts/lib/evidence.mjs', 'core/scripts/lib/config.mjs', 'core/scripts/lib/runlog.mjs', 'core/scripts/install-agents.mjs', 'core/roles/roles.json', 'agents/openai.yaml', 'adapters/claude-code/README.md', 'adapters/codex/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
   if (dirName === 'implementer') for (const f of ['references/triage.md', 'references/tdd-and-acceptance.md', 'templates/mini-spec.md', 'core/config.default.json', 'core/scripts/impl.mjs', 'core/scripts/lib/ledger.mjs', 'core/scripts/install-agents.mjs', 'core/roles/roles.json', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
@@ -148,6 +158,7 @@ async function validateSkill(dirName) {
     return /\.(md|json|mjs)$/.test(r);
   });
   for (const f of neutral) {
+    if ((Object.hasOwn(HOST_TOKEN_EXEMPT, dirName) ? HOST_TOKEN_EXEMPT[dirName] : []).includes(rel(f))) continue;
     const t = fs.readFileSync(f, 'utf8');
     for (const re of HOST_TOKENS) if (re.test(t)) S('error', `${rel(f)}: host-specific token ${re} in agent-neutral content (move to adapters/)`);
   }

@@ -21,6 +21,15 @@ function brokenCopy(mutate) {
   return JSON.parse(r.stdout).errors.map((e) => e.msg);
 }
 
+test('validator: a skill directory named like an Object.prototype key (constructor) is checked, not a crash', () => {
+  const root = tmpDir('skills-root-');
+  fs.cpSync(SKILL, path.join(root, 'constructor'), { recursive: true });
+  const r = validate(root);
+  assert.doesNotMatch(r.stderr, /TypeError/, r.stderr);
+  const errors = JSON.parse(r.stdout).errors.map((e) => e.msg);
+  assert.ok(errors.some((m) => m.includes('must match directory')), 'the normal checks ran');
+});
+
 test('validator: bad name, long description, missing description', () => {
   const e1 = brokenCopy((d) => fs.writeFileSync(path.join(d, 'SKILL.md'), fs.readFileSync(path.join(d, 'SKILL.md'), 'utf8').replace('name: product-intelligence', 'name: Product_Intelligence')));
   assert.ok(e1.some((m) => m.includes('must match directory')));
@@ -149,4 +158,15 @@ test('security: user-scope install ignores the current project config', () => {
   const r = spawnSync('node', [inst, '--agent', 'claude-code', '--scope', 'user', '--project-dir', proj], { encoding: 'utf8', env: { ...process.env, HOME: home } });
   assert.equal(r.status, 0, r.stderr);
   assert.match(fs.readFileSync(path.join(home, '.claude/agents/pi-repository-analyst.md'), 'utf8'), /^model: haiku$/m);
+});
+
+test('validator: host-token exemption covers only the factory Claude-runtime files', () => {
+  const root = tmpDir('skills-root-');
+  const d = path.join(root, 'delivery-orchestrator');
+  fs.cpSync(path.join(REPO, 'skills', 'delivery-orchestrator'), d, { recursive: true });
+  fs.appendFileSync(path.join(d, 'core/scripts/lib/sessions.mjs'), '\n// see CLAUDE.md and ~/.claude/settings.json\n');
+  fs.appendFileSync(path.join(d, 'core/scripts/lib/proc.mjs'), '\n// see CLAUDE.md\n');
+  const msgs = JSON.parse(validate(root).stdout).errors.map((e) => e.msg).filter((m) => m.includes('host-specific token'));
+  assert.ok(msgs.some((m) => m.includes('core/scripts/lib/proc.mjs')), 'a non-exempt file is still checked');
+  assert.ok(!msgs.some((m) => m.includes('sessions.mjs')), 'the exempt file is not');
 });

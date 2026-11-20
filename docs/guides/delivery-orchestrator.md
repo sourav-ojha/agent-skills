@@ -70,6 +70,17 @@ Before letting a repo run unattended, check it: `node <skill-dir>/core/scripts/d
 
 Each failing check comes with a fix item. The result is stored in `~/.factory/readiness/`, outside your repo. To enforce it, add `"readiness": {"min_level": 3, "max_age_days": 14}` to `.product/delivery.json`: a run that may merge then refuses to start without a fresh result at that level. Without that key nothing changes. Each feature outcome is also logged to `.skill-runs/factory-runs.jsonl`; `si runs-factory` adds token cost. Details: [`references/readiness.md`](../../skills/delivery-orchestrator/references/readiness.md).
 
+## Verified delivery: the factory driver
+For merges proven by checks the builder can neither see nor edit, run the factory driver yourself, from a checkout of the repo (macOS; it needs `sandbox-exec`):
+```bash
+node <skill-dir>/core/scripts/factory.mjs scenarios              # hidden scenarios for every ready spec
+node <skill-dir>/core/scripts/factory.mjs scenarios --approve FEATURE-001 --by you   # only with scenario_approval: human
+node <skill-dir>/core/scripts/factory.mjs run [--only IDS] [--limit N]
+```
+It works in its own clones (`~/.factory/clones/<owner>__<repo>` for itself, `~/.factory-builder/<owner>__<repo>` for the builder), so your checkout is never touched. Each feature: builder session, anti-gaming checks, PR, CI, then the hidden API scenarios run twice against the app built from the exact PR head, in a sandbox. A pass posts the `factory/verified` status and merges that commit; a fail sends the builder criterion IDs only and uses a fix round. Exit `0` done, `1` refused (it prints what to fix), `2` stopped or a feature needs you; run it again to resume.
+
+It refuses to start unless `.product/delivery.json` on the base says `"verification": {"required": true}`, `"readiness": {"min_level": 4}` and `"local_checks": []`, a level-4 readiness result is stored, branch protection requires the `factory/verified` status, and every picked feature has current approved scenarios. Your user Claude Code `settings.json` may hold only allowlisted keys (`$schema`, `model`, `cleanupPeriodDays`, `includeCoAuthoredBy`, a few telemetry and timeout `env` names, `permissions.deny`, and `enabledPlugins` and `sandbox` only when empty); any other key, hooks, a status line or plugins included, refuses every session. Details and known gaps: [`references/factory-driver.md`](../../skills/delivery-orchestrator/references/factory-driver.md), [`references/verification.md`](../../skills/delivery-orchestrator/references/verification.md).
+
 ## What you get
 A final report: merged features (PR and sha), PRs waiting for you (and why), blocked or skipped features (and where the partial work is: a branch plus `git stash list`), and non-code follow-ups from the specs' delivery logs.
 

@@ -1,0 +1,25 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..fc2bf8821643671659830f71ab93484639464fd1 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -7,6 +7,7 @@ const fail = (status, error) => ({ status, body: { error } });
+ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+ 
+ export const validTitle = (t) => typeof t === 'string' && t.trim() !== '';
++const TITLE_MAX = 200;
+ 
+ export const routes = [
+   ['GET', '/api/health', () => ok({ ok: true })],
+@@ -15,9 +16,10 @@ export const routes = [
+ 
+   ['POST', '/api/tasks', ({ body }) => {
+     if (!isObject(body)) return fail(400, 'invalid_body');
+-    if (!validTitle(body.title)) return fail(400, 'invalid_title');
++    const title = typeof body.title === 'string' ? body.title.trim() : body.title;
++    if (!validTitle(title) || title.length > TITLE_MAX) return fail(400, 'invalid_title');
+     if (body.done !== undefined && typeof body.done !== 'boolean') return fail(400, 'invalid_done');
+-    return ok(store.create({ title: body.title, done: body.done ?? false }), 201);
++    return ok(store.create({ title, done: body.done ?? false }), 201);
+   }],
+ 
+   ['GET', '/api/tasks/:id', ({ params }) => {

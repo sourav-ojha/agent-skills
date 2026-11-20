@@ -6,12 +6,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize } from './lib/queue.mjs';
+import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, discover, buildQueue, pickNext, runStop, slugify, touchesCi, summarize, overrideValid } from './lib/queue.mjs';
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
 import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
+import { readVerdict, verdictMatches } from './lib/verdict.mjs';
+import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
+import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios.mjs';
+import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
+import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs, checkNoHooks, GIT_SAFE_FLAGS } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
@@ -29,13 +34,17 @@ const outcome = (o) => { emit(o); process.exitCode = 2; };
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
   next | built ID [--tier T] | pr ID --title T --body-file .delivery/F | ci ID [--timeout S] [--interval S] [--grace S] | fix ID | push ID | merge ID [--settle S]
   retry ID [--no-ci] [--checks A,B] | block ID --reason R | skip ID --reason R | status [--json] | reset --yes
+  hold ID --reason R [--kind K [--sha S --ids G1,G4]]   (factory driver only: a queue under FACTORY_HOME)
   readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
 
 const root = path.resolve(opt.dir || '.');
 const dirState = path.join(root, '.delivery');
-const file = path.join(dirState, 'queue.json');
+// DELIVER_QUEUE (absolute path) relocates the queue file; PR body files still live under <root>/.delivery/.
+const queueOverride = process.env.DELIVER_QUEUE || '';
+if (queueOverride && !path.isAbsolute(queueOverride)) die('DELIVER_QUEUE must be an absolute path');
+const file = queueOverride ? path.normalize(queueOverride) : path.join(dirState, 'queue.json');
 const t0 = Date.now();
 const extra = {};
 process.on('exit', (code) => { if (cmd !== 'status') logEvent(root, 'delivery-orchestrator', runId('deliver', 'run'), { event: cmd, ok: code === 0, ms: Date.now() - t0, ...extra }); });
@@ -84,16 +93,17 @@ let curQ = null;
 const pending = [];
 // A feature waiting for a person is not working: its record window ends when it entered awaiting_human (f.ts_wait), so a later
 // refresh/skip/merge of it does not stretch the window over other features' runs (which would make the token join ambiguous).
-const note = (f, from) => {
+const note = (f, from, at) => {
   if (!curQ || !RECORDED.has(f.state)) return;
   const waited = from === 'awaiting_human' && Number.isFinite(Date.parse(f.ts_wait)) ? Date.parse(f.ts_wait) : null;
-  pending.push({ f: JSON.parse(JSON.stringify(f)), at: waited ?? Date.now() });
+  pending.push({ f: JSON.parse(JSON.stringify(f)), at: waited ?? at ?? Date.now() });
 };
 const transition = (f, to, reason) => {
   const from = f.state;
   transitionState(f, to, reason);
-  if (to === 'awaiting_human') f.ts_wait = new Date().toISOString();
-  note(f, from);
+  const now = new Date();
+  if (to === 'awaiting_human') f.ts_wait = now.toISOString();
+  note(f, from, now.getTime()); // one clock reading, so the record's end equals ts_wait exactly
   return f;
 };
 let stamps;
@@ -108,6 +118,7 @@ const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_
 
 // ---- state -----------------------------------------------------------------------------------------------------------
 function load() {
+  if (queueOverride) for (const p of [file, path.dirname(file)]) { try { if (fs.lstatSync(p).isSymbolicLink()) die(`refusing to use a symlinked queue path (${p})`); } catch { /* absent */ } }
   if (!fs.existsSync(file)) die('no run in progress here; use init first');
   let q;
   try { q = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { die(`queue file is invalid JSON (${e.message}); reset and re-init (merged PRs are on GitHub)`); }
@@ -124,13 +135,30 @@ function load() {
   useAccount(q.policy.github.account, q.policy.github.host);
   return q;
 }
-function save(q) {
-  fs.mkdirSync(dirState, { recursive: true });
+// .delivery/ and its .gitignore are created without following links: a branch can commit a symlink there (a dangling
+// .delivery/.gitignore link would otherwise make this write create its target anywhere the user can write).
+const NOFOLLOW_CREATE = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0);
+function stateDir() {
+  let st = null; try { st = fs.lstatSync(dirState); } catch { /* absent */ }
+  if (st && (st.isSymbolicLink() || !st.isDirectory())) die('.delivery is a symlink or not a directory; remove it and run again');
+  if (!st) fs.mkdirSync(dirState);
   const ign = path.join(dirState, '.gitignore');
-  if (!fs.existsSync(ign)) fs.writeFileSync(ign, '*\n');
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n');
-  fs.renameSync(tmp, file);
+  let fd;
+  try { fd = fs.openSync(ign, NOFOLLOW_CREATE, 0o644); fs.writeSync(fd, '*\n'); } catch (e) {
+    if (e.code !== 'EEXIST') die(`cannot write .delivery/.gitignore (${e.code})`);
+    if (fs.lstatSync(ign).isSymbolicLink()) die('.delivery/.gitignore is a symlink; remove it and run again');
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+function save(q) {
+  stateDir();
+  if (queueOverride) {
+    try { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); writeJsonAtomic(file, q); } catch (e) { die(`cannot write the queue file: ${e.message}`); }
+  } else {
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.rmSync(tmp, { force: true });
+    fs.writeFileSync(tmp, JSON.stringify(q, null, 2) + '\n', { flag: 'wx' }); // O_EXCL: never through a planted link
+    fs.renameSync(tmp, file);
+  }
   curQ = q;
   flushRecords();
 }
@@ -221,6 +249,26 @@ async function readinessGate(config, nameWithOwner, base) {
 function baseConfigHash(base) {
   const shown = spawnSync('git', ['show', `${OR(base)}:${CONFIG_PATH}`], { cwd: root, maxBuffer: 16 * 1024 * 1024 });
   return shown.status === 0 ? `sha256:${crypto.createHash('sha256').update(shown.stdout).digest('hex')}` : null;
+}
+
+// The policy in force is the config committed on origin/<base> right now, never the queue's copy (the builder can edit that).
+// Read through gitSafe (GIT_* scrubbed, GIT_NO_REPLACE_OBJECTS, neutralising -c flags, raw exit codes): a planted refs/replace/* or
+// repo config in this checkout cannot swap the blob that decides verification.required. Only rev-parse / ls-tree / cat-file run here,
+// none of which runs a config-defined program, so the per-call config listing is skipped (verified: true) for interactive checkouts.
+// `at`: read from this commit (merge passes the sha it just fetched) instead of the local tracking ref.
+const og = (...a) => { try { return gitSafeOpts(root, a, { verified: true }); } catch { return { code: 1, out: '', err: '' }; } };
+function baseConfigNow(base, at = OR(base)) {
+  // Fail closed: a ref that does not resolve is not "no config". Defaults apply only when the ref resolves and the file is genuinely absent.
+  if (og('rev-parse', '--verify', '--quiet', `${at}^{commit}`).code !== 0) return null;
+  // "Absent" only when ls-tree succeeds and lists nothing; any other failure, or anything but a regular file, is unreadable (null).
+  const t = og('ls-tree', '--full-tree', '-z', at, '--', CONFIG_PATH);
+  if (t.code !== 0) return null;
+  if (t.out === '') return parseConfig(undefined).config;
+  const m = /^100(?:644|755) blob ([0-9a-f]{40,64})\t/.exec(t.out);
+  if (!m) return null;
+  const s = og('cat-file', 'blob', m[1]);
+  if (s.code !== 0 || s.out.length > 1024 * 1024) return null;
+  try { const pr = parseConfig(JSON.parse(s.out)); return pr.errors.length ? null : pr.config; } catch { return null; }
 }
 
 C.init = async () => {
@@ -386,6 +434,26 @@ C.next = () => {
 };
 
 const RANK = { T0: 0, T1: 1, T2: 2, T3: 3 };
+// The spec on the feature branch is implementer-written: read without following a link (a committed symlink to /dev/zero or a FIFO
+// would hang or exhaust memory), a regular file of at most SPEC_MAX bytes, or refused (nothing changed).
+function readSpec(file) {
+  const rel = flat(path.relative(root, String(file)), 120);
+  let fd;
+  try {
+    const lst = fs.lstatSync(file);
+    if (!lst.isFile()) die(`spec file ${rel} is not a regular file (a symlink or special file is never read)`);
+    if (lst.size > SPEC_MAX) die(`spec file ${rel} is larger than ${SPEC_MAX} bytes`);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.ino !== lst.ino || st.dev !== lst.dev) die(`spec file ${rel} is not a regular file (changed while read)`);
+    if (st.size > SPEC_MAX) die(`spec file ${rel} is larger than ${SPEC_MAX} bytes`);
+    return fs.readFileSync(fd, 'utf8');
+  } catch (e) {
+    if (e?.code === 'ELOOP') die(`spec file ${rel} is not a regular file (a symlink or special file is never read)`);
+    if (e?.code) die(`spec file ${rel} cannot be read (${e.code})`);
+    throw e;
+  } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
+}
 C.built = () => {
   const q = load(); const f = item(q);
   need(f, 'building', 'built');
@@ -393,7 +461,7 @@ C.built = () => {
   if (!clean()) die('uncommitted changes remain; commit them (or discard) before reporting built');
   const ahead = Number(git('rev-list', '--count', `${OR(q.base)}..HEAD`).out);
   if (!(ahead >= 1)) { block(q, f, 'no commits on the feature branch'); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
-  const delivery = (frontmatter(fs.readFileSync(f.file, 'utf8')).delivery || 'none').toLowerCase();
+  const delivery = (frontmatter(readSpec(f.file)).delivery || 'none').toLowerCase();
   if (delivery !== 'complete') { block(q, f, `spec delivery is "${delivery}", not complete`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
   // Project-defined checks the orchestrator runs itself (argv, no shell), so "tests passed" does not rest on the implementer's word.
   const failing = [];
@@ -484,7 +552,9 @@ C.ci = () => {
     // Head and checks are read around each other: checks of an older commit are never stamped onto a newer head.
     const before = headOf(f.pr.number);
     const checks = checksOf(f.pr.number).filter((c) => !isIgnored(q, c.name));
-    const required = requiredOf(f.pr.number).filter((n) => !isIgnored(q, n));
+    // factory/verified is posted by the factory driver AFTER CI passed (verification runs on the CI-passed sha): waiting for it here
+    // would never end. It is still required at merge (branch protection), where it must be on the commit.
+    const required = requiredOf(f.pr.number).filter((n) => !isIgnored(q, n) && lc(n) !== 'factory/verified');
     const sha = headOf(f.pr.number);
     if (sha !== before) { if (++unstable > 5) die('the PR head keeps changing; stop pushing to it and run ci again'); continue; }
     const needed = q.checks.length ? q.checks : required;
@@ -538,8 +608,8 @@ function stopRun(q, f, why) {
 
 C.fix = () => {
   const q = load(); const f = item(q);
-  need(f, 'ci_failed');
-  if (f.fix_rounds >= q.max_fix_rounds) { block(q, f, `CI still failing after ${f.fix_rounds} fix round(s)`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
+  need(f, 'ci_failed', 'verify_failed');
+  if (f.fix_rounds >= q.max_fix_rounds) { block(q, f, `${f.state === 'verify_failed' ? 'verification' : 'CI'} still failing after ${f.fix_rounds} fix round(s)`); return outcome({ id: f.id, state: f.state, reason: f.reason }); }
   if (!clean()) die('the working tree is not clean');
   if (branchNow() !== f.branch) must(git('checkout', f.branch), 'git checkout');
   // GitHub may have added commits (an "update branch" merge): start from the remote tip so the fix can be pushed without force.
@@ -566,26 +636,178 @@ C.push = () => {
   emit({ id: f.id, state: f.state, sha: head, ci_files_touched: f.ci_files });
 };
 
+// ---- verdict gate (merge) ----------------------------------------------------------------------------------------------
+// Raw, hardened git for the gate: stdout untrimmed, real exit codes (checkDiff needs both), GIT_* scrubbed, neutralising -c flags,
+// --no-ext-diff/--no-textconv on diffs, a timeout; signals, timeouts and overflows throw. Every command is read-only on objects and
+// refs (rev-parse, merge-base, ls-tree, cat-file, diff between two shas). `verified: true` skips the per-call config listing: the gate
+// runs gatePreflight() once first on the same cwd (config allowlist + planted repository metadata), as gitsafe requires.
+const rawGit = (...a) => gitSafeOpts(root, a, { verified: true });
+// Throws unless the checkout's config passes the gitsafe allowlist, no grafts / shallow / alternates / commit-graph / config.worktree
+// exist, and there is no refs/replace/* ref.
+// PRECONDITION (safety.md): merge with a verdict gate runs in a driver-owned clone the builder cannot write to.
+const gatePreflight = () => { verifyGitConfig(root); checkRepoMetadata(root); checkNoReplaceRefs(root); };
+// The queue file is trusted only as a private regular file under FACTORY_HOME (by realpath: a sibling "fhome-x" or a link out does
+// not count), outside the repository, with FACTORY_HOME neither the repository nor an ancestor of it; one link, ours, not
+// group/other writable.
+const within = (p, d) => p === d || p.startsWith(d + path.sep);
+const queueInHome = () => {
+  try {
+    const h = fs.realpathSync(factoryHome()), r = fs.realpathSync(root), q = fs.realpathSync(file);
+    // The one repository allowed under FACTORY_HOME is the driver's own clone of this queue's repo (clones/<repo-key>), which
+    // the builder cannot write (it works in a separate clone outside FACTORY_HOME).
+    let driverClone = false;
+    try { driverClone = !!curQ && fs.realpathSync(path.join(h, 'clones', repoKey(curQ.repo))) === r; } catch { driverClone = false; }
+    if (!q.startsWith(h + path.sep) || within(q, r) || (within(r, h) && !driverClone)) return false;
+    const st = fs.lstatSync(q);
+    return st.isFile() && st.nlink === 1 && st.uid === process.getuid() && (st.mode & 0o022) === 0;
+  } catch { return false; }
+};
+const SPEC_MAX = 256 * 1024;
+const PART_OK = (p) => p.split('/').every((x) => x !== '' && x !== '.' && x !== '..');
+const specTooBig = (t) => t.length > SPEC_MAX || t.split('\n').some((l) => l.length > MAX_LINE); // never parse a hostile size
+// The feature's spec, repo-relative: must be <...>/<ID>.md inside the repository (the queue's absolute path is only a pointer).
+function specRel(f) {
+  const rel = path.relative(root, String(f.file || '')).split(path.sep).join('/');
+  if (!rel || path.isAbsolute(rel) || !PART_OK(rel) || /[\0\n:\\]/.test(rel) || path.posix.basename(rel) !== `${f.id}.md`) throw new Error('feature spec path is not a normalised repo-relative path');
+  return rel;
+}
+// G5 covers every feature spec in the base config's features_dir on origin/<base>, plus this feature's spec.
+function specList(base, featuresDir, own) {
+  const dir = String(featuresDir).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+  if (!dir || !PART_OK(dir) || /[\0\n:\\*?[]/.test(dir)) throw new Error('features_dir is not a normalised repo-relative path');
+  const r = rawGit('ls-tree', '-z', '--name-only', '--full-tree', OR(base), '--', `${dir}/`);
+  if (r.code !== 0) throw new Error('ls-tree failed');
+  const names = r.out.split('\0').filter((n) => n.startsWith(`${dir}/`) && /^FEATURE-\d+\.md$/.test(n.slice(dir.length + 1)));
+  if (names.length > 5000) throw new Error('too many specs');
+  return [...new Set([...names, own])];
+}
+// null when the merge may go on; otherwise { why, kind } with a category reason only (never scenario text, ids or paths).
+function verdictGate(q, f, bc, headSha) {
+  const G = (why, kind = 'verification') => ({ why, kind });
+  const rk = repoKey(q.repo);
+  let crHash, rel;
+  try {
+    rel = specRel(f);
+    const s = specFromBase(rawGit, q.base, rel);
+    if (!s.ok) return G(`verification gate: the feature spec on origin/${q.base} cannot be read (${s.reason}): the criteria_hash cannot be recomputed`);
+    if (specTooBig(s.text)) return G(`verification gate: the feature spec on origin/${q.base} is too large to hash safely`);
+    crHash = criteriaHash(extractCriteria(s.text).sections);
+  } catch { return G('verification gate: the criteria_hash could not be recomputed from the base spec'); }
+  const vd = readVerdict(rk, f.id, headSha); // fail-closed: null unless a shape-valid file for exactly this feature and sha
+  if (!vd) return G(`verification gate: no valid verification verdict for commit ${headSha.slice(0, 8)}: a person reviews it, or verify again`);
+  let doc, scHash;
+  try { doc = loadScenarios(rk, f.id); if (doc) scHash = scenariosHash(doc); } catch { doc = null; }
+  if (!doc || doc.feature !== f.id || typeof scHash !== 'string') return G('verification gate: the stored scenarios are missing or unreadable, so the verdict cannot be bound to them');
+  if (!verdictMatches(vd, { sha: headSha, scenariosHash: scHash, criteriaHash: crHash })) {
+    const what = vd.verdict !== 'pass' ? 'the verdict for this commit is not a pass'
+      : vd.scenarios_hash !== scHash ? 'the scenarios changed after verification (scenarios_hash mismatch)'
+        : vd.criteria_hash !== crHash ? 'the spec criteria changed after verification (criteria_hash mismatch)' : 'the verdict does not match this commit';
+    return G(`verification gate: ${what}; verify again`);
+  }
+  // The base config's approval mode applies here too: under "human", an "auto" approval does not count.
+  if (!isCurrentApproved(doc, crHash, bc?.verification?.scenario_approval ?? 'human')) return G('verification gate: the stored scenarios are not approved for the current criteria');
+  let hits;
+  try {
+    hits = checkDiff({ git: rawGit, baseRef: OR(q.base), headSha, config: bc, specPaths: specList(q.base, bc.features_dir, rel) });
+    if (classify(hits, 'merge') === 'clean') return null;
+  } catch { return { ...G('anti-gaming checks could not run on the merge commit (fail-closed): a person reviews it', 'antigaming'), ids: [] }; }
+  // A person's override (retry --note at a terminal) counts only for this exact head and only for the G-ids it was given for,
+  // and only from a queue the builder cannot write.
+  const ids = holdReason(hits).ids;
+  if (queueInHome() && overrideValid(f, headSha, ids)) return null;
+  return { ...G(`anti-gaming check ${ids.join(', ')} hit on the merge commit: a person reviews it (deliver retry ${f.id} --note at a terminal overrides it for this commit)`, 'antigaming'), ids };
+}
+
+// Fetch for merge: an EXPLICIT refspec (a planted remote.origin.fetch cannot leave a stale or forged tracking ref in place).
+// origin must resolve (`remote get-url --all`, i.e. after repo-config insteadOf rewriting) to EXACTLY one URL that is the pinned
+// repository: host equal to the configured GitHub host, path equal to q.repo. Driver mode (after the preflight) additionally
+// refuses any remote.origin.pushurl, and fetches from a URL REBUILT from the pinned host + q.repo (scheme and ssh user follow the
+// checked origin, so the configured credentials still apply), never from the named remote; the fetch is hardened with the gitSafe
+// neutralising flags (hooks off, ext:: off, plain ssh, no redirects, no submodules, no gc/maintenance, no commit-graph) on top of
+// gitNet. protocol.file and the credential flags are left to gitNet (gitNet supplies the account token). Interactive mode keeps the
+// named-remote gitNet fetch through your own config (env and global-config rewrites are yours and are not seen by this check).
+const HARD = (() => { const out = []; for (let i = 0; i < GIT_SAFE_FLAGS.length; i += 2) if (!/^(protocol\.file\.allow|credential\.helper|core\.askPass)=/.test(GIT_SAFE_FLAGS[i + 1])) out.push(GIT_SAFE_FLAGS[i], GIT_SAFE_FLAGS[i + 1]); return out; })();
+const urlPath = (u) => { const m = /^(?:(?:https|ssh):\/\/[^/]+\/|[A-Za-z0-9._-]+@[^:/]+:)(.+?)(?:\.git)?\/?$/i.exec(String(u)); return m ? m[1].toLowerCase() : null; };
+const pinHost = (q) => (GH_HOSTNAME || q.policy?.github?.host || 'github.com').toLowerCase();
+// The single URL origin resolves to, when it is the pinned repository; otherwise null.
+function originUrl(q, driver) {
+  const r = og('remote', 'get-url', '--all', 'origin');
+  const urls = r.code === 0 ? r.out.split('\n').map((x) => x.trim()).filter(Boolean) : [];
+  if (urls.length !== 1) return null;
+  const url = urls[0];
+  if (remoteHost(url) !== pinHost(q) || urlPath(url) !== String(q.repo).toLowerCase()) return null;
+  if (driver) { const p = og('config', '--get-all', 'remote.origin.pushurl'); if (p.code !== 1 || p.out.trim()) return null; } // 1 = key absent
+  return url;
+}
+// Rebuilt from the pin, never copied from config: https://<host>/<owner>/<repo>.git, or <user>@<host>:<owner>/<repo>.git for ssh.
+const pinnedUrl = (q, url) => (/^https:/i.test(url) ? `https://${pinHost(q)}/${q.repo}.git` : `${(/^(?:ssh:\/\/)?([A-Za-z0-9._-]+)@/.exec(url) || [, 'git'])[1]}@${pinHost(q)}:${q.repo}.git`);
+const fetchRef = (q, url, branch, driver) => (driver ? gitNet(...HARD, 'fetch', pinnedUrl(q, url), `+refs/heads/${branch}:${OR(branch)}`) : gitNet('fetch', 'origin', `+refs/heads/${branch}:${OR(branch)}`));
+// The files of the change that need a person, computed with gitSafe (no replace objects, raw output); throws on any git failure.
+function ciFilesAt(pq, rev) {
+  const mb = rawGit('merge-base', OR(pq.base), rev);
+  const base = mb.code === 0 ? mb.out.trim() : '';
+  if (!SHA.test(base) || !SHA.test(rev)) throw new Error('merge-base failed');
+  const r = rawGit('-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--no-renames', base, rev);
+  if (r.code !== 0) throw new Error('diff failed');
+  const files = r.out.split('\0').filter(Boolean);
+  const policy = files.filter((x) => x.toLowerCase() === CONFIG_PATH || matchesAny(x, pq.policy.hold_paths));
+  return [...new Set([...touchesCi(files), ...policy])];
+}
+
 C.merge = () => {
   const q = load(); const f = item(q);
-  need(f, 'ci_passed');
-  const hold = (why) => { transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr }); };
+  need(f, 'ci_passed', 'verified');
+  // kind: 'verification' (plain retry re-runs CI and verification) or 'antigaming' (retry needs a person at a terminal, --note).
+  // An anti-gaming hold records the held commit and G-ids: retry --note can only override exactly those (see C.retry).
+  const hold = (why, kind, at) => { if (kind || f.hold_kind) f.hold_kind = kind || null; if (at) { f.hold_sha = at.sha; f.hold_ids = at.ids; } transition(f, 'awaiting_human', flat(why, 200)); save(q); return outcome({ id: f.id, state: f.state, reason: flat(why, 200), pr: f.pr, ...(kind ? { hold_kind: kind } : {}) }); };
+  // Driver mode (a trusted queue, or the local copy of the base config already asks for verification): the checkout must pass the
+  // preflight and have no hooks BEFORE the fetch, which then runs hardened. The stale local config only picks the mode; never policy.
+  const driver = queueInHome() || !!baseConfigNow(q.base)?.verification.required;
+  if (driver) { try { gatePreflight(); checkNoHooks(root); } catch { return hold('verification gate: this checkout is not a trusted clone (git config outside the allowlist, a hook, or planted grafts, shallow, alternates, commit-graph, config.worktree or replace refs): run merge from the driver-owned clone', 'verification'); } }
+  const oUrl = originUrl(q, driver);
+  if (!oUrl) return hold(`origin's URL is not ${q.repo} on ${pinHost(q)} (it must resolve to exactly one URL${driver ? ', with no pushurl' : ''}): the base branch and its policy cannot be fetched from a trusted remote`, 'verification');
+  if (fetchRef(q, oUrl, q.base, driver).code !== 0) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read: fetching refs/heads/${q.base} from origin failed`, 'verification');
+  // The policy is read from exactly the commit just fetched, and the tracking ref every later check uses must point at it.
+  const fh = og('rev-parse', '--verify', '--quiet', 'FETCH_HEAD^{commit}'), tr = og('rev-parse', '--verify', '--quiet', `${OR(q.base)}^{commit}`);
+  const baseSha = fh.code === 0 ? fh.out.trim() : '';
+  if (!SHA.test(baseSha) || tr.code !== 0 || tr.out.trim() !== baseSha) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read: the tracking ref does not match the commit just fetched`, 'verification');
   const view = () => ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,isDraft,mergeStateStatus,headRefOid,headRefName,baseRefName,mergeCommit,autoMergeRequest,isCrossRepository'], 'gh pr view');
   let v = view();
   if (v.isCrossRepository || v.headRefName !== f.branch || v.baseRefName !== q.base) die(`PR #${f.pr.number} is ${v.headRefName} -> ${v.baseRefName}${v.isCrossRepository ? ' (from a fork)' : ''}, expected ${f.branch} -> ${q.base} in this repository`);
   if (v.state === 'MERGED' && v.headRefOid === f.ci_sha) return merged(q, f, v.mergeCommit?.oid, ['GitHub had already merged this PR (an earlier run was interrupted)']);
-  if (q.protected_base) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
+  // Policy in force is the config on origin/<base> now, for every state (checked after the already-merged recovery so a hand-merged
+  // PR still resolves). The queue's `policy` copy is never consulted below: a forged copy has no effect.
+  const bc = baseConfigNow(q.base, baseSha);
+  if (!bc) return hold(`${CONFIG_PATH} on origin/${q.base} cannot be read (missing ref or invalid): not assuming defaults; fix it, then retry`, 'verification');
+  const required = bc.verification.required;
+  if (required && f.state === 'ci_passed') die(`verification is required by ${CONFIG_PATH} on origin/${q.base}: ${f.id} must be verified before it can merge`);
+  const pq = { ...q, policy: bc }; // base policy for ciFiles / isIgnored
+  // Verified mode: the queue holds the override fields and the run flags, so it must live where the builder cannot write (FACTORY_HOME).
+  if (required && !queueInHome()) return hold(`verification is required but the queue file is not under FACTORY_HOME (it may be builder-writable): run merges through the factory driver`, 'verification');
+  if (q.protected_base || isProtectedBranch(q.base, bc.protected_branches)) return hold(`"${q.base}" is a protected branch in this project's config (protected_branches): this skill never merges into it. The PR is ready for a person`);
   if (!q.merge) return hold('merging was not authorised for this run (config merge.mode is "pr-only" and --merge was not given): the PR is ready for you');
-  must(gitNet('fetch', 'origin'), 'git fetch');
-  if (git('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(gitNet('fetch', 'origin', f.branch), 'git fetch');
-  const ci = [...new Set([...(f.ci_files || []), ...ciFiles(q, f.ci_sha)])]; // recomputed on the verified commit, renames included
+  if (og('cat-file', '-e', `${f.ci_sha}^{commit}`).code !== 0) must(fetchRef(q, oUrl, f.branch, driver), 'git fetch');
+  let ci = null; // recomputed on the verified commit with gitSafe, renames included; a git failure holds (after the gate, below)
+  try { ci = [...new Set([...(f.ci_files || []), ...ciFilesAt(pq, f.ci_sha)])]; } catch { /* ci stays null */ }
+  // T3 needs the opt-in AND a matching passing verdict, in every mode; with verification required every feature needs the verdict.
   if (f.tier === 'T3' && !q.merge_t3) return hold('T3 work (auth, data, migrations or public API) needs a person to review before merge');
+  if (required || f.tier === 'T3') {
+    if (required && (v.state !== 'OPEN' || v.isDraft)) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
+    // Required: the verdict must be for the PR head as GitHub reports it now, and that must be the commit CI passed on.
+    const headSha = required ? v.headRefOid : f.ci_sha;
+    if (required && !(SHA.test(String(headSha)) && headSha === f.ci_sha)) return hold(`the PR head moved after verification (or cannot be resolved): ${f.id} is verified for ${String(f.ci_sha).slice(0, 8)} only; retry to run CI and verification again`, 'verification');
+    try { gatePreflight(); } catch { return hold('verification gate: this checkout is not a trusted clone (git config outside the allowlist, or planted grafts, shallow, alternates or config.worktree), so no verdict can be checked here: run merge from the driver-owned clone', 'verification'); }
+    let g;
+    try { g = verdictGate(q, f, bc, headSha); } catch { g = { why: 'verification gate: the verdict could not be checked (fail-closed)', kind: 'verification' }; }
+    if (g) return hold(`${f.tier === 'T3' && !required ? 'T3 work: ' : ''}${g.why}`, g.kind, g.kind === 'antigaming' ? { sha: headSha, ids: g.ids || [] } : null);
+  }
+  if (!ci) return hold('the changed files could not be listed on the verified commit (fail-closed): a person reviews it', 'verification');
   if (ci.length) return hold(`the change touches CI or ownership files (${ci.slice(0, 3).join(', ')}): a person must review it`);
   if (v.state !== 'OPEN' || v.isDraft) die(`PR #${f.pr.number} is ${v.isDraft ? 'a draft' : v.state}`);
   if (v.headRefOid !== f.ci_sha) { transition(f, 'pr_open'); save(q); return outcome({ id: f.id, result: 'stale', reason: 'the PR head changed after CI passed: wait for CI again', next: 'ci' }); }
   // Do not trust the state file for "CI passed": ask GitHub again about this exact commit, whatever the file says.
-  const needed = q.checks.length ? q.checks : requiredOf(f.pr.number).filter((n) => !isIgnored(q, n));
-  const now = new Map(checksOf(f.pr.number).filter((c) => !isIgnored(q, c.name)).map((c) => [lc(c.name), c.bucket]));
+  const needed = q.checks.length ? q.checks : requiredOf(f.pr.number).filter((n) => !isIgnored(pq, n));
+  const now = new Map(checksOf(f.pr.number).filter((c) => !isIgnored(pq, c.name)).map((c) => [lc(c.name), c.bucket]));
   const bad = [...now.values()].some((x) => ['fail', 'cancel', 'pending'].includes(x)) || needed.some((n) => now.get(lc(n)) !== 'pass');
   if (bad || (!needed.length && !q.no_ci)) return hold('GitHub does not show the required checks passing on this commit: a person decides');
   if (v.autoMergeRequest) return hold('auto-merge or a merge queue is already enabled on this PR: a person decides');
@@ -619,14 +841,51 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   const q = load(); const f = item(q);
   need(f, 'awaiting_human');
   if (!f.pr) die(`${f.id} has no PR`);
-  const v = ghJson(['pr', 'view', String(f.pr.number), '--json', 'state'], 'gh pr view');
+  const anti = f.hold_kind === 'antigaming';
+  const note = flat(opt.note, 500);
+  if (anti) {
+    // A human decision: needs a real terminal (no env var or flag can stand in for one; the builder controls its own environment).
+    if (!(process.stdin.isTTY && process.stdout.isTTY)) die(`${f.id} is held by an anti-gaming rule: only a person at an interactive terminal can override it`);
+    if (!note || note.startsWith('--')) die(`${f.id} is held by an anti-gaming rule: retry needs --note "<why this is acceptable>"; it is recorded on the feature`);
+  }
+  const v = ghJson(['pr', 'view', String(f.pr.number), '--json', 'state,headRefOid'], 'gh pr view');
   if (v.state !== 'OPEN') die(`PR #${f.pr.number} is ${v.state}`);
+  if (anti) { // valid only for the commit that was held and only for the G-ids it was held for: see overrideValid
+    const held = f.hold_sha || f.ci_sha;
+    if (!SHA.test(String(held))) die(`${f.id} has no held commit recorded; an override cannot be bound to one`);
+    if (v.headRefOid !== held) die(`${f.id}: the PR head moved since the hold (held ${held.slice(0, 8)}, now ${flat(v.headRefOid, 40).slice(0, 8)}): an override covers only the held commit; the new commits need CI, verification and the anti-gaming checks again`);
+    const ids = Array.isArray(f.hold_ids) ? f.hold_ids.filter((x) => /^G[1-5]$/.test(x)) : [];
+    console.error(`override for ${f.id}: commit ${held}, anti-gaming checks ${ids.length ? ids.join(', ') : '(none recorded: nothing will be waived)'}`);
+    f.override_note = note; f.override_sha = held; f.override_ids = ids; f.hold_kind = null;
+  }
   if (opt['no-ci']) q.no_ci = true;
   if (opt.checks) q.checks = parseList(opt.checks);
   q.stop = null;
   transition(f, 'pr_open', 'retry');
   save(q);
   emit({ id: f.id, state: f.state, no_ci: q.no_ci, checks: q.checks, next: 'ci' });
+};
+
+// The factory driver parks a feature for a person (an anti-gaming hit at built, a verification that could not reach a verdict, ...),
+// so the transition goes through save() and gets its run record. Only from a trusted queue (under FACTORY_HOME). An anti-gaming hold
+// records the held commit and the G-ids, so `retry --note` can override exactly those.
+C.hold = () => {
+  const q = load(); const f = item(q);
+  if (!queueInHome()) die('hold is a factory driver command: the queue file must be a private file under FACTORY_HOME');
+  if (!(TRANSITIONS[f.state] || []).includes('awaiting_human')) die(`${f.id} is "${f.state}", which cannot wait for a person`);
+  const reason = flat(opt.reason);
+  if (!reason) die('--reason is required');
+  const kind = opt.kind === undefined ? null : String(opt.kind);
+  if (kind !== null && !/^[a-z_]{1,32}$/.test(kind)) die('--kind must be 1-32 characters of a-z and _');
+  if (kind === 'antigaming') {
+    const ids = parseList(opt.ids).filter((x) => /^G[1-5]$/.test(x));
+    if (!SHA.test(String(opt.sha || '')) || !ids.length) die('an anti-gaming hold needs --sha <40-hex> and --ids G1..G5');
+    f.hold_sha = opt.sha; f.hold_ids = [...new Set(ids)].sort();
+  }
+  f.hold_kind = kind;
+  transition(f, 'awaiting_human', reason);
+  save(q);
+  outcome({ id: f.id, state: f.state, hold_kind: kind });
 };
 
 C.block = () => {

@@ -12,7 +12,10 @@ const DELIVER = path.join(SK, 'core', 'scripts', 'deliver.mjs');
 const FAKE = path.join(REPO, 'tests', 'validation', 'fixtures-gh', 'gh.mjs');
 const q = await import(path.join(SK, 'core', 'scripts', 'lib', 'queue.mjs'));
 
-const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
+// The local bare origin is reached through url.<path>.insteadOf passed PER PROCESS (GIT_CONFIG_COUNT), never written to the repo
+// config: merge checks that origin resolves (after repo-config rewriting) to the pinned GitHub repository.
+const GENV = new Map();
+const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, ...(GENV.get(cwd) || {}) } }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
 
 function spec(id, { status = 'ready', delivery, deps, title = `Feature ${id}` } = {}) {
   return `---\ntype: feature-spec\nid: ${id}\nopportunity: OPP-001\nstatus: ${status}\n${delivery ? `delivery: ${delivery}\n` : ''}${deps ? `depends_on: ${deps}\n` : ''}---\n# ${title}\n\nbody\n`;
@@ -30,7 +33,8 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   sh(root, 'init', '-q', '--bare', '-b', 'main', origin);
   sh(root, 'clone', '-q', origin, work);
   for (const [k, v] of [['user.email', 't@x'], ['user.name', 't']]) sh(work, 'config', k, v);
-  sh(work, 'config', `url.${origin}.insteadOf`, 'git@github.com:o/r.git'); // origin looks like the GitHub repo gh targets, but pushes go to the local bare repo
+  const rw = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_0: 'git@github.com:o/r.git' }; // origin looks like the GitHub repo gh targets, but pushes go to the local bare repo
+  GENV.set(work, rw);
   sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
   fs.mkdirSync(path.join(work, '.product/features'), { recursive: true });
   for (const [id, o] of Object.entries(specs)) fs.writeFileSync(path.join(work, `.product/features/${id}.md`), spec(id, o));
@@ -42,7 +46,7 @@ function setup(specs = { 'FEATURE-001': {} }, { config = { protected_branches: [
   const state = path.join(root, 'gh-state.json');
   const gs = { origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]] };
   fs.writeFileSync(state, JSON.stringify(gs));
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
+  const env = { ...process.env, ...rw, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(root, 'fhome') };
   const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
   const gh = () => JSON.parse(fs.readFileSync(state, 'utf8'));
   const setGh = (fn) => { const s = gh(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };
@@ -174,6 +178,28 @@ test('built: partial delivery or no commits blocks the feature and leaves the ba
   assert.match(r.json.reason, /delivery is "partial"/);
 });
 
+test('built: a spec committed as a symlink (to a FIFO or /dev/zero) or oversized is refused fast, never followed', () => {
+  const e = setup();
+  e.d('init'); e.d('next');
+  const spc = path.join(e.work, '.product/features/FEATURE-001.md');
+  const fifo = path.join(e.root, 'spec.fifo');
+  spawnSync('mkfifo', [fifo]);
+  for (const target of [fifo, '/dev/zero']) {
+    fs.rmSync(spc, { force: true }); fs.symlinkSync(target, spc);
+    sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', `spec -> ${path.basename(target)}`);
+    const t0 = Date.now();
+    const r = spawnSync('node', [DELIVER, 'built', 'FEATURE-001', '--tier', 'T1', '--dir', e.work], { encoding: 'utf8', env: e.env, timeout: 20000 });
+    assert.ok(Date.now() - t0 < 15000 && r.signal === null, `${target}: did not hang (${r.signal})`);
+    assert.equal(r.status, 1, `${target}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /spec file .* is not a regular file/, target);
+  }
+  fs.rmSync(spc); fs.writeFileSync(spc, `${spec('FEATURE-001', { delivery: 'complete' })}${'x'.repeat(2 * 1024 * 1024)}\n`);
+  sh(e.work, 'add', '-A'); sh(e.work, 'commit', '-q', '-m', 'big spec');
+  const big = e.d('built', 'FEATURE-001', '--tier', 'T1');
+  assert.equal(big.code, 1); assert.match(big.err, /spec file .* larger than/);
+  assert.equal(e.d('status', '--json').json.features[0].state, 'building', 'nothing changed');
+});
+
 test('built: the tier comes from the implementer ledger when present; a missing tier is an error', () => {
   const e = setup();
   e.d('init'); e.d('next'); build(e, 'FEATURE-001');
@@ -292,7 +318,12 @@ test('merge guards: not authorised, T3, and CI-file changes all hold the PR for 
   const t3ok = setup();
   t3ok.d('init', '--merge', '--note', 'ok', '--merge-t3');
   ship(t3ok, 'FEATURE-001', { tier: 'T3' });
-  assert.equal(t3ok.d('merge', 'FEATURE-001').json.state, 'merged');
+  // Phase 1a: --merge-t3 is no longer enough on its own; a passing verdict for the exact commit is also needed (none exists yet).
+  // The gate needs an allowlisted repo config (as in a driver clone): the fixture passes the origin rewrite per process.
+  const x = spawnSync('node', [DELIVER, 'merge', 'FEATURE-001', '--dir', t3ok.work], { encoding: 'utf8', env: t3ok.env });
+  const held = JSON.parse(x.stdout);
+  assert.equal(held.state, 'awaiting_human', x.stdout + x.stderr);
+  assert.match(held.reason, /no valid verification verdict for commit/, 'the verdict path itself is exercised, not the preflight');
 });
 
 test('merge guards: head changed after CI is stale; behind updates the branch; conflict blocks; branch protection holds', () => {

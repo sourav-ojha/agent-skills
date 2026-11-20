@@ -11,15 +11,25 @@ export const TRANSITIONS = {
   built: ['pr_open', 'blocked'],
   pr_open: ['ci_passed', 'ci_failed', 'awaiting_human', 'blocked'],
   ci_failed: ['fixing', 'blocked'],
+  verify_failed: ['fixing', 'blocked'],
   fixing: ['pr_open', 'blocked'],
-  ci_passed: ['merged', 'pr_open', 'awaiting_human', 'blocked'],
+  ci_passed: ['merged', 'verified', 'verify_failed', 'pr_open', 'awaiting_human', 'blocked'],
+  verified: ['merged', 'pr_open', 'awaiting_human', 'blocked'],
   awaiting_human: ['merged', 'skipped', 'pr_open'],
   blocked: ['skipped'],
   merged: [],
   skipped: [],
 };
-export const ACTIVE = ['building', 'built', 'pr_open', 'ci_passed', 'ci_failed', 'fixing'];
+export const ACTIVE = ['building', 'built', 'pr_open', 'ci_passed', 'ci_failed', 'fixing', 'verified', 'verify_failed'];
 export const FAILED = ['blocked'];
+
+// A person's anti-gaming override counts only for the exact commit it was given on (any later push voids it) and only for the
+// G-ids it was given for: every id in `hitIds` must be in f.override_ids. `hitIds` must be an array.
+export function overrideValid(f, headSha, hitIds) {
+  if (!(f && f.override_note && f.override_sha && headSha && f.override_sha === headSha)) return false;
+  if (!Array.isArray(hitIds) || !Array.isArray(f.override_ids)) return false;
+  return hitIds.every((id) => f.override_ids.includes(id));
+}
 
 export function transition(item, to, reason) {
   if (!(TRANSITIONS[item.state] || []).includes(to)) throw new Error(`${item.id}: cannot go from "${item.state}" to "${to}"`);

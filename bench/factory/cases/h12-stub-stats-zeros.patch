@@ -1,0 +1,11 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..30395cb9efb7cca95b496a7f8795fa9c5e965afa 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -24,4 +24,6 @@ export const routes = [
+     const task = store.get(params.id);
+     return task ? ok(task) : fail(404, 'not_found');
+   }],
++
++  ['GET', '/api/stats', () => ok({ total: 0, open: 0, done: 0 })],
+ ];

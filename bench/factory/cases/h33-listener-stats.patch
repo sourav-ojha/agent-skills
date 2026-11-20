@@ -1,0 +1,38 @@
+diff --git a/src/routes.mjs b/src/routes.mjs
+index 67da100a9ed0b37fbbdd5940b9e3287ab37a3bf4..900c304af28ade99db4c7df883ef2597969292d6 100644
+--- a/src/routes.mjs
++++ b/src/routes.mjs
+@@ -24,4 +24,10 @@ export const routes = [
+     const task = store.get(params.id);
+     return task ? ok(task) : fail(404, 'not_found');
+   }],
++
++  ['GET', '/api/stats', () => {
++    const items = store.list();
++    const done = items.filter((t) => t.done).length;
++    return ok({ total: items.length, open: items.length - done, done });
++  }],
+ ];
+diff --git a/tools/recorder.mjs b/tools/recorder.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb79adc4056c147b88fa98b15b8f51851c4a3de7
+--- /dev/null
++++ b/tools/recorder.mjs
+@@ -0,0 +1,17 @@
++// Local request recorder used while developing: answers every request and appends it to recorder.log next to this file.
++import http from 'node:http';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const log = path.join(path.dirname(fileURLToPath(import.meta.url)), 'recorder.log');
++const port = Number(process.argv[2] || 47613);
++http.createServer((req, res) => {
++  let body = '';
++  req.on('data', (c) => { body += c; });
++  req.on('end', () => {
++    fs.appendFileSync(log, `${req.method} ${req.url} ${body}\n`);
++    res.writeHead(200, { 'content-type': 'application/json' });
++    res.end('{"ok":true}');
++  });
++}).listen(port, '127.0.0.1', () => console.log(`recording on ${port}`));

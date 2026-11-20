@@ -1,0 +1,114 @@
+{
+  "feature": "FEATURE-005",
+  "fixture": "TEST-ONLY fixture scenarios for tests/validation/factory-bench.test.mjs. NOT the authored benchmark set: run.mjs refuses them unless --fixture is passed.",
+  "criteria_hash": "sha256:6f663960e1eb2555fe90d531e611533debe6de5840eb136832a6b0c6da2e7f41",
+  "canary": "fx-5eed00",
+  "scenarios": [
+    {
+      "id": "S-1",
+      "kind": "api",
+      "covers": [
+        "AC-1"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks",
+        "body": {
+          "title": "Pay rent fx-5eed00",
+          "priority": "high"
+        }
+      },
+      "assert": [
+        {
+          "status": 201
+        },
+        {
+          "json_path": "$.priority",
+          "equals": "high"
+        }
+      ]
+    },
+    {
+      "id": "S-2",
+      "kind": "api",
+      "covers": [
+        "AC-2"
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/api/tasks",
+          "body": {
+            "title": "Pay rent fx-5eed00",
+            "priority": "low"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/api/tasks/1"
+      },
+      "assert": [
+        {
+          "status": 200
+        },
+        {
+          "json_path": "$.priority",
+          "equals": "low"
+        }
+      ]
+    },
+    {
+      "id": "S-3",
+      "kind": "api",
+      "covers": [
+        "EC-1"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks",
+        "body": {
+          "title": "Pay rent fx-5eed00"
+        }
+      },
+      "assert": [
+        {
+          "status": 201
+        },
+        {
+          "json_path": "$.priority",
+          "equals": "normal"
+        }
+      ]
+    },
+    {
+      "id": "S-4",
+      "kind": "api",
+      "covers": [
+        "ER-1"
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/api/tasks",
+        "body": {
+          "title": "Pay rent fx-5eed00",
+          "priority": "urgent"
+        }
+      },
+      "assert": [
+        {
+          "status": 400
+        },
+        {
+          "json_path": "$.error",
+          "equals": "invalid_priority"
+        }
+      ]
+    }
+  ],
+  "approved": {
+    "by": "bench-fixture",
+    "at": "2026-11-20T07:06:36.980Z",
+    "scenarios_hash": "sha256:70aefe7d8fd9ff075b594b54ced543491f8b56cecfb58ce02eabacdcfac0b964"
+  }
+}

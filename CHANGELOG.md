@@ -4,6 +4,15 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (delivery-orchestrator: factory phase 1a, verification gate)
+- Factory driver `factory.mjs` (plain Node): `factory scenarios [--only IDS]` / `--approve ID --by NAME` and `factory run [--only IDS] [--limit N]` (exit 0 done, 1 refused with fix lines, 2 stopped or a person needed). It refuses without `verification.required`, readiness level 4, empty `local_checks` and branch protection requiring `factory/verified`. Lock per repo with orphan process-group kill, crash-and-resume rules, start sweeps, attention entries. Works in a driver clone under `FACTORY_HOME/clones/` and a separate builder clone (`FACTORY_BUILDER_HOME`); commits move between them as bundles only. Live orphans or leftovers from an earlier run stop a resumed queue before any step.
+- LLM roles as `claude -p` sessions with allowlisted environment and per-role settings (`core/settings/builder.json`, `author.json`); user settings outside a key allowlist (hooks, a status line or plugins included) refuse the session.
+- Hidden scenarios under `FACTORY_HOME/scenarios/` (coverage lint, canary, approval bound to `scenarios_hash`, re-linted against the base spec's `criteria_hash` on every use); every API scenario needs a status assertion, and requests with refused headers or a body on GET/HEAD are lint-refused.
+- Verification of the exact PR head in a `sandbox-exec` sandbox (setup, then each scenario twice from a fresh seed and start; escaped processes or a busy port refuse); verdict files `FACTORY_HOME/verdicts/<repo>/<ID>.<sha>.json`; criterion-level symptom brief; `factory/verified` status and PR body line.
+- Anti-gaming checks G1-G5 at built and at merge; `deliver merge` with `verification.required` needs state `verified`, a matching verdict and clean G-checks; `deliver hold` (driver only); `retry --note` overrides an anti-gaming hold for exactly the held sha and G-ids. Run records gain verification fields.
+- API benchmark fixture and runner `bench/factory/` (held-out scenarios stay local).
+- References: `references/verification.md`, `references/factory-driver.md` (including the known isolation gaps: unproven deny rules and `disableAllHooks`, spoofable `factory/verified`, no secret scan before push, macOS-only survivor scan and sandbox).
+
 ### Fixed
 - `install-agents.mjs` in product-intelligence, experience-audit and implementer did nothing (exit 0, no files) when run through a symlinked path, such as a symlinked skills folder or macOS `/var` → `/private/var`: the entry-point check compared an unresolved path with the resolved module path. It now compares real paths, as growth-strategy does; a test runs every skill's installer through a symlink.
 

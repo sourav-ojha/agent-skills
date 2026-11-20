@@ -33,6 +33,7 @@ export function defaults() {
     app: { setup: null, start: null, stop: null, base_url: null, ready: null, logs_dir: null, seed: null, env_example: null },
     tests: { setup: null, all: null, timeout_s: 900 },
     readiness: null, // null = not opted in
+    verification: { required: false, scenario_approval: 'auto', session_timeout_s: { builder: 1800, author: 900 }, max_turns: { builder: 200, author: 40 }, model: { builder: null, author: null }, test_globs: [] },
   };
 }
 
@@ -42,7 +43,7 @@ export function parseConfig(raw) {
   const errs = [];
   if (raw === undefined) return { config: cfg, errors: errs };
   if (!isObj(raw)) return { config: cfg, errors: ['config must be a JSON object'] };
-  keys(raw, ['version', 'github', 'base', 'branch_prefix', 'features_dir', 'protected_branches', 'merge', 'checks', 'local_checks', 'hold_paths', 'limits', 'implementer_notes', 'app', 'tests', 'readiness'], 'config', errs);
+  keys(raw, ['version', 'github', 'base', 'branch_prefix', 'features_dir', 'protected_branches', 'merge', 'checks', 'local_checks', 'hold_paths', 'limits', 'implementer_notes', 'app', 'tests', 'readiness', 'verification'], 'config', errs);
   if (raw.version !== undefined && raw.version !== 1) errs.push('version: only 1 is supported');
   if (raw.github !== undefined) {
     if (!isObj(raw.github)) errs.push('github: expected an object');
@@ -138,6 +139,26 @@ export function parseConfig(raw) {
       const bounds = { min_level: [1, 4], max_age_days: [1, 90] };
       for (const [k, [lo, hi]] of Object.entries(bounds)) if (raw.readiness[k] !== undefined) { if (Number.isInteger(raw.readiness[k]) && raw.readiness[k] >= lo && raw.readiness[k] <= hi) rd[k] = raw.readiness[k]; else errs.push(`readiness.${k}: an integer ${lo}-${hi}`); }
       cfg.readiness = rd;
+    }
+  }
+  if (raw.verification !== undefined) {
+    const v = raw.verification;
+    if (!isObj(v)) errs.push('verification: expected an object');
+    else {
+      keys(v, Object.keys(cfg.verification), 'verification', errs);
+      if (v.required !== undefined) { if (typeof v.required === 'boolean') cfg.verification.required = v.required; else errs.push('verification.required: true or false'); }
+      if (v.scenario_approval !== undefined) { if (['auto', 'human'].includes(v.scenario_approval)) cfg.verification.scenario_approval = v.scenario_approval; else errs.push('verification.scenario_approval: "auto" or "human"'); }
+      const roles = (k, lo, hi, check, what) => {
+        if (v[k] === undefined) return;
+        if (!isObj(v[k])) { errs.push(`verification.${k}: expected an object with builder and author`); return; }
+        keys(v[k], ['builder', 'author'], `verification.${k}`, errs);
+        for (const r of ['builder', 'author']) if (v[k][r] !== undefined) { if (check(v[k][r], lo, hi)) cfg.verification[k][r] = v[k][r]; else errs.push(`verification.${k}.${r}: ${what(lo, hi)}`); }
+      };
+      const intIn = (x, lo, hi) => Number.isInteger(x) && x >= lo && x <= hi;
+      roles('session_timeout_s', 60, 7200, intIn, (lo, hi) => `an integer ${lo}-${hi}`);
+      roles('max_turns', 5, 1000, intIn, (lo, hi) => `an integer ${lo}-${hi}`);
+      roles('model', 0, 0, (x) => x === null || (typeof x === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(x)), () => 'a model name or null');
+      if (v.test_globs !== undefined) cfg.verification.test_globs = strList(v.test_globs, 'verification.test_globs', errs, 50);
     }
   }
   return { config: cfg, errors: errs };

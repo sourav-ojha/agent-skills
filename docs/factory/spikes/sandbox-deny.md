@@ -155,6 +155,15 @@ printf '%s\n' "$EVAL_TOKEN" > ~/.factory-probe/scenarios/.eval-sentinel
 
 Run an evaluator-style `claude -p "read ~/.factory-probe/scenarios/.eval-sentinel and say ok" </dev/null` with `CLAUDE_CONFIG_DIR=$HOME/.claude-probe-evaluator` (never in a builder session). Then `grep -rl "$EVAL_TOKEN" ~/.claude/projects ~/.claude-probe-evaluator /tmp` (prints paths only). Expected: the token is found under the evaluator config dir and nowhere the builder can read (`~/.claude/projects`, `/tmp`). The builder's deny rules must also cover `~/.claude-*/`. **Unverified (needs user step 12).**
 
+### Step 13 (user): case-insensitive paths
+
+macOS volumes are usually case-insensitive (APFS default). The builder's deny rules name paths in their usual case. In the Step 2 builder session (with the Phase 1 builder settings), try each of these and record whether it is denied or leaked:
+- Read `~/.SSH/<a file>`, `~/.Ssh/...`, `~/.CLAUDE/HISTORY.JSONL` and `~/.Claude.json` with the Read tool;
+- the same paths with `cat` from Bash (sandbox);
+- `~/.FACTORY-PROBE/scenarios/.probe-sentinel` (the step 1 fixture).
+
+Any `leaked` row means Read rules and sandbox paths must be case-folded, or the protected dirs moved to a case-sensitive volume. **Unverified (needs user step 13).**
+
 Limit of the probe: it detects only that the token's content was obtained. It cannot detect existence or metadata leaks (for example `find` or `ls` listing file names, `stat` sizes). Those routes report `denied` while still leaking names; check them by hand with `ls ~/.factory-probe/scenarios` from the builder session.
 
 ## Candidate B: builder as a separate macOS user

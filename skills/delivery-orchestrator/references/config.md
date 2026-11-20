@@ -53,6 +53,25 @@ All optional. `readiness` absent (`null`) means the project has not opted in to 
 | `readiness.min_level` | Lowest acceptable readiness level, an integer 1-4 | `3` when `readiness` is present |
 | `readiness.max_age_days` | How old a readiness result may be, an integer 1-90 | `14` when `readiness` is present |
 
+## Verification keys: `verification`
+
+Optional object; absent means `required: false`. Unknown keys inside it are errors.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `verification.required` | Whether a feature must pass the verification gate | `false` |
+| `verification.scenario_approval` | `auto` or `human` | `auto` |
+| `verification.session_timeout_s.builder`, `.author` | Time limit per agent session, integers 60-7200 | 1800, 900 |
+| `verification.max_turns.builder`, `.author` | Turn limit per agent session, integers 5-1000 | 200, 40 |
+| `verification.model.builder`, `.author` | Model name, or `null` for the default | `null` |
+| `verification.test_globs` | Up to 50 path globs that identify test files | `[]` |
+
+`factory run` additionally refuses unless, on `origin/<base>`: `verification.required` is `true`; `readiness.min_level` is `4`; `local_checks` is `[]` (they would run outside the untrusted-code sandbox: run them in CI); `checks.required` does not name `factory/verified`; and `github.host` is the origin host. It merges only with `merge.mode: "squash"`. Verification also needs `app.start`, `app.base_url` with a port, and `app.ready` (a `ready.url` must use the same port). The app gets `HOST=127.0.0.1` and `PORT=<port>` and must listen on 127.0.0.1: a `localhost` base URL is contacted as 127.0.0.1. Full list: [factory-driver.md](factory-driver.md#refusals-at-start-factory-run).
+
+Environment for the factory driver: `FACTORY_HOME` (default `~/.factory`) holds scenarios, verdicts, the queue and the driver clone; `FACTORY_BUILDER_HOME` (default `<FACTORY_HOME>-builder`) holds the builder clone and must be outside `FACTORY_HOME`.
+
+The queue file can be moved with the `DELIVER_QUEUE` environment variable (an absolute path; the folder is created with mode 0700 and a symlinked file or folder is refused). PR body files still live in `.delivery/`.
+
 ## Safety of the file itself
 - It must be **committed and identical to the copy on `origin/<base>`** when a run starts, so the rules in force are the ones that were reviewed and merged. A local edit, or a copy that only exists on a feature branch, is refused.
 - A feature that changes it is held for a person, and the run keeps using the policy it started with.
