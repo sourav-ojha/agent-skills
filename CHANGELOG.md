@@ -13,6 +13,9 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - API benchmark fixture and runner `bench/factory/` (held-out scenarios stay local).
 - References: `references/verification.md`, `references/factory-driver.md` (including the known isolation gaps: unproven deny rules and `disableAllHooks`, spoofable `factory/verified`, no secret scan before push, macOS-only survivor scan and sandbox).
 
+### Fixed
+- `install-agents.mjs` in product-intelligence, experience-audit and implementer did nothing (exit 0, no files) when run through a symlinked path, such as a symlinked skills folder or macOS `/var` → `/private/var`: the entry-point check compared an unresolved path with the resolved module path. It now compares real paths, as growth-strategy does; a test runs every skill's installer through a symlink.
+
 ### Added (delivery-orchestrator: factory phase 0)
 - `deliver readiness [--repeat N] [--json]`: scores a repo from level 0 to 4 (config, tests run, CI gate, app starts with logs and seed) with a result and fix item per check, run in a temporary worktree with an allowlisted environment. The result is saved outside the repo in `~/.factory/readiness/` (`FACTORY_HOME` overrides). Exit `2` when below `readiness.min_level`. New optional config keys: `app`, `tests`, `readiness`.
 - Merge gate in `deliver init`: when merging is authorised and the config has a `readiness` key, `init` refuses on a missing, stale, future-dated or config-mismatched result, or a level below `min_level` (it re-runs the cheap checks and can only lower the stored level). Repos without the key behave as before.

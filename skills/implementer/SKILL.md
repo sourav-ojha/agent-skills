@@ -36,6 +36,7 @@ only the lead runs `impl` (no locking) and never commits `.implementation/`.
 No person is available to answer, so nothing may wait for one, and nothing that needs a person may be guessed:
 - Plan approval (T2/T3) is not awaited: record the plan as a ruling (`impl ruling`) and proceed. The spec was already approved upstream.
 - Every "stop and ask" case under Decisions and stops (destructive or security-sensitive action, side effect outside the worktree, user-challenge decision, spec conflict, task blocked after 3 fix rounds) ends the run instead: leave the work committed, report `BLOCKED` with the exact question, and do not continue on a guess.
+- A T2/T3 review that was not independent (no reviewer sub-agent available) must be recorded as a ruling (`impl ruling --what "review not independent"`) so it shows in the delivery log and the PR body. Do not let a self-review pass look like an independent one.
 - Use `--name <slug>` as the ledger name when given. Never push, merge or open a PR, whatever else is asked (the orchestrator owns that). Still do the full close-out in the spec.
 - **Result file, always, as the last act** (after the close-out, also when blocked or failing): write `.implementation/<ID>/result.json`, where `<ID>` is the feature id (`FEATURE-NNN`), as `{ "status": "done" | "blocked", "question": "...", "summary": "..." }`. `done` only when every task passed and the work is committed; otherwise `blocked` with the exact question. Plain text, at most 2000 characters each; no secrets. A missing or malformed file counts as `blocked`.
 

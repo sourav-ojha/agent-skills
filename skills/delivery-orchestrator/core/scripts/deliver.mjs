@@ -28,7 +28,7 @@ for (let i = 0; i < argv.length; i++) {
 }
 const [cmd, arg] = pos;
 const die = (m) => { console.error(`error: ${m}`); process.exit(1); };
-const emit = (o) => console.log(JSON.stringify(o, null, 2));
+const emit = (o) => { if (o && typeof o.result === 'string') extra.result = o.result; console.log(JSON.stringify(o, null, 2)); }; // the run log records the outcome word, so a CI wait is not mistaken for a failure
 const outcome = (o) => { emit(o); process.exitCode = 2; };
 
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
@@ -186,6 +186,7 @@ function refresh(q) {
 }
 
 function block(q, f, reason) {
+  extra.blocked = true; // the run log must not file a command that blocked the feature (e.g. an exhausted CI budget, result 'timeout') as a wait
   transition(f, 'blocked', flat(reason));
   if (!clean()) git('stash', 'push', '-u', '-m', `delivery-orchestrator: partial work on ${f.id}`);
   git('checkout', q.base);

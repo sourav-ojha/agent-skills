@@ -5,8 +5,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { REPO, tmpDir } from './helpers.mjs';
 import { parseSession } from '../../skills/skill-insights/core/scripts/lib/transcripts.mjs';
-import { windows, inventory } from '../../skills/skill-insights/core/scripts/lib/analyze.mjs';
+import { windows, inventory, dedupeSessions } from '../../skills/skill-insights/core/scripts/lib/analyze.mjs';
 import crypto from 'node:crypto';
+import { summarizeRuns } from '../../skills/skill-insights/core/scripts/lib/runs.mjs';
 import { joinTokens, coverage, latestPerFeature } from '../../skills/skill-insights/core/scripts/lib/factory.mjs';
 
 const SI = path.join(REPO, 'skills/skill-insights/core/scripts/si.mjs');
@@ -229,4 +230,125 @@ test('F9 CLI runs-factory with a transcript folder but no turns in the window pr
   assert.equal(r.code, 0, r.out);
   assert.doesNotMatch(r.out, /no transcript folder/);
   assert.match(r.out, /n\/a of tokens/);
+});
+
+// ---- measurement fixes: forked-session dedupe, true repeated file reads, report --top ----
+const jl = (a) => a.map((o) => JSON.stringify(o)).join('\n');
+const sess = (project, sessionId, text) => ({ project, sessionId, date: '2026-11-17', ...parseSession(text) });
+
+test('M1 a forked session repeats its parent history: shared turns are counted once, own work stays owned by the active skill', () => {
+  const parent = jl([
+    asst('a1', 1, usage(10, 100, 500), [toolUse('Skill', { skill: 'alpha' })]),
+    asst('a2', 2, usage(10, 200, 600), [toolUse('Bash', { command: 'ls' })]),
+  ]);
+  const fork = jl([
+    asst('a1', 1, usage(10, 100, 500), [toolUse('Skill', { skill: 'alpha' })]),
+    asst('a2', 2, usage(10, 200, 600), [toolUse('Bash', { command: 'ls' })]),
+    asst('a3', 5, usage(10, 300, 700), [toolUse('Bash', { command: 'pwd' })]),
+  ]);
+  const out = dedupeSessions([sess('p', 'fork', fork), sess('p', 'parent', parent)]);
+  const w = out.flatMap((s) => windows(s)).filter((x) => x.skill === 'alpha');
+  assert.equal(w.reduce((t, x) => t + x.tokens.out, 0), 100 + 200 + 300, 'each turn counted once');
+  assert.equal(w.length, 2, 'parent window plus the fork window that inherited the skill');
+  assert.equal(inventory(out, []).used.find((u) => u.skill === 'alpha').invocations, 1, 'inherited marker is not a second invocation');
+  assert.equal(w.reduce((t, x) => t + x.toolCalls, 0), 3, 'Skill call + Bash ls + Bash pwd; the inherited marker is not a tool call');
+});
+
+test('M2 dedupe never merges different projects or sessions that merely look alike but differ in content', () => {
+  const text = jl([asst('a1', 1, usage(1, 10), [toolUse('Skill', { skill: 'alpha' })])]);
+  const other = jl([asst('b1', 1, usage(1, 11), [toolUse('Skill', { skill: 'alpha' })])]);
+  assert.equal(dedupeSessions([sess('p1', 's1', text), sess('p2', 's2', text)]).length, 2, 'same text, different projects');
+  assert.equal(dedupeSessions([sess('p', 's1', text), sess('p', 's2', other)]).length, 2, 'same project, different usage');
+});
+
+test('M3 repeated file reads count any file re-read in a window; an edit in between resets it; paths are not kept', () => {
+  const read = (id, min, f) => asst(id, min, usage(1, 1), [toolUse('Read', { file_path: f }, id)]);
+  const edit = (id, min, f) => asst(id, min, usage(1, 1), [toolUse('Edit', { file_path: f }, id)]);
+  const text = jl([
+    asst('s', 0, usage(1, 1), [toolUse('Skill', { skill: 'alpha' })]),
+    read('r1', 1, '/proj/src/a.js'), read('r2', 2, '/proj/src/a.js'), // repeat 1
+    edit('e1', 3, '/proj/src/a.js'), read('r3', 4, '/proj/src/a.js'), // after edit: not a repeat
+    read('r4', 5, '/proj/src/b.js'),
+  ]);
+  const s = parseSession(text);
+  assert.ok(!JSON.stringify(s.entries).includes('/proj/src'), 'no path text kept in entries');
+  const w = windows(s).find((x) => x.skill === 'alpha');
+  assert.equal(w.fileReads, 4);
+  assert.equal(w.repeatedFileReads, 1);
+});
+
+test('M4 CLI report: --top limits the cost table to the costliest skills; repeated file reads get a column and a flag', () => {
+  const tmp = tmpDir('si-top');
+  const proj = path.join(tmp, 'projects', '-x-y');
+  fs.mkdirSync(proj, { recursive: true });
+  const read = (id, min) => asst(id, min, usage(1, 1), [toolUse('Read', { file_path: '/x/same.js' }, id)]);
+  const body = [];
+  for (const [i, name] of ['quick', 'slow'].entries()) {
+    const base = i * 30;
+    body.push(asst(`s${i}`, base, usage(1, 1), [toolUse('Skill', { skill: name })]));
+    const n = name === 'slow' ? 8 : 1;
+    for (let j = 0; j < n; j++) body.push(read(`r${i}${j}`, base + 1 + j));
+  }
+  fs.writeFileSync(path.join(proj, 'sess.jsonl'), jl(body));
+  const run = (...a) => spawnSync('node', [SI, 'report', '--projects-dir', path.join(tmp, 'projects'), '--skills-dir', path.join(tmp, 'none'), ...a], { encoding: 'utf8' });
+  const full = run().stdout;
+  assert.match(full, /Repeated file reads/);
+  assert.match(full, /slow: 7 file\(s\) re-read without an edit/);
+  const costRows = (t) => t.split('## Cost and friction per skill')[1].split('## Flags')[0].split('\n').filter((l) => /^\| (quick|slow) /.test(l));
+  assert.deepEqual(costRows(full).map((l) => l.split(' | ')[0].replace('| ', '')), ['slow', 'quick'], 'sorted by total minutes, costliest first');
+  const top1 = costRows(run('--top', '1').stdout);
+  assert.equal(top1.length, 1);
+  assert.match(top1[0], /^\| slow /, 'the costliest skill survives --top');
+  assert.doesNotMatch(full.split('## Flags')[1], /quick:/, 'one read is not flagged');
+});
+
+test('M5 run summary separates CI waits (timeout, stale, updated) from real failures; old logs without a result stay failures', () => {
+  const ev = (n, event, ok, result) => ({ ts: `2026-11-18T10:0${n}:00Z`, skill: 'delivery-orchestrator', run: 'r', event, ok, ...(result ? { result } : {}) });
+  const [r] = summarizeRuns([ev(1, 'ci', false, 'timeout'), ev(2, 'ci', false, 'timeout'), ev(3, 'ci', false, 'stale'), ev(4, 'ci', false, 'updated'), ev(5, 'ci', false, 'failed'), ev(6, 'ci', false), ev(7, 'ci', true, 'passed')]);
+  assert.equal(r.waitingCommands, 4, 'timeout, timeout, stale, updated');
+  assert.deepEqual(r.failedCommands, ['ci', 'ci'], 'a real failure and a legacy entry with no result');
+  const [b] = summarizeRuns([{ ...ev(1, 'ci', false, 'timeout'), blocked: true }]);
+  assert.equal(b.waitingCommands, 0, 'a timeout that blocked the feature is not a wait');
+  assert.deepEqual(b.failedCommands, ['ci']);
+});
+
+test('M6 dedupe edge cases: identical size-only entries with different tool ids are kept; a fully duplicated session vanishes; no marker when the child starts with its own Skill', () => {
+  const res = (id, min, tid) => ({ type: 'user', timestamp: T(min), message: { content: [{ type: 'tool_result', tool_use_id: tid, content: 'x'.repeat(40) }] } });
+  const a = jl([asst('a1', 1, usage(1, 10), [toolUse('Skill', { skill: 'alpha' })]), res('r', 2, 'tuA')]);
+  const b = jl([asst('b1', 1, usage(1, 11), [toolUse('Skill', { skill: 'alpha' })]), res('r', 2, 'tuB')]); // same ts and size, different tool_use_id
+  const kept = dedupeSessions([sess('p', 's1', a), sess('p', 's2', b)]);
+  assert.equal(kept.flatMap((s) => s.entries.filter((e) => e.bytes)).length, 2, 'two real results, not collapsed');
+  assert.equal(dedupeSessions([sess('p', 's1', a), sess('p', 's2', a)]).length, 1, 'a verbatim copy contributes nothing');
+  const own = jl([asst('a1', 1, usage(1, 10), [toolUse('Skill', { skill: 'alpha' })]), asst('c1', 5, usage(1, 5), [toolUse('Skill', { skill: 'beta' })])]);
+  const child = dedupeSessions([sess('p', 's1', a), sess('p', 's2', own)]).find((s) => s.sessionId === 's2');
+  assert.deepEqual(child.entries.filter((e) => e.skill).map((e) => [e.skill, !!e.inherited]), [['beta', false]], 'no inherited marker when the child opens its own skill');
+});
+
+test('M7 repeated file reads: a new skill window resets tracking; Write and NotebookEdit reset it; skill-file reads are tracked too', () => {
+  const r = (id, min, f) => asst(id, min, usage(1, 1), [toolUse('Read', { file_path: f }, id)]);
+  const wr = (id, min, name, input) => asst(id, min, usage(1, 1), [toolUse(name, input, id)]);
+  const text = jl([
+    asst('s1', 0, usage(1, 1), [toolUse('Skill', { skill: 'alpha' })]), r('a', 1, '/p/a.js'),
+    asst('s2', 2, usage(1, 1), [toolUse('Skill', { skill: 'beta' })]), r('b', 3, '/p/a.js'), // other window: not a repeat
+    wr('w', 4, 'Write', { file_path: '/p/a.js' }), r('c', 5, '/p/a.js'), // after Write: not a repeat
+    r('d', 6, '/p/nb.ipynb'), wr('n', 7, 'NotebookEdit', { notebook_path: '/p/nb.ipynb' }), r('e', 8, '/p/nb.ipynb'), // notebook edit resets too
+    r('f', 9, '/x/skills/foo/SKILL.md'), r('g', 10, '/x/skills/foo/SKILL.md'), // skill file read twice
+  ]);
+  const ws = windows(parseSession(text));
+  const alpha = ws.find((x) => x.skill === 'alpha'); const beta = ws.find((x) => x.skill === 'beta');
+  assert.equal(alpha.repeatedFileReads, 0);
+  assert.equal(beta.repeatedFileReads, 1, 'only the second read of the skill file');
+  assert.equal(beta.repeatedReads, 1, 'and it is also a repeated skill-file read');
+});
+
+test('M8 CLI: a parent and its fork in one project count each turn once end to end', () => {
+  const tmp = tmpDir('si-fork');
+  const proj = path.join(tmp, 'projects', '-x-y');
+  fs.mkdirSync(proj, { recursive: true });
+  const parent = [asst('a1', 1, usage(1, 100), [toolUse('Skill', { skill: 'alpha' })]), asst('a2', 2, usage(1, 200), [toolUse('Bash', { command: 'ls' })])];
+  fs.writeFileSync(path.join(proj, 'parent.jsonl'), jl(parent));
+  fs.writeFileSync(path.join(proj, 'fork.jsonl'), jl([...parent, asst('a3', 5, usage(1, 300), [toolUse('Bash', { command: 'pwd' })])]));
+  const r = spawnSync('node', [SI, 'runs', '--json', '--skill', 'alpha', '--projects-dir', path.join(tmp, 'projects')], { encoding: 'utf8' });
+  const rows = JSON.parse(r.stdout);
+  assert.equal(rows.reduce((t, x) => t + x.tokens.out, 0), 600, '100 + 200 + 300, not 100 + 200 + 100 + 200 + 300');
 });
