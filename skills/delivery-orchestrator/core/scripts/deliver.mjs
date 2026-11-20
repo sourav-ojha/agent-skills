@@ -34,6 +34,7 @@ const outcome = (o) => { emit(o); process.exitCode = 2; };
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
   next | built ID [--tier T] | pr ID --title T --body-file .delivery/F | ci ID [--timeout S] [--interval S] [--grace S] | fix ID | push ID | merge ID [--settle S]
   retry ID [--no-ci] [--checks A,B] | block ID --reason R | skip ID --reason R | status [--json] | reset --yes
+  hold ID --reason R [--kind K [--sha S --ids G1,G4]]   (factory driver only: a queue under FACTORY_HOME)
   readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
@@ -517,7 +518,9 @@ C.ci = () => {
     // Head and checks are read around each other: checks of an older commit are never stamped onto a newer head.
     const before = headOf(f.pr.number);
     const checks = checksOf(f.pr.number).filter((c) => !isIgnored(q, c.name));
-    const required = requiredOf(f.pr.number).filter((n) => !isIgnored(q, n));
+    // factory/verified is posted by the factory driver AFTER CI passed (verification runs on the CI-passed sha): waiting for it here
+    // would never end. It is still required at merge (branch protection), where it must be on the commit.
+    const required = requiredOf(f.pr.number).filter((n) => !isIgnored(q, n) && lc(n) !== 'factory/verified');
     const sha = headOf(f.pr.number);
     if (sha !== before) { if (++unstable > 5) die('the PR head keeps changing; stop pushing to it and run ci again'); continue; }
     const needed = q.checks.length ? q.checks : required;
@@ -616,7 +619,11 @@ const within = (p, d) => p === d || p.startsWith(d + path.sep);
 const queueInHome = () => {
   try {
     const h = fs.realpathSync(factoryHome()), r = fs.realpathSync(root), q = fs.realpathSync(file);
-    if (!q.startsWith(h + path.sep) || within(q, r) || within(r, h)) return false;
+    // The one repository allowed under FACTORY_HOME is the driver's own clone of this queue's repo (clones/<repo-key>), which
+    // the builder cannot write (it works in a separate clone outside FACTORY_HOME).
+    let driverClone = false;
+    try { driverClone = !!curQ && fs.realpathSync(path.join(h, 'clones', repoKey(curQ.repo))) === r; } catch { driverClone = false; }
+    if (!q.startsWith(h + path.sep) || within(q, r) || (within(r, h) && !driverClone)) return false;
     const st = fs.lstatSync(q);
     return st.isFile() && st.nlink === 1 && st.uid === process.getuid() && (st.mode & 0o022) === 0;
   } catch { return false; }
@@ -822,6 +829,28 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   transition(f, 'pr_open', 'retry');
   save(q);
   emit({ id: f.id, state: f.state, no_ci: q.no_ci, checks: q.checks, next: 'ci' });
+};
+
+// The factory driver parks a feature for a person (an anti-gaming hit at built, a verification that could not reach a verdict, ...),
+// so the transition goes through save() and gets its run record. Only from a trusted queue (under FACTORY_HOME). An anti-gaming hold
+// records the held commit and the G-ids, so `retry --note` can override exactly those.
+C.hold = () => {
+  const q = load(); const f = item(q);
+  if (!queueInHome()) die('hold is a factory driver command: the queue file must be a private file under FACTORY_HOME');
+  if (!(TRANSITIONS[f.state] || []).includes('awaiting_human')) die(`${f.id} is "${f.state}", which cannot wait for a person`);
+  const reason = flat(opt.reason);
+  if (!reason) die('--reason is required');
+  const kind = opt.kind === undefined ? null : String(opt.kind);
+  if (kind !== null && !/^[a-z_]{1,32}$/.test(kind)) die('--kind must be 1-32 characters of a-z and _');
+  if (kind === 'antigaming') {
+    const ids = parseList(opt.ids).filter((x) => /^G[1-5]$/.test(x));
+    if (!SHA.test(String(opt.sha || '')) || !ids.length) die('an anti-gaming hold needs --sha <40-hex> and --ids G1..G5');
+    f.hold_sha = opt.sha; f.hold_ids = [...new Set(ids)].sort();
+  }
+  f.hold_kind = kind;
+  transition(f, 'awaiting_human', reason);
+  save(q);
+  outcome({ id: f.id, state: f.state, hold_kind: kind });
 };
 
 C.block = () => {

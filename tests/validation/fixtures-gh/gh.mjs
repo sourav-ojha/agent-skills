@@ -71,7 +71,10 @@ if (a === 'pr' && b === 'checks') {
   if (st.noChecks) fail(`no checks reported on the '${p.head}' branch`);
   if (st.bump > 0) { st.bump--; pushCommit(p.head, 'bump'); }
   const q = st.checkQueue || [];
-  const cur = q.length > 1 ? q.shift() : q[0] || [];
+  let cur = q.length > 1 ? q.shift() : q[0] || [];
+  // statusesAsChecks: like GitHub, commit statuses on the head (factory/verified) are listed with the check runs.
+  if (st.statusesAsChecks) { const latest = new Map(); for (const x of (st.statuses?.[headSha(p)] || [])) latest.set(x.context, x.state); cur = [...cur, ...[...latest].map(([name, s]) => ({ name, bucket: s === 'success' ? 'pass' : s === 'pending' ? 'pending' : 'fail', link: '', state: s.toUpperCase() }))]; }
+  st.lastChecks = cur;
   out(cur);
 }
 if (a === 'pr' && b === 'update-branch') { const p = find(args[2]); p.mergeState = 'CLEAN'; pushCommit(p.head, 'Merge branch main into branch'); out(''); }
@@ -82,6 +85,15 @@ if (a === 'pr' && b === 'merge') {
   if (st.mergeQueue) { p.autoMerge = true; out(''); }
   const want = flag('--match-head-commit');
   if (want && want !== headSha(p)) fail('head commit does not match');
+  // enforceProtection: like GitHub, refuse unless every required context of st.protection is a passing check of the last
+  // `pr checks` answer or a success commit status on the head (e.g. factory/verified posted by the driver).
+  if (st.enforceProtection) {
+    const req = st.protection?.required_status_checks?.contexts || [];
+    const passing = new Set((st.lastChecks || []).filter((c) => c.bucket === 'pass').map((c) => c.name));
+    const latest = new Map(); for (const x of (st.statuses?.[headSha(p)] || [])) latest.set(x.context, x.state);
+    const missing = req.filter((c) => !passing.has(c) && latest.get(c) !== 'success');
+    if (missing.length) fail(`GraphQL: Required status check "${missing[0]}" is expected. (mergePullRequest)`);
+  }
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fakemerge-'));
   git(os.tmpdir(), 'clone', '-q', st.origin, tmp);
   git(tmp, 'config', 'user.email', 'b@x'); git(tmp, 'config', 'user.name', 'bot');

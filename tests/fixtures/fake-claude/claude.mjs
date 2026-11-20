@@ -96,6 +96,7 @@ function factory() {
       const g = (...a) => spawnSync('git', a, { cwd: process.cwd(), encoding: 'utf8' });
       g('add', '-A'); g('commit', '-q', '-m', `feat: ${id}`);
     }
+    if (s.dirty_file) fs.writeFileSync(path.join(process.cwd(), s.dirty_file), 'uncommitted\n');
     await assistant('msg_1', 'working'); await assistant('msg_2', 'done');
     if (s.status === 'usage') { await result({ is_error: true, api_error_status: 429, result: "You've hit your session limit · resets 3:45pm", terminal_reason: 'api_error' }); return 1; }
     if (s.status !== 'none') writeResult(s.status === 'blocked' ? { status: 'blocked', question: s.question || 'Which database?' } : { status: 'done', summary: 'implemented' });

@@ -1024,3 +1024,247 @@ test('run record: verification fields and session usage are IDs and counts only;
   const empty = RR.buildRecord({ q: {}, f: { id: 'FEATURE-002', state: 'blocked', verdict: 'maybe', verdict_sha: 'zz', verify_runs: -3, sessions: 'x' }, run: 'r', project: 'p', skills: {} });
   assert.deepEqual([empty.verify_runs, empty.verify_ms, empty.verdict, empty.verdict_sha, empty.gap_criteria, empty.antigaming, empty.override_note, empty.sessions], [0, 0, null, null, [], [], false, []]);
 });
+
+// ---- factory run --------------------------------------------------------------------------------------------------------------------
+const crypto = await import('node:crypto');
+// A stored readiness result at level 4 for the config now on origin/main (deliver init's gate re-checks C1, C2, C4 and C5).
+function readiness(w, level = 4) {
+  const raw = fs.readFileSync(path.join(w.work, '.product/delivery.json'));
+  const doc = { helper_version: '0.1.0', base: 'main', base_sha: w.sh(w.work, 'rev-parse', 'HEAD'), config_hash: `sha256:${crypto.createHash('sha256').update(raw).digest('hex')}`, level,
+    results: ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8'].map((id) => ({ id, status: 'pass', reason: '' })), fixes: [], at: new Date().toISOString() };
+  fs.mkdirSync(path.join(w.fhome, 'readiness'), { recursive: true });
+  fs.writeFileSync(path.join(w.fhome, 'readiness', 'o__r.json'), JSON.stringify(doc));
+}
+const good = (id, extra = {}) => ({ files: { [`src/${id}.txt`]: 'good\n', ...extra }, spec_complete: true, commit: true, pr_body: `Implements ${id}.\n` });
+const ready = (t, opts = {}) => { const w = world(t, opts); readiness(w); const s = w.factory(['scenarios']); assert.equal(s.code, 0, s.out + s.err); return w; };
+const builderRuns = (w, id) => w.sessions().filter((s) => !s.argv.includes('--tools') && s.argv[s.argv.indexOf('-p') + 1].includes(id));
+const promptOf = (s) => s.argv[s.argv.indexOf('-p') + 1];
+const verifyCalls = (w) => { const f = path.join(w.fhome, 'verify-calls.log'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean) : []; };
+
+test('factory run: two API features delivered end to end; factory/verified posted on the merged head before the merge', (t) => {
+  const w = ready(t, { fake: { plan: { 'FEATURE-001': [good('FEATURE-001')], 'FEATURE-002': [good('FEATURE-002')] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  noText(r.out + r.err, [w.root]);
+  const q = w.queue();
+  assert.deepEqual(q.features.map((f) => f.state), ['merged', 'merged']);
+  const gh = w.ghState();
+  for (const f of q.features) {
+    const st = (gh.statuses[f.ci_sha] || []).find((s) => s.context === 'factory/verified');
+    assert.equal(st?.state, 'success', `${f.id}: factory/verified on the merged head`);
+    const merge = gh.calls.find((c) => c[0] === 'pr' && c[1] === 'merge' && c[2] === String(f.pr.number));
+    assert.equal(merge[merge.indexOf('--match-head-commit') + 1], f.ci_sha, 'the verified sha is the one merged');
+    assert.equal(gh.prs[f.pr.number - 1].state, 'MERGED');
+    assert.match(gh.prs[f.pr.number - 1].body, /^Verified: 2\/2 scenarios at [0-9a-f]{7}$/m);
+    assert.equal(builderRuns(w, f.id).length, 1);
+  }
+  // The builder ran in the builder clone (outside FACTORY_HOME), never in the driver clone.
+  for (const s of w.sessions().filter((x) => !x.argv.includes('--tools'))) { assert.equal(s.cwd, w.builder); assert.ok(!s.cwd.startsWith(w.fhome + path.sep)); }
+  assert.ok(fs.existsSync(path.join(w.clone, '.git')) && fs.statSync(path.join(w.clone, '.git')).isDirectory());
+  assert.match(r.out, /features: merged 2/);
+});
+
+test('factory run: a wrong build fails verification; the symptom-fix session gets only the brief; fixed; merged; run record fields', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), files: { 'src/FEATURE-001.txt': 'wrong\n' } }, { files: { 'src/FEATURE-001.txt': 'good\n' }, commit: true }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'merged');
+  assert.equal(f.fix_rounds, 1);
+  assert.deepEqual(verifyCalls(w).map((l) => l.split(' ')[2]), ['fail', 'pass']);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 2);
+  const fixPrompt = promptOf(runs[1]);
+  assert.match(fixPrompt, /AC-1: an endpoint returned an unexpected status or body/);
+  assert.match(fixPrompt, /EC-1: an endpoint returned an unexpected status or body/);
+  const doc = w.inHome(() => SC.loadScenarios('o__r', 'FEATURE-001'));
+  for (const s of [fixPrompt, fs.readFileSync(path.join(w.builder, '.implementation', 'FEATURE-001', 'fix-brief.md'), 'utf8')]) {
+    for (const x of [doc.canary, HIDDEN, '/api/items', 'S-1', 'S-2', w.fhome, 'status": 200', 'json_path']) assert.ok(!s.includes(x), `the symptom brief leaks ${x}`);
+  }
+  const rec = w.records().filter((x) => x.feature === 'FEATURE-001').pop();
+  assert.equal(rec.outcome, 'merged');
+  assert.equal(rec.verify_runs, 2); assert.ok(Number.isInteger(rec.verify_ms));
+  assert.equal(rec.verdict, 'pass'); assert.equal(rec.verdict_sha, f.ci_sha);
+  assert.deepEqual(rec.gap_criteria, ['AC-1', 'EC-1']);
+  assert.deepEqual(rec.antigaming, []); assert.equal(rec.override_note, false);
+  assert.equal(rec.sessions.length, 2);
+  assert.deepEqual(rec.sessions[0], { role: 'builder', id: '00000000-0000-4000-8000-000000000001', in: 120, out: 45, cache_create: 300, cache_read: 9000, turns: 2 });
+  const raw = fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8');
+  for (const x of [doc.canary, HIDDEN, '/api/items', 'json_path', w.root]) assert.ok(!raw.includes(x), `the run record leaks ${x}`);
+});
+
+test('factory run: a blocked builder blocks the feature with an attention line (the question stays in the queue); start sweeps', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ status: 'blocked', question: 'Postgres or SQLite?' }] } } });
+  // Leftovers of a dead run: a verification worktree of this repo, a trash entry and a kept run temp (no process uses them).
+  for (const d of [['work', 'o__r', `FEATURE-009-${'a'.repeat(40)}`, 'src'], ['trash', 'q1'], ['tmp', 'r1']]) fs.mkdirSync(path.join(w.fhome, ...d), { recursive: true });
+  const r = w.factory(['run']);
+  for (const d of [['work', 'o__r', `FEATURE-009-${'a'.repeat(40)}`], ['trash', 'q1'], ['tmp', 'r1']]) assert.equal(fs.existsSync(path.join(w.fhome, ...d)), false, d.join('/'));
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /^attention: FEATURE-001 blocked \(block\)$/m);
+  assert.ok(!r.out.includes('Postgres'), 'builder text is not printed');
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'blocked'); assert.match(f.reason, /Postgres or SQLite/);
+  assert.equal(verifyCalls(w).length, 0);
+  const att = fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(att.map((a) => [a.feature, a.state, a.kind]), [['FEATURE-001', 'blocked', 'block']]);
+});
+
+test('factory run: a config-injection PR (.claude/settings.json) is held by G4 at pr_open, bound to the sha; never verified or merged', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001', { '.claude/settings.json': '{"hooks":{"Stop":[]}}\n' })] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /attention: FEATURE-001 awaiting_human \(antigaming\)/);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'awaiting_human'); assert.equal(f.hold_kind, 'antigaming');
+  assert.deepEqual(f.hold_ids, ['G4']); assert.equal(f.hold_sha, f.pr.head_sha); assert.equal(f.antigaming_hold.sha, f.built_sha);
+  assert.deepEqual(f.antigaming, ['G4']);
+  assert.equal(verifyCalls(w).length, 0, 'held before verification');
+  assert.ok(!w.ghState().calls.some((c) => c[0] === 'pr' && c[1] === 'merge'));
+  const rec = w.records().pop();
+  assert.equal(rec.outcome, 'awaiting_human'); assert.deepEqual(rec.antigaming, ['G4']);
+});
+
+test('factory run: a second run is refused while the lock is held', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const held = L.acquire('o__r', { home: w.fhome });
+  t.after(() => held.release());
+  const r = w.factory(['run']);
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.out, /refused: another factory run holds the lock/);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 0);
+});
+
+test('factory run: killed after built, the restart resumes at pr without a second build session', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const k = w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'built' }) });
+  assert.equal(k.signal, 'SIGKILL', k.out + k.err);
+  assert.equal(w.queue().features[0].state, 'built');
+  assert.ok(fs.existsSync(path.join(w.fhome, 'locks', 'o__r.lock')), 'the dead driver left its lock');
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /FEATURE-001 built -> pr/);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'merged'); assert.equal(f.resumes, 1);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 1, 'no second build session');
+});
+
+test('factory run: refusals with fix text (protection, verification.required, readiness, missing scenarios); nothing starts', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, gh: { protection: { required_status_checks: { contexts: ['ci'] } } }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.out, /refused: .*branch protection on main does not require the factory\/verified status/);
+  assert.match(r.out, /^fix: require the "factory\/verified" status check in branch protection/m);
+  w.setGh((s) => { delete s.protection; });
+  assert.match(w.factory(['run']).out, /does not require the factory\/verified/);
+  const n = world(t, { config: { ...BASE_CONFIG, verification: { required: false }, readiness: null, local_checks: [{ name: 'unit', command: ['true'], timeout_s: 10 }] }, specs: { 'FEATURE-001': 'Items one' } });
+  const x = n.factory(['run']);
+  assert.equal(x.code, 1);
+  assert.match(x.out, /local_checks are configured/); assert.match(x.out, /^fix: run those checks in CI/m);
+  assert.match(x.out, /verification\.required is not true/); assert.match(x.out, /readiness level 4/); assert.match(x.out, /stored readiness result is missing/);
+  assert.ok((x.out.match(/^fix: /gm) || []).length >= 3, 'one fix line per problem');
+  const s = world(t, { specs: { 'FEATURE-001': 'Items one' } });
+  readiness(s);
+  const y = s.factory(['run']);
+  assert.equal(y.code, 1, y.out);
+  assert.match(y.out, /features without current approved scenarios: FEATURE-001 \(missing\)/);
+  assert.equal(fs.existsSync(s.queueFile), false, 'no queue was created');
+  readiness(s, 3);
+  assert.match(s.factory(['run']).out, /level 3/);
+  for (const v of [w, n, s]) assert.equal(v.sessions().filter((e) => !e.argv.includes('--tools')).length, 0);
+});
+
+test('factory run: G2 at built gets one builder fix attempt (antigaming_fix brief), then blocks when it still fires', (t) => {
+  const only = { 'test/items.test.js': "it.only('lists', () => {});\n" };
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001', only), { status: 'done' }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 2);
+  assert.match(promptOf(runs[1]), /Anti-gaming checks G2 fired/);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'blocked'); assert.match(f.reason, /G2 still fire after a builder fix attempt/);
+  assert.equal(f.ag_fix_attempts, 1);
+  assert.match(r.out, /attention: FEATURE-001 blocked/);
+  assert.equal(w.ghState().prs.length, 0, 'no PR for a G2/G3 build');
+});
+
+test('factory run: with no checks.required, CI waits only for CI (not factory/verified); merge needs factory/verified on the head', (t) => {
+  const w = ready(t, { config: { ...BASE_CONFIG, checks: { required: [] } }, specs: { 'FEATURE-001': 'Items one' }, gh: { required: [{ name: 'ci', bucket: 'pass' }, { name: 'factory/verified', bucket: 'pending' }], statusesAsChecks: true }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(w.queue().features[0].state, 'merged');
+});
+
+test('deliver hold is a driver command: refused for a queue outside FACTORY_HOME; held states only', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ status: 'blocked' }] } } });
+  assert.equal(w.factory(['run']).code, 0);
+  const out = path.join(w.root, 'q.json'); fs.copyFileSync(w.queueFile, out);
+  const d = (q, ...a) => spawnSync(process.execPath, [path.join(SCRIPTS, 'deliver.mjs'), ...a, '--dir', w.clone], { encoding: 'utf8', env: { ...w.env, DELIVER_QUEUE: q } });
+  const x = d(out, 'hold', 'FEATURE-001', '--reason', 'r');
+  assert.equal(x.status, 1); assert.match(x.stderr, /factory driver command/);
+  const y = d(w.queueFile, 'hold', 'FEATURE-001', '--reason', 'r');
+  assert.equal(y.status, 1); assert.match(y.stderr, /"blocked", which cannot wait for a person/);
+});
+
+test('factory run: a session that writes no result never reuses the previous one (result.json deleted before every session)', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), files: { 'src/FEATURE-001.txt': 'wrong\n' } }, { files: { 'src/FEATURE-001.txt': 'good\n' }, commit: true, status: 'none' }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'blocked', 'no result = blocked (no_result), not the stale "done" of the first session');
+  assert.match(f.reason, /no_result/);
+  assert.equal(verifyCalls(w).length, 1);
+});
+
+test('factory run: a process escaping the builder session (own session, cwd in the clone) stops the run before any git call there', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), escape_ms: 20000 }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  assert.match(r.out, /attention: FEATURE-001 building \(leftovers\)/); assert.match(r.out, /stopped: leftovers/);
+  assert.equal(w.queue().features[0].state, 'building', 'state left as it is');
+});
+
+test('factory run: verification that throws holds (no fix round used); the builder dir may not be inside FACTORY_HOME', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), files: { 'src/FEATURE-001.txt': 'throw\n' } }] } } });
+  const bad = w.factory(['run'], { FACTORY_BUILDER_HOME: path.join(w.fhome, 'b') });
+  assert.equal(bad.code, 1); assert.match(bad.out, /refused: the builder directory must be outside FACTORY_HOME/);
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  const f = w.queue().features[0];
+  assert.equal(f.state, 'awaiting_human'); assert.equal(f.hold_kind, 'verification'); assert.equal(f.fix_rounds, 0);
+  assert.equal(f.verify_runs, 1); assert.equal(f.verdict, undefined);
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 1);
+});
+
+test('factory run: on resume, features whose scenarios are no longer current are refused before anything runs', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'built' }) }).signal, 'SIGKILL');
+  const sp = path.join(w.fhome, 'scenarios', 'o__r', 'FEATURE-001.json');
+  const saved = fs.readFileSync(sp);
+  fs.writeFileSync(sp, JSON.stringify({ ...JSON.parse(saved), scenarios: [] }));
+  const r = w.factory(['run']);
+  assert.equal(r.code, 1, r.out); assert.match(r.out, /features without current approved scenarios: FEATURE-001 \(lint\)/);
+  assert.equal(w.queue().features[0].state, 'built');
+  fs.writeFileSync(sp, saved);
+  // Queue tamper: a queue for another repository is refused; a queue file swapped for a symlink is never read.
+  const qsaved = fs.readFileSync(w.queueFile);
+  fs.writeFileSync(w.queueFile, JSON.stringify({ ...JSON.parse(qsaved), repo: 'evil/r' }));
+  const a = w.factory(['run']); assert.equal(a.code, 1); assert.match(a.out, /refused: the stored queue is for another repository/);
+  const elsewhere = path.join(w.root, 'q-elsewhere.json'); fs.writeFileSync(elsewhere, qsaved); fs.rmSync(w.queueFile); fs.symlinkSync(elsewhere, w.queueFile);
+  const b = w.factory(['run']); assert.equal(b.code, 1); assert.match(b.out, /error: the queue file is not a regular file/);
+  fs.rmSync(w.queueFile); fs.writeFileSync(w.queueFile, qsaved, { mode: 0o600 });
+  assert.equal(w.factory(['run']).code, 0);
+  assert.equal(w.queue().features[0].state, 'merged');
+});
+
+test('factory run: killed after a build session that left the tree dirty, the restart resets and rebuilds (dirty = deliver built\'s check)', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [{ ...good('FEATURE-001'), dirty_file: 'stray.txt' }, good('FEATURE-001')] } } });
+  assert.equal(w.factory(['run'], { FACTORY_TEST: JSON.stringify({ killAfter: 'build' }) }).signal, 'SIGKILL');
+  assert.equal(w.queue().features[0].state, 'building');
+  const r = w.factory(['run']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /FEATURE-001 building -> build \(build\)/);
+  assert.equal(w.queue().features[0].state, 'merged');
+  assert.equal(builderRuns(w, 'FEATURE-001').length, 2, 'a dirty tree is reset and rebuilt, never reported built');
+  assert.equal(fs.existsSync(path.join(w.builder, 'stray.txt')), false, 'clean -fd removed the stray file');
+});
