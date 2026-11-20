@@ -594,10 +594,10 @@ test('Driver actions: ci_passed | verification fail | -> verify_failed; deliver 
   assert.deepEqual(D.nextAction(fixing, null, RUN), { do: 'build', brief: 'symptom_fix' });
 });
 
-test('Driver actions: ci_passed | usage limit | stays ci_passed, run paused', () => {
-  const a = D.nextAction(feat('ci_passed'), S('usage_limit', { resetAt: '2026-11-20T15:00:00.000Z' }), RUN);
-  assert.deepEqual(a, { do: 'stop', kind: 'usage_limit', reason: 'usage limit reached: the run stops and every state is left as it is', resetAt: '2026-11-20T15:00:00.000Z' });
-  for (const st of ['building', 'fixing']) assert.equal(D.nextAction(feat(st, { history: hist('ci_failed', 'fixing') }), S('usage_limit'), RUN).do, 'stop', st);
+test('Driver actions: ci_passed | usage limit | stays ci_passed, interrupted handling (Phase 2)', () => {
+  const a = D.nextAction(feat('ci_passed'), S('usage_limit', { limit: 'session', resetAt: '2026-11-20T15:00:00.000Z' }), RUN);
+  assert.deepEqual(a, { do: 'interrupt', kind: 'usage_limit', limit: 'session', resetAt: '2026-11-20T15:00:00.000Z' });
+  for (const st of ['building', 'fixing']) assert.equal(D.nextAction(feat(st, { history: hist('ci_failed', 'fixing') }), S('usage_limit', { limit: 'rate' }), RUN).do, 'interrupt', st);
 });
 
 test('Driver actions: verified | merge stale / updated / behind | back to pr_open, CI and verification again', () => {
@@ -631,10 +631,12 @@ test('Driver actions: all exit-2 results are handled; only the ones marked "stop
   assert.equal(D.nextAction(feat('awaiting_human'), R('ci', 'unconfirmed'), RUN).do, 'stop');
 });
 
-test('Driver actions: interruptions (usage limit, timeout) of a session stop the run and leave the branch as it is (until Phase 2)', () => {
-  for (const k of ['usage_limit', 'timeout', 'no_result', 'other']) {
+test('Driver actions: interruptions (usage limit, timeout) go to interrupted handling (Phase 2); a session without a result stops the run', () => {
+  assert.equal(D.nextAction(feat('building'), S('usage_limit', { limit: 'session' }), RUN).do, 'interrupt');
+  assert.deepEqual(D.nextAction(feat('building'), S('timeout'), RUN), { do: 'interrupt', kind: 'timeout' });
+  for (const k of ['no_result', 'other']) {
     const a = D.nextAction(feat('building'), S(k), RUN);
-    assert.equal(a.do, 'stop', k); assert.ok(['usage_limit', 'interrupted'].includes(a.kind), k);
+    assert.equal(a.do, 'stop', k); assert.equal(a.kind, 'interrupted', k);
   }
 });
 
@@ -703,10 +705,10 @@ test('driver: sessionResult normalises runSession + readBuilderResult into a dri
   assert.deepEqual(D.sessionResult(ok, { status: 'blocked', question: 'no_result' }), { step: 'session', kind: 'blocked', question: 'no_result' });
   assert.deepEqual(D.sessionResult(ok, null), { step: 'session', kind: 'blocked', question: 'no_result' });
   const at = '2026-11-20T15:00:00.000Z';
-  for (const k of ['session', 'weekly', 'model', 'rate']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k, resetAt: at } }, { status: 'done' }), { step: 'session', kind: 'usage_limit', resetAt: at });
+  for (const k of ['session', 'weekly', 'model', 'rate']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k, resetAt: at } }, { status: 'done' }), { step: 'session', kind: 'usage_limit', limit: k, resetAt: at });
   for (const bad of ['R', '2026-13-45T99:00:00Z', 'tomorrow', 5, {}, null, undefined, '2026-11-20T15:00:00.000Z<script>'])
-    assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'session', resetAt: bad } }), { step: 'session', kind: 'usage_limit', resetAt: null }, String(bad));
-  assert.equal(D.nextAction(feat('building'), S('usage_limit', { resetAt: 'not a date' }), RUN).resetAt, null);
+    assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'session', resetAt: bad } }), { step: 'session', kind: 'usage_limit', limit: 'session', resetAt: null }, String(bad));
+  assert.equal(D.nextAction(feat('building'), S('usage_limit', { limit: 'session', resetAt: 'not a date' }), RUN).resetAt, null);
   for (const k of ['max_turns', 'timeout', 'no_result', 'other', 'spawn_failed', 'unsafe_binary']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k } }, { status: 'done' }), { step: 'session', kind: k }, k);
   assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'settings_unsafe', keys: ['hooks'] } }), { step: 'session', kind: 'settings_unsafe', keys: ['hooks'] });
   assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'brand_new' } }), { step: 'session', kind: 'other' });

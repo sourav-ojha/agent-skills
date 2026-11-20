@@ -984,6 +984,9 @@ async function execute(ctx, q, f, act) {
       if (f && act.attention) attention(ctx, f.id, f.state, act.kind);
       ctx.out(`stopped: ${act.kind}${act.resetAt ? ` (resets ${act.resetAt})` : ''}`);
       return { end: 2 };
+    case 'interrupt': // until handleInterrupt (Task 8): stop as Phase 1 did, leaving every state as it is
+      ctx.out(`stopped: ${act.kind === 'usage_limit' ? 'usage_limit' : 'interrupted'}${act.resetAt ? ` (resets ${act.resetAt})` : ''}`);
+      return { end: 2 };
     default: throw new Error('unknown action');
   }
 }
