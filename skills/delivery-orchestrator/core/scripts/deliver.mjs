@@ -18,6 +18,7 @@ import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
 import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs, checkNoHooks, GIT_SAFE_FLAGS } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
+import { inspect } from './lib/lock.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
 const argv = process.argv.slice(2);
@@ -86,6 +87,27 @@ const validRef = (s) => typeof s === 'string' && REF.test(s) && !s.includes('..'
 // Always the remote-tracking ref, fully qualified: a local tag or branch named "origin/<x>" must never shadow it.
 const OR = (b) => `refs/remotes/origin/${b}`;
 
+// ---- factory guard ----------------------------------------------------------------------------------------------------
+// While a factory run holds this repository (its lock is live) or a `factory stop` is pending (the stop flag), interactive commands
+// that change anything are refused: a person racing the driver would corrupt its queue or branches. The driver's own calls carry
+// FACTORY_DRIVER_PID = the lock holder's pid. A convenience guard, not a security control (anyone can set the variable). Read-only
+// commands (status, config, readiness --json, help) always run.
+const READ_ONLY = cmd === 'status' || cmd === 'config' || (cmd === 'readiness' && opt.json === true);
+function factoryGuard(nameWithOwner) {
+  if (READ_ONLY) return;
+  let key;
+  try { key = repoKey(nameWithOwner); if (!/^[A-Za-z0-9._-]+$/.test(key)) return; } catch { return; }
+  const home = factoryHome();
+  let lock;
+  try { lock = inspect(key, { home }); } catch { lock = { state: 'absent', pid: null }; }
+  const me = Number(process.env.FACTORY_DRIVER_PID);
+  if (lock.state === 'live' && Number.isInteger(me) && me === lock.pid) return; // the driver itself
+  if (lock.state === 'live') die('a factory run holds this repository; run factory stop first');
+  let flag = false;
+  try { fs.lstatSync(path.join(home, 'stop', key)); flag = true; } catch { flag = false; }
+  if (flag) die('a factory stop is pending for this repository; continue the run with "factory run --continue" (or let it finish) first');
+}
+
 // ---- run records ------------------------------------------------------------------------------------------------------
 // A record per transition into merged, skipped, blocked or awaiting_human. Snapshots are taken at the transition and written
 // by save(), so a record exists only for a state that was persisted. queue.mjs stays pure; this is the only writer.
@@ -132,6 +154,7 @@ function load() {
     if (!FEATURE_ID.test(f.id) || !(f.state in TRANSITIONS) || (f.branch && !validRef(f.branch)) || (f.ci_sha && !SHA.test(f.ci_sha)) || (f.built_sha && !SHA.test(f.built_sha)) || (f.pr && !Number.isInteger(f.pr.number))) die(`queue file has an invalid entry for ${f.id}; reset and re-init`);
   }
   REPO = q.repo;
+  factoryGuard(q.repo);
   curQ = q;
   useAccount(q.policy.github.account, q.policy.github.host);
   return q;
@@ -283,6 +306,7 @@ C.init = async () => {
   if (errors.length) die(`${CONFIG_PATH}: ${errors.join('; ')}`);
   useAccount(config.github.account, config.github.host);
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,viewerPermission'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
+  factoryGuard(repo.nameWithOwner);
   if (!['WRITE', 'MAINTAIN', 'ADMIN'].includes(repo.viewerPermission)) die(`the GitHub account in use has "${repo.viewerPermission}" permission on ${repo.nameWithOwner}; it needs WRITE or higher${config.github.account ? '' : ' (set github.account in the config if gh has several accounts)'}`);
   const url = git('config', '--get', 'remote.origin.url').out;
   const originHost = remoteHost(url);
@@ -363,6 +387,7 @@ C.readiness = async () => {
   // The working-copy config is untrusted: it is used only to pick credentials for the fetch below.
   let accountError = useAccount(config.github.account, config.github.host, { soft: true }); // C2 reports it; the run continues on gh's default login
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
+  factoryGuard(repo.nameWithOwner);
   must(gitNet('fetch', 'origin'), 'git fetch');
   const committedConfig = (ref) => {
     const s = git('show', `${OR(ref)}:${CONFIG_PATH}`);
@@ -946,6 +971,8 @@ C.status = () => {
 
 C.reset = () => {
   if (!opt.yes) die('reset discards the run state (merged PRs stay merged on GitHub); pass --yes');
+  const old = readJson(file);
+  if (old && typeof old.repo === 'string') factoryGuard(old.repo);
   fs.rmSync(file, { force: true });
   emit({ reset: true });
 };

@@ -60,8 +60,14 @@ const within = (p, root) => p === root || p.startsWith(`${root}/`);
 // The marker as a whole path: followed by the end, "/" or whitespace (".../run/o__r" must not match ".../run/o__r2").
 const mentions = (text, k) => { for (let i = text.indexOf(k); i !== -1; i = text.indexOf(k, i + 1)) { const c = text[i + k.length]; if (c === undefined || c === '/' || /\s/.test(c)) return true; } return false; };
 export function scanSurvivors(markers) {
+  const r = survivorPids(markers);
+  return r.ok ? r.pids.size : Math.max(1, r.pids.size);
+}
+// The same scan, as { ok, pids: Set<number> } (ok false: ps or lsof failed, pids holds what was found before that). For the stop
+// path, which signals the survivors (never this process).
+export function survivorPids(markers) {
   const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
-  if (ps.status !== 0 || ps.error) return 1;
+  if (ps.status !== 0 || ps.error) return { ok: false, pids: new Set() };
   const hits = new Set();
   for (const line of ps.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line);
@@ -69,13 +75,14 @@ export function scanSurvivors(markers) {
     if (markers.some((k) => mentions(m[3], k))) hits.add(m[1]);
   }
   const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 5000 });
-  if (lsof.error || !lsof.stdout) return 1;
+  const num = () => new Set([...hits].map(Number).filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid));
+  if (lsof.error || !lsof.stdout) return { ok: false, pids: num() };
   let pid = null;
   for (const line of lsof.stdout.split('\n')) {
     if (line.startsWith('p')) pid = line.slice(1);
     else if (line.startsWith('n') && pid && Number(pid) !== process.pid && markers.some((k) => within(line.slice(1), k))) hits.add(pid);
   }
-  return hits.size;
+  return { ok: true, pids: num() };
 }
 // Polls briefly: processes the phase's process-group kill just ended may still be listed for a moment.
 async function sweepSurvivors(markers) {

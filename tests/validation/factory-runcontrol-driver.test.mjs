@@ -277,9 +277,10 @@ test('limit with only .implementation/ changes: no WIP commit, no error; wait_fo
 });
 
 test('resetAt unknown: run state shows paused estimated true until now + 5 h; the stop flag ends the wait and the run (status stopped)', (t) => {
-  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), fake: { plan: { 'FEATURE-001': [limited({ resets_at: null })] } } });
+  const w = ready(t, { specs: { 'FEATURE-001': 'Items one' }, test: T() });
+  // The session creates the stop flag (a stale flag before the run would refuse it: Task 9).
+  w.setFake((s) => { s.plan = { 'FEATURE-001': [limited({ resets_at: null, touch: path.join(w.fhome, 'stop', 'o__r') })] }; });
   writeLocal(w, WAIT_ON);
-  fs.mkdirSync(path.join(w.fhome, 'stop'), { recursive: true, mode: 0o700 }); fs.writeFileSync(path.join(w.fhome, 'stop', 'o__r'), '');
   const r = w.factory(['run']);
   assert.equal(r.code, 2, r.out + r.err);
   assert.match(r.out, new RegExp(`^paused: usage_limit session until ${iso(NOW + 5 * H).replace(/\./g, '\\.')} \\(estimated\\)$`, 'm'));
@@ -429,7 +430,7 @@ test('factory scenarios: an author session hit by a session limit is restarted f
   const x = s.factory(['scenarios']);
   assert.equal(x.code, 2, x.out + x.err);
   assert.match(x.out, /^stopped: usage_limit$/m);
-  assert.equal(runState(s).status, 'stopped');
+  assert.equal(fs.existsSync(path.join(s.fhome, 'runs', 'o__r.json')), false, 'scenarios writes only the run state of its own waits (Task 9)');
 });
 
 test('a failing WIP commit (.git/index.lock left behind) stops the run as wip_failed with interrupted set; the next run continues without a reset and the edits survive', (t) => {

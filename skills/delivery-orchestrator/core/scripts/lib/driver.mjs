@@ -14,7 +14,8 @@ export const RESULTS = Object.freeze({
   next: Object.freeze(['ok', 'error']),
   built: Object.freeze(['ok', 'local_check_failed', 'error']),
   pr: Object.freeze(['ok', 'error']),
-  ci: Object.freeze(['passed', 'unverified-allowed', 'failed', 'timeout', 'unconfirmed', 'error']),
+  // stopped: `factory stop --now` ended the CI wait (the deliver ci child was killed); the feature stays in pr_open.
+  ci: Object.freeze(['passed', 'unverified-allowed', 'failed', 'timeout', 'unconfirmed', 'error', 'stopped']),
   fix: Object.freeze(['ok', 'error']),
   push: Object.freeze(['ok', 'error']),
   verify: Object.freeze(['pass', 'fail', 'threw']),
@@ -158,6 +159,8 @@ function decide(f, lastResult, run) {
     if (last.kind === 'spawn_failed' || last.kind === 'unsafe_binary') return hold('environment', last.kind === 'spawn_failed' ? 'the claude binary could not be started' : 'the claude binary resolves inside the session working directory');
     if (st !== 'building' && st !== 'fixing') return hold('inconsistent', `a builder session result for a feature in "${st}"`);
   }
+  // A stopped CI wait (stop --now) is an interruption too: the run stops and the feature continues from CI next time.
+  if (last?.step === 'ci' && last.kind === 'stopped') return { do: 'interrupt', kind: 'stop' };
   if (last && last.kind === 'error') return hold('error', `the ${last.step} step failed: a person looks at it`);
 
   switch (st) {
