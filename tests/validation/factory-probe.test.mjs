@@ -8,7 +8,8 @@ import { spawnSync } from 'node:child_process';
 import { REPO } from './helpers.mjs';
 
 const SCRIPT = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'probe.mjs');
-const { runProbe, ROUTES } = await import(SCRIPT);
+const HS = await import(path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'lib', 'hardstops.mjs'));
+const { runProbe, ROUTES, savedValue, mergeSaved, controlProblems } = await import(SCRIPT);
 const TOKEN = 'probe-token-' + 'a1b2c3d4e5f6a7b8';
 const tmp = (t) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'factory-probe-')); t.after(() => { try { fs.chmodSync(path.join(d, 'target', '.probe-sentinel'), 0o600); } catch { /* absent */ } fs.rmSync(d, { recursive: true, force: true }); }); return d; };
 const fixture = (t) => {
@@ -244,7 +245,7 @@ test('--control: an unconfigured route in both runs is exempt; a control run tha
 
 // ---- --save ---------------------------------------------------------------------------------------------------------------------
 const saveEnv = (fh) => ({ PROBE_TOKEN: TOKEN, FACTORY_HOME: fh });
-test('--save: writes $FACTORY_HOME/probes/last.json privately ({ ts, routes }); without an accepted control a denied route is saved as error', (t) => {
+test('--save: writes $FACTORY_HOME/probes/last.json privately with its evidence; without an accepted control a denied route is saved as error', (t) => {
   const f = fixture(t);
   const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
   const run = cli(f, ['--save', '--net-host', '192.0.2.1:9', '--net-timeout-ms', '1500'], saveEnv(fh));
@@ -253,11 +254,15 @@ test('--save: writes $FACTORY_HOME/probes/last.json privately ({ ts, routes }); 
   assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.deepEqual(Object.keys(saved).sort(), ['routes', 'ts']);
+  assert.deepEqual(Object.keys(saved).sort(), ['builder_settings_sha256', 'factory_home', 'net_host', 'routes', 'target', 'targets', 'ts']);
   assert.ok(!Number.isNaN(Date.parse(saved.ts)));
-  assert.deepEqual(Object.keys(saved.routes).sort(), [...ROUTES].sort());
-  for (const v of Object.values(saved.routes)) assert.ok(['denied', 'leaked', 'error'].includes(v));
-  assert.equal(saved.routes.cat, 'leaked');
+  assert.equal(saved.builder_settings_sha256, HS.builderSettingsSha());
+  assert.equal(saved.target, f.target); assert.equal(saved.factory_home, null); assert.equal(saved.net_host, '192.0.2.1:9');
+  assert.deepEqual(Object.keys(saved.routes).sort(), ['net bash', 'write'], 'only configured write/home/net routes');
+  assert.equal(saved.targets.length, 1); assert.equal(saved.targets[0].target, f.target);
+  assert.deepEqual(Object.keys(saved.targets[0].routes).sort(), ROUTES.filter((r) => !r.startsWith('write') && r !== 'net bash').sort());
+  for (const v of [...Object.values(saved.routes), ...Object.values(saved.targets[0].routes)]) assert.ok(['denied', 'leaked', 'error'].includes(v));
+  assert.equal(saved.targets[0].routes.cat, 'leaked');
   assert.equal(saved.routes['net bash'], 'error', 'a denied result without an accepted control run is not saved as proof');
   assert.ok(!fs.readFileSync(file, 'utf8').includes(TOKEN));
   assert.deepEqual(fs.readdirSync(dir), ['last.json'], 'atomic: no temp file left');
@@ -274,12 +279,14 @@ test('--save: an accepted control keeps denied results; --from re-saves an earli
   const s = spawnSync('node', [SCRIPT, '--from', resFile, '--control', ctlFile, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh }, timeout: 60000 });
   assert.ok([0, 1, 2].includes(s.status), s.stderr);
   const saved = JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8'));
-  assert.equal(saved.routes.cat, 'denied');
-  assert.equal(saved.routes['net bash'], 'error', 'not configured');
+  assert.equal(saved.targets[0].routes.cat, 'denied');
+  assert.equal(saved.routes['net bash'], undefined, 'not configured: not saved');
   // without --control, --from saves no denied result as proof
   const s2 = spawnSync('node', [SCRIPT, '--from', resFile, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh }, timeout: 60000 });
   assert.notEqual(s2.status, 3, s2.stderr);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8')).routes.cat, 'error');
+  const again = JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8'));
+  assert.equal(again.targets.length, 1, 'the same target is replaced, not duplicated');
+  assert.equal(again.targets[0].routes.cat, 'error');
   // a malformed --from file is a usage error and saves nothing new
   fs.writeFileSync(resFile, '{"routes": 5}');
   const before = fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8');
@@ -301,4 +308,99 @@ test('--save: refuses a symlinked probes directory or result file (exit 2) and w
   const run2 = cli(f, ['--save'], saveEnv(fh));
   assert.equal(run2.status, 2); assert.match(run2.stderr, /symlink/);
   assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
+// ---- fix round 1: per-target evidence, strict --from, control-route provenance ------------------------------------------------
+const route = (name, result, detail = 'x') => ({ route: name, result, detail });
+test('savedValue: denied is kept only when the control leaked through that same route', () => {
+  const ctl = { routes: [route('cat', 'leaked'), route('tar', 'error', 'tool missing'), route('write stop/', 'error', 'not configured (no --factory-home)'), route('net bash', 'denied', 'timeout'), route('cp', 'error', 'timeout')] };
+  assert.equal(savedValue(route('cat', 'denied'), ctl), 'denied');
+  assert.equal(savedValue(route('tar', 'denied'), ctl), 'error', 'control tool missing');
+  assert.equal(savedValue(route('write stop/', 'denied'), ctl), 'error', 'control not configured');
+  assert.equal(savedValue(route('net bash', 'denied'), ctl), 'error', 'the control connect did not succeed');
+  assert.equal(savedValue(route('cp', 'denied'), ctl), 'error', 'control errored');
+  assert.equal(savedValue(route('find', 'denied'), ctl), 'error', 'route absent from the control');
+  assert.equal(savedValue(route('cat', 'denied'), null), 'error', 'no accepted control');
+  assert.equal(savedValue(route('cat', 'leaked'), null), 'leaked');
+  assert.equal(savedValue(route('cat', 'error'), ctl), 'error');
+});
+
+const fakeRes = (target, over = {}, extra = {}) => ({ target, factory_home: null, net_host: null, routes: ROUTES.map((r) => route(r, over[r] || 'denied', r === 'write' ? 'x' : (r.startsWith('write ') && !extra.factory_home) || (r === 'net bash' && !extra.net_host) ? 'not configured' : 'x')), ...extra });
+const leakCtl = { routes: ROUTES.map((r) => route(r, 'leaked')) };
+test('mergeSaved: targets accumulate per target; the same target is replaced; a run without --factory-home / --net-host keeps those results; other builder settings start over', () => {
+  const sha = 'a'.repeat(64);
+  const a = mergeSaved(null, fakeRes('/h/.ssh', {}, { factory_home: '/h/.factory', net_host: '192.0.2.1:9' }), leakCtl, { builderSha: sha });
+  assert.deepEqual(a.targets.map((t) => t.target), ['/h/.ssh']);
+  assert.equal(a.routes['write stop/'], 'denied'); assert.equal(a.routes['net bash'], 'denied'); assert.equal(a.factory_home, '/h/.factory');
+  const b = mergeSaved(a, fakeRes('/h/.aws'), leakCtl, { builderSha: sha });
+  assert.deepEqual(b.targets.map((t) => t.target), ['/h/.ssh', '/h/.aws']);
+  assert.equal(b.routes['write stop/'], 'denied', 'kept: this run had no --factory-home'); assert.equal(b.factory_home, '/h/.factory'); assert.equal(b.net_host, '192.0.2.1:9');
+  assert.equal(b.target, '/h/.aws');
+  const c = mergeSaved(b, fakeRes('/h/.ssh', { cat: 'leaked' }), leakCtl, { builderSha: sha });
+  assert.deepEqual(c.targets.map((t) => t.target), ['/h/.aws', '/h/.ssh']);
+  assert.equal(c.targets.find((t) => t.target === '/h/.ssh').routes.cat, 'leaked');
+  const d = mergeSaved(c, fakeRes('/h/.netrc', {}, { factory_home: '/elsewhere' }), null, { builderSha: sha });
+  assert.equal(d.factory_home, '/elsewhere'); assert.equal(d.routes['write stop/'], 'error', 'replaced, and unproven without a control');
+  const e = mergeSaved(d, fakeRes('/h/.netrc'), leakCtl, { builderSha: 'b'.repeat(64) });
+  assert.deepEqual(e.targets.map((t) => t.target), ['/h/.netrc'], 'a result for other builder settings is discarded');
+  assert.equal(e.factory_home, null); assert.equal(e.routes['write stop/'], undefined);
+});
+
+test('--from refuses duplicate, missing or forged route entries and a missing target (exit 2, nothing saved)', (t) => {
+  const f = fixture(t);
+  const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
+  const good = JSON.parse(cli(f).stdout);
+  const file = path.join(f.d, 'forged.json');
+  const variants = {
+    duplicate: { ...good, routes: [...good.routes.map((r) => (r.route === 'cat' ? { ...r, result: 'denied' } : r)), { route: 'cat', result: 'leaked', detail: 'token obtained' }] },
+    duplicateSameLength: { ...good, routes: good.routes.map((r) => (r.route === 'tar' ? { ...good.routes.find((x) => x.route === 'cat'), result: 'denied' } : r)) },
+    missingRoute: { ...good, routes: good.routes.filter((r) => r.route !== 'cat') },
+    unknownRoute: { ...good, routes: [...good.routes.slice(1), { route: 'bogus', result: 'denied', detail: 'x' }] },
+    noTarget: (({ target, ...r }) => r)(good),
+    badFactoryHome: { ...good, factory_home: 5 },
+  };
+  for (const [name, doc] of Object.entries(variants)) {
+    fs.writeFileSync(file, JSON.stringify(doc));
+    const r = spawnSync('node', [SCRIPT, '--from', file, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh } });
+    assert.equal(r.status, 2, `${name}: ${r.stderr}`);
+    assert.equal(fs.existsSync(path.join(fh, 'probes', 'last.json')), false, name);
+  }
+});
+
+test('--control: a control file listing a route twice is rejected (exit 3)', (t) => {
+  const f = fixture(t);
+  const good = JSON.parse(cli(f).stdout);
+  const res = { ...good };
+  assert.deepEqual(controlProblems({ ...good, routes: [...good.routes, good.routes[0]] }, res), ['control file lists a route more than once']);
+  const ctlFile = path.join(f.d, 'control.json'); fs.writeFileSync(ctlFile, JSON.stringify({ ...good, routes: [...good.routes, good.routes[1]] }));
+  const r = cli(f, ['--control', ctlFile]);
+  assert.equal(r.status, 3); assert.match(r.stderr, /more than once/);
+});
+
+test('--target-file: a single file (like ~/.netrc) is probed through every read route; unreadable -> denied; no token fallback from the file', (t) => {
+  const f = fixture(t);
+  const netrc = path.join(f.d, '.netrc'); fs.writeFileSync(netrc, `machine example.invalid login u password ${TOKEN}\n`, { mode: 0o600 });
+  const o = { targetFile: netrc, writeTarget: f.wt, workdir: f.work, token: TOKEN, timeoutMs: 3000 };
+  let r = byRoute(runProbe(o));
+  for (const x of ['fs.readFile', 'cat', 'cp', 'find', 'tar', 'node -e', 'git -C', 'hardlink', 'symlink']) assert.equal(r[x].result, 'leaked', `${x}: ${r[x].detail}`);
+  assert.equal(runProbe(o).target, netrc);
+  const none = runProbe({ ...o, token: '' });
+  assert.ok(none.routes.filter((x) => ROUTES.indexOf(x.route) < ROUTES.indexOf('write')).every((x) => x.result === 'error'), 'the file content is never used as the token');
+  assert.equal(none.token_sha256, null);
+  if (process.getuid && process.getuid() === 0) return;
+  fs.chmodSync(netrc, 0o000);
+  try { r = byRoute(runProbe(o)); } finally { fs.chmodSync(netrc, 0o600); }
+  for (const x of ['fs.readFile', 'cat', 'cp', 'tar', 'node -e', 'hardlink', 'symlink']) assert.equal(r[x].result, 'denied', `${x}: ${r[x].detail}`);
+  // CLI: exactly one of --target / --target-file
+  assert.equal(spawnSync('node', [SCRIPT, '--target', f.target, '--target-file', netrc, '--write-target', f.wt], { encoding: 'utf8' }).status, 2);
+});
+
+test('--save via the CLI merges targets: two runs against two directories keep both', (t) => {
+  const f = fixture(t);
+  const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
+  const second = path.join(f.d, 'second'); fs.mkdirSync(second); fs.writeFileSync(path.join(second, '.probe-sentinel'), TOKEN + '\n');
+  assert.equal(cli(f, ['--save'], saveEnv(fh)).status, 1);
+  assert.equal(cli({ ...f, target: second }, ['--save'], saveEnv(fh)).status, 1);
+  const saved = JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8'));
+  assert.deepEqual(saved.targets.map((x) => x.target), [f.target, second]);
 });

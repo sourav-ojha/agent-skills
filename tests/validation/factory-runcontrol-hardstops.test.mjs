@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { REPO, tmpDir } from './helpers.mjs';
-import { SCRIPTS, BASE_CONFIG, ready, good } from './factory-world.mjs';
+import { SCRIPTS, BASE_CONFIG, ready, good, provingProbe } from './factory-world.mjs';
 
 const HS = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'hardstops.mjs')).href);
 const ag = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'antigaming.mjs')).href);
@@ -18,7 +18,10 @@ const BUILDER = JSON.parse(fs.readFileSync(path.join(REPO, 'skills', 'delivery-o
 
 const probeRows = HS.HARD_STOPS.filter((r) => r.proof.kind === 'probe');
 const routesOf = (row) => HS.proofRoutes(row);
-const allDenied = () => ({ ts: '2026-11-21T00:00:00.000Z', routes: Object.fromEntries(ROUTES.map((r) => [r, 'denied'])) });
+// A proving result for a fake home and FACTORY_HOME, and the matching options (as reportHardStops passes them).
+const HOME = '/Users/probe-user'; const FH = '/Users/probe-user/.factory';
+const OPTS = { home: HOME, factoryHome: FH, builderSha: HS.builderSettingsSha() };
+const allDenied = () => provingProbe({ home: HOME, fhome: FH });
 
 // ---- the matrix ---------------------------------------------------------------------------------------------------------------
 test('HARD_STOPS: seven P2.2 rows with unique ids, a mechanism and a test or probe proof', () => {
@@ -32,14 +35,15 @@ test('HARD_STOPS: seven P2.2 rows with unique ids, a mechanism and a test or pro
   assert.ok(Object.isFrozen(HS.HARD_STOPS));
 });
 
-test('every test-proof ref names a test file that exists and contains the row id', () => {
+test('every test-proof ref names a test file that exists and has a test whose title starts with the row id', () => {
   const refs = HS.HARD_STOPS.filter((r) => r.proof.kind === 'test');
   assert.ok(refs.length >= 3);
   for (const r of refs) {
     assert.match(r.proof.ref, /^[\w.-]+\.test\.mjs$/, r.id);
     const file = path.join(REPO, 'tests', 'validation', r.proof.ref);
     assert.ok(fs.existsSync(file), `${r.id}: ${r.proof.ref} is missing`);
-    assert.ok(fs.readFileSync(file, 'utf8').includes(r.id), `${r.id}: ${r.proof.ref} does not name the row`);
+    const title = new RegExp(`^\\s*(?:test|it)\\(\\s*(['"\`])${r.id}:`, 'm');
+    assert.match(fs.readFileSync(file, 'utf8'), title, `${r.id}: no test( / it( title in ${r.proof.ref} starts with the row id`);
   }
 });
 
@@ -51,7 +55,7 @@ test('every probe-proof route is a real probe route', () => {
 });
 
 // ---- hs-network: static half (the tool layer) -----------------------------------------------------------------------------------
-test('hs-network: the builder settings deny WebFetch and WebSearch, project MCP servers are off and buildArgv passes --strict-mcp-config', () => {
+test('hs-network: (static tool half) the builder settings deny WebFetch and WebSearch, project MCP servers are off and buildArgv passes --strict-mcp-config', () => {
   for (const tool of ['WebFetch', 'WebSearch']) assert.ok(BUILDER.permissions.deny.includes(tool), tool);
   assert.equal(BUILDER.enableAllProjectMcpServers, false);
   assert.deepEqual(BUILDER.sandbox.network.allowedDomains, []);
@@ -91,17 +95,60 @@ test('hs-delivery-config: .product/delivery.json is a G4 protected path; a build
 });
 
 // ---- unprovenRows ---------------------------------------------------------------------------------------------------------------
-test('unprovenRows: null (no saved result) returns every probe row; all denied returns none; one leaked route returns its row', () => {
-  assert.deepEqual(HS.unprovenRows(null).map((r) => r.id), probeRows.map((r) => r.id));
-  assert.deepEqual(HS.unprovenRows(allDenied()), []);
+const ids = (rows) => rows.map((r) => r.id);
+test('unprovenRows: null (no saved result) returns every probe row; a proving result returns none; one leaked route returns its row', () => {
+  assert.deepEqual(ids(HS.unprovenRows(null, OPTS)), ids(probeRows));
+  assert.deepEqual(ids(HS.unprovenRows(allDenied(), OPTS)), []);
   const one = allDenied(); one.routes['write records/'] = 'leaked';
-  assert.deepEqual(HS.unprovenRows(one).map((r) => r.id), ['hs-run-history']);
+  assert.deepEqual(ids(HS.unprovenRows(one, OPTS)), ['hs-run-history']);
+  assert.equal(HS.whyUnproven(HS.HARD_STOPS.find((r) => r.id === 'hs-run-history'), one, OPTS), 'not denied: write records/');
   const err = allDenied(); err.routes['net bash'] = 'error';
-  assert.deepEqual(HS.unprovenRows(err).map((r) => r.id), ['hs-network']);
+  assert.deepEqual(ids(HS.unprovenRows(err, OPTS)), ['hs-network']);
   const missing = allDenied(); delete missing.routes['write stop/'];
-  assert.deepEqual(HS.unprovenRows(missing).map((r) => r.id), ['hs-factory-state'], 'a route absent from the saved result is unproven');
-  for (const bad of [{}, { routes: null }, { routes: [] }, 'x', 5]) assert.deepEqual(HS.unprovenRows(bad).map((r) => r.id), probeRows.map((r) => r.id), JSON.stringify(bad));
-  assert.ok(HS.unprovenRows(null).every((r) => r.proof.kind === 'probe'), 'test-proof rows are never reported');
+  assert.deepEqual(ids(HS.unprovenRows(missing, OPTS)), ['hs-factory-state'], 'a route absent from the saved result is unproven');
+  for (const bad of [{}, { routes: null }, { routes: [] }, { routes: {} }, 'x', 5]) assert.deepEqual(ids(HS.unprovenRows(bad, OPTS)), ids(probeRows), JSON.stringify(bad));
+  assert.ok(HS.unprovenRows(null, OPTS).every((r) => r.proof.kind === 'probe'), 'test-proof rows are never reported');
+});
+
+test('hs-secrets: one probed directory never proves the row; every credential class as a saved target does', () => {
+  assert.deepEqual(HS.HARD_STOPS.find((r) => r.id === 'hs-secrets').proof.targets, ['.ssh', '.aws', '.config/gh', '.netrc']);
+  const sec = HS.HARD_STOPS.find((r) => r.id === 'hs-secrets');
+  const onlySsh = allDenied(); onlySsh.targets = onlySsh.targets.filter((t) => t.target === `${HOME}/.ssh`);
+  assert.deepEqual(ids(HS.unprovenRows(onlySsh, OPTS)), ['hs-secrets']);
+  assert.equal(HS.whyUnproven(sec, onlySsh, OPTS), 'targets not proven: ~/.aws, ~/.config/gh, ~/.netrc');
+  assert.equal(HS.whyUnproven(sec, allDenied(), OPTS), null, 'all four classes: proven');
+  const leakAws = allDenied(); leakAws.targets.find((t) => t.target === `${HOME}/.aws`).routes['node -e'] = 'leaked';
+  assert.equal(HS.whyUnproven(sec, leakAws, OPTS), 'targets not proven: ~/.aws');
+  const gapGh = allDenied(); delete gapGh.targets.find((t) => t.target === `${HOME}/.config/gh`).routes.tar;
+  assert.equal(HS.whyUnproven(sec, gapGh, OPTS), 'targets not proven: ~/.config/gh', 'a read route missing for a target is unproven');
+  const elsewhere = allDenied(); for (const t of elsewhere.targets) t.target = t.target.replace(HOME, '/tmp/other');
+  assert.equal(HS.whyUnproven(sec, elsewhere, OPTS), 'targets not proven: ~/.ssh, ~/.aws, ~/.config/gh, ~/.netrc', 'targets under another home prove nothing');
+  const flat = allDenied(); flat.routes = { ...flat.routes, ...Object.fromEntries(HS.READ_ROUTES.map((r) => [r, 'denied'])) }; flat.targets = [];
+  assert.equal(HS.whyUnproven(sec, flat, OPTS)?.startsWith('targets not proven'), true, 'top-level read routes are not target evidence');
+});
+
+test('evidence: FACTORY_HOME rows need the real FACTORY_HOME; a result for other builder settings (or none recorded) proves no probe row', () => {
+  const other = allDenied(); other.factory_home = '/tmp/stub-home';
+  assert.deepEqual(ids(HS.unprovenRows(other, OPTS)), ['hs-factory-state', 'hs-run-history']);
+  assert.equal(HS.whyUnproven(HS.HARD_STOPS.find((r) => r.id === 'hs-factory-state'), other, OPTS), 'the saved probe ran against another FACTORY_HOME');
+  const none = allDenied(); delete none.factory_home;
+  assert.deepEqual(ids(HS.unprovenRows(none, OPTS)), ['hs-factory-state', 'hs-run-history']);
+  const stale = allDenied(); stale.builder_settings_sha256 = 'f'.repeat(64);
+  assert.deepEqual(ids(HS.unprovenRows(stale, OPTS)), ids(probeRows));
+  assert.equal(HS.whyUnproven(probeRows[0], stale, OPTS), 'the saved probe result is for other builder settings');
+  const noSha = allDenied(); delete noSha.builder_settings_sha256;
+  assert.deepEqual(ids(HS.unprovenRows(noSha, OPTS)), ids(probeRows));
+  assert.deepEqual(ids(HS.unprovenRows(allDenied(), { ...OPTS, builderSha: '0'.repeat(64) })), ids(probeRows), 'builder.json changed since the save');
+  assert.match(HS.builderSettingsSha(), /^[0-9a-f]{64}$/);
+});
+
+test('FACTORY_HOME match is by real path (a symlink to the real FACTORY_HOME counts)', () => {
+  const d = tmpDir('hardstops-real-');
+  try {
+    const realHome = path.join(d, 'factory'); fs.mkdirSync(realHome); fs.symlinkSync(realHome, path.join(d, 'link'));
+    const res = provingProbe({ home: HOME, fhome: path.join(d, 'link') });
+    assert.deepEqual(ids(HS.unprovenRows(res, { ...OPTS, factoryHome: realHome })), []);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
 
 test('loadProbeResult: absent, corrupt or symlinked -> null; a regular private file is read', () => {
@@ -133,7 +180,7 @@ test('factory run with no saved probe result: prints every probe-proof row as un
   const w = ready(t, { probe: null, specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
   const r = w.factory(['run']);
   assert.equal(r.code, 0, r.out + r.err);
-  for (const row of probeRows) assert.match(r.out, new RegExp(`^unproven hard stop: ${row.id} ${row.name.replace(/[()]/g, '\\$&')}$`, 'm'), row.id);
+  for (const row of probeRows) assert.match(r.out, new RegExp(`^unproven hard stop: ${row.id} ${row.name} \\(no saved probe result\\)$`, 'm'), row.id);
   for (const row of HS.HARD_STOPS.filter((x) => x.proof.kind === 'test')) assert.ok(!r.out.includes(`unproven hard stop: ${row.id}`), row.id);
   assert.equal(w.queue().features[0].state, 'merged', 'the warning does not block the run');
   const items = attentionItems(w).filter((i) => i.kind === 'unproven_hardstop');
@@ -145,13 +192,12 @@ test('factory run with no saved probe result: prints every probe-proof row as un
 });
 
 test('factory run with a saved result: only the leaked row is printed; all denied prints nothing and clears the attention row', (t) => {
-  const one = allDenied(); one.routes['write records/'] = 'leaked';
-  const w = ready(t, { probe: one, specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
+  const w = ready(t, { probe: (p) => { p.routes['write records/'] = 'leaked'; return p; }, specs: { 'FEATURE-001': 'Items one' }, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
   const r = w.factory(['run']);
   assert.equal(r.code, 0, r.out + r.err);
-  assert.deepEqual(r.out.split('\n').filter((l) => l.startsWith('unproven hard stop:')), ['unproven hard stop: hs-run-history editing the run history']);
+  assert.deepEqual(r.out.split('\n').filter((l) => l.startsWith('unproven hard stop:')), ['unproven hard stop: hs-run-history editing the run history (not denied: write records/)']);
   assert.equal(attentionItems(w).filter((i) => i.kind === 'unproven_hardstop').length, 1);
-  fs.writeFileSync(path.join(w.fhome, 'probes', 'last.json'), JSON.stringify(allDenied()));
+  fs.writeFileSync(path.join(w.fhome, 'probes', 'last.json'), JSON.stringify(provingProbe({ home: w.home, fhome: w.fhome })));
   const again = w.factory(['run']);
   assert.ok(!again.out.includes('unproven hard stop:'), again.out);
   assert.equal(attentionItems(w).filter((i) => i.kind === 'unproven_hardstop').length, 0, 'a proven matrix resolves the attention row');

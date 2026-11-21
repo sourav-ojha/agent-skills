@@ -39,7 +39,7 @@ import { CLASSIFIER_STATUS } from './lib/limits.mjs';
 import { addUsage, dayUsage, featureUsage, UsageError } from './lib/usage.mjs';
 import { checkBudget } from './lib/budget.mjs';
 import { addAttention, listAttention, resolveAttention } from './lib/attention.mjs';
-import { loadProbeResult, unprovenRows, PROBE_RUN } from './lib/hardstops.mjs';
+import { loadProbeResult, whyUnproven, HARD_STOPS, builderSettingsSha, PROBE_RUN } from './lib/hardstops.mjs';
 import { routeInterruption } from './lib/interrupt.mjs';
 import { readRun, updateRun, RunStateError } from './lib/runstate.mjs';
 import { notify } from './lib/notify.mjs';
@@ -1191,10 +1191,13 @@ function sweep(ctx) {
 // ---- run: the loop ------------------------------------------------------------------------------------------------------------------
 const TERMINAL = ['merged', 'skipped', 'blocked'];
 // P2.2: a hard stop proven only by the isolation probe is unproven until a saved probe result ($FACTORY_HOME/probes/last.json)
-// shows its routes denied. Each unproven row is printed and recorded as one attention row; the run is not blocked by it.
+// for these builder settings, this FACTORY_HOME and (secrets) every credential class shows its routes denied. Each unproven row
+// is printed with the reason and recorded as one attention row; the run is not blocked by it.
 function reportHardStops(ctx) {
-  const rows = unprovenRows(loadProbeResult(ctx.fh));
-  for (const r of rows) ctx.out(`unproven hard stop: ${r.id} ${r.name}`);
+  const result = loadProbeResult(ctx.fh);
+  const opts = { factoryHome: ctx.fh, builderSha: builderSettingsSha(), home: defaultHome(ctx.env) };
+  const rows = HARD_STOPS.map((r) => ({ ...r, why: whyUnproven(r, result, opts) })).filter((r) => r.why !== null);
+  for (const r of rows) ctx.out(`unproven hard stop: ${r.id} ${r.name} (${r.why})`);
   const item = { id: 'probe', kind: 'unproven_hardstop' };
   const what = `unproven hard stops: ${rows.map((r) => r.id).join(', ')}`;
   if (rows.length && listAttention(ctx.fh, ctx.key).some((i) => i.id === item.id && i.kind === item.kind && i.what === what)) return;

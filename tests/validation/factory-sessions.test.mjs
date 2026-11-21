@@ -241,8 +241,7 @@ test('runSession author: no tools, no session persistence; CLAUDE_CONFIG_DIR onl
   assert.ok(b.envKeys.includes('CLAUDE_CONFIG_DIR'));
 });
 
-// Hard stop hs-merge-gate (P2.2): no GitHub token reaches the builder, so it cannot merge outside the gate.
-test('runSession env: only the allowlist reaches claude (no GH_TOKEN, cloud keys, API keys)', async (t) => {
+test('hs-merge-gate: runSession env: only the allowlist reaches claude (no GH_TOKEN, cloud keys, API keys)', async (t) => {
   const f = fake(t, { mode: 'echo-argv' });
   const { cwd, settingsFile } = setup(t);
   const base = { ...process.env, GH_TOKEN: 'ghp_fake', GITHUB_TOKEN: 'x', AWS_SECRET_ACCESS_KEY: 'y', ANTHROPIC_API_KEY: 'z', NPM_TOKEN: 'n', FACTORY_HOME: '/f', USER: 'u', LOGNAME: 'u', SHELL: '/bin/zsh' };

@@ -14,6 +14,17 @@ const HARNESS = path.join(REPO, 'tests', 'fixtures', 'factory-harness.mjs');
 const FAKE_GH = path.join(REPO, 'tests', 'validation', 'fixtures-gh', 'gh.mjs');
 const FAKE_CLAUDE = path.join(REPO, 'tests', 'fixtures', 'fake-claude', 'claude');
 const { ROUTES: PROBE_ROUTES } = await import(pathToFileURL(path.join(SCRIPTS, 'probe.mjs')).href);
+const HS = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'hardstops.mjs')).href);
+// A saved probe result that proves every probe row for this home and FACTORY_HOME (the shape probe.mjs --save writes).
+export function provingProbe({ home, fhome }) {
+  const read = PROBE_ROUTES.filter((r) => HS.READ_ROUTES.includes(r));
+  const other = PROBE_ROUTES.filter((r) => !read.includes(r) && !['mdfind', 'qlmanage'].includes(r));
+  return {
+    ts: '2026-11-21T00:00:00.000Z', builder_settings_sha256: HS.builderSettingsSha(), factory_home: fhome, net_host: '192.0.2.1:9', target: path.join(home, '.netrc'),
+    routes: Object.fromEntries(other.map((r) => [r, 'denied'])),
+    targets: HS.SECRET_TARGETS.map((c) => ({ target: path.join(home, c), routes: Object.fromEntries(read.map((r) => [r, 'denied'])) })),
+  };
+}
 
 export const fspec = (id, title) => `---\ntype: feature-spec\nid: ${id}\nopportunity: OPP-001\nstatus: ready\n---\n# ${title}\n\n## Acceptance criteria\n\n| ID | Criterion |\n|---|---|\n| AC-1 | Given items When listing Then they are returned |\n\n## Edge cases\n\n- EC-1: an empty list returns an empty array\n\n## HTTP contract\n\n- \`GET /api/items\`\n- \`POST /api/items\`\n`;
 export const HIDDEN = 'hidden-alpha-item';
@@ -24,8 +35,10 @@ export const AUTHOR_OK = JSON.stringify({ scenarios: [
 export const BASE_CONFIG = { protected_branches: [], merge: { mode: 'squash' }, checks: { required: ['ci'] }, readiness: { min_level: 4 }, verification: { required: true } };
 
 // A bare origin with two ready API features, a fake gh (protection requiring factory/verified), the fake claude as `claude`.
-// probe: the saved isolation-probe result (FACTORY_HOME/probes/last.json). Default: every route denied, so the hard-stop matrix is
-// proven and `factory run` prints no unproven row; null: no saved result; an object: written as is.
+// probe: the saved isolation-probe result (FACTORY_HOME/probes/last.json). Default ('denied'): a result that proves the whole
+// hard-stop matrix for this world (current builder.json sha, this FACTORY_HOME, every credential class under this HOME, every
+// route denied), so `factory run` prints no unproven row; null: no saved result; a function: called with that proving result,
+// returns the document to write; an object: written as is.
 export function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items one', 'FEATURE-002': 'Items two' }, fake = {}, gh = {}, test = {}, probe = 'denied' } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'factory-run-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -34,7 +47,8 @@ export function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items
   fs.mkdirSync(fhome, { mode: 0o700 });
   if (probe !== null) {
     fs.mkdirSync(path.join(fhome, 'probes'), { mode: 0o700 });
-    const doc = probe === 'denied' ? { ts: '2026-11-21T00:00:00.000Z', routes: Object.fromEntries(PROBE_ROUTES.map((r) => [r, 'denied'])) } : probe;
+    const proving = provingProbe({ home, fhome });
+    const doc = probe === 'denied' ? proving : typeof probe === 'function' ? probe(proving) : probe;
     fs.writeFileSync(path.join(fhome, 'probes', 'last.json'), JSON.stringify(doc), { mode: 0o600 });
   }
   fs.copyFileSync(FAKE_GH, path.join(bin, 'gh.mjs'));

@@ -37,10 +37,14 @@
 
 Each Phase 2 hard stop (spec P2.2) has a real mechanism and a proof, listed in `core/scripts/lib/hardstops.mjs`. Rows proven by a test are covered by the test suite. Rows proven by the isolation probe (`core/scripts/probe.mjs`) stay **unproven** until a saved probe result shows their routes denied: `factory run` prints each one at start (`unproven hard stop: <id> <name>`) and adds one attention row (`unproven_hardstop`). It is a warning; the run continues.
 
-To prove them on this machine (the builder cannot write `~/.factory`, so the save happens outside it):
+A saved result proves only what it probed. It records the builder settings it was made with (`builder_settings_sha256`), so any change to `core/settings/builder.json` makes every probe row unproven again. The FACTORY_HOME rows count only when the probe wrote into your real FACTORY_HOME. The secrets row needs one saved target per credential class: `~/.ssh`, `~/.aws`, `~/.config/gh` and `~/.netrc`, each with every read route denied. One directory never proves it.
 
-1. Outside the builder: put a random token in `<dir>/.probe-sentinel`, then run `PROBE_TOKEN=<token> node probe.mjs --target <dir> --write-target <dir2> --factory-home ~/.factory --net-host <host:port> --json > control.json`. Every route should leak there (the control).
+To prove them on this machine (the builder cannot write `~/.factory`, so the save happens outside it), repeat once per credential class:
+
+1. Outside the builder (the control): for a directory, put a random token in `<dir>/.probe-sentinel` and run `PROBE_TOKEN=<token> node probe.mjs --target <dir> --write-target <dir2> --factory-home ~/.factory --net-host <host:port> --json > control.json`. For `~/.netrc` (a file), use `--target-file ~/.netrc` with `PROBE_TOKEN` set to a distinctive substring of that file. Every route should leak there.
 2. Inside a builder session: the same command with `> probe.json`.
-3. Outside it: `node probe.mjs --from probe.json --control control.json --save` writes `~/.factory/probes/last.json`. Without an accepted control, denied routes are saved as `error` (still unproven).
+3. Inspect `probe.json` yourself. Then, outside the builder, run `node probe.mjs --from probe.json --control control.json --save` **yourself, not through an agent**. It merges this target's results into `~/.factory/probes/last.json`. A route is saved as `denied` only when the control run leaked through that same route. Otherwise it is saved as `error` and stays unproven.
+
+A `--from` result is only as trustworthy as the channel that produced it: it is whatever the builder session wrote. `--from` refuses malformed files and duplicate route entries, but it cannot tell whether a well-formed file is genuine.
 
 `--net-host` must be a non-local host you are allowed to connect to; never a production host or database. Denying `gh` or `git push` by permission pattern is only a prompt-layer rule; the real controls are no token, the network limit and branch protection.
