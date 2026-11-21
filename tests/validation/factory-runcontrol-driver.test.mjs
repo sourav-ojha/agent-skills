@@ -465,9 +465,9 @@ test('wipCommit leaves no driver-owned path staged in the builder clone', (t) =>
 });
 
 test('attention view: a blocked and a held feature each get a row with a run command, counted by status; no feature text in the rows; the next run removes the row of a feature the person released', (t) => {
-  const w = ready(t, { specs: { 'FEATURE-001': 'Secret title one', 'FEATURE-002': 'Secret title two' }, test: { now: NOW, timeoutS: 1 }, fake: { plan: {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Secret title one', 'FEATURE-002': 'Secret title two' }, test: { now: NOW }, fake: { plan: {
     'FEATURE-001': [good('FEATURE-001', { '.claude/settings.json': '{"hooks":{"Stop":[]}}\n' })],
-    'FEATURE-002': [{ sleep_ms: 5000, status: 'none', files: { 'src/a.txt': 'a\n' } }] } } });
+    'FEATURE-002': [{ status: 'blocked', question: 'Zebra question text?' }] } } });
   const r = w.factory(['run']);
   assert.equal(r.code, 2, r.out + r.err);
   const q = w.queue().features;
@@ -479,7 +479,7 @@ test('attention view: a blocked and a held feature each get a row with a run com
   assert.match(items[1].run, /DELIVER_QUEUE=.* node .*deliver\.mjs skip FEATURE-002 --reason "<why>"/);
   const md = fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.md'), 'utf8');
   assert.match(md, /antigaming:FEATURE-001/); assert.match(md, /blocked:FEATURE-002/);
-  for (const text of [md, JSON.stringify(items)]) assert.doesNotMatch(text, /Secret title|settings\.json|feat\//);
+  for (const text of [md, JSON.stringify(items)]) assert.doesNotMatch(text, /Secret title|Zebra question|settings\.json|feat\//);
   const st = JSON.parse(w.factory(['status', '--json']).out);
   assert.equal(st.attention, 2);
   // The person releases FEATURE-001 (skip): the next run drops its row and keeps the blocked one.
