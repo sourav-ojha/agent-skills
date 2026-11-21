@@ -149,6 +149,8 @@ test('graceful stop during a session aborts it, WIP-commits its edits, ends stat
   assert.equal(r.code, 2, r.out);
   assert.match(r.out, /^stopped: stop$/m);
   assert.equal(builderRuns(w, 'FEATURE-001').length, 1, 'no new session');
+  const stoppedRows = JSON.parse(fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.json'), 'utf8'));
+  assert.deepEqual(stoppedRows.map((i) => [i.id, i.kind, i.run]), [['FEATURE-001', 'stopped', 'factory run --continue']]);
   assert.equal(runState(w).status, 'stopped');
   assert.match(runState(w).reason, /stop/);
   const f = w.queue().features[0];
@@ -157,6 +159,7 @@ test('graceful stop during a session aborts it, WIP-commits its edits, ends stat
   const c = w.factory(['run', '--continue']);
   assert.equal(c.code, 0, c.out + c.err);
   assert.equal(w.queue().features[0].state, 'merged');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.json'), 'utf8')), [], '--continue resolves the stopped row');
   const runs = builderRuns(w, 'FEATURE-001');
   assert.equal(runs.length, 2); assert.match(promptOf(runs[1]), CONTINUE);
   // The final record still says the person stopped it (sticky across the continue), and nothing else was flagged.

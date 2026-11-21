@@ -584,7 +584,7 @@ export async function cmdScenarios(ctx) {
     if (!bc || !bc.criteria.ok) { counts.criteria_errors++; ctx.out(`${spec.id} criteria: ${bc ? bc.criteria.errors.length : 1} error(s) in the base spec; fix the spec first`); code = 1; continue; }
     const now = scenarioState(ctx.key, spec.id, bc, mode);
     if (now.ok) { counts.current++; ctx.out(`${spec.id} scenarios: current and approved`); continue; }
-    if (now.why === 'unapproved') { counts.awaiting_approval++; ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
+    if (now.why === 'unapproved') { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
     const r = await authorOne(ctx, spec, bc);
     if (r.status === 'error') {
       ctx.out(`${spec.id} author session: ${r.kind}`);
@@ -601,7 +601,7 @@ export async function cmdScenarios(ctx) {
     if (r.status === 'invalid') { counts.invalid++; ctx.out(`${spec.id} scenarios rejected: ${r.problems.length} problem(s)`); for (const p of r.problems.slice(0, 50)) ctx.out(`  ${p}`); code = 1; continue; }
     const doc = mode === 'auto' ? approve(r.doc, 'auto') : r.doc;
     saveScenarios(ctx.key, spec.id, doc);
-    if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto`); } else { counts.awaiting_approval++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); }
+    if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto`); } else { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); }
   }
   ctx.out(`scenarios: ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`);
   endRun('finished');
@@ -631,6 +631,10 @@ async function authorInterrupt(ctx, spec, r) {
   return 'retry';
 }
 
+// A scenario set that waits for a person's approval: one row until `factory scenarios --approve` (fixed text, no spec content).
+function approvalRow(ctx, id) {
+  try { addAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval', severity: 'medium', what: 'scenarios wait for your approval', run: `factory scenarios --approve ${id} --by <name>` }); } catch { /* the terminal line names the command */ }
+}
 function approveCmd(ctx, id, by) {
   if (!FEATURE_ID.test(String(id))) refuse('--approve needs a feature id like FEATURE-001');
   if (typeof by !== 'string' || !BY.test(by)) refuse('--approve needs --by <name> (1-64 characters of letters, digits, _ . @ -)');
@@ -639,10 +643,11 @@ function approveCmd(ctx, id, by) {
   if (!spec) refuse(`${id} has no spec on origin/${ctx.base}`);
   const bc = baseCriteria(ctx.git, ctx.base, spec.rel);
   const st = scenarioState(ctx.key, id, bc, ctx.policy.verification.scenario_approval);
-  if (st.ok) { ctx.out(`${id} scenarios: already approved`); return 0; }
+  if (st.ok) { try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval' }); } catch { /* advisory */ } ctx.out(`${id} scenarios: already approved`); return 0; }
   if (st.why !== 'unapproved') refuse(`${id} has no current scenarios to approve (${st.why}${st.problems ? `: ${st.problems.length} problem(s)` : ''})`, `run "factory scenarios --only ${id}" first`);
   const { approved: _drop, ...doc } = st.doc;
   saveScenarios(ctx.key, id, approve(doc, by));
+  try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval' }); } catch { /* advisory */ }
   ctx.out(`${id} scenarios: approved`);
   return 0;
 }
@@ -733,7 +738,34 @@ function deliverWatch(ctx, ...args) {
     c.on('close', (code) => done(code));
   });
 }
-function attention(ctx, id, state, kind) {
+// The terminal line, the event log row (jsonl) and, unless `row` is false (the caller adds its own), a row in the current view
+// (attention/<key>.md) for a feature that needs a person. The row text is fixed per (state, kind): no feature title, branch, question
+// or reason. A row with a `state` is resolved when the feature leaves that state (reconcileAttention).
+const ALIVE_FIX = 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again';
+const WHAT = {
+  blocked: 'feature blocked: its work is on the branch or in a stash',
+  antigaming: 'held by anti-gaming checks: review the PR, then release it',
+  ci_unconfirmed: 'no CI evidence that the tests ran: a person decides',
+  leftovers: 'processes or directories from an earlier run are still alive',
+  resume_loop: 'resumed several times after crashes: a person looks at it',
+  resume_error: 'the restart check of this feature failed: a person looks at it',
+  hold_failed: 'the feature could not be parked for a person',
+  error: 'a step failed: a person looks at it',
+};
+function attentionRow(ctx, id, state, kind) {
+  const k = state === 'blocked' ? 'blocked' : (/^[a-z_]{1,32}$/.test(String(kind)) ? kind : 'other');
+  const base = `DELIVER_QUEUE=${ctx.queueFile} node ${DELIVER}`;
+  const dir = ctx.D ? ` --dir ${ctx.D}` : '';
+  let run = 'factory status';
+  if (k === 'blocked' || k === 'resume_loop') run = `${base} skip ${id} --reason "<why>"${dir}`;
+  else if (k === 'antigaming') run = `${base} retry ${id} --note "<why>"${dir}`;
+  else if (k === 'ci_unconfirmed') run = `${base} retry ${id} --checks "<test check>"${dir}`;
+  else if (k === 'leftovers') run = ALIVE_FIX;
+  const what = WHAT[k] || (state === 'awaiting_human' ? `held for a person (${k})` : `needs a person (${k})`);
+  const severity = ['blocked', 'antigaming', 'leftovers', 'resume_loop'].includes(k) ? 'high' : 'medium';
+  return { id, kind: k, severity, what, run, state };
+}
+function attention(ctx, id, state, kind, { row = true } = {}) {
   const once = `${id}\u0000${state}`;
   if ((ctx.attended ||= new Set()).has(once)) return;
   ctx.attended.add(once);
@@ -743,6 +775,23 @@ function attention(ctx, id, state, kind) {
     const dir = privateDir(path.join(ctx.fh, 'attention'));
     fs.appendFileSync(path.join(dir, `${ctx.key}.jsonl`), `${JSON.stringify({ at: new Date().toISOString(), feature: id, state, kind: kind || null })}\n`, { mode: 0o600 });
   } catch { /* the terminal line is the record of last resort */ }
+  if (row) { try { addAttention(ctx.fh, ctx.key, attentionRow(ctx, id, state, kind)); } catch { /* the jsonl row and the terminal line remain */ } }
+}
+// Rows that follow a feature's state go when it leaves that state (a person retried or skipped it). At the start of a run the rows of
+// the earlier stop (stopped, usage limit, day budget, leftovers, a failed WIP commit, ...) go too: the run re-adds what still holds.
+const STOP_KINDS = new Set(['stopped', 'usage_limit', 'day_budget', 'wip_failed', 'leftovers', 'resume_error', 'hold_failed', 'error', 'inconsistent']);
+function reconcileAttention(ctx, start) {
+  try {
+    const q = readQueue(ctx);
+    for (const it of listAttention(ctx.fh, ctx.key)) {
+      if (it.id === 'probe') continue;
+      const f = q.features.find((x) => x.id === it.id);
+      const sticky = it.state === 'blocked' || it.state === 'awaiting_human'; // follows the feature's state
+      const follows = typeof it.state === 'string' && it.state ? (sticky ? !f || f.state !== it.state : start) : false;
+      const stopRow = start && !it.state && STOP_KINDS.has(it.kind);
+      if (follows || stopRow) resolveAttention(ctx.fh, ctx.key, { id: it.id, kind: it.kind });
+    }
+  } catch { /* the view is advisory: the queue and the terminal lines are the record */ }
 }
 
 // ---- run: builder clone -----------------------------------------------------------------------------------------------------------------
@@ -1230,7 +1279,7 @@ export async function cmdRun(ctx) {
   if (opt['raise-budget'] !== undefined && !resuming) refuse('--raise-budget needs a run in progress: no feature is held for a budget');
   const alive = ctx.orphansAlive > 0 || ctx.leftovers > 0;
   const aliveWhy = `processes or worktrees from an earlier run are still alive (${ctx.orphansAlive} process group(s), ${ctx.leftovers} directory(ies))`;
-  const aliveFix = 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again';
+  const aliveFix = ALIVE_FIX;
   if (!resuming && alive) refuse(aliveWhy, aliveFix);
   // A queue in progress, whatever its states (queued, blocked and awaiting_human included): nothing runs (no deliver next, no
   // session) while something from the earlier run may still act. The run stops with the feature states left as they are.
@@ -1263,6 +1312,7 @@ export async function cmdRun(ctx) {
     if (raise) applyRaise(ctx, raise);
   }
   if (opt.continue && fs.existsSync(STOP_FLAG(ctx))) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('continue: the stop request is cleared'); }
+  reconcileAttention(ctx, true);
   updateRun(ctx.fh, ctx.key, { status: 'running', pause: null, reason: null, current: null, started_at: isoAt(ctx.deps.clock.now()), pid: process.pid });
   // A run stopped during a wait continues by finishing that wait (its saved reset time) before the interrupted step runs again, so
   // the first continued session does not hit the same limit.
@@ -1352,7 +1402,7 @@ async function loop(ctx) {
     let res;
     try { res = await execute(ctx, q, f, act, last); } catch (e) {
       const kind = e instanceof Leftover ? 'leftovers' : e instanceof WipFailed ? 'wip_failed' : 'error';
-      if (f) attention(ctx, f.id, f.state, kind);
+      if (f) attention(ctx, f.id, f.state, kind, { row: kind !== 'wip_failed' });
       if (f && kind === 'wip_failed') {
         try { addAttention(ctx.fh, ctx.key, { id: f.id, kind, severity: 'high', what: 'the WIP commit of the interrupted session failed: the work is uncommitted in the builder clone', run: 'factory run --continue' }); } catch { /* the jsonl row and the terminal line remain */ }
       }
@@ -1481,7 +1531,7 @@ function stopRun(ctx, f, kind, reason) {
   ctx.stopReason = clean(`${kind}: ${reason}`, 200);
   ctx.out(`${kind === 'usage_limit' ? 'usage limit' : 'reason'}: ${clean(reason, 200)}`);
   limitNote(ctx, kind);
-  if (f) attention(ctx, f.id, f.state, kind);
+  if (f) attention(ctx, f.id, f.state, kind, { row: false });
   addAttention(ctx.fh, ctx.key, { id: f?.id || 'run', kind: kind === 'stop' ? 'stopped' : kind, severity: 'high', what: clean(reason, 200), run: 'factory run --continue' });
   return { end: 2 };
 }
@@ -1495,8 +1545,8 @@ function budgetInterrupt(ctx, f, act, last) {
   const d = deliver(ctx, 'hold', f.id, '--reason', what, '--kind', 'budget');
   const held = (d.code === 0 || d.code === 2) && readQueue(ctx).features.find((x) => x.id === f.id)?.state === 'awaiting_human';
   if (!held) { attention(ctx, f.id, f.state, 'hold_failed'); ctx.out(`stopped: ${f.id} could not be parked (budget)`); return { end: 2 }; }
-  attention(ctx, f.id, 'awaiting_human', 'budget');
-  addAttention(ctx.fh, ctx.key, { id: f.id, kind: 'budget', severity: 'high', what, run: `factory run --raise-budget ${f.id}` });
+  attention(ctx, f.id, 'awaiting_human', 'budget', { row: false });
+  addAttention(ctx.fh, ctx.key, { id: f.id, kind: 'budget', severity: 'high', what, run: `factory run --raise-budget ${f.id}`, state: 'awaiting_human' });
   return { cur: null };
 }
 
@@ -1509,6 +1559,7 @@ function finish(ctx, code) {
   } catch { /* the count stays: the next run may hold resume_loop */ }
   const status = code === 0 ? 'finished' : 'stopped';
   try { updateRun(ctx.fh, ctx.key, { status, reason: status === 'stopped' ? (ctx.stopReason || 'stopped') : null, ended_at: isoAt(ctx.deps.clock.now()) }); } catch { /* the terminal lines are the record */ }
+  reconcileAttention(ctx, false);
   tell(ctx, status);
   try {
     const q = readQueue(ctx);

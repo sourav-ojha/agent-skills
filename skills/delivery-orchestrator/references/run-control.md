@@ -18,7 +18,7 @@ Committed in `.product/delivery.json`: `"autonomy": { "level": "L0" | "L1" }`.
 
 ## Budgets
 
-Budgets are runaway guards, not a model of subscription use. Tokens = input + output + cache creation of each session's final usage; cache reads are recorded separately (and cost, when the session reports it).
+Budgets are runaway guards, not a model of subscription use. Budget tokens = input + output + cache creation of each session's final usage; cache reads are recorded separately and not counted against a cap (cost too, when the session reports it). Note that `tokens_by_role` in the run record (below) is a plain total that **includes** cache reads, so it will not match a cap.
 
 | Cap | Where | Default |
 |---|---|---|
@@ -38,7 +38,7 @@ An interrupted session is not a crash. The driver keeps the work and resumes the
 | Kind | Handling |
 |---|---|
 | `session` limit | wait and resume if `wait_for_reset` is on and the wait fits `max_wait_h`, else stop |
-| `weekly` limit | stop, unless `max_wait_weekly_h` > 0 (then wait within that many hours) |
+| `weekly` limit | stop, unless `max_wait_weekly_h` > 0 (then wait within that many hours; this does not need `wait_for_reset`) |
 | `model` limit | switch to `fallback_model` once; stop if none is set or the fallback is limited too |
 | `rate` | retry after 1, 2 and 4 minutes, then stop (treated as other) |
 | `timeout` | continue at once; the third timeout of a feature blocks it |
@@ -58,7 +58,8 @@ The interruption uses no fix round and is not counted as a crash (`resumes`). A 
 - The wait is recorded as a run pause (`kind`, `reset_at`, `estimated`) and slept in 30-second slices measured against the wall clock, so sleep or a clock jump does not stretch or skip it.
 - First retry at `reset_at` plus 2 minutes; if the limit is hit again, every 10 minutes, up to `max_wait_h` in total (`max_wait_weekly_h` for a weekly limit). An unknown reset time is now plus 5 hours, marked estimated.
 - With `keep_awake` (default on), macOS `caffeinate -i -w <driver pid>` runs during the wait. It prevents idle sleep; it does not keep a closed lid awake, and a late wake-up is harmless.
-- A day-cap wait is not bounded by `max_wait_h`.
+- A day-cap wait is not bounded by `max_wait_h`, and still needs `wait_for_reset` (so it is refused while the classifier is fixtures only; the run stops `day_budget` instead).
+- The `paused` notification fires on every pause, including each rate retry and each 10-minute re-wait.
 - `factory run --continue` after a stop during a wait first waits out the saved `pause.reset_at`. A plain `factory run` does not (see the known gaps).
 
 ### `wait_for_reset` and the classifier
@@ -71,8 +72,8 @@ To turn waiting on once a real capture exists: record the capture and validate t
 
 | Command | Effect |
 |---|---|
-| `factory stop` | writes the stop flag `FACTORY_HOME/stop/<key>`. The driver checks it before every step and every 5 seconds during sessions, the CI wait and waits: the running session is interrupted (WIP commit), no new step starts, the run ends `stopped` (exit 2) |
-| `factory stop --now` | also interrupts the CI wait immediately. A verification run in progress still finishes (known gap), as do short driver-only steps |
+| `factory stop` | writes the stop flag `FACTORY_HOME/stop/<key>`. The driver checks it before every step and polls it every 5 seconds during a builder or author session, which is then interrupted (WIP commit); a wait notices it within 30 seconds. The CI wait is **not** cut short by a graceful stop (it ends when CI answers or its timeout passes, and the stop applies at the next step boundary). No new step starts; the run ends `stopped` (exit 2) |
+| `factory stop --now` | also ends the CI wait (polled every 5 seconds). A verification run in progress still finishes (known gap), as do short driver-only steps |
 | `factory run --continue` | clears the flag and continues the same run (the only way to clear it). Without `--continue`, `factory run` and `factory scenarios` refuse while the flag exists |
 | `factory status [--json]` | run status and reason, current step, pause and next resume time, lock state, stop flag, feature states with usage against caps, day usage, attention count. Read-only; takes no lock |
 
@@ -81,7 +82,7 @@ To turn waiting on once a real capture exists: record the capture and validate t
 
 ## Attention and notifications
 
-- `FACTORY_HOME/attention/<key>.md` is the current view (a table; each row says exactly what to run; rows are removed when resolved); `<key>.json` holds the rows and the existing `<key>.jsonl` stays the event log. Items: budget holds, stops (`factory run --continue`), `wip_failed`, held and blocked features, unproven hard stops.
+- `FACTORY_HOME/attention/<key>.md` is the current view (a table; each row says exactly what to run; rows are removed when resolved); `<key>.json` holds the rows and the existing `<key>.jsonl` stays the event log. Rows carry fixed text (never a feature title, branch, question or reason). Kinds: `blocked` (`deliver skip`), holds such as `antigaming` (`deliver retry --note`), `ci_unconfirmed` (`deliver retry --checks`) and merge holds (`factory status`), `budget` (`--raise-budget`), `scenario_approval` (`factory scenarios --approve ID --by <name>`), stops (`stopped`, `usage_limit`, `day_budget`, `wip_failed`: `factory run --continue`), `leftovers`, `resume_loop`, and `unproven_hardstop`. A row follows its feature: the next run (and the end of a run) removes it once the feature has left the blocked or held state, and a new run or `--continue` removes the earlier stop's rows. `factory status` counts the rows.
 - macOS notifications on `paused`, `stopped` and `finished` carry the repo key, the event and a count only, never feature content. (A per-item attention notification exists in `notify.mjs` but the driver does not send it yet.)
 
 ## Where things live

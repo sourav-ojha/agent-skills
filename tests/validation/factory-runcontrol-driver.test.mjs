@@ -396,6 +396,7 @@ test('day cap stop (wait_for_reset off): attention row names factory run --conti
   writeLocal(w, { budgets: { day_tokens: 1000000 } });
   const r2 = w.factory(['run']);
   assert.equal(r2.code, 0, r2.out + r2.err);
+  assert.deepEqual(attentionItems(w), [], 'the next run resolves the day_budget row');
   assert.match(r2.out, /FEATURE-001 building -> built/);
   assert.equal(w.queue().features[0].state, 'merged');
   assert.equal(builderRuns(w, 'FEATURE-001').length, 2);
@@ -461,4 +462,39 @@ test('wipCommit leaves no driver-owned path staged in the builder clone', (t) =>
   const f = w.queue().features[0];
   assert.deepEqual(w.sh(w.builder, 'show', '--name-only', '--format=', f.branch).split('\n'), ['src/x.wip']);
   assert.equal(w.sh(w.builder, 'diff', '--cached', '--name-only'), '', 'nothing left staged');
+});
+
+test('attention view: a blocked and a held feature each get a row with a run command, counted by status; no feature text in the rows; the next run removes the row of a feature the person released', (t) => {
+  const w = ready(t, { specs: { 'FEATURE-001': 'Secret title one', 'FEATURE-002': 'Secret title two' }, test: { now: NOW, timeoutS: 1 }, fake: { plan: {
+    'FEATURE-001': [good('FEATURE-001', { '.claude/settings.json': '{"hooks":{"Stop":[]}}\n' })],
+    'FEATURE-002': [{ sleep_ms: 5000, status: 'none', files: { 'src/a.txt': 'a\n' } }] } } });
+  const r = w.factory(['run']);
+  assert.equal(r.code, 2, r.out + r.err);
+  const q = w.queue().features;
+  assert.equal(q[0].state, 'awaiting_human'); assert.equal(q[0].hold_kind, 'antigaming');
+  assert.equal(q[1].state, 'blocked');
+  const items = attentionItems(w);
+  assert.deepEqual(items.map((i) => [i.id, i.kind, i.severity]), [['FEATURE-001', 'antigaming', 'high'], ['FEATURE-002', 'blocked', 'high']]);
+  assert.match(items[0].run, /DELIVER_QUEUE=.* node .*deliver\.mjs retry FEATURE-001 --note "<why>"/);
+  assert.match(items[1].run, /DELIVER_QUEUE=.* node .*deliver\.mjs skip FEATURE-002 --reason "<why>"/);
+  const md = fs.readFileSync(path.join(w.fhome, 'attention', 'o__r.md'), 'utf8');
+  assert.match(md, /antigaming:FEATURE-001/); assert.match(md, /blocked:FEATURE-002/);
+  for (const text of [md, JSON.stringify(items)]) assert.doesNotMatch(text, /Secret title|settings\.json|feat\//);
+  const st = JSON.parse(w.factory(['status', '--json']).out);
+  assert.equal(st.attention, 2);
+  // The person releases FEATURE-001 (skip): the next run drops its row and keeps the blocked one.
+  const qf = w.queue(); qf.features[0].state = 'skipped'; fs.writeFileSync(w.queueFile, JSON.stringify(qf));
+  const r2 = w.factory(['run']);
+  assert.equal(r2.code, 2, r2.out + r2.err);
+  assert.deepEqual(attentionItems(w).map((i) => [i.id, i.kind]), [['FEATURE-002', 'blocked']]);
+});
+
+test('attention view: a scenario set awaiting approval has a row naming the approve command, removed by --approve', (t) => {
+  const w = world(t, { config: { ...BASE_CONFIG, verification: { required: true, scenario_approval: 'human' } } });
+  const r = w.factory(['scenarios', '--only', 'FEATURE-001']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(attentionItems(w).map((i) => [i.id, i.kind, i.run]), [['FEATURE-001', 'scenario_approval', 'factory scenarios --approve FEATURE-001 --by <name>']]);
+  const a = w.factory(['scenarios', '--approve', 'FEATURE-001', '--by', 'me']);
+  assert.equal(a.code, 0, a.out + a.err);
+  assert.deepEqual(attentionItems(w), []);
 });

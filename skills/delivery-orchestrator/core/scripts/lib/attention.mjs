@@ -54,14 +54,15 @@ function save(p, items) {
 
 export const listAttention = (home, repoKey) => load(paths(home, repoKey));
 
-export function addAttention(home, repoKey, { id, kind, severity, what, run } = {}) {
+// `state` (optional, a feature state) marks a row that follows the feature: the driver resolves it once the feature leaves that state.
+export function addAttention(home, repoKey, { id, kind, severity, what, run, state } = {}) {
   const p = paths(home, repoKey);
   if (!id || !kind) throw new AttentionError('attention item needs id and kind');
   if (!SEVERITIES.includes(severity)) throw new AttentionError(`attention severity must be one of ${SEVERITIES.join(', ')}`);
   if (typeof run !== 'string' || !run.trim()) throw new AttentionError('attention item needs the exact command to run');
   const items = load(p);
   if (items.some((i) => i.id === id && i.kind === kind)) return;
-  items.push({ id, kind, severity, what: String(what ?? ''), run });
+  items.push({ id, kind, severity, what: String(what ?? ''), run, ...(typeof state === 'string' && state ? { state } : {}) });
   save(p, items);
 }
 

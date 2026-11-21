@@ -24,9 +24,9 @@ All run control is in the factory driver. Two config files:
 | File | Holds | Why there |
 |---|---|---|
 | `.product/delivery.json` (committed, read from `origin/<base>`) | `autonomy.level`, feature budgets | Repo policy: reviewed like code, can't be changed by a builder PR without a hold |
-| `~/.factory/config.json` (local, per machine) | `wait_for_reset`, wait limits, `keep_awake`, daily cap, notifications | Your preferences for this machine and account; changing them needs no PR; never published |
+| `~/.factory/config.json` (local, per machine) | `wait_for_reset`, wait limits, `keep_awake`, `fallback_model`, daily cap (rev 3: there is no notifications key) | Your preferences for this machine and account; changing them needs no PR; never published |
 
-Run state: `~/.factory/runs/<repo-key>.json` (atomic writes): run id, status (`running`, `paused`, `stopped`, `finished`), pause kind and resume time, counters, current step, session id.
+Run state: `~/.factory/runs/<repo-key>.json` (atomic writes): (rev 3: as stored: `status` (`running`, `paused`, `stopped`, `finished`), `reason`, `current` (feature, state, action), `pause` (kind, limit, `reset_at`, `estimated`), `started_at`, `ended_at`, `pid`; no run id, counters or session id).
 
 Daily usage (rev 3): `~/.factory/usage/<YYYY-MM-DD>/<repo-key>.json`, one file per repo per local day, summed on read, because subscription limits are per account (one writer per file).
 
@@ -52,7 +52,7 @@ Daily usage (rev 3): `~/.factory/usage/<YYYY-MM-DD>/<repo-key>.json`, one file p
 | Hard stop | Real mechanism | Prompt-level extra | Test |
 |---|---|---|---|
 | Builder reads secrets (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.netrc`, keychain, `.env*` except the example) | Sandbox read deny; allowlisted environment with no tokens | Settings deny rules | P0.4 probe, extended |
-| Builder reaches production hosts or databases | Network limited to registries and localhost for Bash and for untrusted code; **WebFetch, WebSearch and non-role MCP servers disabled** for the builder | — | Probe: outbound to a non-local host fails via Bash and via each tool |
+| Builder reaches production hosts or databases | Network limited to registries and localhost for Bash and for untrusted code; **WebFetch, WebSearch and non-role MCP servers disabled** for the builder | — | Probe: outbound to a non-local host fails via Bash (rev 3: the tool layer, WebFetch, WebSearch and MCP, is a static check of the settings, not a live probe) |
 | Destructive data operations | Only local seeded data is reachable (network rule); migrations are T3 and held | — | Bench: a table-dropping migration is held |
 | Merge outside the gate; disabling CI or protection | No GitHub token in the builder's environment, network rule, branch protection requiring `factory/verified`, CI-config changes held | Settings deny `gh`, `git push` | Phase 1a exit 6 |
 | Changing autonomy or delivery config | `.product/delivery.json` changes are already held by `deliver` (it treats the config file like a hold path); the driver adds it to G4 so it is also held at merge | — | Existing hold test, plus a driver test: a builder PR raising a budget is held |
@@ -132,7 +132,7 @@ This also amends Phase 1's action table: rows for limit, budget, stop and timeou
 
 ### Driver death
 
-If the driver dies, nothing is running, because sessions are children of the driver and are killed with it (verified as part of exit criteria; P0.4 confirms whether `claude` exits on a closed pipe). Running `factory run` again takes the lock and continues: a `paused` run keeps waiting, an interrupted step resumes as above, anything else follows the crash rules.
+If the driver dies, nothing is running, because sessions are children of the driver and are killed with it (verified as part of exit criteria; P0.4 confirms whether `claude` exits on a closed pipe). Running `factory run` again takes the lock and continues: a `paused` run keeps waiting (rev 3: only with `factory run --continue`, which waits out the saved reset; a plain `factory run` continues the interrupted step at once and waits again if the limit is still on), an interrupted step resumes as above, anything else follows the crash rules.
 
 ## P2.5 Kill switch and locking
 
@@ -142,8 +142,8 @@ If the driver dies, nothing is running, because sessions are children of the dri
 
 ### Stop
 
-- `factory stop` (graceful): the driver finishes the current driver-only step, starts no new session, interrupts any running session (P2.4 handling), and ends with status `stopped`.
-- `factory stop --now`: also interrupts the CI wait immediately (rev 3: a verification run in progress finishes; a known gap).
+- `factory stop` (graceful): the driver finishes the current driver-only step, starts no new session, interrupts any running session (P2.4 handling), and ends with status `stopped`. (rev 3: a session notices the flag within 5 seconds, a wait within 30; the CI wait is not cut short.)
+- `factory stop --now`: also interrupts the CI wait immediately (rev 3: polled every 5 seconds; a verification run in progress finishes; a known gap).
 - The flag is `~/.factory/stop/<repo-key>`. The driver checks it before every step and every 5 seconds during sessions and waits. Interactive `deliver` commands refuse while the flag exists; the driver's own `deliver` calls are not blocked.
 - Killing: SIGTERM to the session's process group, SIGKILL after 10 seconds, then kill any remaining process whose working directory is in the factory clone, builder clone or work directory, or whose environment shows this driver's run temps (rev 3: not processes that merely mention those paths), and warn if an app port is still in use.
 - `factory run --continue` clears the stop flag and continues the same run. `factory run --raise-budget` is separate (P2.3).

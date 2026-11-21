@@ -78,7 +78,7 @@ It refuses unless the base config sets `verification.required: true`, `readiness
 ## Run control (factory driver)
 
 Unattended `factory run` is bounded and stoppable: `autonomy.level` `L0` (no merges) or `L1` (merge on green) in the committed config; per-feature token and turn caps (`budgets.feature`, default 3,000,000 and 400) and an optional local day cap; a usage limit, timeout or `factory stop` WIP-commits the work and resumes with a continue brief, not a fix round.
-- `factory stop [--now]`, `factory run --continue`, `factory status [--json]`, `factory run --raise-budget ID[=TOKENS]` (a budget-held feature; bare ID doubles its caps).
+- `factory stop [--now]`, `factory run --continue`, `factory status [--json]`, `factory run --raise-budget ID[=TOKENS]` (a budget-held feature; bare ID adds the policy caps again; the first raise doubles them).
 - `wait_for_reset` (waiting out a usage limit) stays refused while the limit classifier is fixtures only. Hard-stop rows that only the isolation probe can prove are printed at start as unproven.
 - Interactive `deliver` refuses while a driver run holds the repository or a stop is pending. Details: [references/run-control.md](references/run-control.md).
 
