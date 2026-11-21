@@ -48,3 +48,5 @@ To prove them on this machine (the builder cannot write `~/.factory`, so the sav
 A `--from` result is only as trustworthy as the channel that produced it: it is whatever the builder session wrote. `--from` refuses malformed files and duplicate route entries, but it cannot tell whether a well-formed file is genuine.
 
 `--net-host` must be a non-local host you are allowed to connect to; never a production host or database. Denying `gh` or `git push` by permission pattern is only a prompt-layer rule; the real controls are no token, the network limit and branch protection.
+
+Run control (budgets, interruptions, stop and kill rules, the attention view): [run-control.md](run-control.md).

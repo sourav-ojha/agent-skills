@@ -75,6 +75,13 @@ For merges proven by hidden scenarios the builder never sees, the factory driver
 
 It refuses unless the base config sets `verification.required: true`, `readiness.min_level: 4` (with a stored level-4 result) and `local_checks: []`, and branch protection requires the `factory/verified` status. The queue lives under `FACTORY_HOME` and belongs to the driver; a person releases an anti-gaming hold with `deliver retry ID --note "<why>"` at an interactive terminal (you cannot: it refuses without a TTY). Details: [references/factory-driver.md](references/factory-driver.md), [references/verification.md](references/verification.md).
 
+## Run control (factory driver)
+
+Unattended `factory run` is bounded and stoppable: `autonomy.level` `L0` (no merges) or `L1` (merge on green) in the committed config; per-feature token and turn caps (`budgets.feature`, default 3,000,000 and 400) and an optional local day cap; a usage limit, timeout or `factory stop` WIP-commits the work and resumes with a continue brief, not a fix round.
+- `factory stop [--now]`, `factory run --continue`, `factory status [--json]`, `factory run --raise-budget ID[=TOKENS]` (a budget-held feature; bare ID doubles its caps).
+- `wait_for_reset` (waiting out a usage limit) stays refused while the limit classifier is fixtures only. Hard-stop rows that only the isolation probe can prove are printed at start as unproven.
+- Interactive `deliver` refuses while a driver run holds the repository or a stop is pending. Details: [references/run-control.md](references/run-control.md).
+
 ## Stop and report (do not push through)
 
 No CI evidence (see `unconfirmed`) · the run's circuit breaker trips · the base cannot be fast-forwarded · `gh` is not logged in or the remote is not GitHub · the implementer reports `BLOCKED` on something only a person can decide · anything unexpected about what a command printed. Say what you saw and the exact next command.
