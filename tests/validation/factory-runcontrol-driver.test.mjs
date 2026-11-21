@@ -317,6 +317,7 @@ test('weekly and model limits stop and notify (injected notify records "stopped"
     const r = w.factory(['run']);
     assert.equal(r.code, 2, `${limit}: ${r.out}${r.err}`);
     assert.match(r.out, /^stopped: usage_limit$/m, limit);
+    assert.match(r.out, /^note: the usage-limit classifier is fixtures only \(not yet validated against a real limit event\)$/m, `${limit}: the stop says the classifier is fixtures only`);
     assert.deepEqual(lines(w, 'notify.log').map((l) => l.split(' ')[0]), ['stopped'], limit);
     assert.equal(w.queue().features[0].interrupted.kind, limit);
     assert.equal(attentionItems(w)[0].run, 'factory run --continue');

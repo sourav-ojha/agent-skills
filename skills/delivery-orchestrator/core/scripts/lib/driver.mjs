@@ -55,6 +55,9 @@ export function fixKind(f) {
   for (let i = h.length - 1; i >= 0; i--) {
     if (h[i]?.state !== 'fixing') continue;
     const prev = h[i - 1]?.state;
+    // awaiting_human -> fixing is only deliver unhold (a released budget hold): the same fix step, so its kind is the kind of the
+    // fixing entry the hold was taken from.
+    if (prev === 'awaiting_human' && h[i - 2]?.state === 'fixing') continue;
     return prev === 'ci_failed' ? 'ci_fix' : prev === 'verify_failed' ? 'symptom_fix' : null;
   }
   return null;

@@ -281,7 +281,8 @@ export function prepare(ctx) {
   // refused wait_for_reset: true still comes back true). The classifier gate: wait_for_reset needs a validated classifier.
   // CLASSIFIER_STATUS becomes 'real' once the classifier is validated against a captured limit event; until then only the test
   // seam deps.classifierReal lets config.json turn wait_for_reset on.
-  const lc = loadLocalConfig(ctx.fh, { classifierReal: ctx.deps.classifierReal === true || CLASSIFIER_STATUS === 'real' });
+  ctx.classifierReal = ctx.deps.classifierReal === true || CLASSIFIER_STATUS === 'real';
+  const lc = loadLocalConfig(ctx.fh, { classifierReal: ctx.classifierReal });
   if (lc.errors.length) refuse(`the local config is invalid: ${lc.errors.join('; ')}`, `fix ${path.join(ctx.fh, 'config.json')} (or remove it to use the defaults)`);
   ctx.local = lc.config;
   const dir = path.resolve(opt.dir || process.cwd());
@@ -612,6 +613,7 @@ async function authorInterrupt(ctx, spec, r) {
   const stopA = (kind, reason) => {
     ctx.out(`stopped: ${kind}`);
     ctx.out(`${kind === 'usage_limit' ? 'usage limit' : 'reason'}: ${clean(reason, 200)}`);
+    limitNote(ctx, kind);
     addAttention(ctx.fh, ctx.key, { id: spec.id, kind, severity: 'high', what: clean(reason, 200), run: 'factory scenarios' });
     return 'stop';
   };
@@ -1469,12 +1471,16 @@ export async function handleInterrupt(ctx, f, act, last) {
   route.commit();
   return resumed(route.until - start);
 }
+// Spec P2 exit criteria: while no real limit event has been captured, a limit stop says the classification rests on fixtures only.
+const FIXTURES_NOTE = 'note: the usage-limit classifier is fixtures only (not yet validated against a real limit event)';
+function limitNote(ctx, kind) { if (kind === 'usage_limit' && ctx.classifierReal !== true) ctx.out(FIXTURES_NOTE); }
 // The run ends stopped: the terminal lines, the attention event and row (with the command that continues the run).
 function stopRun(ctx, f, kind, reason) {
   if (kind === 'stop' && f) update(ctx, f.id, (x) => { x.stopped_by_user = true; }); // sticky, like budget_hit: survives the continue
   ctx.out(`stopped: ${kind}`);
   ctx.stopReason = clean(`${kind}: ${reason}`, 200);
   ctx.out(`${kind === 'usage_limit' ? 'usage limit' : 'reason'}: ${clean(reason, 200)}`);
+  limitNote(ctx, kind);
   if (f) attention(ctx, f.id, f.state, kind);
   addAttention(ctx.fh, ctx.key, { id: f?.id || 'run', kind: kind === 'stop' ? 'stopped' : kind, severity: 'high', what: clean(reason, 200), run: 'factory run --continue' });
   return { end: 2 };

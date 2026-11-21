@@ -720,6 +720,10 @@ test('driver: fixKind reads the state before the last "fixing" from the history;
   assert.equal(D.fixKind(feat('fixing', { history: hist('pr_open', 'ci_failed', 'fixing') })), 'ci_fix');
   assert.equal(D.fixKind(feat('fixing', { history: hist('ci_failed', 'fixing', 'pr_open', 'ci_passed', 'verify_failed', 'fixing') })), 'symptom_fix');
   assert.equal(D.fixKind(feat('fixing', { history: hist('fixing') })), null);
+  // A released budget hold (deliver unhold: awaiting_human -> fixing) continues the fix step it was taken from.
+  assert.equal(D.fixKind(feat('fixing', { history: hist('pr_open', 'ci_failed', 'fixing', 'awaiting_human', 'fixing') })), 'ci_fix');
+  assert.equal(D.fixKind(feat('fixing', { history: hist('ci_passed', 'verify_failed', 'fixing', 'awaiting_human', 'fixing', 'awaiting_human', 'fixing') })), 'symptom_fix');
+  assert.equal(D.fixKind(feat('fixing', { history: hist('pr_open', 'awaiting_human', 'fixing') })), null, 'awaiting_human -> fixing without a fixing step before it');
   assert.equal(D.fixKind(feat('fixing', { history: 'x' })), null);
   for (const st of ['pr_open', 'ci_passed', 'verified']) assert.equal(D.canHold(st), true, st);
   for (const st of ['queued', 'building', 'built', 'ci_failed', 'fixing', 'verify_failed', 'awaiting_human', 'blocked', 'merged', 'skipped', 'garbage', '__proto__']) assert.equal(D.canHold(st), false, st);
