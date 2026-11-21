@@ -35,7 +35,8 @@ export function routeInterruption({ limit, resetAt, nowMs, local, waitedMs = 0, 
       if (local.wait_for_reset !== true) return stop('session limit: wait_for_reset is off');
       if (!okNum(local.max_wait_h)) return stop('session limit: max_wait_h unknown');
       return wait(resetAt, nowMs, waitedMs, local.max_wait_h, 'session');
-    case 'weekly':
+    case 'weekly': // needs wait_for_reset too, so the classifier gate (fixtures only: no waiting) covers weekly waits as well
+      if (local.wait_for_reset !== true) return stop('weekly limit: wait_for_reset is off');
       if (!okNum(local.max_wait_weekly_h) || !(local.max_wait_weekly_h > 0)) return stop('weekly limit: waiting is off (max_wait_weekly_h is 0)');
       return wait(resetAt, nowMs, waitedMs, local.max_wait_weekly_h, 'weekly');
     case 'model':

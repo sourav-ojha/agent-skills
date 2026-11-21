@@ -59,6 +59,11 @@ test('routeInterruption: weekly stops by default; waits when max_wait_weekly_h c
   assert.equal(I.routeInterruption({ limit: 'weekly', resetAt: iso(NOW + 30 * H), nowMs: NOW, local: local({ max_wait_weekly_h: 24 }) }).do, 'stop', 'beyond max_wait_weekly_h');
 });
 
+test('routeInterruption: a weekly wait also needs wait_for_reset (the classifier gate applies to it too)', () => {
+  const off = I.routeInterruption({ limit: 'weekly', resetAt: iso(NOW + 10 * H), nowMs: NOW, local: local({ wait_for_reset: false, max_wait_weekly_h: 24 }) });
+  assert.equal(off.do, 'stop'); assert.match(off.reason, /^weekly limit: wait_for_reset is off$/);
+});
+
 test('routeInterruption: model switches to fallback_model when set, else stops', () => {
   assert.deepEqual(I.routeInterruption({ limit: 'model', resetAt: null, nowMs: NOW, local: local({ fallback_model: 'claude-sonnet' }) }), { do: 'switch_model', model: 'claude-sonnet' });
   const s = I.routeInterruption({ limit: 'model', resetAt: null, nowMs: NOW, local: local() });

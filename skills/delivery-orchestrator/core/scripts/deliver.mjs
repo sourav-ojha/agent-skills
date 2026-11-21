@@ -876,6 +876,8 @@ function merged(q, f, sha, warn = []) {
 C.retry = () => { // a feature held for a CI reason goes back to waiting for CI, with the run's CI policy changed on purpose
   const q = load(); const f = item(q);
   need(f, 'awaiting_human');
+  // A budget hold is released by raising the cap (the driver continues the step it was parked in), never by a CI retry.
+  if (f.hold_kind === 'budget') die(`${f.id} is held for its budget: run "factory run --raise-budget ${f.id}" to raise its cap and continue it`);
   if (!f.pr) die(`${f.id} has no PR`);
   const anti = f.hold_kind === 'antigaming';
   const note = flat(opt.note, 500);

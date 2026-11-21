@@ -68,6 +68,8 @@ function writeResult(obj) {
 //   require_files: [paths] (the session reports blocked "missing <path>" when one is absent: proves a continued session sees edits).
 //   status "usage" with limit: session|weekly|model|rate and resets_at: <epoch s>|null emits a rejected rate_limit_event of that
 //   kind (rate: a 429 "Rate limit reached" instead); without limit it is the session-limit text "resets 3:45pm".
+//   status "error": an is_error result whose text no classifier rule knows (kind other); status "exit": no result event (no_result).
+//   checkout: <branch> (the session switches the clone to a new branch of that name before its edits: HEAD off the feature branch).
 function factory() {
   const argv = process.argv.slice(2);
   const prompt = argv[argv.indexOf('-p') + 1] || '';
@@ -102,6 +104,7 @@ function factory() {
     // app the session started and still runs); it lives as long as the session's group does.
     if (s.app_port) spawn(process.execPath, ['-e', `require('net').createServer().listen(${Number(s.app_port)}, '127.0.0.1');setInterval(() => {}, 1000)`], { cwd: process.cwd(), stdio: 'ignore' }).unref();
     if (s.escape_ms) spawn(process.execPath, ['-e', `${s.escape_port ? `require('net').createServer().listen(${Number(s.escape_port)}, '127.0.0.1');` : ''}setTimeout(() => process.exit(0), ${Number(s.escape_ms)})`], { cwd: process.cwd(), detached: true, stdio: 'ignore' }).unref();
+    if (s.checkout) spawnSync('git', ['checkout', '-q', '-b', String(s.checkout)], { cwd: process.cwd() });
     for (const [p, text] of Object.entries(s.files || {})) { fs.mkdirSync(path.dirname(path.join(process.cwd(), p)), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), p), text); }
     if (s.spec_complete) {
       const sp = path.join(process.cwd(), '.product', 'features', `${id}.md`);
@@ -129,6 +132,8 @@ function factory() {
       return 1;
     }
     if (s.status === 'usage') { await result({ is_error: true, api_error_status: 429, result: "You've hit your session limit · resets 3:45pm", terminal_reason: 'api_error' }); return 1; }
+    if (s.status === 'error') { await result({ is_error: true, result: 'API Error: the upstream service misbehaved', terminal_reason: 'api_error' }); return 1; }
+    if (s.status === 'exit') return 1;
     if (s.status !== 'none') writeResult(s.status === 'blocked' ? { status: 'blocked', question: s.question || 'Which database?' } : { status: 'done', summary: 'implemented' });
     await result(Number.isInteger(s.tokens) ? { usage: { ...usage, input_tokens: s.tokens } } : {});
     return 0;

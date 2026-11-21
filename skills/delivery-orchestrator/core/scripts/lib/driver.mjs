@@ -140,7 +140,7 @@ function decide(f, lastResult, run) {
 
   // Interruptions and environment failures of any session, in any state. Phase 2 amends Phase 1's table: limit, budget, stop and
   // timeout go to interrupted handling (the caller's `interrupt` action keeps the work and decides wait/retry/stop); a session that
-  // ended without a result still stops the run.
+  // ended without a result (other, no_result) still stops the run, never waits.
   if (last?.step === 'session') {
     if (last.kind === 'usage_limit') {
       if (!USAGE_KINDS.has(last.limit)) return hold('unknown_result', 'a usage limit of an unknown kind');
@@ -157,7 +157,8 @@ function decide(f, lastResult, run) {
       if (!BUDGET_SCOPES.has(last.scope)) return hold('unknown_result', 'a budget result of an unknown scope');
       return { do: 'interrupt', kind: 'budget', scope: last.scope };
     }
-    if (['no_result', 'other'].includes(last.kind)) return stop('interrupted', 'the session ended without a result: the run stops and the branch is left as it is');
+    // The driver kept its work (WIP commit, f.interrupted) before deciding: the run stops without waiting, the next run continues.
+    if (['no_result', 'other'].includes(last.kind)) return stop('interrupted', 'the session ended without a result: its work is kept on the branch and the run stops');
     if (last.kind === 'settings_unsafe') return hold('settings_unsafe', `user Claude settings are unsafe for unattended sessions (${categories(last.keys).join(', ') || 'unknown'}): fix them, then run again`);
     if (last.kind === 'spawn_failed' || last.kind === 'unsafe_binary') return hold('environment', last.kind === 'spawn_failed' ? 'the claude binary could not be started' : 'the claude binary resolves inside the session working directory');
     if (st !== 'building' && st !== 'fixing') return hold('inconsistent', `a builder session result for a feature in "${st}"`);

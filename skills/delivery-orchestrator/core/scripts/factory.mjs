@@ -411,9 +411,10 @@ const alivePid = (pid) => { try { process.kill(pid, 0); return true; } catch (e)
 // or a verification run temp this driver created, ctx.runTemps; never FACTORY_HOME/tmp as a whole: it holds every repository's run
 // temps, and another repository's driver may be verifying right now) get SIGTERM, then
 // SIGKILL after 10 s if a fresh scan still finds them (a pid that exited and was reused meanwhile is not signalled). A process that
-// only mentions those paths in its argv or environment (an editor, `git -C <clone>`, a shell) is never killed: the broad detection
-// (noLiveBuilder, the next start's sweep) refuses to continue instead. Then the app ports of the base config must be free. Never this
-// process or its parent. Best effort: what is left is reported.
+// only mentions those paths in its argv or environment (an editor, `git -C <clone>`, a shell) is never killed, and neither is one
+// with a controlling terminal whose cwd is in them (a person's shell or editor opened in a clone; sessions and apps are started
+// detached, without one): the broad detection (noLiveBuilder, the next start's sweep) refuses to continue instead. Then the app
+// ports of the base config must be free. Never this process or its parent. Best effort: what is left is reported.
 export async function killLeftovers(ctx) {
   const markers = [ctx.bRoot && path.join(ctx.bRoot, ctx.key), ctx.bRoot && builderRun(ctx), ctx.D, ctx.fh && ctx.key && path.join(ctx.fh, 'work', ctx.key)].filter(Boolean);
   const real = (d) => { try { return fs.realpathSync(d); } catch { return d; } }; // /tmp vs /private/tmp on macOS
@@ -564,8 +565,10 @@ export async function cmdScenarios(ctx) {
   const { opt } = ctx.args;
   if (opt.approve !== undefined) return approveCmd(ctx, opt.approve, opt.by);
   const only = idList(opt.only);
-  // A pending stop stops authoring too (its sessions would be aborted at once); only `factory run --continue` clears the flag.
-  if (stopRequested(ctx)) refuse('a stop was requested for this repository (factory stop)', 'run "factory run --continue" to clear the stop and continue the run, then author scenarios');
+  // A stop flag found here predates this command, and no run is live (scenarios holds the repository lock): it cannot stop
+  // anything, so it is cleared (said in one line) instead of locking authoring out. A stop written while scenarios runs still
+  // aborts its author sessions.
+  if (stopRequested(ctx)) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('scenarios: a stop request left with no run active is cleared'); }
   usagePreflight(ctx);
   // Run state: scenarios writes only the state of its own waits, and never over a stopped or paused run (Task 9).
   let prior = null;
@@ -779,7 +782,7 @@ function attention(ctx, id, state, kind, { row = true } = {}) {
 }
 // Rows that follow a feature's state go when it leaves that state (a person retried or skipped it). At the start of a run the rows of
 // the earlier stop (stopped, usage limit, day budget, leftovers, a failed WIP commit, ...) go too: the run re-adds what still holds.
-const STOP_KINDS = new Set(['stopped', 'usage_limit', 'day_budget', 'wip_failed', 'leftovers', 'resume_error', 'hold_failed', 'error', 'inconsistent']);
+const STOP_KINDS = new Set(['stopped', 'usage_limit', 'day_budget', 'wip_failed', 'wip_skipped', 'interrupted', 'leftovers', 'resume_error', 'hold_failed', 'error', 'inconsistent']);
 function reconcileAttention(ctx, start) {
   try {
     const q = readQueue(ctx);
@@ -1028,31 +1031,54 @@ async function builderSession(ctx, f, act) {
   const entry = usageEntry('builder', r);
   update(ctx, f.id, (x) => { (x.sessions ||= []).push(entry); });
   recordUsage(ctx, entry);
+  // Before the leftover check: an interrupted session (or one that ended without a result) marks its step interrupted, so a
+  // `leftovers` stop right below still continues the step from the branch next time (whose keepWork commits the edits) instead of
+  // resetting it as a crash. handleInterrupt replaces this minimal record (head null) with the full one.
+  const step = STEP_OF[f.state];
+  const ikind = r?.ok === true ? null : interruptKind(sessionResult(r, null));
+  if (ikind && step) update(ctx, f.id, (x) => { x.interrupted = { kind: ikind, step, session_id: typeof entry.id === 'string' ? entry.id : null, head: null, ts: isoAt(ctx.deps.clock.now()) }; });
   noLiveBuilder(ctx);
   fs.rmSync(runDir, { recursive: true, force: true });
   const res = sessionResult(r, readBuilderResult(ctx.B, f.id));
+  // A session that ended without a result (other, no_result: an unrecognised usage limit lands here) is an interruption that
+  // stops without waiting: its work is kept in a WIP commit now, the decision table stops the run (`interrupted`), and the next
+  // run continues the step from the branch.
+  if (step && ENDED_KINDS.has(res.kind)) {
+    const w = keepWork(ctx, f, res.kind);
+    if (w.committed) {
+      update(ctx, f.id, (x) => { if (x.interrupted) x.interrupted.head = w.head; });
+      ctx.out(`${f.id} interrupted (${res.kind}): work kept in a WIP commit`);
+    }
+  }
   // A session that ended without an interruption ends the interrupted step: the record and the crash-resume count of an
   // interrupted feature go, and so does the wait already spent on it.
-  if (!INTERRUPT_KINDS.has(res.kind)) {
+  if (!INTERRUPT_KINDS.has(res.kind) && !ENDED_KINDS.has(res.kind)) {
     update(ctx, f.id, (x) => { delete x.interrupted; if (x.interrupted_resumes !== undefined) x.interrupted_resumes = 0; });
     if (ctx.waits?.id === f.id) ctx.waits = null;
   }
   return res;
 }
 const INTERRUPT_KINDS = new Set(['usage_limit', 'timeout', 'stopped', 'budget']);
+const ENDED_KINDS = new Set(['other', 'no_result']); // ended without a result: kept like an interruption, then the run stops
 const STEP_OF = { building: 'build', fixing: 'fix' };
+// The f.interrupted kind of a session result (handleInterrupt's names: the limit kind, stop, timeout), or null when the result is no
+// interruption (a budget refusal starts no session). Bounded to /^[a-z_]{1,32}$/.
+function interruptKind(res) {
+  const k = res?.kind === 'usage_limit' ? res.limit : res?.kind === 'stopped' ? 'stop' : ['timeout', ...ENDED_KINDS].includes(res?.kind) ? res.kind : null;
+  return k === null ? null : /^[a-z_]{1,32}$/.test(String(k)) ? k : 'other';
+}
 
-// wipCommit(ctx, f, kind) -> { committed, head }: the interrupted session's uncommitted work, committed on the feature branch in the
+// wipCommit(ctx, f, kind) -> { committed, head, skipped? }: the interrupted session's uncommitted work, committed on the feature branch in the
 // builder clone with the hook-free gitSafe wrapper as "wip(<ID>): interrupted (<kind>)". Driver-owned paths (.implementation,
 // .delivery, .skill-runs) are never staged; with nothing else to stage there is no commit (and no error). Only after noLiveBuilder.
-// A builder that left HEAD on another branch gets no commit (its edits are not on the feature branch to keep).
+// A builder that left HEAD on another branch gets no commit (its edits are not on the feature branch to keep): skipped true.
 export function wipCommit(ctx, f, kind) {
   if (!bExists(ctx)) return { committed: false, head: null };
   ensureBuilder(ctx); noLiveBuilder(ctx);
   const g = bGit(ctx);
   const head = headOf(g, f.branch);
   const sym = g('symbolic-ref', '-q', 'HEAD');
-  if (!head || sym.code !== 0 || sym.out.trim() !== `refs/heads/${f.branch}`) return { committed: false, head };
+  if (!head || sym.code !== 0 || sym.out.trim() !== `refs/heads/${f.branch}`) return { committed: false, head, skipped: true };
   const spec = ['--', '.', ...DRIVER_OWNED.map((n) => `:(exclude)${n}`)];
   // add -A -- . (an exclude pathspec on add fails on the ignored .implementation/); the excludes apply to the check and the commit.
   must(g('add', '-A', '--', '.'), 'staging the interrupted work');
@@ -1065,8 +1091,15 @@ export function wipCommit(ctx, f, kind) {
   return { committed: true, head: headOf(g, f.branch) };
 }
 // wipCommit for the interruption paths: any failure but a live builder process is a WipFailed (the run stops, nothing is reset).
+// A commit skipped because HEAD left the feature branch gets one line and a wip_skipped attention row (fixed text).
 function keepWork(ctx, f, kind) {
-  try { return wipCommit(ctx, f, kind); } catch (e) { if (e instanceof Leftover) throw e; throw new WipFailed(e?.message || 'the WIP commit failed'); }
+  let w;
+  try { w = wipCommit(ctx, f, kind); } catch (e) { if (e instanceof Leftover) throw e; throw new WipFailed(e?.message || 'the WIP commit failed'); }
+  if (w.skipped) {
+    ctx.out(`${f.id} interrupted: the builder left HEAD off the feature branch; no WIP commit was made`);
+    try { addAttention(ctx.fh, ctx.key, { id: f.id, kind: 'wip_skipped', severity: 'high', what: 'the builder left HEAD off the feature branch: its uncommitted edits are not in a WIP commit', run: 'factory run --continue' }); } catch { /* the terminal line remains */ }
+  }
+  return w;
 }
 
 // ---- run: steps -----------------------------------------------------------------------------------------------------------------------
@@ -1262,6 +1295,9 @@ export async function cmdRun(ctx) {
   if (opt.limit !== undefined && !(Number.isInteger(Number(opt.limit)) && Number(opt.limit) >= 1 && Number(opt.limit) <= 1000)) refuse('--limit must be an integer 1-1000');
   // A stop flag left by `factory stop` (the run it stopped, or one that was not running) is never cleared silently.
   if (stopRequested(ctx) && !opt.continue) refuse('a stop was requested for this repository (factory stop)', 'run "factory run --continue" to clear the stop and continue the same run');
+  // --continue clears it first, before any refusal below (missing scenarios, budgets): this command holds the lock, so no run is
+  // live that the flag could still stop, and a refused --continue must not leave the repository locked out by it.
+  if (opt.continue && fs.existsSync(STOP_FLAG(ctx))) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('continue: the stop request is cleared'); }
   startChecks(ctx);
   if (ctx.local.budgets.day_tokens === null) ctx.out('warning: no daily token cap is set (budgets.day_tokens in ~/.factory/config.json)');
   reportHardStops(ctx);
@@ -1311,7 +1347,6 @@ export async function cmdRun(ctx) {
     if (bad.length) refuse(`features without current approved scenarios: ${bad.join(', ')}`, 'run "factory scenarios" (and approve them), then run again');
     if (raise) applyRaise(ctx, raise);
   }
-  if (opt.continue && fs.existsSync(STOP_FLAG(ctx))) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('continue: the stop request is cleared'); }
   reconcileAttention(ctx, true);
   updateRun(ctx.fh, ctx.key, { status: 'running', pause: null, reason: null, current: null, started_at: isoAt(ctx.deps.clock.now()), pid: process.pid });
   // A run stopped during a wait continues by finishing that wait (its saved reset time) before the interrupted step runs again, so
@@ -1461,6 +1496,8 @@ async function execute(ctx, q, f, act, last = null) {
       return { cur: null };
     }
     case 'stop':
+      // A session that ended without a result (its work already kept by builderSession): a stop with the continue row.
+      if (act.kind === 'interrupted') return stopRun(ctx, f, 'interrupted', act.reason || 'the session ended without a result');
       if (f && act.attention) attention(ctx, f.id, f.state, act.kind);
       ctx.out(`stopped: ${act.kind}${act.resetAt ? ` (resets ${act.resetAt})` : ''}`);
       ctx.stopReason = clean(`${act.kind}${act.reason ? `: ${act.reason}` : ''}`, 200);
@@ -1584,7 +1621,8 @@ const lockState = (ctx) => { try { return inspect(ctx.key, { home: ctx.fh, ...(c
 
 // factory stop [--now]: writes the stop flag { at, now }. A running driver sees it before its next step, every 5 s during a session
 // (the session is interrupted and its work kept in a WIP commit) and during waits; --now also ends the CI wait. A verification run
-// in progress always finishes. The flag stays until `factory run --continue`; the run ends with status stopped.
+// in progress always finishes. The flag stays until `factory run --continue` (or a `factory scenarios`, which runs only when no run is
+// live); the run ends with status stopped.
 export function cmdStop(ctx) {
   const now = ctx.args.opt.now === true;
   const file = STOP_FLAG(ctx);
@@ -1598,10 +1636,13 @@ export function cmdStop(ctx) {
   return 0;
 }
 
-// The facts `factory status` reports, all read-only: run state, queue, usage against caps, attention, lock and stop flag.
+// The facts `factory status` reports, all read-only: run state, queue, usage against caps, attention, lock, driver and stop flag.
 export function statusFacts(ctx) {
   const err = (e) => clean(String(e?.message || e), 160).replace(/(?:\/[^\s/:'"]+)+\/?/g, '<path>');
-  const out = { repo: ctx.id.repo, run: null, pause: null, next_resume: null, stop_requested: stopRequested(ctx), lock: lockState(ctx).state, features: [], counts: {}, day: null, attention: 0, errors: [] };
+  const lock = lockState(ctx).state;
+  // driver: whether a driver process holds the repository now (a live lock). A run state that says running or paused with no live
+  // lock is a driver that died: `factory run` continues it.
+  const out = { repo: ctx.id.repo, run: null, pause: null, next_resume: null, stop_requested: stopRequested(ctx), lock, driver: lock === 'live' ? 'running' : 'not_running', features: [], counts: {}, day: null, attention: 0, errors: [] };
   try {
     const r = readRun(ctx.fh, ctx.key);
     if (r) {
@@ -1633,6 +1674,7 @@ export function cmdStatus(ctx) {
   const cap = (n) => (n === null || n === undefined ? '-' : n);
   ctx.out(`repo: ${s.repo}`);
   ctx.out(`run: ${s.run?.status ?? 'none'}`);
+  if (['running', 'paused'].includes(s.run?.status) && s.driver !== 'running') ctx.out('driver: not running');
   if (s.run?.reason) ctx.out(`reason: ${s.run.reason}`);
   if (s.run?.current) ctx.out(`current: ${s.run.current.feature ? `${s.run.current.feature} ${s.run.current.state}` : 'queue'} -> ${s.run.current.action}`);
   if (s.next_resume) ctx.out(`next resume: ${s.next_resume}`);

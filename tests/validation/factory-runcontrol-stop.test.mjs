@@ -114,7 +114,7 @@ test('the stop sweep env rule uses only the run temps this driver created: anoth
 });
 
 // ---- the stop flag ---------------------------------------------------------------------------------------------------------------------------
-test('stop writes the flag; run without --continue refuses with the fix line naming --continue; plain scenarios refuses and keeps it; run --continue removes the flag and carries on', (t) => {
+test('stop writes the flag; run without --continue refuses with the fix line naming --continue; plain scenarios clears a flag left with no run active; run --continue removes the flag and carries on', (t) => {
   const w = ready(t, { specs: ONE, fake: { plan: { 'FEATURE-001': [good('FEATURE-001')] } } });
   const s = w.factory(['stop']);
   assert.equal(s.code, 0, s.out + s.err);
@@ -128,10 +128,12 @@ test('stop writes the flag; run without --continue refuses with the fix line nam
   assert.match(r.out, /^refused: a stop was requested for this repository/m);
   assert.match(r.out, /^fix: .*factory run --continue/m);
   assert.equal(fs.existsSync(w.queueFile), false, 'nothing ran');
+  // factory scenarios holds the lock, so no run is live that the flag could stop: it clears the flag (one line) instead of refusing.
   const sc = w.factory(['scenarios']);
-  assert.equal(sc.code, 1, sc.out + sc.err);
-  assert.match(sc.out, /^fix: .*factory run --continue/m);
-  assert.ok(fs.existsSync(flagFile(w)), 'a plain factory scenarios does not clear the flag');
+  assert.equal(sc.code, 0, sc.out + sc.err);
+  assert.match(sc.out, /^scenarios: a stop request left with no run active is cleared$/m);
+  assert.equal(fs.existsSync(flagFile(w)), false, 'factory scenarios cleared the flag');
+  assert.equal(w.factory(['stop']).code, 0);
   const c = w.factory(['run', '--continue']);
   assert.equal(c.code, 0, c.out + c.err);
   assert.equal(fs.existsSync(flagFile(w)), false, '--continue removed the flag');
@@ -184,13 +186,14 @@ test('after stop no process with the factory clone or work directory as cwd surv
   assert.ok(subjects(w, w.queue().features[0].branch).includes('wip(FEATURE-001): interrupted (stop)'));
 });
 
-test('the stop kill sweep signals only processes whose cwd is in the clone (or started in a sandbox): one that only mentions the clone path in its argv survives (and detection still refuses to continue)', async (t) => {
-  const w = ready(t, { specs: ONE, fake: { plan: { 'FEATURE-001': [{ files: { 'src/x.wip': 'x\n' }, linger_ms: 60000 }] } } });
+test('the stop kill sweep signals only processes whose cwd is in the clone (or started in a sandbox): one that only mentions the clone path in its argv survives (and detection still refuses to continue); once it is gone, --continue continues the step from the branch with its work', async (t) => {
+  const w = ready(t, { specs: ONE, fake: { plan: { 'FEATURE-001': [{ files: { 'src/x.wip': 'x\n' }, linger_ms: 60000 }, { ...good('FEATURE-001'), require_files: ['src/x.wip'] }] } } });
   const run = bg(w, ['run']);
   await until(() => builderRuns(w, 'FEATURE-001').length === 1 && fs.existsSync(path.join(w.builder, 'src', 'x.wip')), 'the builder session');
   const keep = 'setTimeout(() => {}, 120000)';
-  const inClone = spawn(process.execPath, ['-e', keep], { cwd: w.builder, stdio: 'ignore' });
-  const decoy = spawn(process.execPath, ['-e', keep, w.builder], { cwd: os.tmpdir(), stdio: 'ignore' }); // like `code <clone>`
+  // detached: no controlling terminal, like the processes a session leaves (a process with one, a person's shell, is not killed).
+  const inClone = spawn(process.execPath, ['-e', keep], { cwd: w.builder, stdio: 'ignore', detached: true });
+  const decoy = spawn(process.execPath, ['-e', keep, w.builder], { cwd: os.tmpdir(), stdio: 'ignore', detached: true }); // like `code <clone>`
   t.after(() => { for (const c of [inClone, decoy]) try { c.kill('SIGKILL'); } catch { /* gone */ } });
   const gone = (c) => new Promise((r) => { if (c.exitCode !== null || c.signalCode !== null) r(true); else c.once('exit', () => r(true)); });
   await until(() => VF.scanSurvivors([w.builder]) >= 2, 'both processes listed', 10000);
@@ -202,7 +205,22 @@ test('the stop kill sweep signals only processes whose cwd is in the clone (or s
   assert.equal(decoy.exitCode, null, 'the decoy that only mentions the path is still running');
   assert.doesNotThrow(() => process.kill(decoy.pid, 0));
   assert.match(r.out, /^stopped: leftovers$/m, 'the broad detection still refuses to touch the branch while the decoy lives');
+  // The leftover stop came before the WIP commit, but the step was already marked interrupted: nothing is reset next time.
+  const f = w.queue().features[0];
+  assert.equal(f.interrupted?.kind, 'stop'); assert.equal(f.interrupted?.step, 'build');
   decoy.kill('SIGKILL');
+  await gone(decoy);
+  await until(() => VF.scanSurvivors([w.builder]) === 0, 'the decoy gone', 10000);
+  const c = w.factory(['run', '--continue']);
+  assert.equal(c.code, 0, c.out + c.err);
+  assert.match(c.out.split('\n').find((l) => / -> /.test(l)), /^FEATURE-001 building -> build \(build\)$/);
+  const runs = builderRuns(w, 'FEATURE-001');
+  assert.equal(runs.length, 2);
+  assert.match(promptOf(runs[1]), CONTINUE, 'the continue brief, not a fresh build');
+  assert.ok(subjects(w, f.branch).includes('wip(FEATURE-001): interrupted (stop)'), 'the next run made the WIP commit');
+  const wip = w.sh(w.builder, 'log', '--format=%H', '--grep', '^wip(FEATURE-001): interrupted (stop)$', f.branch).split('\n')[0];
+  assert.ok(w.sh(w.builder, 'show', '--name-only', '--format=', wip).split('\n').includes('src/x.wip'), 'src/x.wip is in the WIP commit');
+  assert.equal(w.queue().features[0].state, 'merged', 'the continued session saw src/x.wip (require_files)');
 });
 
 test('stop --now during the CI wait kills the deliver child within 15 s and the run ends stopped; the feature is still pr_open and the next run continues from CI', async (t) => {
