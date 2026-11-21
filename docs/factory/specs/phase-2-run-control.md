@@ -99,11 +99,11 @@ State transitions added for budget holds (rev 3: only `building` and `fixing`; `
 | Kind (P0.3 classifier) | Handling |
 |---|---|
 | `session` (5-hour window) | Wait and resume if `wait_for_reset` is on and the wait is within `max_wait_h`; else stop |
-| `weekly` | Stop and notify (waiting days is rarely wanted); waiting only if `max_wait_weekly_h` > 0 |
+| `weekly` | Stop and notify (waiting days is rarely wanted); waiting only if `max_wait_weekly_h` > 0 and `wait_for_reset` is on (rev 3, final review) |
 | `model` (a model-specific cap) | Stop and notify, or switch to `fallback_model` if you configured one |
 | `rate` (short-term throttling) | Retry the step after 1, 2 and 4 minutes, then treat as `other` |
 | budget, stop, timeout | As in P2.3 and P2.5 |
-| `other` | Normal failure, handled by the Phase 1 action table |
+| `other` | Normal failure, handled by the Phase 1 action table (rev 3, final review: a builder session that ends as `other` or `no_result` keeps its work in a WIP commit, records `f.interrupted` with that kind and stops without waiting; the next run continues the step. An unrecognised real limit event lands here) |
 
 `wait_for_reset` defaults to **off**, and cannot be turned on while the classifier is marked "fixtures only" by Phase 0 (no real capture yet); `factory run` says so.
 
@@ -132,7 +132,7 @@ This also amends Phase 1's action table: rows for limit, budget, stop and timeou
 
 ### Driver death
 
-If the driver dies, nothing is running, because sessions are children of the driver and are killed with it (verified as part of exit criteria; P0.4 confirms whether `claude` exits on a closed pipe). Running `factory run` again takes the lock and continues: a `paused` run keeps waiting (rev 3: only with `factory run --continue`, which waits out the saved reset; a plain `factory run` continues the interrupted step at once and waits again if the limit is still on), an interrupted step resumes as above, anything else follows the crash rules.
+(rev 3, final review: corrected) If the driver dies, a running session is **not** killed with it: it runs in its own process group and outlives the driver (exit criterion E3) until the next start kills the recorded group. Until then it keeps spending, up to `session_timeout_s` and its max turns, and its usage is never recorded, so the feature and day caps undercount (known gap). Running `factory run` again takes the lock and continues: a `paused` run keeps waiting (rev 3: only with `factory run --continue`, which waits out the saved reset; a plain `factory run` continues the interrupted step at once and waits again if the limit is still on), an interrupted step resumes as above, anything else follows the crash rules (a step whose session was running when the driver died is rebuilt from the base: that session's work is lost).
 
 ## P2.5 Kill switch and locking
 
@@ -144,9 +144,9 @@ If the driver dies, nothing is running, because sessions are children of the dri
 
 - `factory stop` (graceful): the driver finishes the current driver-only step, starts no new session, interrupts any running session (P2.4 handling), and ends with status `stopped`. (rev 3: a session notices the flag within 5 seconds, a wait within 30; the CI wait is not cut short.)
 - `factory stop --now`: also interrupts the CI wait immediately (rev 3: polled every 5 seconds; a verification run in progress finishes; a known gap).
-- The flag is `~/.factory/stop/<repo-key>`. The driver checks it before every step and every 5 seconds during sessions and waits. Interactive `deliver` commands refuse while the flag exists; the driver's own `deliver` calls are not blocked.
-- Killing: SIGTERM to the session's process group, SIGKILL after 10 seconds, then kill any remaining process whose working directory is in the factory clone, builder clone or work directory, or whose environment shows this driver's run temps (rev 3: not processes that merely mention those paths), and warn if an app port is still in use.
-- `factory run --continue` clears the stop flag and continues the same run. `factory run --raise-budget` is separate (P2.3).
+- The flag is `~/.factory/stop/<repo-key>`. The driver checks it before every step, every 5 seconds during sessions and the CI wait, and every 30 seconds during waits (rev 3). Interactive `deliver` commands refuse while the flag exists; the driver's own `deliver` calls are not blocked.
+- Killing: SIGTERM to the session's process group, SIGKILL after 10 seconds, then kill any remaining process whose working directory is in the factory clone, builder clone or work directory (rev 3, final review: only when it has no controlling terminal, so a person's shell or editor opened there is left alone; it still stops the next start), or whose environment shows this driver's run temps (rev 3: not processes that merely mention those paths), and warn if an app port is still in use.
+- `factory run --continue` clears the stop flag (rev 3, final review: before any refusal, so a refused `--continue` cannot leave the repository locked out) and continues the same run. `factory scenarios` clears a flag it finds at its start, saying so in one line: it holds the lock, so no run is live that the flag could stop. `factory run --raise-budget` is separate (P2.3).
 
 ## P2.6 Attention, status, notifications
 
@@ -234,12 +234,12 @@ Plan rulings:
 Later rulings from the build ledger:
 - **Budget detection and handling are split:** `enforceBudget` only detects; the driver's `interrupt` action does the hold (feature) or the day stop or wait. The template ships `autonomy.level` L1, not L0, to keep the old squash behaviour.
 - **`budget_hit` and `stopped_by_user` are sticky** run-record flags: they survive `--raise-budget` and `--continue`.
-- **Weekly waiting** is allowed by `max_wait_weekly_h` > 0 alone; it does not also need `wait_for_reset`.
+- **Weekly waiting** needs `max_wait_weekly_h` > 0 **and** `wait_for_reset` (final review: it inherits the classifier gate, so it is off while the classifier is fixtures only).
 - **The kill sweep is narrowed** to processes whose cwd is in the clones or work dir, or whose environment shows this repository's builder run dir or this driver's own verification run temps. Detection (`leftovers` stop) stays broad. Another repository's run temps are never signalled.
 - **Probe proofs are bound** to the target, `FACTORY_HOME` and the builder-settings sha; the secrets row needs one saved target per credential class; a route is saved `denied` only when the control run leaked through the same route; `--from` results are only as trustworthy as the channel (the user runs `--save` themselves).
 - **Task 8b interrupted resumes:** crash-resumes of an interrupted feature count in `interrupted_resumes` (cap 3, then `resume_loop`), separate from `resumes`.
 - **Timeouts are counted before the decision** (`f.timeouts`), so the third blocks.
 - **A failed WIP commit** stops the run as `wip_failed` with `f.interrupted` already recorded; the next run continues without a reset.
-- **`--continue`** reads the saved `pause.reset_at` and waits it out; a plain `factory run` after a crash while paused does not (known gap). A stop flag without `--continue` refuses `run` and `scenarios`.
+- **`--continue`** reads the saved `pause.reset_at` and waits it out; a plain `factory run` after a crash while paused does not (known gap). A stop flag without `--continue` refuses `run`; `scenarios` clears it (final review).
 - **`wait_for_reset`** is turned on by flipping `CLASSIFIER_STATUS` in `lib/limits.mjs` from `'fixtures_only'` to `'real'` after a real capture is recorded.
 - **`factory scenarios`** writes run state only for its own waits and never overwrites a stopped run's state.

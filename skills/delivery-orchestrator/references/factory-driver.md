@@ -168,7 +168,7 @@ Author: every built-in tool denied (`Bash`, `Read`, `Edit`, `Write`, `NotebookEd
 | awaiting_human | ci unconfirmed | stop `ci_unconfirmed`; attention |
 | awaiting_human | merge held | attention (kind = the feature's `hold_kind`, else `merge`), next feature |
 | any | session usage limit, timeout, stop, budget | `interrupt` (Phase 2): WIP commit, wait or retry or stop, continue brief; see [run-control.md](run-control.md#interruptions-and-the-continue-brief) |
-| any | session no result, other | stop `interrupted`, branch left as it is |
+| any | session no result, other | stop `interrupted`: in building or fixing the work is first kept (WIP commit, `f.interrupted` with kind `other` or `no_result`), so the next run continues the step |
 | any | settings_unsafe / spawn_failed / unsafe_binary | hold `settings_unsafe` / `environment` |
 | any | a step's `error` | hold `error` |
 
@@ -241,5 +241,7 @@ Phase 2 (run control, [run-control.md](run-control.md)) additions:
 31. **Unproven hard-stop rows.** Rows proven only by the isolation probe stay unproven (printed at start, one attention row) until you save a probe result. The network row needs a reachable host of your choice (`--net-host`); the tool-layer half (WebFetch, WebSearch, MCP) is a static check, not a live probe.
 32. **The usage-limit classifier is fixtures only**, so `wait_for_reset` cannot be turned on. Runs stop at a limit; `factory run --continue` resumes.
 33. **A plain `factory run` after a driver crash while paused** does not wait out the saved reset: it continues the interrupted step at once, hits the limit again and waits again (one extra short session). Only `--continue` waits out the saved `pause.reset_at`.
-34. **The stop sweep kills by cwd and sandbox environment only.** A leftover that merely mentions a clone or work path in its arguments is not killed, but it stops the next start (`leftovers`) until you end it. A process that clears its environment and leaves the path is not found.
+34. **The stop sweep kills by cwd and sandbox environment only.** A leftover that merely mentions a clone or work path in its arguments is not killed, and neither is one with a controlling terminal whose cwd is in a clone (a person's shell or editor); both stop the next start (`leftovers`) until you end them. A process of yours with its cwd in a clone and no controlling terminal is killed. A process that clears its environment and leaves the path is not found.
 35. **Crash-resume of an interrupted feature** is capped separately (`interrupted_resumes`, 3, then `resume_loop`); a session that always times out is blocked after three timeouts.
+36. **A dying driver leaves its session running.** The session is in its own process group, so it outlives a driver that is SIGKILLed or crashes (exit criterion E3) and runs until the next start kills the recorded group, up to `session_timeout_s` and its max turns. Its usage is never recorded, so the feature and day caps undercount. A crash during a session that was not interrupted rebuilds that step from the base (crash rules): the session's work is lost.
+37. **HEAD off the feature branch.** A builder that switched the clone to another branch gets no WIP commit when it is interrupted (one line, a `wip_skipped` row); continuing the step checks the feature branch out again and its uncommitted edits are lost.
