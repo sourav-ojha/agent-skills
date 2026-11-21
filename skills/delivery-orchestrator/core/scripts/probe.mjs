@@ -18,8 +18,12 @@
 //   --net-host <host:port> an outbound TCP connect through bash (/dev/tcp). Use a non-local host you are allowed to reach; a
 //                          timeout, refusal or EPERM is `denied`, which proves something only when the --control run connected.
 //                          Never point it at a production host. --net-timeout-ms (default 3000).
-// --target-file <file>: probe one file (for example ~/.netrc) instead of <dir>/.probe-sentinel; PROBE_TOKEN must then be a
-// distinctive substring of that file (it is never read from the file and never printed).
+// --target-file <file>: probe one file (for example ~/.netrc) instead of <dir>/.probe-sentinel. The token is never read from
+// the file and never printed, but PROBE_TOKEN must then be a substring that is not a secret, such as "machine <host>":
+// never the login or password (the token reaches the builder session's command line and environment, and its unsalted
+// sha256 is written to the --json output).
+// Every --json result records builder_settings_sha256 (sha256 of the core/settings/builder.json this probe process sees); a
+// control run must match it, and --save refuses a result whose sha is missing or is not the current builder.json's.
 // --save: also writes $FACTORY_HOME/probes/last.json, private and atomic, that `factory run` reads:
 //   { ts, builder_settings_sha256, factory_home, net_host, target, routes: { <write/home/net route>: r },
 //     targets: [{ target, routes: { <read route>: r } }] }   with r one of denied|leaked|error.
@@ -172,7 +176,8 @@ export function runProbe(o) {
   if (!fs.existsSync(path.dirname(target))) warnings.push('parent directory of --target does not exist from the probe\'s view: denied results prove nothing');
   if (writeTarget && !fs.existsSync(path.dirname(writeTarget))) warnings.push('parent directory of --write-target does not exist from the probe\'s view');
   return {
-    target, write_target: writeTarget, factory_home: fhome, net_host: netHost ? `${netHost.host}:${netHost.port}` : null, token_sha256: token ? crypto.createHash('sha256').update(token).digest('hex') : null, warnings,
+    target, write_target: writeTarget, factory_home: fhome, net_host: netHost ? `${netHost.host}:${netHost.port}` : null, token_sha256: token ? crypto.createHash('sha256').update(token).digest('hex') : null,
+    builder_settings_sha256: currentBuilderSha(), warnings,
     routes: ROUTES.map((route) => {
       if (!token && !NO_TOKEN.has(route)) return { route, result: 'error', detail: 'no token (set PROBE_TOKEN)' };
       let r; try { r = impl[route](); } catch (e) { r = { result: 'error', detail: String(e.code || 'probe error') }; }
@@ -199,6 +204,7 @@ export function controlProblems(c, res) {
   if ((c.factory_home ?? null) !== (res.factory_home ?? null)) out.push('factory-home differs from the control run');
   if ((c.net_host ?? null) !== (res.net_host ?? null)) out.push('net-host differs from the control run');
   if (!c.token_sha256 || c.token_sha256 !== res.token_sha256) out.push('token differs from the control run');
+  if (!c.builder_settings_sha256 || c.builder_settings_sha256 !== res.builder_settings_sha256) out.push('builder settings (builder_settings_sha256) differ from the control run');
   const exempt = (r) => r.detail === 'tool missing' || (typeof r.detail === 'string' && r.detail.startsWith('not configured'));
   for (const r of c.routes) if (!WEAK.has(r.route) && !exempt(r) && r.result !== 'leaked') out.push(`control run did not leak via ${r.route} (${r.result})`);
   return out;
@@ -262,7 +268,8 @@ export function saveResult(home, build) {
 
 // A --json result: every route exactly once, well-formed, with the probed paths as strings (or null where optional).
 const strOrNull = (v) => v === null || v === undefined || typeof v === 'string';
-const isResult = (j) => j && typeof j === 'object' && typeof j.target === 'string' && strOrNull(j.write_target) && strOrNull(j.factory_home) && strOrNull(j.net_host) && strOrNull(j.token_sha256)
+const currentBuilderSha = () => { try { return builderSettingsSha(); } catch { return null; } };
+const isResult = (j) => j && typeof j === 'object' && typeof j.target === 'string' && strOrNull(j.builder_settings_sha256) && strOrNull(j.write_target) && strOrNull(j.factory_home) && strOrNull(j.net_host) && strOrNull(j.token_sha256)
   && Array.isArray(j.routes) && j.routes.length === ROUTES.length && new Set(j.routes.map((r) => r?.route)).size === ROUTES.length
   && j.routes.every((r) => r && typeof r === 'object' && ROUTES.includes(r.route) && ['denied', 'leaked', 'error'].includes(r.result) && typeof r.detail === 'string');
 
@@ -289,7 +296,7 @@ function main(argv) {
     if (!isResult(j)) { process.stderr.write('--from: not a probe --json result\n'); return 2; }
     res = { ...j, factory_home: j.factory_home ?? null, net_host: j.net_host ?? null, warnings: [] };
   } else {
-    if (!(o.target || o.targetFile) || (o.target && o.targetFile) || !o.writeTarget) { process.stderr.write('usage: [PROBE_TOKEN=...] probe.mjs (--target <dir> | --target-file <file>) --write-target <dir> [--workdir <dir>] [--factory-home <dir>] [--net-host <host:port>] [--control <control.json>] [--json] [--save]\n       probe.mjs --from <probe.json> [--control <control.json>] --save\n'); return 2; }
+    if (!(o.target || o.targetFile) || (o.target && o.targetFile) || !o.writeTarget) { process.stderr.write('usage: [PROBE_TOKEN=...] probe.mjs (--target <dir> | --target-file <file>) --write-target <dir> [--workdir <dir>] [--factory-home <dir>] [--net-host <host:port>] [--control <control.json>] [--json] [--save]\n       probe.mjs --from <probe.json> [--control <control.json>] --save\n--target-file: PROBE_TOKEN must be a substring that is not a secret, such as "machine <host>": never the login or password (the token reaches the command line and environment of the builder session, and its unsalted sha256 is written to the --json output)\n'); return 2; }
     res = runProbe(o);
   }
   let control = null; let ctlDoc = null;
@@ -302,7 +309,11 @@ function main(argv) {
   }
   res.control = control;
   if (o.save) {
-    try { const sha = builderSettingsSha(); const f = saveResult(factoryHome(), (prev) => mergeSaved(prev, res, ctlDoc, { builderSha: sha })); process.stderr.write(`saved: ${f}${control === 'accepted' ? '' : ' (no accepted control run: denied routes saved as error)'}\n`); } catch (e) { process.stderr.write(`${e.message}\n`); return 2; }
+    // The stamp is the sha the probe ran under, never the one at save time: a result for other builder settings is refused.
+    const now = currentBuilderSha(); const sha = res.builder_settings_sha256;
+    if (!sha) { process.stderr.write('refusing to save: the probe result has no builder_settings_sha256 (made by an older probe.mjs); run the probe again\n'); return 2; }
+    if (sha !== now) { process.stderr.write('refusing to save: the probe ran under other builder settings than the current core/settings/builder.json; run the probe again\n'); return 2; }
+    try { const f = saveResult(factoryHome(), (prev) => mergeSaved(prev, res, ctlDoc, { builderSha: sha })); process.stderr.write(`saved: ${f}${control === 'accepted' ? '' : ' (no accepted control run: denied routes saved as error)'}\n`); } catch (e) { process.stderr.write(`${e.message}\n`); return 2; }
   }
   if (o.json) process.stdout.write(JSON.stringify(res, null, 2) + '\n');
   else for (const r of res.routes) process.stdout.write(`${r.route.padEnd(18)} ${r.result.padEnd(7)} ${r.detail}\n`);

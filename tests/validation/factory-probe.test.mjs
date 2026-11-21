@@ -404,3 +404,49 @@ test('--save via the CLI merges targets: two runs against two directories keep b
   const saved = JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8'));
   assert.deepEqual(saved.targets.map((x) => x.target), [f.target, second]);
 });
+
+// ---- fix round 2: the builder sha is the one the probe ran under; --target-file token guidance ---------------------------------
+test('runProbe records the builder_settings_sha256 it ran under; a control run for other builder settings is rejected', (t) => {
+  const f = fixture(t);
+  const res = runProbe(opts(f));
+  assert.equal(res.builder_settings_sha256, HS.builderSettingsSha());
+  assert.deepEqual(controlProblems(res, res), []);
+  assert.ok(controlProblems({ ...res, builder_settings_sha256: 'f'.repeat(64) }, res).some((p) => /builder settings/.test(p)));
+  assert.ok(controlProblems((({ builder_settings_sha256, ...r }) => r)(res), res).some((p) => /builder settings/.test(p)), 'a control without the field');
+  const ctlFile = path.join(f.d, 'control.json');
+  const j = JSON.parse(cli(f).stdout); j.builder_settings_sha256 = '0'.repeat(64); fs.writeFileSync(ctlFile, JSON.stringify(j));
+  const r = cli(f, ['--control', ctlFile]);
+  assert.equal(r.status, 3); assert.match(r.stderr, /builder settings \(builder_settings_sha256\) differ from the control run/);
+});
+
+test('--from --save refuses a result made under other builder settings, or with no recorded sha (exit 2, nothing saved)', (t) => {
+  const f = fixture(t);
+  const fh = path.join(f.d, 'factory'); fs.mkdirSync(fh, { mode: 0o700 });
+  const ctlFile = path.join(f.d, 'control.json'); const resFile = path.join(f.d, 'probe.json');
+  const good = JSON.parse(cli(f).stdout);
+  const from = (extra = []) => spawnSync('node', [SCRIPT, '--from', resFile, ...extra, '--save'], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: fh } });
+  // Taken under an older builder.json: probe and control agree with each other, but not with the current file.
+  const old = { ...good, builder_settings_sha256: 'e'.repeat(64) };
+  fs.writeFileSync(resFile, JSON.stringify(old)); fs.writeFileSync(ctlFile, JSON.stringify(old));
+  let r = from(['--control', ctlFile]);
+  assert.equal(r.status, 2, r.stderr); assert.match(r.stderr, /other builder settings/);
+  assert.equal(fs.existsSync(path.join(fh, 'probes', 'last.json')), false);
+  // An old-schema result without the field.
+  const noSha = (({ builder_settings_sha256, ...x }) => x)(good);
+  fs.writeFileSync(resFile, JSON.stringify(noSha));
+  r = from();
+  assert.equal(r.status, 2, r.stderr); assert.match(r.stderr, /no builder_settings_sha256 \(made by an older probe\.mjs\)/);
+  assert.equal(fs.existsSync(path.join(fh, 'probes', 'last.json')), false);
+  // The current sha saves, stamped with the probe's own sha.
+  fs.writeFileSync(resFile, JSON.stringify(good));
+  r = from();
+  assert.equal(JSON.parse(fs.readFileSync(path.join(fh, 'probes', 'last.json'), 'utf8')).builder_settings_sha256, good.builder_settings_sha256, r.stderr);
+});
+
+test('--target-file guidance: the usage text and safety.md say to use a non-secret substring, never the login or password', () => {
+  const r = spawnSync('node', [SCRIPT], { encoding: 'utf8' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--target-file: .*not a secret, such as "machine <host>": never the login or password/);
+  assert.match(fs.readFileSync(SCRIPT, 'utf8'), /never the login or password/);
+  assert.match(fs.readFileSync(path.join(REPO, 'skills', 'delivery-orchestrator', 'references', 'safety.md'), 'utf8'), /such as `machine <host>`: never the login or password/);
+});

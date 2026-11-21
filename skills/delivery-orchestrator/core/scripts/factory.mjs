@@ -1195,7 +1195,7 @@ const TERMINAL = ['merged', 'skipped', 'blocked'];
 // is printed with the reason and recorded as one attention row; the run is not blocked by it.
 function reportHardStops(ctx) {
   const result = loadProbeResult(ctx.fh);
-  const opts = { factoryHome: ctx.fh, builderSha: builderSettingsSha(), home: defaultHome(ctx.env) };
+  const opts = { factoryHome: ctx.fh, builderSha: builderSettingsSha(), home: ctx.deps.home || defaultHome(ctx.env) };
   const rows = HARD_STOPS.map((r) => ({ ...r, why: whyUnproven(r, result, opts) })).filter((r) => r.why !== null);
   for (const r of rows) ctx.out(`unproven hard stop: ${r.id} ${r.name} (${r.why})`);
   const item = { id: 'probe', kind: 'unproven_hardstop' };
