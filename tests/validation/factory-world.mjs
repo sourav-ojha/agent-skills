@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import net from 'node:net';
+import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { REPO } from './helpers.mjs';
 
@@ -101,3 +102,37 @@ export const ready = (t, opts = {}) => { const w = world(t, opts); readiness(w);
 export const builderRuns = (w, id) => w.sessions().filter((s) => !s.argv.includes('--tools') && s.argv[s.argv.indexOf('-p') + 1].includes(id));
 export const promptOf = (s) => s.argv[s.argv.indexOf('-p') + 1];
 export const verifyCalls = (w) => { const f = path.join(w.fhome, 'verify-calls.log'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean) : []; };
+
+// ---- run-control helpers (shared by the Phase 2 exit-criteria tests) ------------------------------------------------------------
+const DELIVER = path.join(SCRIPTS, 'deliver.mjs');
+export const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
+// A factory command in the background: { child, done: Promise<{ code, signal, out }>, out() }. The child is the driver process
+// itself (the harness runs main() in-process), so killing it with SIGKILL is a driver crash.
+export function bg(w, args, extra = {}) {
+  const child = spawn(process.execPath, [HARNESS, ...args, '--dir', w.work], { env: { ...w.env, ...extra }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
+  const done = new Promise((r) => { child.on('close', (code, signal) => r({ code, signal, out })); });
+  return { child, done, out: () => out };
+}
+export async function until(fn, what, ms = 90000) {
+  const t0 = Date.now();
+  while (!(await fn())) { if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`); await sleep(100); }
+}
+// Interactive deliver (no FACTORY_DRIVER_PID unless given) on the factory queue in the driver clone.
+export const deliverI = (w, args, extra = {}) => { const r = spawnSync(process.execPath, [DELIVER, ...args, '--dir', w.clone], { encoding: 'utf8', env: { ...w.env, DELIVER_QUEUE: w.queueFile, ...extra } }); return { code: r.status, out: r.stdout, err: r.stderr }; };
+export const freePort = () => new Promise((r) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)); }); });
+export const fhLines = (w, name) => { const f = path.join(w.fhome, name); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean) : []; };
+export const runState = (w) => JSON.parse(fs.readFileSync(path.join(w.fhome, 'runs', 'o__r.json'), 'utf8'));
+export const writeLocal = (w, doc) => fs.writeFileSync(path.join(w.fhome, 'config.json'), JSON.stringify(doc));
+export const attentionItems = (w) => { const f = path.join(w.fhome, 'attention', 'o__r.json'); return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : []; };
+export const lockDoc = (w) => { const f = path.join(w.fhome, 'locks', 'o__r.lock'); return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null; };
+export const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// A HARD_STOPS test proof: the named test file exists and has a test( / it( whose title starts with "<row id>:".
+export function testProofProblem(row) {
+  if (!/^[\w.-]+\.test\.mjs$/.test(row.proof.ref)) return `${row.id}: ${row.proof.ref} is not a test file name`;
+  const file = path.join(REPO, 'tests', 'validation', row.proof.ref);
+  if (!fs.existsSync(file)) return `${row.id}: ${row.proof.ref} is missing`;
+  const title = new RegExp(`^\\s*(?:test|it)\\(\\s*(['"\`])${row.id}:`, 'm');
+  return title.test(fs.readFileSync(file, 'utf8')) ? null : `${row.id}: no test( / it( title in ${row.proof.ref} starts with the row id`;
+}

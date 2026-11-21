@@ -8,7 +8,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { REPO, tmpDir } from './helpers.mjs';
-import { SCRIPTS, BASE_CONFIG, ready, good, provingProbe } from './factory-world.mjs';
+import { SCRIPTS, BASE_CONFIG, ready, good, provingProbe, testProofProblem } from './factory-world.mjs';
 
 const HS = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'hardstops.mjs')).href);
 const ag = await import(pathToFileURL(path.join(SCRIPTS, 'lib', 'antigaming.mjs')).href);
@@ -38,13 +38,9 @@ test('HARD_STOPS: seven P2.2 rows with unique ids, a mechanism and a test or pro
 test('every test-proof ref names a test file that exists and has a test whose title starts with the row id', () => {
   const refs = HS.HARD_STOPS.filter((r) => r.proof.kind === 'test');
   assert.ok(refs.length >= 3);
-  for (const r of refs) {
-    assert.match(r.proof.ref, /^[\w.-]+\.test\.mjs$/, r.id);
-    const file = path.join(REPO, 'tests', 'validation', r.proof.ref);
-    assert.ok(fs.existsSync(file), `${r.id}: ${r.proof.ref} is missing`);
-    const title = new RegExp(`^\\s*(?:test|it)\\(\\s*(['"\`])${r.id}:`, 'm');
-    assert.match(fs.readFileSync(file, 'utf8'), title, `${r.id}: no test( / it( title in ${r.proof.ref} starts with the row id`);
-  }
+  for (const r of refs) assert.equal(testProofProblem(r), null, r.id);
+  assert.match(testProofProblem({ id: 'hs-merge-gate', proof: { kind: 'test', ref: 'factory-runcontrol-hardstops.test.mjs' } }), /no test\( \/ it\( title/, 'a ref whose file lacks the row id is reported');
+  assert.match(testProofProblem({ id: 'hs-merge-gate', proof: { kind: 'test', ref: 'nope.test.mjs' } }), /is missing/);
 });
 
 test('every probe-proof route is a real probe route', () => {

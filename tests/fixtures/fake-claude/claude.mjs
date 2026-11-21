@@ -64,7 +64,7 @@ function writeResult(obj) {
 //   times: N (this step is used for N sessions in a row: "first N sessions then the next step").
 //   index_lock: true (leaves .git/index.lock behind, as a session killed in the middle of a git command can).
 //   touch: <absolute path> (creates that file after the edits), linger_ms (sleeps after the edits), escape_port (with escape_ms:
-//   the escaped process listens on 127.0.0.1:<port>).
+//   the escaped process listens on 127.0.0.1:<port>), app_port (a listening child kept in the session's process group).
 //   require_files: [paths] (the session reports blocked "missing <path>" when one is absent: proves a continued session sees edits).
 //   status "usage" with limit: session|weekly|model|rate and resets_at: <epoch s>|null emits a rejected rate_limit_event of that
 //   kind (rate: a 429 "Rate limit reached" instead); without limit it is the session-limit text "resets 3:45pm".
@@ -98,6 +98,9 @@ function factory() {
     if (s.sleep_ms) await sleep(s.sleep_ms);
     // escape_ms: leaves a process in its own session (setsid) with cwd in the clone, out of the session's process group.
     // escape_port: that escaped process also listens on 127.0.0.1:<port> (an app left running by the session).
+    // app_port: a child left in the session's own process group (not escaped) listening on 127.0.0.1:<port>, cwd in the clone (an
+    // app the session started and still runs); it lives as long as the session's group does.
+    if (s.app_port) spawn(process.execPath, ['-e', `require('net').createServer().listen(${Number(s.app_port)}, '127.0.0.1');setInterval(() => {}, 1000)`], { cwd: process.cwd(), stdio: 'ignore' }).unref();
     if (s.escape_ms) spawn(process.execPath, ['-e', `${s.escape_port ? `require('net').createServer().listen(${Number(s.escape_port)}, '127.0.0.1');` : ''}setTimeout(() => process.exit(0), ${Number(s.escape_ms)})`], { cwd: process.cwd(), detached: true, stdio: 'ignore' }).unref();
     for (const [p, text] of Object.entries(s.files || {})) { fs.mkdirSync(path.dirname(path.join(process.cwd(), p)), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), p), text); }
     if (s.spec_complete) {

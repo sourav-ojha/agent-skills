@@ -4,6 +4,7 @@
 //   verify: { file: "src/{ID}.txt" }   stub verifyFeature: reads that file at the sha from the driver clone; "good" passes, "throw"
 //                                       throws, anything else fails. It writes a real verdict file (verdict.mjs) and returns the real
 //                                       symptom brief (verify.mjs symptomBrief), so the gate, postVerified and the brief are real.
+//                                       delayMs: the stub first waits that long (a verification in progress, for kill tests).
 //   killAfter: "<action>"              SIGKILLs this process right after that driver action finished (crash tests).
 //   ciArgs: [...]                      extra deliver ci arguments (fast polling).
 //   now: <ms>                          a fake clock (deps.clock) starting at that time; sleep(ms) advances it without waiting.
@@ -31,6 +32,7 @@ const cfg = JSON.parse(process.env.FACTORY_TEST || '{}');
 const extraEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(k)));
 
 async function verifyStub({ repoKey, id, sha, scenarios, criteriaHash, git }) {
+  if (Number.isFinite(cfg.verify?.delayMs)) await new Promise((r) => { setTimeout(r, cfg.verify.delayMs); });
   const rel = String(cfg.verify?.file || 'src/{ID}.txt').replace('{ID}', id);
   const r = git('cat-file', '-p', `${sha}:${rel}`);
   const text = r.code === 0 ? r.out.trim() : '';
