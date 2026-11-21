@@ -342,7 +342,7 @@ const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,99}$/;
 const absNoCtrl = (v) => typeof v === 'string' && path.isAbsolute(v) && !CTRL.test(v) && path.normalize(v) === v;
 const bad = (msg) => { throw new TypeError(msg); };
 
-const OPTIONS = ['role', 'cwd', 'prompt', 'settingsFile', 'configDir', 'maxTurns', 'timeoutS', 'model', 'claudeBin', 'baseEnv', 'killGraceMs', 'maxLineChars', 'onSpawn', 'tmpDir', 'home'];
+const OPTIONS = ['role', 'cwd', 'prompt', 'settingsFile', 'configDir', 'maxTurns', 'timeoutS', 'model', 'claudeBin', 'baseEnv', 'killGraceMs', 'maxLineChars', 'onSpawn', 'tmpDir', 'home', 'shouldAbort', 'abortPollMs'];
 function checkArgs(o) {
   if (!o || typeof o !== 'object') bad('runSession needs an options object');
   for (const k of Object.keys(o)) if (!OPTIONS.includes(k)) bad(`unknown option ${cleanKey(k)}`);
@@ -356,6 +356,8 @@ function checkArgs(o) {
   if (o.prompt.includes('\0')) bad('prompt contains NUL');
   if (!Number.isInteger(o.maxTurns) || o.maxTurns < 1 || o.maxTurns > 1000) bad('maxTurns must be an integer 1-1000');
   if (typeof o.timeoutS !== 'number' || !Number.isFinite(o.timeoutS) || o.timeoutS <= 0 || o.timeoutS > 86400) bad('timeoutS must be a number of seconds');
+  if (o.shouldAbort !== undefined && o.shouldAbort !== null && typeof o.shouldAbort !== 'function') bad('shouldAbort must be a function');
+  if (o.abortPollMs !== undefined && (!Number.isInteger(o.abortPollMs) || o.abortPollMs < 10 || o.abortPollMs > 3600000)) bad('abortPollMs must be an integer of at least 10 ms');
   if (o.model !== undefined && o.model !== null && (typeof o.model !== 'string' || !MODEL.test(o.model))) bad('bad model name');
   if (o.configDir !== undefined && o.configDir !== null) {
     if (o.role !== 'author') bad('configDir is for the author role only');
@@ -396,7 +398,7 @@ const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 // eat the budget) -> SIGTERM to the process group, SIGKILL after killGraceMs.
 export async function runSession(opts) {
   checkArgs(opts);
-  const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineChars = DEFAULT_MAX_LINE_CHARS, onSpawn, tmpDir } = opts;
+  const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineChars = DEFAULT_MAX_LINE_CHARS, onSpawn, tmpDir, shouldAbort, abortPollMs = 5000 } = opts;
   const argv = buildArgv(opts);
   // `home` (default: the parent's HOME, as materialiseSettings uses) becomes the child's HOME and the lint's home.
   const home = opts.home ?? defaultHome(baseEnv);
@@ -409,7 +411,7 @@ export async function runSession(opts) {
 
   return new Promise((resolve) => {
     const st = { sessionId: null, last: null, rejected: null, ids: new Map(), truncated: false };
-    let partial = ''; let dropping = false; let timedOut = false; let done = false;
+    let partial = ''; let dropping = false; let timedOut = false; let stopped = false; let done = false;
     let child; let tick; let killTimer; let unregister = () => {};
 
     const handle = (line) => {
@@ -447,9 +449,10 @@ export async function runSession(opts) {
       turns = r && Number.isInteger(r.num_turns) && r.num_turns >= 0 ? r.num_turns : st.ids.size;
       const result = r && typeof r.result === 'string' ? r.result.slice(0, MAX_RESULT) : null;
       const costUsd = r && typeof r.total_cost_usd === 'number' && Number.isFinite(r.total_cost_usd) ? r.total_cost_usd : null;
-      const ok = !timedOut && !spawnFailed && Boolean(r) && r.is_error === false && r.subtype === 'success' && exitCode === 0;
+      const ok = !timedOut && !stopped && !spawnFailed && Boolean(r) && r.is_error === false && r.subtype === 'success' && exitCode === 0;
       let failure = null;
       if (timedOut) failure = { kind: 'timeout', resetAt: null };
+      else if (stopped) failure = { kind: 'stopped', resetAt: null };
       else if (spawnFailed) failure = { kind: 'spawn_failed', resetAt: null };
       else if (!ok) {
         // Most specific first: max turns (even with is_error:true); a result naming its own error subtype is classified on
@@ -494,12 +497,24 @@ export async function runSession(opts) {
 
     const t0 = process.hrtime.bigint();
     const limit = BigInt(Math.round(timeoutS * 1e9));
+    const pollNs = BigInt(abortPollMs) * 1000000n; let lastPoll = t0; // abort poll on the monotonic clock too
     tick = setInterval(() => {
-      if (timedOut || process.hrtime.bigint() - t0 < limit) return;
-      timedOut = true;
+      if (timedOut || stopped) return;
+      const now = process.hrtime.bigint();
+      if (now - t0 >= limit) {
+        timedOut = true;
+        killGroup(pgid, 'SIGTERM');
+        killTimer = setTimeout(() => killGroup(pgid, 'SIGKILL'), killGraceMs);
+        return;
+      }
+      if (typeof shouldAbort !== 'function' || now - lastPoll < pollNs) return;
+      lastPoll = now;
+      let abort = false; try { abort = shouldAbort() === true; } catch { abort = false; }
+      if (!abort) return;
+      stopped = true;
       killGroup(pgid, 'SIGTERM');
       killTimer = setTimeout(() => killGroup(pgid, 'SIGKILL'), killGraceMs);
-    }, Math.max(10, Math.min(250, Math.floor(timeoutS * 1000))));
+    }, Math.max(10, Math.min(250, Math.floor(timeoutS * 1000), Math.floor(abortPollMs / 2))));
   });
 }
 

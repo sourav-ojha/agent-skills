@@ -59,6 +59,8 @@ Exit: the spec's 1a and 1b criteria (1a requires every held-out API bad case cau
 
 ### Phase 2 — Run control (minimal)
 
+Status: implemented (spec revision 3 records the code as built). The usage-limit classifier is still fixtures only, so `wait_for_reset` stays off until a real limit capture is recorded; unproven hard-stop rows need a saved probe result.
+
 Spec: [specs/phase-2-run-control.md](specs/phase-2-run-control.md).
 
 Autonomy levels L0 and L1; hard stops backed by real mechanisms; budgets per feature and per day in tokens and turns (window share and dollar caps deferred); interruption handling that commits work and resumes with a continue brief (or `--resume` if Phase 0 proves it), with optional waiting for usage-limit resets (`max_wait_h`, `max_wait_weekly_h`); kill switch checked before every step and every 5 seconds; single-driver lock; attention queue and notifications.

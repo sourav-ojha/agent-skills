@@ -10,7 +10,9 @@ Set the rules once per project. Create the file with `deliver config --write`, e
   "branch_prefix": "feat/",
   "features_dir": ".product/features",
   "protected_branches": ["main", "master", "prod", "production", "release/*"],
-  "merge": { "mode": "squash", "allow_tier3": false },
+  "autonomy": { "level": "L1" },
+  "merge": { "allow_tier3": false },
+  "budgets": { "feature": { "tokens": 3000000, "turns": 400 } },
   "checks": { "required": ["unit-tests", "build"], "ignored": ["e2e", "e2e-*"], "allow_without_ci": false },
   "local_checks": [ { "name": "unit tests", "command": ["npm", "test"], "timeout_s": 900 } ],
   "hold_paths": ["migrations/", "infra/"],
@@ -26,6 +28,8 @@ Every key is optional. An unknown key or a wrong type is an error, so a typo can
 | `github.account`, `github.host` | Which `gh` login to use when several are logged in. Its token is used for every `gh` call (and for `git` over https), held in memory only. The helper checks the token really is that account and that it can write to the repo. For SSH remotes git uses your SSH key; the setting then applies to `gh` only | `gh`'s active account |
 | `base` | The branch every feature starts from (always its latest tip, fast-forwarded before each feature) and every PR targets and merges into | the repo's default branch |
 | `protected_branches` | Branch names (globs: `*` within a segment, `**` across) this skill **never merges into**. If `base` matches, PRs are opened and checked but left for a person. Flags cannot override it | `main`, `master`, `prod`, `production`, `release/*`, `release-*` |
+| `autonomy.level` | `L0` (PRs only, nothing merged; `--merge` is ignored when this is written explicitly) or `L1` (squash-merge on green). `L2` and `L3` are rejected. Writing it together with a disagreeing `merge.mode` is an error | from `merge.mode`, else `L0` |
+| `budgets.feature.tokens`, `.turns` | Runaway caps per feature for `factory run` (tokens 10,000 to 1,000,000,000; turns 10 to 5,000). Tokens = input + output + cache creation. See [run-control.md](run-control.md) | 3,000,000 and 400 |
 | `merge.mode` | `pr-only`: open PRs, never merge. `squash`: standing authorisation to squash-merge (equivalent to `--merge` each run) | `pr-only` |
 | `merge.allow_tier3` | Also merge T3 work (auth, data, migrations, public API) | `false` |
 | `checks.required` | CI checks that must be reported and pass (exact names). Empty: the base branch's required checks from branch protection are used | `[]` |
@@ -67,6 +71,8 @@ Optional object; absent means `required: false`. Unknown keys inside it are erro
 | `verification.test_globs` | Up to 50 path globs that identify test files | `[]` |
 
 `factory run` additionally refuses unless, on `origin/<base>`: `verification.required` is `true`; `readiness.min_level` is `4`; `local_checks` is `[]` (they would run outside the untrusted-code sandbox: run them in CI); `checks.required` does not name `factory/verified`; and `github.host` is the origin host. It merges only with `merge.mode: "squash"`. Verification also needs `app.start`, `app.base_url` with a port, and `app.ready` (a `ready.url` must use the same port). The app gets `HOST=127.0.0.1` and `PORT=<port>` and must listen on 127.0.0.1: a `localhost` base URL is contacted as 127.0.0.1. Full list: [factory-driver.md](factory-driver.md#refusals-at-start-factory-run).
+
+Local run-control settings (`wait_for_reset`, `max_wait_h`, `max_wait_weekly_h`, `keep_awake`, `fallback_model`, `budgets.day_tokens`) live in `~/.factory/config.json`, not in this file: [run-control.md](run-control.md#config-reference).
 
 Environment for the factory driver: `FACTORY_HOME` (default `~/.factory`) holds scenarios, verdicts, the queue and the driver clone; `FACTORY_BUILDER_HOME` (default `<FACTORY_HOME>-builder`) holds the builder clone and must be outside `FACTORY_HOME`.
 

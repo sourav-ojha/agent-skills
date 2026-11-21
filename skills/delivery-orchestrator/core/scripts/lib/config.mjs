@@ -25,6 +25,8 @@ export function defaults() {
     features_dir: '.product/features',
     protected_branches: [...DEFAULT_PROTECTED],
     merge: { mode: 'pr-only', allow_tier3: false },
+    autonomy: { level: 'L0', explicit: false },
+    budgets: { feature: { tokens: 3000000, turns: 400 } },
     checks: { required: [], ignored: [], allow_without_ci: false },
     local_checks: [],
     hold_paths: [],
@@ -43,7 +45,7 @@ export function parseConfig(raw) {
   const errs = [];
   if (raw === undefined) return { config: cfg, errors: errs };
   if (!isObj(raw)) return { config: cfg, errors: ['config must be a JSON object'] };
-  keys(raw, ['version', 'github', 'base', 'branch_prefix', 'features_dir', 'protected_branches', 'merge', 'checks', 'local_checks', 'hold_paths', 'limits', 'implementer_notes', 'app', 'tests', 'readiness', 'verification'], 'config', errs);
+  keys(raw, ['version', 'github', 'base', 'branch_prefix', 'features_dir', 'protected_branches', 'merge', 'autonomy', 'budgets', 'checks', 'local_checks', 'hold_paths', 'limits', 'implementer_notes', 'app', 'tests', 'readiness', 'verification'], 'config', errs);
   if (raw.version !== undefined && raw.version !== 1) errs.push('version: only 1 is supported');
   if (raw.github !== undefined) {
     if (!isObj(raw.github)) errs.push('github: expected an object');
@@ -63,6 +65,39 @@ export function parseConfig(raw) {
       keys(raw.merge, ['mode', 'allow_tier3'], 'merge', errs);
       if (raw.merge.mode !== undefined) { if (['pr-only', 'squash'].includes(raw.merge.mode)) cfg.merge.mode = raw.merge.mode; else errs.push('merge.mode: "pr-only" or "squash"'); }
       if (raw.merge.allow_tier3 !== undefined) { if (typeof raw.merge.allow_tier3 === 'boolean') cfg.merge.allow_tier3 = raw.merge.allow_tier3; else errs.push('merge.allow_tier3: true or false'); }
+    }
+  }
+  // autonomy.level and merge.mode are two spellings of one setting: L0 = pr-only, L1 = squash. Writing both and disagreeing is an error.
+  const modeWritten = isObj(raw.merge) && raw.merge.mode !== undefined && ['pr-only', 'squash'].includes(raw.merge.mode);
+  const MODE_LEVEL = { 'pr-only': 'L0', squash: 'L1' };
+  if (modeWritten) cfg.autonomy.level = MODE_LEVEL[raw.merge.mode];
+  if (raw.autonomy !== undefined) {
+    if (!isObj(raw.autonomy)) errs.push('autonomy: expected an object');
+    else {
+      keys(raw.autonomy, ['level'], 'autonomy', errs);
+      const lv = raw.autonomy.level;
+      if (lv !== undefined) {
+        if (lv === 'L0' || lv === 'L1') {
+          if (modeWritten && MODE_LEVEL[raw.merge.mode] !== lv) errs.push(`autonomy.level and merge.mode disagree: ${lv} means merge.mode "${lv === 'L0' ? 'pr-only' : 'squash'}" but merge.mode is "${raw.merge.mode}"; write only one`);
+          else { cfg.autonomy = { level: lv, explicit: true }; cfg.merge.mode = lv === 'L0' ? 'pr-only' : 'squash'; }
+        } else if (lv === 'L2') errs.push('autonomy.level: "L2" is not available until Phase 6; use "L0" or "L1"');
+        else if (lv === 'L3') errs.push('autonomy.level: "L3" is not available until Phase 8; use "L0" or "L1"');
+        else errs.push('autonomy.level: "L0" or "L1"');
+      }
+    }
+  }
+  if (raw.budgets !== undefined) {
+    if (!isObj(raw.budgets)) errs.push('budgets: expected an object');
+    else {
+      keys(raw.budgets, ['feature'], 'budgets', errs);
+      if (raw.budgets.feature !== undefined) {
+        if (!isObj(raw.budgets.feature)) errs.push('budgets.feature: expected an object');
+        else {
+          keys(raw.budgets.feature, ['tokens', 'turns'], 'budgets.feature', errs);
+          const bounds = { tokens: [10000, 1000000000], turns: [10, 5000] };
+          for (const [k, [lo, hi]] of Object.entries(bounds)) { const x = raw.budgets.feature[k]; if (x !== undefined) { if (Number.isInteger(x) && x >= lo && x <= hi) cfg.budgets.feature[k] = x; else errs.push(`budgets.feature.${k}: an integer ${lo}-${hi}`); } }
+        }
+      }
     }
   }
   if (raw.checks !== undefined) {

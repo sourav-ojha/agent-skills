@@ -10,7 +10,7 @@ import { FEATURE_ID, TRANSITIONS, transition as transitionState, frontmatter, di
 import { parseConfig, CONFIG_PATH, isProtectedBranch, matchesAny, remoteHost, isHttps } from './lib/config.mjs';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
-import { appendRecord, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
+import { appendRecord, appendRecordTo, buildRecord, projectHash, skillStamps } from './lib/runrecord.mjs';
 import { factoryHome, repoKey, writeJsonAtomic, readJson } from './lib/factoryhome.mjs';
 import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
@@ -18,6 +18,7 @@ import { loadScenarios, scenariosHash, isCurrentApproved } from './lib/scenarios
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
 import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs, checkNoHooks, GIT_SAFE_FLAGS } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
+import { inspect } from './lib/lock.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write']);
 const argv = process.argv.slice(2);
@@ -34,7 +35,8 @@ const outcome = (o) => { emit(o); process.exitCode = 2; };
 const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base B] [--merge --note "<user's words>"] [--checks A,B] [--no-ci] [--merge-t3] [--max-fix-rounds N] [--max-failures N] [--ci-budget S] [--dry-run]
   next | built ID [--tier T] | pr ID --title T --body-file .delivery/F | ci ID [--timeout S] [--interval S] [--grace S] | fix ID | push ID | merge ID [--settle S]
   retry ID [--no-ci] [--checks A,B] | block ID --reason R | skip ID --reason R | status [--json] | reset --yes
-  hold ID --reason R [--kind K [--sha S --ids G1,G4]]   (factory driver only: a queue under FACTORY_HOME)
+  hold ID --reason R [--kind K [--sha S --ids G1,G4]]   (factory driver only: a queue under FACTORY_HOME; from building/fixing only --kind budget)
+  unhold ID --to building|fixing   (factory driver only: resumes a budget hold)
   readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
@@ -85,6 +87,27 @@ const validRef = (s) => typeof s === 'string' && REF.test(s) && !s.includes('..'
 // Always the remote-tracking ref, fully qualified: a local tag or branch named "origin/<x>" must never shadow it.
 const OR = (b) => `refs/remotes/origin/${b}`;
 
+// ---- factory guard ----------------------------------------------------------------------------------------------------
+// While a factory run holds this repository (its lock is live) or a `factory stop` is pending (the stop flag), interactive commands
+// that change anything are refused: a person racing the driver would corrupt its queue or branches. The driver's own calls carry
+// FACTORY_DRIVER_PID = the lock holder's pid. A convenience guard, not a security control (anyone can set the variable). Read-only
+// commands (status, config, readiness --json, help) always run.
+const READ_ONLY = cmd === 'status' || cmd === 'config' || (cmd === 'readiness' && opt.json === true);
+function factoryGuard(nameWithOwner) {
+  if (READ_ONLY) return;
+  let key;
+  try { key = repoKey(nameWithOwner); if (!/^[A-Za-z0-9._-]+$/.test(key)) return; } catch { return; }
+  const home = factoryHome();
+  let lock;
+  try { lock = inspect(key, { home }); } catch { lock = { state: 'absent', pid: null }; }
+  const me = Number(process.env.FACTORY_DRIVER_PID);
+  if (lock.state === 'live' && Number.isInteger(me) && me === lock.pid) return; // the driver itself
+  if (lock.state === 'live') die('a factory run holds this repository; run factory stop first');
+  let flag = false;
+  try { fs.lstatSync(path.join(home, 'stop', key)); flag = true; } catch { flag = false; }
+  if (flag) die('a factory stop is pending for this repository; continue the run with "factory run --continue" (or let it finish) first');
+}
+
 // ---- run records ------------------------------------------------------------------------------------------------------
 // A record per transition into merged, skipped, blocked or awaiting_human. Snapshots are taken at the transition and written
 // by save(), so a record exists only for a state that was persisted. queue.mjs stays pure; this is the only writer.
@@ -111,7 +134,13 @@ function flushRecords() {
   if (!pending.length) return;
   let project; try { project = projectHash(fs.realpathSync(root)); } catch { project = projectHash(root); }
   stamps ??= skillStamps(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..'));
-  for (const { f, at } of pending.splice(0)) appendRecord(root, buildRecord({ q: curQ, f, run: curQ.run_id || runId('deliver', 'run'), project, skills: stamps, now: at }));
+  // Driver mode (a trusted queue under FACTORY_HOME): records live in FACTORY_HOME/records/<repo-key>.jsonl, not in the project.
+  let target = null;
+  if (queueInHome()) { try { const k = repoKey(curQ.repo); if (/^[A-Za-z0-9._-]+$/.test(k) && !k.startsWith('.')) target = path.join(factoryHome(), 'records', `${k}.jsonl`); } catch { target = null; } }
+  for (const { f, at } of pending.splice(0)) {
+    const rec = buildRecord({ q: curQ, f, run: curQ.run_id || runId('deliver', 'run'), project, skills: stamps, now: at });
+    if (target) appendRecordTo(target, rec); else appendRecord(root, rec);
+  }
 }
 let ciStart = 0;
 const tallyCi = (f) => { f.ci_runs = (f.ci_runs || 0) + 1; f.ci_wait_ms = (f.ci_wait_ms || 0) + (Date.now() - ciStart); };
@@ -131,6 +160,7 @@ function load() {
     if (!FEATURE_ID.test(f.id) || !(f.state in TRANSITIONS) || (f.branch && !validRef(f.branch)) || (f.ci_sha && !SHA.test(f.ci_sha)) || (f.built_sha && !SHA.test(f.built_sha)) || (f.pr && !Number.isInteger(f.pr.number))) die(`queue file has an invalid entry for ${f.id}; reset and re-init`);
   }
   REPO = q.repo;
+  factoryGuard(q.repo);
   curQ = q;
   useAccount(q.policy.github.account, q.policy.github.host);
   return q;
@@ -282,6 +312,7 @@ C.init = async () => {
   if (errors.length) die(`${CONFIG_PATH}: ${errors.join('; ')}`);
   useAccount(config.github.account, config.github.host);
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,viewerPermission'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
+  factoryGuard(repo.nameWithOwner);
   if (!['WRITE', 'MAINTAIN', 'ADMIN'].includes(repo.viewerPermission)) die(`the GitHub account in use has "${repo.viewerPermission}" permission on ${repo.nameWithOwner}; it needs WRITE or higher${config.github.account ? '' : ' (set github.account in the config if gh has several accounts)'}`);
   const url = git('config', '--get', 'remote.origin.url').out;
   const originHost = remoteHost(url);
@@ -301,7 +332,9 @@ C.init = async () => {
   }
   if (opt.merge && !flat(opt.note)) die('--merge needs --note "<the user\'s own words authorising merges>"');
   const protectedBase = isProtectedBranch(base, config.protected_branches);
-  const wantsMerge = !!opt.merge || config.merge.mode === 'squash';
+  // An explicit autonomy.level L0 means "never merge": --merge cannot override it. Legacy pr-only configs (no autonomy key) still honour --merge.
+  const mergeIgnored = !!opt.merge && config.autonomy.explicit && config.autonomy.level === 'L0';
+  const wantsMerge = (!!opt.merge && !mergeIgnored) || config.merge.mode === 'squash';
   const featuresDir = path.resolve(root, opt['features-dir'] || config.features_dir);
   if (!(featuresDir + path.sep).startsWith(fs.realpathSync(root) + path.sep) && !(featuresDir + path.sep).startsWith(root + path.sep)) die('--features-dir must be inside the repository');
   const only = parseList(opt.only);
@@ -315,13 +348,15 @@ C.init = async () => {
     protected_base: protectedBase, merge: wantsMerge && !protectedBase, merge_mode: wantsMerge ? 'squash' : 'pr-only',
     no_ci: !!opt['no-ci'] || config.checks.allow_without_ci, merge_t3: !!opt['merge-t3'] || config.merge.allow_tier3,
     checks: opt.checks ? parseList(opt.checks) : config.checks.required,
-    authorised_by: wantsMerge ? (opt.merge ? flat(opt.note, 300) : `project config ${CONFIG_PATH}`) : null,
+    authorised_by: wantsMerge ? (opt.merge && !mergeIgnored ? flat(opt.note, 300) : `project config ${CONFIG_PATH}`) : null,
     max_fix_rounds: num(opt['max-fix-rounds'], config.limits.max_fix_rounds, 0, 5), max_failures: num(opt['max-failures'], config.limits.max_failures, 1, 10), ci_budget_s: num(opt['ci-budget'], config.limits.ci_budget_s, 1, 86400),
-    policy: config, features,
+    // stored in the committed shape (parseConfig re-validates it on every load): autonomy appears only when the config wrote it
+    policy: { ...config, autonomy: config.autonomy.explicit ? { level: config.autonomy.level } : undefined }, features,
     run_id: `${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`, // one id per init: records of separate runs never share a (run, feature) key
   };
   const summary = { base, repo: q.repo, account: config.github.account || '(gh default)', merge: q.merge, protected_base: protectedBase, no_ci: q.no_ci, checks: q.checks, ignored_checks: config.checks.ignored, local_checks: config.local_checks.map((c) => c.name), hold_paths: config.hold_paths, git_auth: /^https:/i.test(url) ? 'https (uses the configured account)' : 'ssh/other (git uses your own key; the account setting applies to gh only)' };
   const warnings = [];
+  if (mergeIgnored) warnings.push(`--merge ignored: ${CONFIG_PATH} sets autonomy.level "L0" (PRs only); set autonomy.level "L1" in the config and merge it to ${base} to allow merging`);
   if (protectedBase) warnings.push(`"${base}" matches protected_branches: PRs will be opened and checked but this skill will never merge into it`);
   if (!q.merge && !protectedBase) warnings.push('merging is off for this run (config merge.mode is "pr-only" and --merge was not given)');
   if (q.merge && config.readiness) {
@@ -358,6 +393,7 @@ C.readiness = async () => {
   // The working-copy config is untrusted: it is used only to pick credentials for the fetch below.
   let accountError = useAccount(config.github.account, config.github.host, { soft: true }); // C2 reports it; the run continues on gh's default login
   const repo = ghJson(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], 'gh repo view (is gh installed and logged in, and is there a GitHub remote?)');
+  factoryGuard(repo.nameWithOwner);
   must(gitNet('fetch', 'origin'), 'git fetch');
   const committedConfig = (ref) => {
     const s = git('show', `${OR(ref)}:${CONFIG_PATH}`);
@@ -840,6 +876,8 @@ function merged(q, f, sha, warn = []) {
 C.retry = () => { // a feature held for a CI reason goes back to waiting for CI, with the run's CI policy changed on purpose
   const q = load(); const f = item(q);
   need(f, 'awaiting_human');
+  // A budget hold is released by raising the cap (the driver continues the step it was parked in), never by a CI retry.
+  if (f.hold_kind === 'budget') die(`${f.id} is held for its budget: run "factory run --raise-budget ${f.id}" to raise its cap and continue it`);
   if (!f.pr) die(`${f.id} has no PR`);
   const anti = f.hold_kind === 'antigaming';
   const note = flat(opt.note, 500);
@@ -861,6 +899,7 @@ C.retry = () => { // a feature held for a CI reason goes back to waiting for CI,
   if (opt['no-ci']) q.no_ci = true;
   if (opt.checks) q.checks = parseList(opt.checks);
   q.stop = null;
+  f.hold_kind = null; delete f.budget_hold;
   transition(f, 'pr_open', 'retry');
   save(q);
   emit({ id: f.id, state: f.state, no_ci: q.no_ci, checks: q.checks, next: 'ci' });
@@ -877,6 +916,12 @@ C.hold = () => {
   if (!reason) die('--reason is required');
   const kind = opt.kind === undefined ? null : String(opt.kind);
   if (kind !== null && !/^[a-z_]{1,32}$/.test(kind)) die('--kind must be 1-32 characters of a-z and _');
+  // A running step (building, fixing) can only be parked by the run-control budget; every other hold there is the driver's attention-and-stop path.
+  if ((f.state === 'building' || f.state === 'fixing') && kind !== 'budget') die(`${f.id} is "${f.state}", which cannot wait for a person`);
+  if (kind === 'budget') {
+    if (f.state !== 'building' && f.state !== 'fixing') die(`${f.id} is "${f.state}", which cannot be held for a budget (only building and fixing)`);
+    f.budget_hold = { from: f.state }; f.budget_hit = true; // sticky: survives the unhold
+  }
   if (kind === 'antigaming') {
     const ids = parseList(opt.ids).filter((x) => /^G[1-5]$/.test(x));
     if (!SHA.test(String(opt.sha || '')) || !ids.length) die('an anti-gaming hold needs --sha <40-hex> and --ids G1..G5');
@@ -886,6 +931,23 @@ C.hold = () => {
   transition(f, 'awaiting_human', reason);
   save(q);
   outcome({ id: f.id, state: f.state, hold_kind: kind });
+};
+
+// Resumes a budget hold: back to the step it was parked in, marked interrupted so the driver restarts that step.
+C.unhold = () => {
+  const q = load(); const f = item(q);
+  if (!queueInHome()) die('unhold is a factory driver command: the queue file must be a private file under FACTORY_HOME');
+  if (f.state !== 'awaiting_human' || f.hold_kind !== 'budget') die(`${f.id} is not held for a budget (state "${f.state}", hold_kind ${JSON.stringify(f.hold_kind ?? null)})`);
+  const to = opt.to;
+  if (to !== 'building' && to !== 'fixing') die('--to must be building or fixing');
+  const from = f.budget_hold?.from;
+  if (from !== 'building' && from !== 'fixing') die(`${f.id} has no building or fixing budget hold recorded`);
+  if (to !== from) die(`${f.id} was held from "${from}": --to must be ${from}`);
+  delete f.budget_hold; f.hold_kind = null;
+  f.interrupted = { kind: 'budget', step: to === 'building' ? 'build' : 'fix', ts: new Date().toISOString() };
+  transition(f, to, 'budget hold released');
+  save(q);
+  emit({ id: f.id, state: f.state, interrupted: f.interrupted });
 };
 
 C.block = () => {
@@ -917,6 +979,8 @@ C.status = () => {
 
 C.reset = () => {
   if (!opt.yes) die('reset discards the run state (merged PRs stay merged on GitHub); pass --yes');
+  const old = readJson(file);
+  if (old && typeof old.repo === 'string') factoryGuard(old.repo);
   fs.rmSync(file, { force: true });
   emit({ reset: true });
 };

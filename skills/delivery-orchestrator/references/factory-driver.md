@@ -10,7 +10,8 @@ Code: `core/scripts/factory.mjs`, `core/scripts/lib/driver.mjs` (decision table,
 |---|---|
 | `factory scenarios [--only IDS] [--dir D] [--base B]` | Authors, lints and stores hidden scenarios for the ready specs on `origin/<base>` ([verification.md](verification.md#hidden-scenarios)) |
 | `factory scenarios --approve ID --by NAME [--dir D] [--base B]` | Approves current scenarios (`scenario_approval: human`) |
-| `factory run [--only IDS] [--limit N] [--dir D] [--base B]` | Runs the queue: build, PR, CI, verification, merge. Resumes a queue in progress; `--only` and `--limit` (1-1000) apply to a new run only |
+| `factory run [--only IDS] [--limit N] [--continue] [--raise-budget ID[=TOKENS]] [--dir D] [--base B]` | Runs the queue: build, PR, CI, verification, merge. Resumes a queue in progress; `--only` and `--limit` (1-1000) apply to a new run only. `--continue` clears a stop flag; `--raise-budget` releases a budget hold ([run-control.md](run-control.md)) |
+| `factory stop [--now]`, `factory status [--json]` | Stop the running driver; show run state, usage against caps and attention ([run-control.md](run-control.md#stop-continue-status)) |
 
 `--dir` is a checkout of the repository (default: the current directory). Only its identity is used: `gh repo view` names the repository and its `origin` URL must point to the same one. `--base` overrides the base; otherwise `base` from the config on the default branch, else the default branch.
 
@@ -58,7 +59,8 @@ Also refused: a `FACTORY_HOME` that is a symlink, owned by another user or group
 | `FACTORY_HOME/work/<key>/<ID>-<sha>` | verification worktrees |
 | `FACTORY_HOME/tmp/`, `trash/` | run temps and bundles; quarantine before deletion |
 | `FACTORY_HOME/run/author/`, `run/settings/` | empty author cwd per session; per-run settings files (0600) |
-| `FACTORY_HOME/attention/<key>.jsonl` | attention entries `{at, feature, state, kind}` |
+| `FACTORY_HOME/attention/<key>.jsonl` | attention event log `{at, feature, state, kind}`; `<key>.json` and `<key>.md` hold the current rows and view (Phase 2) |
+| `FACTORY_HOME/runs/`, `usage/<day>/`, `stop/`, `records/`, `probes/`, `config.json` | run state, usage, stop flags, run records, probe result, local config ([run-control.md](run-control.md#where-things-live)) |
 | `FACTORY_HOME/readiness/<key>.json` | stored readiness result |
 
 `<key>` is `<owner>__<repo>`.
@@ -165,8 +167,8 @@ Author: every built-in tool denied (`Bash`, `Read`, `Edit`, `Write`, `NotebookEd
 | verified | verified ok | `deliver merge` |
 | awaiting_human | ci unconfirmed | stop `ci_unconfirmed`; attention |
 | awaiting_human | merge held | attention (kind = the feature's `hold_kind`, else `merge`), next feature |
-| any | session usage limit | stop `usage_limit` (with the reset time), every state left as it is |
-| any | session timeout, no result, other | stop `interrupted`, branch left as it is |
+| any | session usage limit, timeout, stop, budget | `interrupt` (Phase 2): WIP commit, wait or retry or stop, continue brief; see [run-control.md](run-control.md#interruptions-and-the-continue-brief) |
+| any | session no result, other | stop `interrupted`: in building or fixing the work is first kept (WIP commit, `f.interrupted` with kind `other` or `no_result`), so the next run continues the step |
 | any | settings_unsafe / spawn_failed / unsafe_binary | hold `settings_unsafe` / `environment` |
 | any | a step's `error` | hold `error` |
 
@@ -233,3 +235,13 @@ Driver and gate:
 27. **tmp sweep** is skipped while any other repository's lock file exists, stale or not.
 28. **`deliver`'s own git is plain git** (not gitSafe), with the driver's environment, in the driver clone. It is protected only by the clone preflight before each `deliver` call (config allowlist, no hooks, metadata, origin pin); `deliver merge`'s gate and changed-file list do use gitSafe. A clone changed between the preflight and a git call inside one `deliver` run is not re-checked.
 29. **`local_checks` are refused** in factory runs rather than sandboxed (by design, until `deliver built` can sandbox them).
+
+Phase 2 (run control, [run-control.md](run-control.md)) additions:
+30. **`stop --now` during verification** does not interrupt it: the verification run in progress (it has its own timeouts) and short driver-only steps finish first. Sessions, waits and the CI wait are interrupted.
+31. **Unproven hard-stop rows.** Rows proven only by the isolation probe stay unproven (printed at start, one attention row) until you save a probe result. The network row needs a reachable host of your choice (`--net-host`); the tool-layer half (WebFetch, WebSearch, MCP) is a static check, not a live probe.
+32. **The usage-limit classifier is fixtures only**, so `wait_for_reset` cannot be turned on. Runs stop at a limit; `factory run --continue` resumes.
+33. **A plain `factory run` after a driver crash while paused** does not wait out the saved reset: it continues the interrupted step at once, hits the limit again and waits again (one extra short session). Only `--continue` waits out the saved `pause.reset_at`.
+34. **The stop sweep kills by cwd and sandbox environment only.** A leftover that merely mentions a clone or work path in its arguments is not killed, and neither is one with a controlling terminal whose cwd is in a clone (a person's shell or editor); both stop the next start (`leftovers`) until you end them. A process of yours with its cwd in a clone and no controlling terminal is killed. A process that clears its environment and leaves the path is not found.
+35. **Crash-resume of an interrupted feature** is capped separately (`interrupted_resumes`, 3, then `resume_loop`); a session that always times out is blocked after three timeouts.
+36. **A dying driver leaves its session running.** The session is in its own process group, so it outlives a driver that is SIGKILLed or crashes (exit criterion E3) and runs until the next start kills the recorded group, up to `session_timeout_s` and its max turns. Its usage is never recorded, so the feature and day caps undercount. A crash during a session that was not interrupted rebuilds that step from the base (crash rules): the session's work is lost.
+37. **HEAD off the feature branch.** A builder that switched the clone to another branch gets no WIP commit when it is interrupted (one line, a `wip_skipped` row); continuing the step checks the feature branch out again and its uncommitted edits are lost.

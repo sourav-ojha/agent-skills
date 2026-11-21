@@ -5,7 +5,9 @@
   "branch_prefix": "feat/",
   "features_dir": ".product/features",
   "protected_branches": ["main", "master", "prod", "production", "release/*"],
-  "merge": { "mode": "squash", "allow_tier3": false },
+  "autonomy": { "level": "L1" },
+  "merge": { "allow_tier3": false },
+  "budgets": { "feature": { "tokens": 3000000, "turns": 400 } },
   "checks": {
     "required": ["unit-tests", "build"],
     "ignored": ["e2e", "e2e-*"],

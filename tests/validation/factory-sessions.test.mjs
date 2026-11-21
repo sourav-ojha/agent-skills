@@ -241,7 +241,7 @@ test('runSession author: no tools, no session persistence; CLAUDE_CONFIG_DIR onl
   assert.ok(b.envKeys.includes('CLAUDE_CONFIG_DIR'));
 });
 
-test('runSession env: only the allowlist reaches claude (no GH_TOKEN, cloud keys, API keys)', async (t) => {
+test('hs-merge-gate: runSession env: only the allowlist reaches claude (no GH_TOKEN, cloud keys, API keys)', async (t) => {
   const f = fake(t, { mode: 'echo-argv' });
   const { cwd, settingsFile } = setup(t);
   const base = { ...process.env, GH_TOKEN: 'ghp_fake', GITHUB_TOKEN: 'x', AWS_SECRET_ACCESS_KEY: 'y', ANTHROPIC_API_KEY: 'z', NPM_TOKEN: 'n', FACTORY_HOME: '/f', USER: 'u', LOGNAME: 'u', SHELL: '/bin/zsh' };
@@ -519,6 +519,16 @@ test('renderPrompt: scenario-author placeholders filled in one pass; unknown or 
   assert.throws(() => S.renderPrompt('../settings/builder', {}), /prompt/);
 });
 
+test('renderPrompt: the continue brief names the feature, the step, the branch and ledger, and result.json; the implementer documents it', () => {
+  const p = S.renderPrompt('continue-brief', { FEATURE_ID: 'FEATURE-7', STEP: 'fix' });
+  assert.match(p, /interrupted fix step of FEATURE-7/);
+  assert.match(p, /continue from the current branch and the `\.implementation\/FEATURE-7\/` ledger; finish with `result\.json`/);
+  assert.ok(!/^-/.test(p));
+  assert.throws(() => S.renderPrompt('continue-brief', { FEATURE_ID: 'FEATURE-7' }), /STEP/);
+  const text = fs.readFileSync(path.join(REPO, 'skills', 'implementer', 'SKILL.md'), 'utf8');
+  assert.match(text, /\*\*continue brief\*\*/); assert.match(text, /wip\(<ID>\): interrupted \(<kind>\)/);
+});
+
 test('implementer SKILL.md: --fix-brief input and the unattended result.json contract', () => {
   const text = fs.readFileSync(path.join(REPO, 'skills', 'implementer', 'SKILL.md'), 'utf8');
   assert.match(text, /--fix-brief <file>/);
@@ -749,4 +759,65 @@ test('readBuilderResult: tag characters, Arabic letter mark, Mongolian vowel sep
   const cp = (...x) => String.fromCodePoint(...x);
   put(c, 'FEATURE-30', JSON.stringify({ status: 'blocked', question: `a${cp(0xe0041, 0xe007f)}b${cp(0x061c)}c${cp(0x180e)}d${cp(0xfe0f)}e${cp(0xe0100)}f${cp(0x2028)}g${cp(0x2029, 0x200b, 0xad)}h${cp(0x034f, 0x115f, 0x1160, 0x3164, 0xffa0)}i${cp(0xe000, 0x0378, 0xe0000)}j${String.fromCharCode(0xd800)}k` }));
   assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdefghijk');
+});
+
+const whenStarted = async (f) => { const end = Date.now() + 10000; while (f.entries().length === 0 && Date.now() < end) await new Promise((r) => setTimeout(r, 20)); };
+
+test('runSession abort: the flag set after 200 ms ends the session as stopped within 2 s and the group is gone', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  let flag = false; let flagAt = 0;
+  (async () => { await whenStarted(f); await new Promise((r) => setTimeout(r, 200)); flagAt = Date.now(); flag = true; })();
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 20, shouldAbort: () => flag });
+  assert.equal(r.ok, false); assert.equal(r.timedOut, false);
+  assert.deepEqual(r.failure, { kind: 'stopped', resetAt: null });
+  assert.ok(flagAt > 0 && Date.now() - flagAt < 2000, 'abort should end the session quickly');
+  assert.ok(await waitDead(f.entries()[0].pid, 2000));
+});
+
+test('runSession abort: a Date.now jump of +1 hour mid-session does not trigger the timeout', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  const realNow = Date.now; let jumped = false; let flag = false;
+  (async () => { await whenStarted(f); await new Promise((r) => setTimeout(r, 100)); Date.now = () => realNow() + 3600e3; jumped = true; await new Promise((r) => setTimeout(r, 600)); flag = true; })();
+  try {
+    const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 20, shouldAbort: () => flag });
+    assert.ok(jumped);
+    assert.equal(r.timedOut, false); assert.equal(r.failure.kind, 'stopped');
+  } finally { Date.now = realNow; }
+});
+
+test('runSession abort: a shouldAbort that throws is treated as false (the session runs to its natural timeout)', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  let calls = 0;
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 1, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 10, shouldAbort: () => { calls++; throw new Error('boom'); } });
+  assert.ok(calls > 0, 'shouldAbort was polled');
+  assert.equal(r.timedOut, true); assert.equal(r.failure.kind, 'timeout');
+});
+
+test('runSession abort: with abortPollMs 100 shouldAbort is polled every 80-180 ms (median gap; no gap under 80 ms or over 500 ms)', async (t) => {
+  const f = fake(t, { mode: 'timeout' });
+  const { cwd, settingsFile } = setup(t);
+  const stamps = [];
+  const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 1, claudeBin: f.bin, killGraceMs: 300, abortPollMs: 100, shouldAbort: () => { stamps.push(process.hrtime.bigint()); return false; } });
+  assert.equal(r.failure.kind, 'timeout');
+  assert.ok(stamps.length >= 3, `only ${stamps.length} polls`);
+  // The median carries the cadence (a fixed 250 ms tick gives ~250); single gaps may stretch under a loaded parallel suite.
+  const gaps = [];
+  for (let i = 1; i < stamps.length; i++) gaps.push(Number(stamps[i] - stamps[i - 1]) / 1e6);
+  for (const gap of gaps) assert.ok(gap >= 80 && gap <= 500, `poll gap ${gap.toFixed(0)} ms`);
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const median = sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  assert.ok(median >= 80 && median <= 180, `median poll gap ${median.toFixed(0)} ms (gaps ${gaps.map((g) => g.toFixed(0)).join(', ')})`);
+  assert.ok(stamps.length >= 5, `only ${stamps.length} polls`);
+});
+
+test('runSession abort: bad abort options throw', async (t) => {
+  const f = fake(t, { mode: 'done' });
+  const { cwd, settingsFile } = setup(t);
+  const base = { role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin };
+  await assert.rejects(S.runSession({ ...base, shouldAbort: 'yes' }), TypeError);
+  await assert.rejects(S.runSession({ ...base, abortPollMs: 9 }), TypeError);
+  await assert.rejects(S.runSession({ ...base, abortPollMs: 1.5 }), TypeError);
 });

@@ -7,15 +7,15 @@ export const FEATURE_ID = /^FEATURE-\d+$/;
 // Allowed state transitions. Anything else throws: the state file cannot jump from "queued" to "merged".
 export const TRANSITIONS = {
   queued: ['building', 'skipped', 'blocked'],
-  building: ['built', 'blocked'],
+  building: ['built', 'blocked', 'awaiting_human'], // awaiting_human: a budget hold only (deliver hold --kind budget)
   built: ['pr_open', 'blocked'],
   pr_open: ['ci_passed', 'ci_failed', 'awaiting_human', 'blocked'],
   ci_failed: ['fixing', 'blocked'],
   verify_failed: ['fixing', 'blocked'],
-  fixing: ['pr_open', 'blocked'],
+  fixing: ['pr_open', 'blocked', 'awaiting_human'], // awaiting_human: a budget hold only
   ci_passed: ['merged', 'verified', 'verify_failed', 'pr_open', 'awaiting_human', 'blocked'],
   verified: ['merged', 'pr_open', 'awaiting_human', 'blocked'],
-  awaiting_human: ['merged', 'skipped', 'pr_open'],
+  awaiting_human: ['merged', 'skipped', 'pr_open', 'building', 'fixing'], // building/fixing: deliver unhold after a budget hold
   blocked: ['skipped'],
   merged: [],
   skipped: [],

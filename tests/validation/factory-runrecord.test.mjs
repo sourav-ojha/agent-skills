@@ -266,3 +266,94 @@ test('.skill-runs as a symlink: nothing is written through it', () => {
   ship(e2, 'FEATURE-001'); assert.equal(e2.d('merge', 'FEATURE-001').json.state, 'merged');
   assert.equal(fs.readFileSync(victim, 'utf8'), 'keep\n');
 });
+
+// ---- Task 10: driver-mode records live under FACTORY_HOME/records ----
+function driver(e) {
+  const queue = path.join(e.root, 'fhome', 'queues', 'o__r.json');
+  const env = { ...process.env, ...GENV.get(e.work), PATH: `${path.join(e.root, 'bin')}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: path.join(e.root, 'gh-state.json'), SKILL_RUNLOG: 'off', FACTORY_HOME: path.join(e.root, 'fhome'), DELIVER_QUEUE: queue };
+  const d = (...a) => { const r = spawnSync('node', [DELIVER, ...a, '--dir', e.work], { encoding: 'utf8', env }); let json; try { json = JSON.parse(r.stdout); } catch { /* not json */ } return { code: r.status, out: r.stdout, err: r.stderr, json }; };
+  return { d };
+}
+function driverShip(e, dd) {
+  assert.equal(dd.d('init', '--merge', '--note', 'ok').code, 0);
+  assert.equal(dd.d('next').json.feature.id, 'FEATURE-001');
+  build(e, 'FEATURE-001');
+  assert.equal(dd.d('built', 'FEATURE-001', '--tier', 'T2').code, 0);
+  assert.equal(dd.d('pr', 'FEATURE-001', '--title', 'feat: x thing', '--body-file', body(e)).code, 0);
+  assert.equal(dd.d('ci', 'FEATURE-001', ...FAST).json.result, 'passed');
+  return dd.d('merge', 'FEATURE-001');
+}
+const recFile = (e) => path.join(e.root, 'fhome', 'records', 'o__r.jsonl');
+
+test('driver mode writes records under FACTORY_HOME/records and not under .skill-runs; the folder is private', () => {
+  const e = setup();
+  const m = driverShip(e, driver(e));
+  assert.equal(m.json.state, 'merged', m.out + m.err);
+  assert.ok(!fs.existsSync(path.join(e.work, '.skill-runs', 'factory-runs.jsonl')));
+  const lines = fs.readFileSync(recFile(e), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(lines.at(-1).outcome, 'merged');
+  assert.deepEqual([lines.at(-1).tokens_by_role, lines.at(-1).budget_hit, lines.at(-1).stopped_by_user, lines.at(-1).interruptions], [{}, false, false, []]);
+  assert.equal(fs.statSync(path.dirname(recFile(e))).mode & 0o077, 0);
+});
+
+test('interactive mode still writes .skill-runs/factory-runs.jsonl and nothing under FACTORY_HOME/records', () => {
+  const e = setup();
+  e.d('init', '--merge', '--note', 'ok');
+  assert.equal(ship(e, 'FEATURE-001').json.result, 'passed');
+  assert.equal(e.d('merge', 'FEATURE-001').json.state, 'merged');
+  assert.equal(records(e).at(-1).outcome, 'merged');
+  assert.ok(!fs.existsSync(path.join(e.root, 'fhome', 'records')));
+});
+
+test('a symlinked records file is refused: the target is untouched and the run still completes', () => {
+  const e = setup();
+  const target = path.join(e.root, 'victim.jsonl'); fs.writeFileSync(target, 'keep\n');
+  fs.mkdirSync(path.dirname(recFile(e)), { recursive: true }); fs.symlinkSync(target, recFile(e));
+  assert.equal(driverShip(e, driver(e)).json.state, 'merged');
+  assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n');
+});
+
+test('a symlinked records directory is refused', () => {
+  const e = setup();
+  const elsewhere = path.join(e.root, 'elsewhere'); fs.mkdirSync(elsewhere);
+  fs.mkdirSync(path.join(e.root, 'fhome'), { recursive: true }); fs.symlinkSync(elsewhere, path.join(e.root, 'fhome', 'records'));
+  assert.equal(driverShip(e, driver(e)).json.state, 'merged');
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
+test('appendRecordTo refuses a symlink and appends otherwise', () => {
+  const d = tmpDir('art-'); const f = path.join(d, 'records', 'k.jsonl');
+  assert.equal(rr.appendRecordTo(f, { a: 1 }), true); assert.equal(rr.appendRecordTo(f, { a: 2 }), true);
+  assert.equal(fs.readFileSync(f, 'utf8'), '{"a":1}\n{"a":2}\n');
+  const l = path.join(d, 'records', 'l.jsonl'); fs.symlinkSync(f, l);
+  assert.equal(rr.appendRecordTo(l, { a: 3 }), false);
+  assert.equal(fs.readFileSync(f, 'utf8'), '{"a":1}\n{"a":2}\n');
+});
+
+test('usage fields: per-role sums, cost, a budget hold that was continued, and metadata only', () => {
+  const sess = (role, n, cost) => ({ role, id: `s-${n}`, in: 10 * n, out: n, cache_create: 2, cache_read: 3, turns: n, cost_usd: cost });
+  const f = { id: 'F', state: 'merged', sessions: [sess('builder', 1, 0.5), sess('builder', 2, 0.25), sess('evaluator', 1, null)],
+    interrupted: { kind: 'budget', step: 'build', ts: 'x' },
+    interruptions: [{ kind: 'budget', step: 'build', minutes_waited: 0, method: 'continue_brief', note: '/Users/x/secret' }] };
+  const r = rr.buildRecord({ q: {}, f, run: 'r', project: 'p', skills: {} });
+  assert.deepEqual(r.tokens_by_role, { builder: 10 + 1 + 5 + 20 + 2 + 5, evaluator: 10 + 1 + 5 });
+  assert.deepEqual(r.turns_by_role, { builder: 3, evaluator: 1 });
+  assert.deepEqual(r.cost_usd_by_role, { builder: 0.75 });
+  assert.equal(r.budget_hit, true);
+  assert.deepEqual(r.interruptions, [{ kind: 'budget', step: 'build', minutes_waited: 0, method: 'continue_brief' }]);
+  assert.equal(r.stopped_by_user, false);
+  assert.ok(!JSON.stringify(r).includes('secret'));
+  // still held for a budget
+  const h = rr.buildRecord({ q: {}, f: { id: 'F', state: 'awaiting_human', hold_kind: 'budget', budget_hold: { from: 'building' } }, run: 'r', project: 'p', skills: {} });
+  assert.equal(h.budget_hit, true); assert.ok(!('cost_usd_by_role' in h));
+});
+
+test('an interrupted-by-stop feature records stopped_by_user; other interruptions do not', () => {
+  const base = { id: 'F', state: 'awaiting_human' };
+  const a = rr.buildRecord({ q: {}, f: { ...base, interrupted: { kind: 'stop', step: 'build' } }, run: 'r', project: 'p', skills: {} });
+  assert.equal(a.stopped_by_user, true);
+  const b = rr.buildRecord({ q: {}, f: { ...base, interruptions: [{ kind: 'stop', step: 'fix', minutes_waited: 0, method: 'continue_brief' }] }, run: 'r', project: 'p', skills: {} });
+  assert.equal(b.stopped_by_user, true);
+  const c = rr.buildRecord({ q: {}, f: { ...base, interruptions: [{ kind: 'stop', step: 'fix', minutes_waited: 0 }, { kind: 'rate_limit', step: 'fix', minutes_waited: 7, method: 'continue_brief' }] }, run: 'r', project: 'p', skills: {} });
+  assert.equal(c.stopped_by_user, false); assert.equal(c.budget_hit, false); assert.equal(c.interruptions[1].minutes_waited, 7);
+});

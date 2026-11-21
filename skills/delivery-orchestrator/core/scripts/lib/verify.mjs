@@ -60,22 +60,53 @@ const within = (p, root) => p === root || p.startsWith(`${root}/`);
 // The marker as a whole path: followed by the end, "/" or whitespace (".../run/o__r" must not match ".../run/o__r2").
 const mentions = (text, k) => { for (let i = text.indexOf(k); i !== -1; i = text.indexOf(k, i + 1)) { const c = text[i + k.length]; if (c === undefined || c === '/' || /\s/.test(c)) return true; } return false; };
 export function scanSurvivors(markers) {
-  const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
-  if (ps.status !== 0 || ps.error) return 1;
-  const hits = new Set();
-  for (const line of ps.stdout.split('\n')) {
-    const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line);
-    if (!m || m[2].startsWith('Z') || Number(m[1]) === process.pid) continue;
-    if (markers.some((k) => mentions(m[3], k))) hits.add(m[1]);
-  }
+  const r = survivorPids(markers);
+  return r.ok ? r.pids.size : Math.max(1, r.pids.size);
+}
+// The same scan, as { ok, pids, killable } (Sets of pids; ok false: ps or lsof failed, the sets hold what was found before that).
+// pids is the broad detection set (argv/env mention or cwd). killable is the narrow set the stop path may signal: the cwd is inside
+// a marker and the process has no controlling terminal, or the environment carries TMPDIR= or HOME= inside one of `sandbox` (the
+// run temps a sandboxed process is started with). A process that only MENTIONS a marker (an editor, `git -C <clone>`, a shell with
+// PWD/OLDPWD there) is never killable, and neither is one with a controlling terminal whose cwd is in a marker (a person's shell or
+// editor opened in a clone: builder sessions and apps are started detached, without one); both stay in pids. Never this process.
+export function survivorPids(markers, { sandbox = [] } = {}) {
+  const ps = spawnSync('/bin/ps', ['-axwwE', '-o', 'pid=,stat=,tt=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, timeout: 5000 });
+  if (ps.status !== 0 || ps.error) return { ok: false, pids: new Set(), killable: new Set() };
   const lsof = spawnSync('/usr/sbin/lsof', ['-n', '-P', '-w', '-d', 'cwd', '-F', 'pn'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 5000 });
-  if (lsof.error || !lsof.stdout) return 1;
-  let pid = null;
-  for (const line of lsof.stdout.split('\n')) {
-    if (line.startsWith('p')) pid = line.slice(1);
-    else if (line.startsWith('n') && pid && Number(pid) !== process.pid && markers.some((k) => within(line.slice(1), k))) hits.add(pid);
+  const lsofText = lsof.error || !lsof.stdout ? null : lsof.stdout;
+  const r = survivorSets({ psText: ps.stdout, lsofText, markers, sandbox, self: process.pid });
+  return { ok: lsofText !== null, pids: r.pids, killable: r.killable };
+}
+// No controlling terminal: `??` (macOS), `?` (Linux procps) or `-`.
+const NO_TTY = new Set(['??', '?', '-']);
+// survivorSets({ psText, lsofText, markers, sandbox, self }) -> { pids, killable }: the pure part of survivorPids. psText holds
+// `ps -o pid=,stat=,tt=,command=` rows (command with -E's environment), lsofText `lsof -d cwd -F pn` output (null: lsof failed,
+// only the ps part is used). Zombies and `self` are skipped.
+export function survivorSets({ psText, lsofText, markers, sandbox = [], self = process.pid }) {
+  const hits = new Set(); const kill = new Set(); const tty = new Map();
+  // `ps -E` appends the environment to the argv with single spaces and no delimiter, so an argv word that looks like
+  // " TMPDIR=<root>..." cannot be told apart from the real variable; such a process would be treated as sandboxed. Accepted: the
+  // roots are this driver's own private run dirs, which nothing else has reason to name.
+  const envIn = (text) => sandbox.some((k) => [' TMPDIR=', ' HOME='].some((v) => mentions(text, `${v}${k}`)));
+  for (const line of String(psText ?? '').split('\n')) {
+    const m = /^\s*(\d+)\s+(\S+)\s+(\S+)\s(.*)$/.exec(line);
+    if (!m || m[2].startsWith('Z') || Number(m[1]) === self) continue;
+    tty.set(m[1], m[3]);
+    if (markers.some((k) => mentions(m[4], k))) hits.add(m[1]);
+    if (envIn(m[4])) { hits.add(m[1]); kill.add(m[1]); }
   }
-  return hits.size;
+  const num = (set) => new Set([...set].map(Number).filter((n) => Number.isInteger(n) && n > 0 && n !== self));
+  if (lsofText === null || lsofText === undefined) return { pids: num(hits), killable: num(kill) };
+  let pid = null;
+  for (const line of String(lsofText).split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1);
+    else if (line.startsWith('n') && pid && Number(pid) !== self && markers.some((k) => within(line.slice(1), k))) {
+      hits.add(pid);
+      // A pid ps did not list (it started after the ps call) has no known terminal: killable, like a detached session child.
+      if (NO_TTY.has(tty.get(pid) ?? '?')) kill.add(pid);
+    }
+  }
+  return { pids: num(hits), killable: num(kill) };
 }
 // Polls briefly: processes the phase's process-group kill just ended may still be listed for a moment.
 async function sweepSurvivors(markers) {

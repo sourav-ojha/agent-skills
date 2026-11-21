@@ -1,19 +1,21 @@
 // Factory driver decision table: pure functions, no I/O. Implements the "Driver actions" table and the "Crash and resume" rules of
-// docs/factory/specs/phase-1-verification-gate.md. The caller (factory.mjs) executes the returned action and feeds the step's
+// docs/factory/specs/phase-1-verification-gate.md, as amended by phase-2-run-control.md P2.4 (interrupted is not crashed). The caller (factory.mjs) executes the returned action and feeds the step's
 // result back in. The feature passed in is in the state the queue holds when the decision is made, i.e. after `deliver` (or the
 // driver) applied the last step's own transition. Anything unknown (state, result, fact, limit) holds: fail closed.
 import { TRANSITIONS, ACTIVE, overrideValid } from './queue.mjs';
 
-export const ACTIONS = Object.freeze(['next', 'build', 'built', 'pr', 'ci', 'fix_ci', 'verify', 'verified', 'fix_verify', 'push', 'merge', 'block', 'hold', 'stop']);
+export const ACTIONS = Object.freeze(['next', 'build', 'built', 'pr', 'ci', 'fix_ci', 'verify', 'verified', 'fix_verify', 'push', 'merge', 'block', 'hold', 'stop', 'interrupt']);
 export const BRIEFS = Object.freeze(['build', 'local_fix', 'antigaming_fix', 'ci_fix', 'symptom_fix']);
 // Every step result the driver understands, as { step, kind }. `error`: the deliver command died (exit 1) or the step failed.
 export const RESULTS = Object.freeze({
-  session: Object.freeze(['done', 'blocked', 'usage_limit', 'max_turns', 'timeout', 'no_result', 'other', 'settings_unsafe', 'spawn_failed', 'unsafe_binary']),
+  // stopped: the run's stop flag ended the session; budget: a runaway-guard cap ({ scope: 'feature' | 'day' }) ended or refused it.
+  session: Object.freeze(['done', 'blocked', 'usage_limit', 'max_turns', 'timeout', 'no_result', 'other', 'settings_unsafe', 'spawn_failed', 'unsafe_binary', 'stopped', 'budget']),
   antigaming: Object.freeze(['fix']), // G2/G3 at built; G1/G4/G5 continue inside the built step (f.antigaming_hold), clean ones are not reported
   next: Object.freeze(['ok', 'error']),
   built: Object.freeze(['ok', 'local_check_failed', 'error']),
   pr: Object.freeze(['ok', 'error']),
-  ci: Object.freeze(['passed', 'unverified-allowed', 'failed', 'timeout', 'unconfirmed', 'error']),
+  // stopped: `factory stop --now` ended the CI wait (the deliver ci child was killed); the feature stays in pr_open.
+  ci: Object.freeze(['passed', 'unverified-allowed', 'failed', 'timeout', 'unconfirmed', 'error', 'stopped']),
   fix: Object.freeze(['ok', 'error']),
   push: Object.freeze(['ok', 'error']),
   verify: Object.freeze(['pass', 'fail', 'threw']),
@@ -23,6 +25,8 @@ export const RESULTS = Object.freeze({
 });
 export const AG_FIX_ATTEMPTS = 1; // P1.3: G2/G3 at built get one "builder fix attempt"
 export const MAX_RESUMES = 3; // default cap on restarts of one feature (run.max_resumes overrides)
+export const MAX_TIMEOUTS = 3; // a step whose session timed out this many times (f.timeouts) blocks instead of continuing
+const BUDGET_SCOPES = new Set(['feature', 'day']);
 
 const USAGE_KINDS = new Set(['session', 'weekly', 'model', 'rate']); // limits.mjs classifyFailure kinds
 const SHA = /^[0-9a-f]{40}$/;
@@ -39,9 +43,11 @@ const stop = (kind, reason, extra = {}) => ({ do: 'stop', kind, reason: cut(reas
 const block = (reason) => ({ do: 'block', reason: cut(reason), attention: true });
 const next = (run) => (typeof run?.stop === 'string' && run.stop ? stop('run_stop', run.stop) : { do: 'next' });
 
-// Can this state go to awaiting_human? A `hold` on a state that cannot (queued, building, built, ci_failed, fixing,
-// verify_failed) cannot park the feature: the caller writes the attention entry and stops the run, leaving the state.
-export const canHold = (state) => knownState(state) && TRANSITIONS[state].includes('awaiting_human');
+// Can the driver's `hold` action park this state in awaiting_human? On a state that cannot (queued, built, ci_failed,
+// verify_failed, and building/fixing) the caller writes the attention entry and stops the run, leaving the state.
+// building and fixing have the edge only for a run-control budget hold, which is not a driver `hold` action.
+const BUDGET_ONLY = new Set(['building', 'fixing']);
+export const canHold = (state) => knownState(state) && !BUDGET_ONLY.has(state) && TRANSITIONS[state].includes('awaiting_human');
 
 // The fix brief of a `fixing` feature, from the state it was in before its last "fixing" history entry.
 export function fixKind(f) {
@@ -49,19 +55,23 @@ export function fixKind(f) {
   for (let i = h.length - 1; i >= 0; i--) {
     if (h[i]?.state !== 'fixing') continue;
     const prev = h[i - 1]?.state;
+    // awaiting_human -> fixing is only deliver unhold (a released budget hold): the same fix step, so its kind is the kind of the
+    // fixing entry the hold was taken from.
+    if (prev === 'awaiting_human' && h[i - 2]?.state === 'fixing') continue;
     return prev === 'ci_failed' ? 'ci_fix' : prev === 'verify_failed' ? 'symptom_fix' : null;
   }
   return null;
 }
 
-// runSession() result + readBuilderResult() -> { step: 'session', kind, question?, keys?, resetAt? }.
+// runSession() result + readBuilderResult() -> { step: 'session', kind, question?, keys?, limit?, resetAt? }.
+// A usage limit keeps the classifier's kind as `limit` (session, weekly, model, rate) for routeInterruption (interrupt.mjs).
 export function sessionResult(run, builder) {
   const r = { step: 'session' };
   if (!run || run.ok !== true) {
     const k = run?.failure?.kind;
-    if (USAGE_KINDS.has(k)) return { ...r, kind: 'usage_limit', resetAt: isoOrNull(run.failure.resetAt) };
+    if (USAGE_KINDS.has(k)) return { ...r, kind: 'usage_limit', limit: k, resetAt: isoOrNull(run.failure.resetAt) };
     if (k === 'settings_unsafe') return { ...r, kind: k, keys: Array.isArray(run.failure.keys) ? [...run.failure.keys] : [] };
-    return { ...r, kind: typeof k === 'string' && RESULTS.session.includes(k) && k !== 'done' && k !== 'blocked' && k !== 'usage_limit' ? k : 'other' };
+    return { ...r, kind: typeof k === 'string' && RESULTS.session.includes(k) && !['done', 'blocked', 'usage_limit', 'budget'].includes(k) ? k : 'other' };
   }
   if (builder?.status === 'done') return { ...r, kind: 'done' };
   return { ...r, kind: 'blocked', question: typeof builder?.question === 'string' && builder.question ? builder.question : 'no_result' };
@@ -107,6 +117,18 @@ function agHold(f) {
 }
 const ci = (f, extra = {}) => agHold(f) ?? { do: 'ci', ...extra };
 
+// The interrupted-step record (f.interrupted, set by the driver or by `deliver unhold`): 'none' when absent, 'bad' when it is
+// malformed or names a step that is not this state's (building <-> build, fixing <-> fix), else the step. An interrupted step is
+// not a crash: it continues with the continue brief, uses no fix round and does not count toward the resume cap.
+const STEP_OF = { building: 'build', fixing: 'fix' };
+function interruptedStep(f) {
+  if (!own(f, 'interrupted') || f.interrupted === undefined || f.interrupted === null) return 'none';
+  const i = f.interrupted;
+  if (typeof i !== 'object' || Array.isArray(i) || i.step !== STEP_OF[f.state]) return 'bad';
+  return i.step;
+}
+const badInterrupted = (f) => hold('inconsistent', `the interrupted-step record does not fit a feature in "${f.state}"`);
+
 // nextAction(feature, lastResult, run?) -> { do, reason?, kind?, brief?, ids?, sha?, resetAt?, attention? }
 //   lastResult: null (nothing ran yet in this state) or { step, kind, ... } from RESULTS (see sessionResult for sessions).
 //   run: { max_fix_rounds, stop } from the queue: max_fix_rounds is q.max_fix_rounds, stop is runStop(q) (stop flag or breaker).
@@ -116,21 +138,43 @@ function decide(f, lastResult, run) {
   const last = lastResult;
   const st = f.state;
 
-  // Interruptions and environment failures of any session, in any state (Phase 2 replaces the stops with its interruption rules).
+  // Interruptions and environment failures of any session, in any state. Phase 2 amends Phase 1's table: limit, budget, stop and
+  // timeout go to interrupted handling (the caller's `interrupt` action keeps the work and decides wait/retry/stop); a session that
+  // ended without a result (other, no_result) still stops the run, never waits.
   if (last?.step === 'session') {
-    if (last.kind === 'usage_limit') return stop('usage_limit', 'usage limit reached: the run stops and every state is left as it is', { resetAt: isoOrNull(last.resetAt) });
-    if (['timeout', 'no_result', 'other'].includes(last.kind)) return stop('interrupted', `the ${last.kind === 'timeout' ? 'session timed out' : 'session ended without a result'}: the run stops and the branch is left as it is`);
+    if (last.kind === 'usage_limit') {
+      if (!USAGE_KINDS.has(last.limit)) return hold('unknown_result', 'a usage limit of an unknown kind');
+      return { do: 'interrupt', kind: 'usage_limit', limit: last.limit, resetAt: isoOrNull(last.resetAt) };
+    }
+    if (last.kind === 'timeout') {
+      const n = f.timeouts ?? 0;
+      if (!isCount(n)) return hold('limits', 'session timeout counter unknown');
+      if (n >= MAX_TIMEOUTS) return block(`the session timed out ${n} times`);
+      return { do: 'interrupt', kind: 'timeout' };
+    }
+    if (last.kind === 'stopped') return { do: 'interrupt', kind: 'stop' };
+    if (last.kind === 'budget') {
+      if (!BUDGET_SCOPES.has(last.scope)) return hold('unknown_result', 'a budget result of an unknown scope');
+      return { do: 'interrupt', kind: 'budget', scope: last.scope };
+    }
+    // The driver kept its work (WIP commit, f.interrupted) before deciding: the run stops without waiting, the next run continues.
+    if (['no_result', 'other'].includes(last.kind)) return stop('interrupted', 'the session ended without a result: its work is kept on the branch and the run stops');
     if (last.kind === 'settings_unsafe') return hold('settings_unsafe', `user Claude settings are unsafe for unattended sessions (${categories(last.keys).join(', ') || 'unknown'}): fix them, then run again`);
     if (last.kind === 'spawn_failed' || last.kind === 'unsafe_binary') return hold('environment', last.kind === 'spawn_failed' ? 'the claude binary could not be started' : 'the claude binary resolves inside the session working directory');
     if (st !== 'building' && st !== 'fixing') return hold('inconsistent', `a builder session result for a feature in "${st}"`);
   }
+  // A stopped CI wait (stop --now) is an interruption too: the run stops and the feature continues from CI next time.
+  if (last?.step === 'ci' && last.kind === 'stopped') return { do: 'interrupt', kind: 'stop' };
   if (last && last.kind === 'error') return hold('error', `the ${last.step} step failed: a person looks at it`);
 
   switch (st) {
     case 'queued':
       return last === null ? next(run) : hold('inconsistent', `a ${last.step} result for a queued feature`);
 
-    case 'building':
+    case 'building': {
+      const ist = interruptedStep(f);
+      if (ist === 'bad') return badInterrupted(f);
+      if (last === null && ist !== 'none') return { do: 'build', brief: 'build', continue: true };
       if (last === null || is(last, 'next', 'ok')) return { do: 'build', brief: 'build' };
       if (is(last, 'session', 'done')) return { do: 'built' };
       if (is(last, 'session', 'blocked')) return block(`builder blocked: ${last.question || 'no_question'}`);
@@ -149,6 +193,7 @@ function decide(f, lastResult, run) {
         return { do: 'build', brief: 'local_fix' };
       }
       return hold('inconsistent', `a ${last.step} ${last.kind} result for a building feature`);
+    }
 
     case 'built':
       if (last === null || is(last, 'built', 'ok')) return { do: 'pr' };
@@ -166,6 +211,9 @@ function decide(f, lastResult, run) {
     case 'fixing': {
       const brief = fixKind(f);
       if (!brief) return hold('inconsistent', 'fixing, but the history does not say whether CI or verification failed');
+      const ist = interruptedStep(f);
+      if (ist === 'bad') return badInterrupted(f);
+      if (last === null && ist !== 'none') return { do: 'build', brief, continue: true };
       if (last === null || is(last, 'fix', 'ok')) return { do: 'build', brief };
       if (is(last, 'session', 'done')) return { do: 'push' };
       if (is(last, 'session', 'blocked')) return block(`builder blocked: ${last.question || 'no_question'}`);
@@ -208,6 +256,8 @@ function decide(f, lastResult, run) {
 //   verdict: 'pass' | 'fail' | 'absent' | 'mismatch' (stored verdict for pr_head checked against the current hashes),
 //   orphans_alive: process groups from the old lock still alive after killOrphans, leftover_worktrees: evaluation worktrees left,
 //   resumes: how many times this feature was already resumed after a crash. These last three are REQUIRED for every state.
+// A building or fixing feature with f.interrupted ended its step knowingly (limit, budget, stop, timeout): it is not a crash, so
+// the resume cap does not apply and the step continues from the branch (continue: true) instead of a reset rebuild.
 const FACT_TYPES = {
   branch_exists: (v) => typeof v === 'boolean', dirty: (v) => typeof v === 'boolean', pr_exists: (v) => typeof v === 'boolean',
   ahead: isCount, orphans_alive: isCount, leftover_worktrees: isCount, resumes: isCount,
@@ -216,8 +266,8 @@ const FACT_TYPES = {
 };
 const need = (facts, ...keys) => keys.every((k) => own(facts, k) && FACT_TYPES[k](facts[k]));
 
-// resumeAction(feature, facts, run?) -> same shape as nextAction; adds `reset: true` (reset the branch to base first) and
-// `reopen: true` (ci_passed/verified -> pr_open first, then CI and verification again).
+// resumeAction(feature, facts, run?) -> same shape as nextAction; adds `reset: true` (reset the branch to base first),
+// `reopen: true` (ci_passed/verified -> pr_open first, then CI and verification again) and `continue: true` (interrupted step).
 function resume(f, facts, run) {
   if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return hold('unknown_result', 'no restart facts');
   if (!f || typeof f !== 'object' || !knownState(f.state)) return hold('unknown_state', `unknown feature state "${cut(f?.state ?? '', 40)}"`);
@@ -228,8 +278,10 @@ function resume(f, facts, run) {
   if (!isCount(maxResumes)) return hold('limits', 'resume limit unknown');
   if (facts.orphans_alive > 0 || facts.leftover_worktrees > 0) return stop('leftovers', 'process groups or evaluation worktrees from the earlier run are still present: remove them first', { attention: true });
 
-  // A feature that keeps crashing the driver is not resumed forever.
-  if (ACTIVE.includes(f.state) && facts.resumes >= maxResumes) return hold('resume_loop', `resumed ${facts.resumes} times already: a person looks at it`);
+  const ist = Object.hasOwn(STEP_OF, f.state) ? interruptedStep(f) : 'none';
+  if (ist === 'bad') return badInterrupted(f);
+  // A feature that keeps crashing the driver is not resumed forever (an interrupted step is not a crash).
+  if (ACTIVE.includes(f.state) && ist === 'none' && facts.resumes >= maxResumes) return hold('resume_loop', `resumed ${facts.resumes} times already: a person looks at it`);
 
   switch (f.state) {
     case 'building':
@@ -237,6 +289,8 @@ function resume(f, facts, run) {
       if (facts.branch_exists && need(facts, 'ahead') && facts.ahead >= 1 && facts.result === 'done' && !facts.dirty) return { do: 'built' };
       if (facts.branch_exists && !need(facts, 'ahead')) return hold('unknown_result', 'restart fact ahead is missing');
       if (facts.result === 'blocked') return block('builder blocked (result found after a restart)'); // the "builder blocked" row
+      // Interrupted: keep the branch (WIP commit included) and continue; with no branch left there is nothing to continue from.
+      if (ist !== 'none' && facts.branch_exists) return { do: 'build', brief: 'build', continue: true };
       return { do: 'build', brief: 'build', reset: true };
 
     case 'built':
@@ -256,7 +310,7 @@ function resume(f, facts, run) {
       if (typeof ciHead !== 'string' || !SHA.test(ciHead)) return hold('inconsistent', 'the head of the last CI run is not recorded');
       // A moved head is pushed only when the fix session finished (result done): a crash mid-session leaves partial commits.
       if (facts.head !== ciHead && !facts.dirty && facts.result === 'done') return { do: 'push' };
-      return { do: 'build', brief };
+      return ist !== 'none' ? { do: 'build', brief, continue: true } : { do: 'build', brief };
     }
 
     case 'ci_passed':

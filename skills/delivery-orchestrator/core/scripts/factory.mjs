@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { factoryHome, repoKey } from './lib/factoryhome.mjs';
 import { gitSafeOpts, gitEnv, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs, checkNoHooks, checkNetworkArgs, GIT_SAFE_FLAGS } from './lib/gitsafe.mjs';
@@ -25,13 +25,24 @@ import { FEATURE_ID, ACTIVE, transition, frontmatter, discover, buildQueue, runS
 import { specFromBase, extractCriteria, criteriaHash, MAX_LINE } from './lib/criteria.mjs';
 import { loadScenarios, saveScenarios, lintScenarios, isCurrentApproved, approve, newCanary, checkRepoKey, scenariosHash } from './lib/scenarios.mjs';
 import { runSession, materialiseSettings, renderPrompt, defaultHome, readBuilderResult } from './lib/sessions.mjs';
-import { sessionResult, nextAction, resumeAction, canHold } from './lib/driver.mjs';
-import { acquire, LockError } from './lib/lock.mjs';
-import { verifyFeature, scanSurvivors, symptomBrief, postVerified } from './lib/verify.mjs';
+import { sessionResult, nextAction, resumeAction, canHold, MAX_RESUMES } from './lib/driver.mjs';
+import { acquire, inspect, LockError } from './lib/lock.mjs';
+import { verifyFeature, scanSurvivors, survivorPids, symptomBrief, postVerified } from './lib/verify.mjs';
+import { portOf, portInUse } from './lib/proc.mjs';
+import { makeRunTemp } from './lib/sandbox.mjs';
 import { readVerdict, verdictMatches } from './lib/verdict.mjs';
 import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
 import { requiredStatusChecks } from './lib/readiness.mjs';
 import { readJson, writeJsonAtomic } from './lib/factoryhome.mjs';
+import { loadLocalConfig } from './lib/localconfig.mjs';
+import { CLASSIFIER_STATUS } from './lib/limits.mjs';
+import { addUsage, dayUsage, featureUsage, UsageError } from './lib/usage.mjs';
+import { checkBudget } from './lib/budget.mjs';
+import { addAttention, listAttention, resolveAttention } from './lib/attention.mjs';
+import { loadProbeResult, whyUnproven, HARD_STOPS, builderSettingsSha, PROBE_RUN } from './lib/hardstops.mjs';
+import { routeInterruption } from './lib/interrupt.mjs';
+import { readRun, updateRun, RunStateError } from './lib/runstate.mjs';
+import { notify } from './lib/notify.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 export const DELIVER = path.join(path.dirname(SELF), 'deliver.mjs');
@@ -48,10 +59,13 @@ export class Refusal extends Error { constructor(msg, fix) { super(msg); this.fi
 // Something from a dead or escaped session may still be running in the builder clone: no git call there, the run stops.
 class Leftover extends Error {}
 class Unsafe extends Error {}
+// The WIP commit of an interrupted session failed (e.g. a .git/index.lock left by the killed session): the run stops, f.interrupted
+// stays set and neither branch is touched, so the next run continues from the builder clone instead of a reset rebuild.
+class WipFailed extends Error {}
 const refuse = (msg, fix) => { throw new Refusal(msg, fix); };
 
 // ---- argv -----------------------------------------------------------------------------------------------------------------------
-const BOOL = new Set([]);
+const BOOL = new Set(['continue', 'now', 'json']);
 export function parseArgs(argv) {
   const opt = {}; const pos = [];
   for (let i = 0; i < argv.length; i++) {
@@ -235,7 +249,10 @@ export function scenarioState(key, id, bc, mode) {
   return { ok: true, doc };
 }
 
-export function makeContext({ argv, deps = {} }) {
+// The driver's wall clock (budget day, waits). Tests inject a fake one through deps.clock.
+const REAL_CLOCK = Object.freeze({ now: () => Date.now(), sleep: (ms) => new Promise((r) => { setTimeout(r, ms); }) });
+export function makeContext({ argv, deps: given = {} }) {
+  const deps = { ...given, clock: given.clock || REAL_CLOCK };
   const env = deps.env || process.env;
   const out = deps.out || ((line) => process.stdout.write(`${line}\n`));
   const ghEnv = {};
@@ -260,6 +277,14 @@ function useAccount(ctx, account, host) {
 export function prepare(ctx) {
   const { opt } = ctx.args;
   ctx.fh = homeDir(ctx.env);
+  // The per-user run-control config (FACTORY_HOME/config.json). Any error refuses: its returned config is never used then (a
+  // refused wait_for_reset: true still comes back true). The classifier gate: wait_for_reset needs a validated classifier.
+  // CLASSIFIER_STATUS becomes 'real' once the classifier is validated against a captured limit event; until then only the test
+  // seam deps.classifierReal lets config.json turn wait_for_reset on.
+  ctx.classifierReal = ctx.deps.classifierReal === true || CLASSIFIER_STATUS === 'real';
+  const lc = loadLocalConfig(ctx.fh, { classifierReal: ctx.classifierReal });
+  if (lc.errors.length) refuse(`the local config is invalid: ${lc.errors.join('; ')}`, `fix ${path.join(ctx.fh, 'config.json')} (or remove it to use the defaults)`);
+  ctx.local = lc.config;
   const dir = path.resolve(opt.dir || process.cwd());
   ctx.id = identify(ctx, dir);
   ctx.key = ctx.id.key;
@@ -324,11 +349,184 @@ export function parseAuthorReply(text) {
 }
 
 function usageEntry(role, r) {
-  return { role, id: r?.sessionId ?? null, in: r?.usage?.in ?? 0, out: r?.usage?.out ?? 0, cache_create: r?.usage?.cache_create ?? 0, cache_read: r?.usage?.cache_read ?? 0, turns: r?.turns ?? 0 };
+  const cost = r?.costUsd;
+  return { role, id: r?.sessionId ?? null, in: r?.usage?.in ?? 0, out: r?.usage?.out ?? 0, cache_create: r?.usage?.cache_create ?? 0, cache_read: r?.usage?.cache_read ?? 0, turns: r?.turns ?? 0, cost_usd: typeof cost === 'number' && Number.isFinite(cost) ? cost : null };
+}
+
+// ---- budgets ----------------------------------------------------------------------------------------------------------------------
+// The daily usage store is read-modify-write without a lock of its own: only the driver that holds this repository's lock writes it.
+function recordUsage(ctx, entry) {
+  if (!ctx.lock?.owned()) throw new Error('the factory lock is no longer ours');
+  addUsage(ctx.fh, ctx.key, new Date(ctx.deps.clock.now()), entry);
+}
+const capOk = (x) => typeof x === 'number' && Number.isFinite(x) && x >= 0;
+// The feature caps: the raised cap of the feature (f.budget_cap, set by --raise-budget) or the base policy's budgets.feature. A
+// malformed cap throws: a budget never fails open.
+export function featureCaps(ctx, f) {
+  const raised = f && f.budget_cap !== undefined && f.budget_cap !== null;
+  const caps = raised ? f.budget_cap : ctx.policy?.budgets?.feature;
+  if (!caps || typeof caps !== 'object' || !capOk(caps.tokens) || !capOk(caps.turns)) throw new Error(`the ${raised ? `raised budget cap of ${f.id}` : 'feature budget cap'} is malformed`);
+  return { tokens: caps.tokens, turns: caps.turns };
+}
+// Called before every builder and author session. Detects only (the caller's `interrupt` action holds or stops): null, or the
+// session result { step: 'session', kind: 'budget', scope: 'feature' | 'day', dim, used, cap }. Author sessions have no queue
+// feature and are checked against the day cap only. A corrupt usage store throws UsageError.
+export function enforceBudget(ctx, f, role) {
+  let caps = featureCaps(ctx, role === 'author' ? null : f);
+  const dayCap = ctx.local?.budgets ? ctx.local.budgets.day_tokens : undefined;
+  if (dayCap !== null && !capOk(dayCap)) throw new Error('the day budget cap is malformed');
+  const feat = role !== 'author' && f ? featureUsage(f) : null;
+  if (!feat) caps = { tokens: Infinity, turns: Infinity };
+  const day = dayCap === null ? { tokens: 0, turns: 0 } : dayUsage(ctx.fh, new Date(ctx.deps.clock.now()));
+  const r = checkBudget({ feature: feat || { tokens: 0, turns: 0 }, caps, day, dayCap });
+  return r.ok ? null : { step: 'session', kind: 'budget', scope: r.scope, dim: r.dim, used: r.used, cap: r.cap };
+}
+// Fail closed at start: an unreadable or corrupt daily usage file refuses the command before any session.
+function usagePreflight(ctx) {
+  try { dayUsage(ctx.fh, new Date(ctx.deps.clock.now())); } catch (e) {
+    if (e instanceof UsageError) refuse(e.message, 'fix or remove that file by hand (it is the daily token record), then run again');
+    throw e;
+  }
+}
+
+// ---- interruptions: waiting, run state, notifications ------------------------------------------------------------------------------
+const isoAt = (ms) => new Date(ms).toISOString();
+// The stop flag FACTORY_HOME/stop/<repo-key>, written by `factory stop` as { at, now }. stopRequested -> { now } | null: any file there
+// is a stop (an empty or unreadable one is a graceful stop: a stop is never missed because its content cannot be read).
+const STOP_FLAG = (ctx) => path.join(ctx.fh, 'stop', ctx.key);
+export function stopRequested(ctx) {
+  const file = STOP_FLAG(ctx);
+  try { fs.lstatSync(file); } catch { return null; }
+  let o = null;
+  try { o = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { o = null; }
+  return { now: o?.now === true };
+}
+const STOP_POLL_MS = 5000; // the stop flag is checked this often during sessions and the CI wait
+const KILL_GRACE_MS = 10000; // SIGTERM to a session's (or deliver's) process group, SIGKILL after this
+// runSession options of every session: the stop flag (graceful or --now) ends it, polled every 5 s.
+const sessionStop = (ctx) => ({ shouldAbort: () => stopRequested(ctx) !== null, abortPollMs: STOP_POLL_MS, killGraceMs: KILL_GRACE_MS });
+const alivePid = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
+// After a stop: the processes still running IN the builder clone, the builder run dirs, the driver clone or the verification work
+// dirs (their cwd is inside one) or started in one of THIS driver's sandboxes (TMPDIR/HOME inside this repository's builder run dir
+// or a verification run temp this driver created, ctx.runTemps; never FACTORY_HOME/tmp as a whole: it holds every repository's run
+// temps, and another repository's driver may be verifying right now) get SIGTERM, then
+// SIGKILL after 10 s if a fresh scan still finds them (a pid that exited and was reused meanwhile is not signalled). A process that
+// only mentions those paths in its argv or environment (an editor, `git -C <clone>`, a shell) is never killed, and neither is one
+// with a controlling terminal whose cwd is in them (a person's shell or editor opened in a clone; sessions and apps are started
+// detached, without one): the broad detection (noLiveBuilder, the next start's sweep) refuses to continue instead. Then the app
+// ports of the base config must be free. Never this process or its parent. Best effort: what is left is reported.
+export async function killLeftovers(ctx) {
+  const markers = [ctx.bRoot && path.join(ctx.bRoot, ctx.key), ctx.bRoot && builderRun(ctx), ctx.D, ctx.fh && ctx.key && path.join(ctx.fh, 'work', ctx.key)].filter(Boolean);
+  const real = (d) => { try { return fs.realpathSync(d); } catch { return d; } }; // /tmp vs /private/tmp on macOS
+  const sandbox = [...new Set([ctx.bRoot && builderRun(ctx), ...(ctx.runTemps || [])].filter(Boolean).map(real))];
+  const scan = ctx.deps.survivorPids || survivorPids;
+  const killable = () => new Set([...(scan(markers, { sandbox }).killable || [])].filter((p) => p !== process.pid && p !== process.ppid));
+  const pids = [...killable()];
+  if (pids.length) {
+    for (const p of pids) try { process.kill(p, 'SIGTERM'); } catch { /* gone */ }
+    const end = Date.now() + KILL_GRACE_MS;
+    while (pids.some(alivePid) && Date.now() < end) await new Promise((r) => { setTimeout(r, 100); });
+    const still = pids.filter(alivePid);
+    if (still.length) { const now = killable(); for (const p of still.filter((x) => now.has(x))) try { process.kill(p, 'SIGKILL'); } catch { /* gone */ } }
+    ctx.out(`stop: ${pids.length} leftover process(es) ended`);
+  }
+  const app = ctx.policy?.app || {};
+  for (const u of [...new Set([app.ready?.url, app.base_url].filter(Boolean))]) {
+    let port; try { port = portOf(u); } catch { continue; }
+    let busy = true;
+    for (let i = 0; i < 20 && busy; i++) { busy = await (ctx.deps.portInUse || portInUse)(port, new URL(u).hostname); if (busy) await new Promise((r) => { setTimeout(r, 100); }); }
+    if (busy) ctx.out(`warning: app port ${port} is still in use after the stop`);
+  }
+}
+// The verification seams with makeRunTemp recorded: each run temp this driver creates goes on ctx.runTemps (the stop sweep's env roots).
+export function verifySeamsFor(ctx) {
+  const given = ctx.deps.verifySeams || {};
+  const make = given.makeRunTemp || makeRunTemp;
+  return { ...given, makeRunTemp: (...a) => { const d = make(...a); (ctx.runTemps ||= []).push(d); return d; } };
+}
+// How long this feature (or author spec) already waited for a usage limit, and how many rate retries it used. Per feature: a new
+// feature starts at zero, and a session that ends normally resets it.
+function waitState(ctx, id) {
+  if (ctx.waits?.id !== id) ctx.waits = { id, ms: 0, rate: 0 };
+  return ctx.waits;
+}
+// routeInterruption for a session's usage-limit result, as { do: 'stop', reason } | { do: 'switch_model', model } |
+// { do: 'wait', until, estimated, commit() } (a rate retry is a short wait; commit() books the wait once it ended).
+function routeLimit(ctx, r, ws) {
+  // Already on the fallback model: switching again would loop on the same limit.
+  if (r.limit === 'model' && ctx.modelOverride && ctx.modelOverride === ctx.local?.fallback_model) return { do: 'stop', reason: 'model limit: the fallback model is limited too' };
+  const now = ctx.deps.clock.now();
+  const x = routeInterruption({ limit: r.limit, resetAt: r.resetAt, nowMs: now, local: ctx.local, waitedMs: ws.ms, rateAttempt: ws.rate });
+  if (x.do === 'stop' || x.do === 'switch_model') return x;
+  if (x.do === 'retry') return { do: 'wait', until: now + x.afterS * 1000, estimated: false, commit: () => { ws.rate++; } };
+  if (x.do === 'wait') return { do: 'wait', until: x.untilMs, estimated: x.estimated === true, commit: () => { ws.ms += x.untilMs - now; } };
+  return { do: 'stop', reason: 'unknown interruption route' };
+}
+function nextMidnight(ctx) { const d = new Date(ctx.deps.clock.now()); d.setHours(24, 0, 0, 0); return d.getTime(); }
+// Notifications carry the repo key, the event and a count only. Never fatal: a notification is a courtesy.
+function tell(ctx, event) {
+  let count = 0;
+  try {
+    const fs0 = ctx.queueFile && fs.existsSync(ctx.queueFile) ? readQueue(ctx).features : [];
+    count = event === 'finished' ? fs0.filter((f) => f.state === 'merged').length : fs0.filter((f) => !TERMINAL.includes(f.state)).length;
+  } catch { count = 0; }
+  try { (ctx.deps.notify || notify)(event, { key: ctx.key, count }); } catch { /* best effort */ }
+}
+// caffeinate -i -w <driver pid>: prevents idle sleep while the driver waits (not a closed lid). argv only, detached from stdio.
+function keepAwake(ctx) {
+  if (ctx.local?.keep_awake !== true || (ctx.deps.platform || process.platform) !== 'darwin') return null;
+  const argv = ['caffeinate', '-i', '-w', String(process.pid)];
+  if (ctx.deps.keepAwake) return ctx.deps.keepAwake(argv);
+  try {
+    const c = spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' });
+    c.on('error', () => { /* no caffeinate: the wall-clock check still holds */ });
+    c.unref();
+    return { kill: () => { try { c.kill(); } catch { /* gone */ } } };
+  } catch { return null; }
+}
+// waitUntil(ctx, untilMs, pause?) -> 'done' | 'stopped'. Sleeps in slices of at most 30 s and re-reads the wall clock after each,
+// so a laptop sleep or clock jump ends the wait at the next slice and never stretches it; the slept time is also bounded by the
+// planned wait, so a clock that never gets there cannot hold the run forever. Each slice: the stop flag, the lock, the run state
+// (status paused with pause { kind, limit?, reset_at, estimated }). Done: back to running.
+export async function waitUntil(ctx, untilMs, pause = {}) {
+  const clock = ctx.deps.clock;
+  const planned = Math.max(0, untilMs - clock.now());
+  const patch = { status: 'paused', pause: { kind: pause.kind || 'usage_limit', ...(pause.limit ? { limit: pause.limit } : {}), reset_at: isoAt(untilMs), estimated: pause.estimated === true } };
+  let slept = 0;
+  const awake = keepAwake(ctx);
+  try {
+    for (;;) {
+      if (stopRequested(ctx)) { runPatch(ctx, patch); return 'stopped'; }
+      if (ctx.lock && !ctx.lock.owned()) throw new Error('the factory lock is no longer ours');
+      const left = Math.min(untilMs - clock.now(), planned - slept);
+      if (left <= 0) break;
+      runPatch(ctx, patch);
+      const ms = Math.min(30000, left);
+      await clock.sleep(ms);
+      slept += ms;
+    }
+  } finally { try { awake?.kill(); } catch { /* gone */ } }
+  runPatch(ctx, { status: 'running', pause: null });
+  return 'done';
+}
+// The run state of a wait. `factory run` owns the run state (errors propagate). `factory scenarios` (ctx.scenarioRun) writes only the
+// state of its own waits, never over a run's stopped or paused state (ctx.scenarioRun.keep), and never fails because of it.
+function runPatch(ctx, patch) {
+  if (!ctx.scenarioRun) { updateRun(ctx.fh, ctx.key, patch); return; }
+  if (ctx.scenarioRun.keep) return;
+  try { updateRun(ctx.fh, ctx.key, patch); ctx.scenarioRun.wrote = true; } catch { /* the terminal lines are the record */ }
+}
+// A wait with its terminal line and the paused notification.
+async function pauseFor(ctx, untilMs, pause) {
+  ctx.out(`paused: ${pause.kind}${pause.limit ? ` ${pause.limit}` : ''} until ${isoAt(untilMs)}${pause.estimated ? ' (estimated)' : ''}`);
+  tell(ctx, 'paused');
+  return waitUntil(ctx, untilMs, pause);
 }
 
 // One author session: an empty directory under FACTORY_HOME/run/, no tools, the spec items passed by the driver.
 async function authorOne(ctx, spec, bc) {
+  const budget = enforceBudget(ctx, null, 'author');
+  if (budget) return { status: 'error', kind: 'budget', budget };
   const canary = newCanary();
   const prompt = renderPrompt('scenario-author', { FEATURE_ID: spec.id, CANARY: canary, SPEC_SECTIONS: specSections(bc.criteria) });
   const runRoot = privateDir(path.join(privateDir(path.join(ctx.fh, 'run')), 'author'));
@@ -340,7 +538,8 @@ async function authorOne(ctx, spec, bc) {
     const v = ctx.policy.verification;
     r = await (ctx.deps.runSession || runSession)({
       role: 'author', cwd, prompt, settingsFile, maxTurns: v.max_turns.author, timeoutS: v.session_timeout_s.author,
-      ...(v.model.author ? { model: v.model.author } : {}), home, baseEnv: ctx.env,
+      ...(ctx.modelOverride || v.model.author ? { model: ctx.modelOverride || v.model.author } : {}), home, baseEnv: ctx.env,
+      ...sessionStop(ctx),
       onSpawn: (x) => { try { ctx.lock.recordGroup(x.pgid); pgid = x.pgid; } catch { /* recorded best effort */ } },
     });
   } catch (e) {
@@ -350,8 +549,10 @@ async function authorOne(ctx, spec, bc) {
     if (pgid) try { ctx.lock.forgetGroup(pgid); } catch { /* kept: killed on the next start */ }
     fs.rmSync(cwd, { recursive: true, force: true });
   }
+  if (r) recordUsage(ctx, usageEntry('author', r));
   const s = sessionResult(r, { status: 'done' });
-  if (s.kind !== 'done') return { status: 'error', kind: s.kind, usage: usageEntry('author', r) };
+  if (s.kind !== 'done') return { status: 'error', kind: s.kind, limit: s.limit, resetAt: s.resetAt, usage: usageEntry('author', r) };
+  if (ctx.waits?.id === `author:${spec.id}`) ctx.waits = null;
   const scenarios = parseAuthorReply(r.result);
   if (!scenarios) return { status: 'invalid', problems: ['the author reply is not one JSON object with a scenarios array'], usage: usageEntry('author', r) };
   const doc = { feature: spec.id, criteria_hash: bc.hash, canary, scenarios };
@@ -364,34 +565,79 @@ export async function cmdScenarios(ctx) {
   const { opt } = ctx.args;
   if (opt.approve !== undefined) return approveCmd(ctx, opt.approve, opt.by);
   const only = idList(opt.only);
+  // A stop flag found here predates this command, and no run is live (scenarios holds the repository lock): it cannot stop
+  // anything, so it is cleared (said in one line) instead of locking authoring out. A stop written while scenarios runs still
+  // aborts its author sessions.
+  if (stopRequested(ctx)) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('scenarios: a stop request left with no run active is cleared'); }
+  usagePreflight(ctx);
+  // Run state: scenarios writes only the state of its own waits, and never over a stopped or paused run (Task 9).
+  let prior = null;
+  try { prior = readRun(ctx.fh, ctx.key); } catch { prior = { status: 'unreadable' }; }
+  ctx.scenarioRun = { keep: !!prior && prior.status !== 'finished', wrote: false };
+  const endRun = (status) => { if (ctx.scenarioRun.wrote) runPatch(ctx, { status, pause: null, ended_at: isoAt(ctx.deps.clock.now()) }); };
   const specs = baseSpecs(ctx.git, ctx.base, ctx.policy.features_dir);
   for (const id of only) if (!specs.some((s) => s.id === id)) refuse(`--only names ${id}, which has no spec on origin/${ctx.base}`);
   const pick = specs.filter((s) => (only.length ? only.includes(s.id) : s.status === 'ready' && s.delivery !== 'complete'));
   const mode = ctx.policy.verification.scenario_approval;
   const counts = { stored: 0, current: 0, awaiting_approval: 0, invalid: 0, criteria_errors: 0, failed: 0 };
   let code = 0;
-  for (const spec of pick) {
+  for (let i = 0; i < pick.length; i++) {
+    const spec = pick[i];
     const bc = baseCriteria(ctx.git, ctx.base, spec.rel);
     if (!bc || !bc.criteria.ok) { counts.criteria_errors++; ctx.out(`${spec.id} criteria: ${bc ? bc.criteria.errors.length : 1} error(s) in the base spec; fix the spec first`); code = 1; continue; }
     const now = scenarioState(ctx.key, spec.id, bc, mode);
     if (now.ok) { counts.current++; ctx.out(`${spec.id} scenarios: current and approved`); continue; }
-    if (now.why === 'unapproved') { counts.awaiting_approval++; ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
+    if (now.why === 'unapproved') { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
     const r = await authorOne(ctx, spec, bc);
     if (r.status === 'error') {
-      counts.failed++;
       ctx.out(`${spec.id} author session: ${r.kind}`);
-      if (r.kind === 'usage_limit') { ctx.out('usage limit reached: stopping; run again later'); return 2; }
+      // Interrupted author sessions are restarted from scratch (no partial context) after the same wait; a stop ends the command.
+      if (r.kind === 'usage_limit' || r.kind === 'budget') {
+        if (await authorInterrupt(ctx, spec, r) === 'retry') { i--; continue; }
+        endRun('stopped');
+        return 2;
+      }
+      if (r.kind === 'stopped') { ctx.out('stopped: stop'); endRun('stopped'); return 2; } // factory stop during the author session
+      counts.failed++;
       code = 1; continue;
     }
     if (r.status === 'invalid') { counts.invalid++; ctx.out(`${spec.id} scenarios rejected: ${r.problems.length} problem(s)`); for (const p of r.problems.slice(0, 50)) ctx.out(`  ${p}`); code = 1; continue; }
     const doc = mode === 'auto' ? approve(r.doc, 'auto') : r.doc;
     saveScenarios(ctx.key, spec.id, doc);
-    if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto`); } else { counts.awaiting_approval++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); }
+    if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto`); } else { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); }
   }
   ctx.out(`scenarios: ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+  endRun('finished');
   return code;
 }
 
+// An author session hit by a usage limit or the day cap: 'retry' (after the wait, a model switch) or 'stop' (printed here).
+async function authorInterrupt(ctx, spec, r) {
+  const stopA = (kind, reason) => {
+    ctx.out(`stopped: ${kind}`);
+    ctx.out(`${kind === 'usage_limit' ? 'usage limit' : 'reason'}: ${clean(reason, 200)}`);
+    limitNote(ctx, kind);
+    addAttention(ctx.fh, ctx.key, { id: spec.id, kind, severity: 'high', what: clean(reason, 200), run: 'factory scenarios' });
+    return 'stop';
+  };
+  if (r.kind === 'budget') {
+    if (ctx.local.wait_for_reset !== true) return stopA('day_budget', 'the daily token cap is reached');
+    return await pauseFor(ctx, nextMidnight(ctx), { kind: 'day_budget' }) === 'stopped' ? stopA('stop', 'a stop was requested during the wait') : 'retry';
+  }
+  const ws = waitState(ctx, `author:${spec.id}`);
+  const route = routeLimit(ctx, r, ws);
+  if (route.do === 'stop') return stopA('usage_limit', route.reason);
+  if (route.do === 'switch_model') { ctx.modelOverride = route.model; ctx.out(`${spec.id} model limit: the next session uses fallback_model`); return 'retry'; }
+  const res = await pauseFor(ctx, route.until, { kind: 'usage_limit', limit: r.limit, estimated: !!route.estimated });
+  if (res === 'stopped') return stopA('stop', 'a stop was requested during the wait');
+  route.commit();
+  return 'retry';
+}
+
+// A scenario set that waits for a person's approval: one row until `factory scenarios --approve` (fixed text, no spec content).
+function approvalRow(ctx, id) {
+  try { addAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval', severity: 'medium', what: 'scenarios wait for your approval', run: `factory scenarios --approve ${id} --by <name>` }); } catch { /* the terminal line names the command */ }
+}
 function approveCmd(ctx, id, by) {
   if (!FEATURE_ID.test(String(id))) refuse('--approve needs a feature id like FEATURE-001');
   if (typeof by !== 'string' || !BY.test(by)) refuse('--approve needs --by <name> (1-64 characters of letters, digits, _ . @ -)');
@@ -400,10 +646,11 @@ function approveCmd(ctx, id, by) {
   if (!spec) refuse(`${id} has no spec on origin/${ctx.base}`);
   const bc = baseCriteria(ctx.git, ctx.base, spec.rel);
   const st = scenarioState(ctx.key, id, bc, ctx.policy.verification.scenario_approval);
-  if (st.ok) { ctx.out(`${id} scenarios: already approved`); return 0; }
+  if (st.ok) { try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval' }); } catch { /* advisory */ } ctx.out(`${id} scenarios: already approved`); return 0; }
   if (st.why !== 'unapproved') refuse(`${id} has no current scenarios to approve (${st.why}${st.problems ? `: ${st.problems.length} problem(s)` : ''})`, `run "factory scenarios --only ${id}" first`);
   const { approved: _drop, ...doc } = st.doc;
   saveScenarios(ctx.key, id, approve(doc, by));
+  try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval' }); } catch { /* advisory */ }
   ctx.out(`${id} scenarios: approved`);
   return 0;
 }
@@ -450,14 +697,78 @@ const saveQueue = (ctx, q) => writeJsonAtomic(ctx.queueFile, q);
 // Read-modify-write of one feature (after deliver saved its own changes).
 function update(ctx, id, fn) { const q = readQueue(ctx); const f = q.features.find((x) => x.id === id); fn(f, q); saveQueue(ctx, q); return f; }
 
-// deliver as a subprocess in the driver clone, the clone preflighted first (deliver's own git is plain git).
+// deliver as a subprocess in the driver clone, the clone preflighted first (deliver's own git is plain git). FACTORY_DRIVER_PID
+// lets the driver's own calls past deliver's interactive guard (a convenience guard against a person racing the driver, not a
+// security control: anyone can set it).
+const deliverEnv = (ctx) => ({ ...ctx.env, FACTORY_HOME: ctx.fh, DELIVER_QUEUE: ctx.queueFile, FACTORY_DRIVER_PID: String(process.pid) });
 function deliver(ctx, ...args) {
   preflight(ctx.D, ctx.id.url);
   if (!ctx.lock.owned()) throw new Error('the factory lock is no longer ours');
-  const r = run(process.execPath, [DELIVER, ...args, '--dir', ctx.D], { cwd: ctx.D, env: { ...ctx.env, FACTORY_HOME: ctx.fh, DELIVER_QUEUE: ctx.queueFile }, timeout: 6 * 3600 * 1000 });
+  const r = run(process.execPath, [DELIVER, ...args, '--dir', ctx.D], { cwd: ctx.D, env: deliverEnv(ctx), timeout: 6 * 3600 * 1000 });
   return { code: r.code, json: json(r.out) };
 }
-function attention(ctx, id, state, kind) {
+// deliver for a long wait (the CI wait): spawned in its own process group (recorded in the lock, so a crashed driver's next start
+// kills it), the stop flag polled every 5 s. A --now stop sends SIGTERM to the group and SIGKILL 10 s later -> { stopped: true }; a
+// graceful stop lets it finish (the run stops before the next step). Otherwise { code, json } as deliver().
+function deliverWatch(ctx, ...args) {
+  preflight(ctx.D, ctx.id.url);
+  if (!ctx.lock.owned()) throw new Error('the factory lock is no longer ours');
+  return new Promise((resolve) => {
+    let c;
+    try { c = spawn(process.execPath, [DELIVER, ...args, '--dir', ctx.D], { cwd: ctx.D, env: deliverEnv(ctx), detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); } catch { resolve({ code: 1, json: null }); return; }
+    let out = ''; let stopped = false; let killT = null; let settled = false;
+    const group = (sig) => { try { process.kill(-c.pid, sig); } catch { /* gone */ } };
+    if (c.pid) try { ctx.lock.recordGroup(c.pid); } catch { /* recorded best effort */ }
+    c.stdout.on('data', (d) => { if (out.length < 16 * 1024 * 1024) out += d; });
+    c.stderr.on('data', () => { /* drained: deliver's errors are not driver output */ });
+    const poll = setInterval(() => {
+      if (stopped || stopRequested(ctx)?.now !== true) return;
+      stopped = true;
+      group('SIGTERM');
+      killT = setTimeout(() => group('SIGKILL'), KILL_GRACE_MS);
+    }, STOP_POLL_MS);
+    const cap = setTimeout(() => group('SIGKILL'), 6 * 3600 * 1000);
+    const done = (code) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll); clearTimeout(cap); if (killT) clearTimeout(killT);
+      // A killed wait: nothing of its group outlives the step (only while the group still has members: an empty pgid may be reused).
+      if (stopped) { let members = false; try { process.kill(-c.pid, 0); members = true; } catch (e) { members = e?.code === 'EPERM'; } if (members) group('SIGKILL'); }
+      if (c.pid) try { ctx.lock.forgetGroup(c.pid); } catch { /* kept: killed on the next start */ }
+      resolve(stopped ? { stopped: true } : { code: code ?? 1, json: json(out) });
+    };
+    c.on('error', () => done(1));
+    c.on('close', (code) => done(code));
+  });
+}
+// The terminal line, the event log row (jsonl) and, unless `row` is false (the caller adds its own), a row in the current view
+// (attention/<key>.md) for a feature that needs a person. The row text is fixed per (state, kind): no feature title, branch, question
+// or reason. A row with a `state` is resolved when the feature leaves that state (reconcileAttention).
+const ALIVE_FIX = 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again';
+const WHAT = {
+  blocked: 'feature blocked: its work is on the branch or in a stash',
+  antigaming: 'held by anti-gaming checks: review the PR, then release it',
+  ci_unconfirmed: 'no CI evidence that the tests ran: a person decides',
+  leftovers: 'processes or directories from an earlier run are still alive',
+  resume_loop: 'resumed several times after crashes: a person looks at it',
+  resume_error: 'the restart check of this feature failed: a person looks at it',
+  hold_failed: 'the feature could not be parked for a person',
+  error: 'a step failed: a person looks at it',
+};
+function attentionRow(ctx, id, state, kind) {
+  const k = state === 'blocked' ? 'blocked' : (/^[a-z_]{1,32}$/.test(String(kind)) ? kind : 'other');
+  const base = `DELIVER_QUEUE=${ctx.queueFile} node ${DELIVER}`;
+  const dir = ctx.D ? ` --dir ${ctx.D}` : '';
+  let run = 'factory status';
+  if (k === 'blocked' || k === 'resume_loop') run = `${base} skip ${id} --reason "<why>"${dir}`;
+  else if (k === 'antigaming') run = `${base} retry ${id} --note "<why>"${dir}`;
+  else if (k === 'ci_unconfirmed') run = `${base} retry ${id} --checks "<test check>"${dir}`;
+  else if (k === 'leftovers') run = ALIVE_FIX;
+  const what = WHAT[k] || (state === 'awaiting_human' ? `held for a person (${k})` : `needs a person (${k})`);
+  const severity = ['blocked', 'antigaming', 'leftovers', 'resume_loop'].includes(k) ? 'high' : 'medium';
+  return { id, kind: k, severity, what, run, state };
+}
+function attention(ctx, id, state, kind, { row = true } = {}) {
   const once = `${id}\u0000${state}`;
   if ((ctx.attended ||= new Set()).has(once)) return;
   ctx.attended.add(once);
@@ -467,6 +778,23 @@ function attention(ctx, id, state, kind) {
     const dir = privateDir(path.join(ctx.fh, 'attention'));
     fs.appendFileSync(path.join(dir, `${ctx.key}.jsonl`), `${JSON.stringify({ at: new Date().toISOString(), feature: id, state, kind: kind || null })}\n`, { mode: 0o600 });
   } catch { /* the terminal line is the record of last resort */ }
+  if (row) { try { addAttention(ctx.fh, ctx.key, attentionRow(ctx, id, state, kind)); } catch { /* the jsonl row and the terminal line remain */ } }
+}
+// Rows that follow a feature's state go when it leaves that state (a person retried or skipped it). At the start of a run the rows of
+// the earlier stop (stopped, usage limit, day budget, leftovers, a failed WIP commit, ...) go too: the run re-adds what still holds.
+const STOP_KINDS = new Set(['stopped', 'usage_limit', 'day_budget', 'wip_failed', 'wip_skipped', 'interrupted', 'leftovers', 'resume_error', 'hold_failed', 'error', 'inconsistent']);
+function reconcileAttention(ctx, start) {
+  try {
+    const q = readQueue(ctx);
+    for (const it of listAttention(ctx.fh, ctx.key)) {
+      if (it.id === 'probe') continue;
+      const f = q.features.find((x) => x.id === it.id);
+      const sticky = it.state === 'blocked' || it.state === 'awaiting_human'; // follows the feature's state
+      const follows = typeof it.state === 'string' && it.state ? (sticky ? !f || f.state !== it.state : start) : false;
+      const stopRow = start && !it.state && STOP_KINDS.has(it.kind);
+      if (follows || stopRow) resolveAttention(ctx.fh, ctx.key, { id: it.id, kind: it.kind });
+    }
+  } catch { /* the view is advisory: the queue and the terminal lines are the record */ }
 }
 
 // ---- run: builder clone -----------------------------------------------------------------------------------------------------------------
@@ -611,7 +939,14 @@ const specRel = (ctx, f) => {
 };
 const RESULT_TEXT = (id) => `At the end write .implementation/${id}/result.json: {"status":"done","summary":"..."} or {"status":"blocked","question":"..."}. Commit your work on the checked-out branch (never push, never open a pull request).`;
 // Briefs (spec "Builder result"): build = id + spec path; CI fix = check names + bounded tail; symptom fix = the symptom brief only.
+// An interrupted step (act.continue) gets the continue brief appended: feature id, step, continue from the branch and the ledger.
+// Never `claude --resume`: the continued session starts fresh from what is committed.
 function briefFor(ctx, f, act) {
+  const b = baseBrief(ctx, f, act);
+  if (act.continue) b.prompt = `${b.prompt}\n${renderPrompt('continue-brief', { FEATURE_ID: f.id, STEP: STEP_OF[f.state] || 'build' }).trim()}`;
+  return b;
+}
+function baseBrief(ctx, f, act) {
   const rel = specRel(ctx, f);
   const head = `${f.id}: specification ${rel}.`;
   switch (act.brief) {
@@ -655,7 +990,19 @@ function tierOf(ctx, f) {
 }
 
 async function builderSession(ctx, f, act) {
-  if (act.brief === 'build') { // a fresh build (or a reset on resume) starts from the base commit in both clones
+  // Before anything touches the branch or the counters: a budget hit starts no session (the interrupt action holds or stops).
+  const budget = enforceBudget(ctx, f, 'builder');
+  if (budget) return budget;
+  if (act.continue) {
+    // An interrupted step continues from the builder clone's branch (its WIP commit included): moved to the driver clone first,
+    // so toBuilder below checks out exactly that head. Never a reset.
+    // Uncommitted edits still in the builder clone (an earlier WIP commit failed) are committed first: toBuilder's forced
+    // checkout would otherwise drop them.
+    if (bExists(ctx)) {
+      keepWork(ctx, f, typeof f.interrupted?.kind === 'string' ? f.interrupted.kind : 'other');
+      try { toDriver(ctx, f); } catch (e) { if (e instanceof Unsafe) return blockUnsafe(ctx, f); throw e; }
+    }
+  } else if (act.brief === 'build') { // a fresh build (or a reset on resume) starts from the base commit in both clones
     must(ctx.git('checkout', '-q', '-f', '-B', f.branch, f.base_sha), 'reset of the feature branch');
   }
   if (act.brief === 'antigaming_fix') update(ctx, f.id, (x) => { x.ag_fix_attempts = (x.ag_fix_attempts ?? 0) + 1; });
@@ -674,14 +1021,85 @@ async function builderSession(ctx, f, act) {
     try { settingsFile = materialiseSettings('builder', { factoryHome: ctx.fh, repoDir: ctx.B, home, runDir }); } catch (e) { if (e?.code === 'settings_unsafe') return { step: 'session', kind: 'settings_unsafe', keys: ['settings'] }; throw e; }
     r = await (ctx.deps.runSession || runSession)({
       role: 'builder', cwd: ctx.B, prompt: brief.prompt, settingsFile, maxTurns: v.max_turns.builder, timeoutS: v.session_timeout_s.builder,
-      ...(v.model.builder ? { model: v.model.builder } : {}), home, tmpDir, baseEnv: ctx.env,
+      ...(ctx.modelOverride || v.model.builder ? { model: ctx.modelOverride || v.model.builder } : {}), home, tmpDir, baseEnv: ctx.env,
+      ...sessionStop(ctx),
       onSpawn: (x) => { pgid = x.pgid; ctx.lock.recordGroup(x.pgid); },
     });
   } finally { if (pgid) try { ctx.lock.forgetGroup(pgid); } catch { /* kept: killed on the next start */ } }
-  update(ctx, f.id, (x) => { (x.sessions ||= []).push(usageEntry('builder', r)); });
+  // A stopped session's group is gone; what it started outside the group (a setsid daemon, an app) goes too before the checks.
+  if (r?.failure?.kind === 'stopped') await killLeftovers(ctx);
+  const entry = usageEntry('builder', r);
+  update(ctx, f.id, (x) => { (x.sessions ||= []).push(entry); });
+  recordUsage(ctx, entry);
+  // Before the leftover check: an interrupted session (or one that ended without a result) marks its step interrupted, so a
+  // `leftovers` stop right below still continues the step from the branch next time (whose keepWork commits the edits) instead of
+  // resetting it as a crash. handleInterrupt replaces this minimal record (head null) with the full one.
+  const step = STEP_OF[f.state];
+  const ikind = r?.ok === true ? null : interruptKind(sessionResult(r, null));
+  if (ikind && step) update(ctx, f.id, (x) => { x.interrupted = { kind: ikind, step, session_id: typeof entry.id === 'string' ? entry.id : null, head: null, ts: isoAt(ctx.deps.clock.now()) }; });
   noLiveBuilder(ctx);
   fs.rmSync(runDir, { recursive: true, force: true });
-  return sessionResult(r, readBuilderResult(ctx.B, f.id));
+  const res = sessionResult(r, readBuilderResult(ctx.B, f.id));
+  // A session that ended without a result (other, no_result: an unrecognised usage limit lands here) is an interruption that
+  // stops without waiting: its work is kept in a WIP commit now, the decision table stops the run (`interrupted`), and the next
+  // run continues the step from the branch.
+  if (step && ENDED_KINDS.has(res.kind)) {
+    const w = keepWork(ctx, f, res.kind);
+    if (w.committed) {
+      update(ctx, f.id, (x) => { if (x.interrupted) x.interrupted.head = w.head; });
+      ctx.out(`${f.id} interrupted (${res.kind}): work kept in a WIP commit`);
+    }
+  }
+  // A session that ended without an interruption ends the interrupted step: the record and the crash-resume count of an
+  // interrupted feature go, and so does the wait already spent on it.
+  if (!INTERRUPT_KINDS.has(res.kind) && !ENDED_KINDS.has(res.kind)) {
+    update(ctx, f.id, (x) => { delete x.interrupted; if (x.interrupted_resumes !== undefined) x.interrupted_resumes = 0; });
+    if (ctx.waits?.id === f.id) ctx.waits = null;
+  }
+  return res;
+}
+const INTERRUPT_KINDS = new Set(['usage_limit', 'timeout', 'stopped', 'budget']);
+const ENDED_KINDS = new Set(['other', 'no_result']); // ended without a result: kept like an interruption, then the run stops
+const STEP_OF = { building: 'build', fixing: 'fix' };
+// The f.interrupted kind of a session result (handleInterrupt's names: the limit kind, stop, timeout), or null when the result is no
+// interruption (a budget refusal starts no session). Bounded to /^[a-z_]{1,32}$/.
+function interruptKind(res) {
+  const k = res?.kind === 'usage_limit' ? res.limit : res?.kind === 'stopped' ? 'stop' : ['timeout', ...ENDED_KINDS].includes(res?.kind) ? res.kind : null;
+  return k === null ? null : /^[a-z_]{1,32}$/.test(String(k)) ? k : 'other';
+}
+
+// wipCommit(ctx, f, kind) -> { committed, head, skipped? }: the interrupted session's uncommitted work, committed on the feature branch in the
+// builder clone with the hook-free gitSafe wrapper as "wip(<ID>): interrupted (<kind>)". Driver-owned paths (.implementation,
+// .delivery, .skill-runs) are never staged; with nothing else to stage there is no commit (and no error). Only after noLiveBuilder.
+// A builder that left HEAD on another branch gets no commit (its edits are not on the feature branch to keep): skipped true.
+export function wipCommit(ctx, f, kind) {
+  if (!bExists(ctx)) return { committed: false, head: null };
+  ensureBuilder(ctx); noLiveBuilder(ctx);
+  const g = bGit(ctx);
+  const head = headOf(g, f.branch);
+  const sym = g('symbolic-ref', '-q', 'HEAD');
+  if (!head || sym.code !== 0 || sym.out.trim() !== `refs/heads/${f.branch}`) return { committed: false, head, skipped: true };
+  const spec = ['--', '.', ...DRIVER_OWNED.map((n) => `:(exclude)${n}`)];
+  // add -A -- . (an exclude pathspec on add fails on the ignored .implementation/); the excludes apply to the check and the commit.
+  must(g('add', '-A', '--', '.'), 'staging the interrupted work');
+  const d = g('diff', '--cached', '--quiet', ...spec);
+  if (d.code === 0) return { committed: false, head };
+  if (d.code !== 1) throw new Error('checking the staged interrupted work failed');
+  // The pathspec again on the commit: a path the builder itself staged under .implementation/ is not committed either.
+  must(g('commit', '-q', '--no-verify', '-m', `wip(${f.id}): interrupted (${/^[a-z_]{1,32}$/.test(String(kind)) ? kind : 'other'})`, ...spec), 'the WIP commit');
+  g('reset', '-q', '--', ...DRIVER_OWNED); // unstage driver-owned paths `add -A` picked up (never committed); failure tolerated
+  return { committed: true, head: headOf(g, f.branch) };
+}
+// wipCommit for the interruption paths: any failure but a live builder process is a WipFailed (the run stops, nothing is reset).
+// A commit skipped because HEAD left the feature branch gets one line and a wip_skipped attention row (fixed text).
+function keepWork(ctx, f, kind) {
+  let w;
+  try { w = wipCommit(ctx, f, kind); } catch (e) { if (e instanceof Leftover) throw e; throw new WipFailed(e?.message || 'the WIP commit failed'); }
+  if (w.skipped) {
+    ctx.out(`${f.id} interrupted: the builder left HEAD off the feature branch; no WIP commit was made`);
+    try { addAttention(ctx.fh, ctx.key, { id: f.id, kind: 'wip_skipped', severity: 'high', what: 'the builder left HEAD off the feature branch: its uncommitted edits are not in a WIP commit', run: 'factory run --continue' }); } catch { /* the terminal line remains */ }
+  }
+  return w;
 }
 
 // ---- run: steps -----------------------------------------------------------------------------------------------------------------------
@@ -720,9 +1138,10 @@ function stepPr(ctx, f) {
   const d = deliver(ctx, 'pr', f.id, '--title', title, '--body-file', file);
   return d.code === 0 ? { step: 'pr', kind: 'ok' } : { step: 'pr', kind: 'error' };
 }
-function stepCi(ctx, f, act) {
+async function stepCi(ctx, f, act) {
   if (act.reopen && (f.state === 'ci_passed' || f.state === 'verified')) update(ctx, f.id, (x) => transition(x, 'pr_open', 'head moved or verdict stale: CI and verification again'));
-  const d = deliver(ctx, 'ci', f.id, ...(ctx.deps.ciArgs || []));
+  const d = await deliverWatch(ctx, 'ci', f.id, ...(ctx.deps.ciArgs || []));
+  if (d.stopped) return { step: 'ci', kind: 'stopped' };
   const res = d.json?.result;
   if (d.code === 0 && (res === 'passed' || res === 'unverified-allowed')) return { step: 'ci', kind: res };
   if (d.code === 2) {
@@ -753,7 +1172,7 @@ async function stepVerify(ctx, f) {
   const t0 = Date.now();
   let r = null; let threw = false;
   try {
-    r = await (ctx.deps.verifyFeature || verifyFeature)({ repoKey: ctx.key, id: f.id, sha: f.ci_sha, baseRef: OR(ctx.base), config: ctx.policy, scenarios: st.doc, criteriaHash: bc.hash, git: (...a) => gitSafeOpts(ctx.D, a) }, ctx.deps.verifySeams);
+    r = await (ctx.deps.verifyFeature || verifyFeature)({ repoKey: ctx.key, id: f.id, sha: f.ci_sha, baseRef: OR(ctx.base), config: ctx.policy, scenarios: st.doc, criteriaHash: bc.hash, git: (...a) => gitSafeOpts(ctx.D, a) }, verifySeamsFor(ctx));
   } catch { threw = true; }
   const ok = !threw && (r?.verdict === 'pass' || r?.verdict === 'fail');
   const failedIds = ok && r.verdict === 'fail' ? (r.doc?.results || []).filter((x) => x.status !== 'pass' || x.flaky).flatMap((x) => x.covers) : [];
@@ -855,11 +1274,36 @@ function sweep(ctx) {
 
 // ---- run: the loop ------------------------------------------------------------------------------------------------------------------
 const TERMINAL = ['merged', 'skipped', 'blocked'];
+// P2.2: a hard stop proven only by the isolation probe is unproven until a saved probe result ($FACTORY_HOME/probes/last.json)
+// for these builder settings, this FACTORY_HOME and (secrets) every credential class shows its routes denied. Each unproven row
+// is printed with the reason and recorded as one attention row; the run is not blocked by it.
+function reportHardStops(ctx) {
+  const result = loadProbeResult(ctx.fh);
+  const opts = { factoryHome: ctx.fh, builderSha: builderSettingsSha(), home: ctx.deps.home || defaultHome(ctx.env) };
+  const rows = HARD_STOPS.map((r) => ({ ...r, why: whyUnproven(r, result, opts) })).filter((r) => r.why !== null);
+  for (const r of rows) ctx.out(`unproven hard stop: ${r.id} ${r.name} (${r.why})`);
+  const item = { id: 'probe', kind: 'unproven_hardstop' };
+  const what = `unproven hard stops: ${rows.map((r) => r.id).join(', ')}`;
+  if (rows.length && listAttention(ctx.fh, ctx.key).some((i) => i.id === item.id && i.kind === item.kind && i.what === what)) return;
+  resolveAttention(ctx.fh, ctx.key, item); // the row always names the current set
+  if (rows.length) addAttention(ctx.fh, ctx.key, { ...item, severity: 'medium', what, run: PROBE_RUN });
+}
+
 export async function cmdRun(ctx) {
   const { opt } = ctx.args;
   const only = idList(opt.only);
   if (opt.limit !== undefined && !(Number.isInteger(Number(opt.limit)) && Number(opt.limit) >= 1 && Number(opt.limit) <= 1000)) refuse('--limit must be an integer 1-1000');
+  // A stop flag left by `factory stop` (the run it stopped, or one that was not running) is never cleared silently.
+  if (stopRequested(ctx) && !opt.continue) refuse('a stop was requested for this repository (factory stop)', 'run "factory run --continue" to clear the stop and continue the same run');
+  // --continue clears it first, before any refusal below (missing scenarios, budgets): this command holds the lock, so no run is
+  // live that the flag could still stop, and a refused --continue must not leave the repository locked out by it.
+  if (opt.continue && fs.existsSync(STOP_FLAG(ctx))) { fs.rmSync(STOP_FLAG(ctx), { force: true }); ctx.out('continue: the stop request is cleared'); }
   startChecks(ctx);
+  if (ctx.local.budgets.day_tokens === null) ctx.out('warning: no daily token cap is set (budgets.day_tokens in ~/.factory/config.json)');
+  reportHardStops(ctx);
+  usagePreflight(ctx);
+  let saved;
+  try { saved = readRun(ctx.fh, ctx.key); } catch (e) { if (e instanceof RunStateError) refuse(e.message, 'fix or remove that file by hand (it is the run state), then run again'); throw e; }
   ctx.queueFile = path.join(privateDir(path.join(ctx.fh, 'queues')), `${ctx.key}.json`);
   ctx.bRoot = builderRoot(ctx);
   ctx.attention = 0;
@@ -867,9 +1311,11 @@ export async function cmdRun(ctx) {
   let q = fs.existsSync(ctx.queueFile) ? readQueue(ctx) : null;
   if (q && (q.repo !== ctx.id.repo || q.base !== ctx.base)) refuse('the stored queue is for another repository or base', `DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs reset --yes`);
   const resuming = q && q.features.some((f) => !['merged', 'skipped'].includes(f.state));
+  // Before anything is written (no checkout, no deliver init): a raise needs a run in progress.
+  if (opt['raise-budget'] !== undefined && !resuming) refuse('--raise-budget needs a run in progress: no feature is held for a budget');
   const alive = ctx.orphansAlive > 0 || ctx.leftovers > 0;
   const aliveWhy = `processes or worktrees from an earlier run are still alive (${ctx.orphansAlive} process group(s), ${ctx.leftovers} directory(ies))`;
-  const aliveFix = 'stop them (see FACTORY_HOME/work and FACTORY_HOME/tmp), then run again';
+  const aliveFix = ALIVE_FIX;
   if (!resuming && alive) refuse(aliveWhy, aliveFix);
   // A queue in progress, whatever its states (queued, blocked and awaiting_human included): nothing runs (no deliver next, no
   // session) while something from the earlier run may still act. The run stops with the feature states left as they are.
@@ -892,21 +1338,68 @@ export async function cmdRun(ctx) {
     if (!fs.existsSync(ctx.queueFile)) { ctx.out('no feature is ready'); return 0; }
   } else {
     if (only.length || opt.limit) ctx.out('note: a run is in progress; --only and --limit apply to a new run only');
-    const bad = missingScenarios(ctx, q.features.filter((f) => f.state === 'queued' || ACTIVE.includes(f.state)).map((f) => f.id));
+    // Every refusal comes before the raise changes anything: the raised feature is checked as the active feature it will become.
+    const raise = opt['raise-budget'] !== undefined ? planRaise(ctx, opt['raise-budget']) : null;
+    for (const f of q.features.filter((x) => !TERMINAL.includes(x.state))) {
+      try { featureCaps(ctx, f); } catch (e) { refuse(`${e.message}`, `fix budget_cap of ${f.id} in ${ctx.queueFile} (or run "factory run --raise-budget ${f.id}")`); }
+    }
+    const bad = missingScenarios(ctx, q.features.filter((f) => f.state === 'queued' || ACTIVE.includes(f.state) || f.id === raise?.id).map((f) => f.id));
     if (bad.length) refuse(`features without current approved scenarios: ${bad.join(', ')}`, 'run "factory scenarios" (and approve them), then run again');
+    if (raise) applyRaise(ctx, raise);
+  }
+  reconcileAttention(ctx, true);
+  updateRun(ctx.fh, ctx.key, { status: 'running', pause: null, reason: null, current: null, started_at: isoAt(ctx.deps.clock.now()), pid: process.pid });
+  // A run stopped during a wait continues by finishing that wait (its saved reset time) before the interrupted step runs again, so
+  // the first continued session does not hit the same limit.
+  const until = opt.continue && saved && ['stopped', 'paused'].includes(saved.status) ? Date.parse(saved.pause?.reset_at) : NaN;
+  if (Number.isFinite(until) && until > ctx.deps.clock.now()) {
+    const p = saved.pause;
+    if (await pauseFor(ctx, until, { kind: typeof p.kind === 'string' ? p.kind : 'usage_limit', ...(typeof p.limit === 'string' ? { limit: p.limit } : {}), estimated: p.estimated === true }) === 'stopped') {
+      return finish(ctx, stopRun(ctx, null, 'stop', 'a stop was requested during the wait').end);
+    }
   }
   return loop(ctx);
 }
 
+// --raise-budget ID[=TOKENS]: a feature parked by its budget (awaiting_human, hold kind budget) gets a raised cap (f.budget_cap) and
+// goes back to the step it was parked in (deliver unhold --to <budget_hold.from>), marked interrupted, so the run continues it from
+// the branch. Bare ID: the base policy's caps once more (the first raise doubles them); ID=N: the token cap is N, turns unchanged.
+// planRaise only checks (it refuses, with the queue unchanged, for any other feature or a cap that would not help); applyRaise writes.
+function planRaise(ctx, spec) {
+  const m = /^(FEATURE-\d+)(?:=([1-9]\d{0,11}))?$/.exec(String(spec));
+  if (!m) refuse('--raise-budget takes FEATURE-ID or FEATURE-ID=TOKENS (a positive integer)');
+  const f = readQueue(ctx).features.find((x) => x.id === m[1]);
+  if (!f) refuse(`${m[1]} is not in the queue`);
+  if (f.state !== 'awaiting_human' || f.hold_kind !== 'budget') refuse(`${f.id} is not held for a budget (state ${f.state}${f.hold_kind ? `, hold ${clean(f.hold_kind, 32)}` : ''})`, 'only a feature parked by its budget can be raised (factory status lists them)');
+  const from = f.budget_hold?.from;
+  if (from !== 'building' && from !== 'fixing') refuse(`${f.id} has no building or fixing budget hold recorded`);
+  let orig; let cur;
+  try { orig = featureCaps(ctx, null); cur = featureCaps(ctx, f); } catch (e) { refuse(e.message, `fix the budget caps (budgets.feature in ${CONFIG_PATH}, budget_cap of ${f.id})`); }
+  const caps = m[2] !== undefined ? { tokens: Number(m[2]), turns: cur.turns } : { tokens: cur.tokens + orig.tokens, turns: cur.turns + orig.turns };
+  const used = featureUsage(f);
+  const what = `the raised cap of ${f.id} (tokens ${caps.tokens}, turns ${caps.turns}) is not above what it used (tokens ${used.tokens}, turns ${used.turns})`;
+  // =N changes tokens only: when turns is the spent dimension only the bare form (which raises both) can help.
+  if (caps.turns <= used.turns) refuse(what, `raise both caps: factory run --raise-budget ${f.id}`);
+  if (caps.tokens <= used.tokens) refuse(what, `pass a larger cap: factory run --raise-budget ${f.id}=<tokens>, or factory run --raise-budget ${f.id}`);
+  return { id: f.id, from, caps };
+}
+function applyRaise(ctx, { id, from, caps }) {
+  const d = deliver(ctx, 'unhold', id, '--to', from);
+  if (d.code !== 0 || readQueue(ctx).features.find((x) => x.id === id)?.state !== from) refuse(`deliver unhold ${id} failed`, `run "DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs status" to see the feature`);
+  update(ctx, id, (x) => { x.budget_cap = caps; });
+  try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'budget' }); } catch { /* the row stays: harmless */ }
+  ctx.out(`${id} budget raised: tokens ${caps.tokens}, turns ${caps.turns}; continuing at ${from}`);
+}
+
 async function loop(ctx) {
-  let cur = null; let last = null;
+  let cur = null; let last = null; let replay = null;
   ctx.resumed = new Set();
   for (let guard = 0; guard < 100000; guard++) {
     const q = readQueue(ctx);
     const runInfo = { max_fix_rounds: q.max_fix_rounds, stop: runStop(q) };
     let f = cur ? q.features.find((x) => x.id === cur) : null;
     let act;
-    if (!f) {
+    if (f && replay) { act = replay; replay = null; } else if (!f) {
       const active = q.features.find((x) => ACTIVE.includes(x.state));
       if (active) { // a feature left active by an earlier (crashed or stopped) run: the restart rules decide, once
         f = active; cur = f.id; last = null;
@@ -916,22 +1409,40 @@ async function loop(ctx) {
           ctx.out(`stopped: ${e instanceof Leftover ? 'leftovers' : 'resume_error'}`);
           return finish(ctx, 2);
         }
-        act = resumeAction(f, facts, runInfo);
+        // An interrupted step (f.interrupted) is not a crash and is not counted in f.resumes (resumeAction does not cap it). A
+        // driver that keeps dying while it continues one would loop forever, so those resumes have their own count and cap.
+        const interrupted = Object.hasOwn(STEP_OF, f.state) && f.interrupted !== undefined && f.interrupted !== null;
+        const ir = Number.isInteger(f.interrupted_resumes) && f.interrupted_resumes >= 0 ? f.interrupted_resumes : 0;
+        act = interrupted && ir >= MAX_RESUMES
+          ? { do: 'hold', kind: 'resume_loop', reason: `the interrupted step was resumed ${ir} times already: a person looks at it`, attention: true }
+          : resumeAction(f, facts, runInfo);
         // Counted before the resumed work starts; a run that then ends through finish() (any stop, hold or end: not a crash)
         // takes it back. Only runs that die (no finish) accumulate. The resume_loop stop itself neither counts nor resets.
         if (act.kind !== 'resume_loop') {
-          update(ctx, f.id, (x) => { x.resumes = (Number.isInteger(x.resumes) ? x.resumes : 0) + 1; });
+          update(ctx, f.id, (x) => { if (interrupted) x.interrupted_resumes = ir + 1; else x.resumes = (Number.isInteger(x.resumes) ? x.resumes : 0) + 1; });
           ctx.resumed.add(f.id);
         }
       } else act = runInfo.stop ? { do: 'stop', kind: 'run_stop', reason: runInfo.stop } : { do: 'next' };
     } else act = nextAction(f, last, runInfo);
     if (act.do === 'next' && f && f.state !== 'queued') { cur = null; last = null; continue; }
+    // The stop flag, before every step: the step that just ran (a driver-only step, a CI wait a graceful stop let finish) is done,
+    // nothing new starts. An interruption still runs first (it keeps the stopped session's work), and so does a stop.
+    if (act.do !== 'interrupt' && act.do !== 'stop' && stopRequested(ctx)) {
+      await killLeftovers(ctx);
+      const res = stopRun(ctx, f, 'stop', 'a stop was requested');
+      return finish(ctx, res.end);
+    }
     ctx.out(`${f ? `${f.id} ${f.state}` : 'queue'} -> ${act.do}${act.brief ? ` (${act.brief})` : ''}`);
+    try { updateRun(ctx.fh, ctx.key, { current: { feature: f ? f.id : null, state: f ? f.state : null, action: act.do } }); } catch { /* status only */ }
     let res;
-    try { res = await execute(ctx, q, f, act); } catch (e) {
-      const kind = e instanceof Leftover ? 'leftovers' : 'error';
-      if (f) attention(ctx, f.id, f.state, kind);
+    try { res = await execute(ctx, q, f, act, last); } catch (e) {
+      const kind = e instanceof Leftover ? 'leftovers' : e instanceof WipFailed ? 'wip_failed' : 'error';
+      if (f) attention(ctx, f.id, f.state, kind, { row: kind !== 'wip_failed' });
+      if (f && kind === 'wip_failed') {
+        try { addAttention(ctx.fh, ctx.key, { id: f.id, kind, severity: 'high', what: 'the WIP commit of the interrupted session failed: the work is uncommitted in the builder clone', run: 'factory run --continue' }); } catch { /* the jsonl row and the terminal line remain */ }
+      }
       ctx.out(`stopped: ${kind}`);
+      ctx.stopReason = kind;
       return finish(ctx, 2);
     }
     // A feature that deliver itself blocked or parked (fix rounds, CI budget, merge conflict, a merge hold) gets its line too.
@@ -939,8 +1450,12 @@ async function loop(ctx) {
       const now = readQueue(ctx).features.find((x) => x.id === f.id)?.state;
       if (now !== f.state && (now === 'blocked' || now === 'awaiting_human')) attention(ctx, f.id, now, act.do);
     }
+    // A timed-out session is counted before the next decision, so the third timeout blocks the feature (decide: f.timeouts >= 3).
+    if (f && res.last?.step === 'session' && res.last.kind === 'timeout') update(ctx, f.id, (x) => { if (x.timeouts === undefined || (Number.isInteger(x.timeouts) && x.timeouts >= 0)) x.timeouts = (x.timeouts ?? 0) + 1; });
+    ctx.prevAct = act;
     ctx.deps.afterAction?.(act.do);
     if (res.end !== undefined) return finish(ctx, res.end);
+    if (res.replay) { replay = res.replay; last = null; continue; }
     if (res.cur !== undefined) cur = res.cur;
     last = res.last ?? null;
   }
@@ -948,7 +1463,7 @@ async function loop(ctx) {
   return finish(ctx, 2);
 }
 
-async function execute(ctx, q, f, act) {
+async function execute(ctx, q, f, act, last = null) {
   switch (act.do) {
     case 'next': {
       const d = deliver(ctx, 'next');
@@ -959,7 +1474,7 @@ async function execute(ctx, q, f, act) {
     case 'build': return { last: await builderSession(ctx, f, act) };
     case 'built': return { last: stepBuilt(ctx, f) };
     case 'pr': return { last: stepPr(ctx, f) };
-    case 'ci': return { last: stepCi(ctx, f, act) };
+    case 'ci': return { last: await stepCi(ctx, f, act) };
     case 'fix_ci': case 'fix_verify': return { last: stepFix(ctx, f, act) };
     case 'push': return { last: stepPush(ctx, f) };
     case 'verify': return { last: await stepVerify(ctx, f) };
@@ -981,19 +1496,108 @@ async function execute(ctx, q, f, act) {
       return { cur: null };
     }
     case 'stop':
+      // A session that ended without a result (its work already kept by builderSession): a stop with the continue row.
+      if (act.kind === 'interrupted') return stopRun(ctx, f, 'interrupted', act.reason || 'the session ended without a result');
       if (f && act.attention) attention(ctx, f.id, f.state, act.kind);
       ctx.out(`stopped: ${act.kind}${act.resetAt ? ` (resets ${act.resetAt})` : ''}`);
+      ctx.stopReason = clean(`${act.kind}${act.reason ? `: ${act.reason}` : ''}`, 200);
       return { end: 2 };
+    case 'interrupt': return handleInterrupt(ctx, f, act, last);
     default: throw new Error('unknown action');
   }
 }
 
+// handleInterrupt(ctx, f, act, last) -> { last } | { cur } | { end } | { replay }: an interrupted session (decision table action
+// `interrupt`). For a builder state (building, fixing), after noLiveBuilder: the WIP commit, then f.interrupted { kind, step,
+// session_id, head, ts } is set BEFORE any wait, so a stop or a crash during the wait still continues the step later. Then per kind:
+//   stop: the run ends stopped. timeout: the step continues at once (f.timeouts was counted by the loop; the third one blocks).
+//   usage_limit: routeInterruption decides wait (session, weekly), retry (rate), switch_model (model, once) or stop.
+//   budget: feature scope holds (budgetInterrupt); day scope waits for local midnight with wait_for_reset, else stops.
+// After a wait the step continues ({ last: null }: the decision table gives the continue brief) and f.interruptions gets
+// { kind, step, minutes_waited, method: 'continue_brief' }. Other states keep their work as it is (no WIP commit) and run their
+// step again after the wait; a terminal state starts nothing.
+export async function handleInterrupt(ctx, f, act, last) {
+  if (act.kind === 'budget' && act.scope !== 'day') return budgetInterrupt(ctx, f, act, last);
+  const kind = act.kind === 'usage_limit' ? act.limit : act.kind === 'budget' ? 'day_budget' : act.kind;
+  const step = f ? STEP_OF[f.state] : undefined;
+  if (act.kind === 'budget' && f) update(ctx, f.id, (x) => { x.budget_hit = true; }); // sticky: the record of a continued feature still says it hit a budget
+  if (act.kind === 'stop') await killLeftovers(ctx); // before noLiveBuilder: what the stopped session left running goes first
+  if (step && act.kind !== 'budget') { // a day-budget hit refused the session before it started: nothing to commit
+    noLiveBuilder(ctx);
+    // Recorded BEFORE the WIP commit: if the commit fails the run stops (WipFailed) and a restart still continues the step
+    // (no reset rebuild); the head is the branch head before the commit, updated after it.
+    const before = bExists(ctx) ? (ensureBuilder(ctx), headOf(bGit(ctx), f.branch)) : null;
+    const sid = (readQueue(ctx).features.find((x) => x.id === f.id)?.sessions || []).at(-1)?.id ?? null;
+    update(ctx, f.id, (x) => { x.interrupted = { kind, step, session_id: typeof sid === 'string' ? sid : null, head: before, ts: isoAt(ctx.deps.clock.now()) }; });
+    const w = keepWork(ctx, f, kind);
+    if (w.committed) {
+      update(ctx, f.id, (x) => { if (x.interrupted) x.interrupted.head = w.head; });
+      ctx.out(`${f.id} interrupted (${kind}): work kept in a WIP commit`);
+    }
+  }
+  if (act.kind === 'stop') return stopRun(ctx, f, 'stop', 'a stop was requested');
+  if (f && TERMINAL.includes(f.state)) return { cur: null };
+  const resumed = (ms) => {
+    if (step) update(ctx, f.id, (x) => { (x.interruptions ||= []).push({ kind, step, minutes_waited: Math.round(ms / 60000), method: 'continue_brief' }); });
+    return { last: null };
+  };
+  if (act.kind === 'timeout') return resumed(0);
+  if (act.kind === 'budget') { // day scope
+    if (ctx.local.wait_for_reset !== true) return stopRun(ctx, f, 'day_budget', 'the daily token cap is reached');
+    if (await pauseFor(ctx, nextMidnight(ctx), { kind: 'day_budget' }) === 'stopped') return stopRun(ctx, f, 'stop', 'a stop was requested during the wait');
+    // The refused session never started: the same action runs again on the new day.
+    return ctx.prevAct ? { replay: ctx.prevAct } : { last: null };
+  }
+  if (act.kind !== 'usage_limit') throw new Error('unknown interruption');
+  const ws = waitState(ctx, f.id);
+  const route = routeLimit(ctx, act, ws);
+  if (route.do === 'stop') return stopRun(ctx, f, 'usage_limit', route.reason);
+  if (route.do === 'switch_model') { ctx.modelOverride = route.model; ctx.out(`${f.id} model limit: the next session uses fallback_model`); return resumed(0); }
+  const start = ctx.deps.clock.now();
+  if (await pauseFor(ctx, route.until, { kind: 'usage_limit', limit: act.limit, estimated: route.estimated }) === 'stopped') return stopRun(ctx, f, 'stop', 'a stop was requested during the wait');
+  route.commit();
+  return resumed(route.until - start);
+}
+// Spec P2 exit criteria: while no real limit event has been captured, a limit stop says the classification rests on fixtures only.
+const FIXTURES_NOTE = 'note: the usage-limit classifier is fixtures only (not yet validated against a real limit event)';
+function limitNote(ctx, kind) { if (kind === 'usage_limit' && ctx.classifierReal !== true) ctx.out(FIXTURES_NOTE); }
+// The run ends stopped: the terminal lines, the attention event and row (with the command that continues the run).
+function stopRun(ctx, f, kind, reason) {
+  if (kind === 'stop' && f) update(ctx, f.id, (x) => { x.stopped_by_user = true; }); // sticky, like budget_hit: survives the continue
+  ctx.out(`stopped: ${kind}`);
+  ctx.stopReason = clean(`${kind}: ${reason}`, 200);
+  ctx.out(`${kind === 'usage_limit' ? 'usage limit' : 'reason'}: ${clean(reason, 200)}`);
+  limitNote(ctx, kind);
+  if (f) attention(ctx, f.id, f.state, kind, { row: false });
+  addAttention(ctx.fh, ctx.key, { id: f?.id || 'run', kind: kind === 'stop' ? 'stopped' : kind, severity: 'high', what: clean(reason, 200), run: 'factory run --continue' });
+  return { end: 2 };
+}
+
+// A budget hit (enforceBudget's result, routed by the decision table). Feature: the feature is parked (deliver hold --kind budget,
+// from building or fixing only) with its work on the branch, an attention row names the command that raises the cap, and the run
+// moves on to the next feature (a hold is not a block: the circuit breaker does not count it). Day: handleInterrupt.
+function budgetInterrupt(ctx, f, act, last) {
+  const b = last?.kind === 'budget' ? last : {};
+  const what = clean(`feature budget reached: ${b.dim ?? 'tokens'} ${Number.isFinite(b.used) ? b.used : '?'} of ${Number.isFinite(b.cap) ? b.cap : '?'}`, 200);
+  const d = deliver(ctx, 'hold', f.id, '--reason', what, '--kind', 'budget');
+  const held = (d.code === 0 || d.code === 2) && readQueue(ctx).features.find((x) => x.id === f.id)?.state === 'awaiting_human';
+  if (!held) { attention(ctx, f.id, f.state, 'hold_failed'); ctx.out(`stopped: ${f.id} could not be parked (budget)`); return { end: 2 }; }
+  attention(ctx, f.id, 'awaiting_human', 'budget', { row: false });
+  addAttention(ctx.fh, ctx.key, { id: f.id, kind: 'budget', severity: 'high', what, run: `factory run --raise-budget ${f.id}`, state: 'awaiting_human' });
+  return { cur: null };
+}
+
 // A run that reaches finish() ended cleanly (a stop, hold, block or the end of the queue): the features it resumed are not crash
 // loops, so their resume count goes back to 0 (terminal features keep it as a record). Only a driver that dies keeps the count.
+// The run state ends finished (the queue is done, exit 0 or 2 for a feature that needs a person) or stopped, with a notification.
 function finish(ctx, code) {
   try {
-    for (const id of ctx.resumed || []) update(ctx, id, (x) => { if (x && !TERMINAL.includes(x.state)) x.resumes = 0; });
+    for (const id of ctx.resumed || []) update(ctx, id, (x) => { if (x && !TERMINAL.includes(x.state)) { x.resumes = 0; if (x.interrupted_resumes !== undefined) x.interrupted_resumes = 0; } });
   } catch { /* the count stays: the next run may hold resume_loop */ }
+  const status = code === 0 ? 'finished' : 'stopped';
+  try { updateRun(ctx.fh, ctx.key, { status, reason: status === 'stopped' ? (ctx.stopReason || 'stopped') : null, ended_at: isoAt(ctx.deps.clock.now()) }); } catch { /* the terminal lines are the record */ }
+  reconcileAttention(ctx, false);
+  tell(ctx, status);
   try {
     const q = readQueue(ctx);
     const by = {};
@@ -1004,10 +1608,91 @@ function finish(ctx, code) {
   return code;
 }
 
+// ---- stop and status (no lock, no clone) --------------------------------------------------------------------------------------------
+// Which repository and where its files are: FACTORY_HOME and the identity of the checkout in --dir. Never the lock, never the clone.
+function prepareLight(ctx) {
+  ctx.fh = homeDir(ctx.env);
+  ctx.id = identify(ctx, path.resolve(ctx.args.opt.dir || process.cwd()));
+  ctx.key = ctx.id.key;
+  ctx.queueFile = path.join(ctx.fh, 'queues', `${ctx.key}.json`);
+  return ctx;
+}
+const lockState = (ctx) => { try { return inspect(ctx.key, { home: ctx.fh, ...(ctx.deps.lockSys ? { sys: ctx.deps.lockSys } : {}) }); } catch { return { state: 'unreadable', pid: null }; } };
+
+// factory stop [--now]: writes the stop flag { at, now }. A running driver sees it before its next step, every 5 s during a session
+// (the session is interrupted and its work kept in a WIP commit) and during waits; --now also ends the CI wait. A verification run
+// in progress always finishes. The flag stays until `factory run --continue` (or a `factory scenarios`, which runs only when no run is
+// live); the run ends with status stopped.
+export function cmdStop(ctx) {
+  const now = ctx.args.opt.now === true;
+  const file = STOP_FLAG(ctx);
+  privateDir(path.join(ctx.fh, 'stop'));
+  const prev = stopRequested(ctx);
+  writeJsonAtomic(file, { at: new Date().toISOString(), now: now || prev?.now === true });
+  ctx.out(`stop requested for ${ctx.id.repo} (${now || prev?.now ? 'now' : 'graceful'})`);
+  const lk = lockState(ctx);
+  if (lk.state === 'live') ctx.out(`the factory run (pid ${lk.pid}) stops ${now ? 'at once (a verification run in progress finishes first)' : 'after its current step; a running session is interrupted and its work kept'}`);
+  else ctx.out('note: no factory run is active for this repository; the next run needs --continue');
+  return 0;
+}
+
+// The facts `factory status` reports, all read-only: run state, queue, usage against caps, attention, lock, driver and stop flag.
+export function statusFacts(ctx) {
+  const err = (e) => clean(String(e?.message || e), 160).replace(/(?:\/[^\s/:'"]+)+\/?/g, '<path>');
+  const lock = lockState(ctx).state;
+  // driver: whether a driver process holds the repository now (a live lock). A run state that says running or paused with no live
+  // lock is a driver that died: `factory run` continues it.
+  const out = { repo: ctx.id.repo, run: null, pause: null, next_resume: null, stop_requested: stopRequested(ctx), lock, driver: lock === 'live' ? 'running' : 'not_running', features: [], counts: {}, day: null, attention: 0, errors: [] };
+  try {
+    const r = readRun(ctx.fh, ctx.key);
+    if (r) {
+      out.run = { status: r.status ?? null, reason: r.reason ?? null, current: r.current ?? null, started_at: r.started_at ?? null, ended_at: r.ended_at ?? null };
+      out.pause = r.pause ?? null;
+      out.next_resume = r.pause && ['paused', 'stopped'].includes(r.status) && typeof r.pause.reset_at === 'string' ? r.pause.reset_at : null;
+    }
+  } catch (e) { out.errors.push(`run state: ${err(e)}`); }
+  let q = null;
+  try { if (fs.existsSync(ctx.queueFile)) q = readQueue(ctx); } catch (e) { out.errors.push(`queue: ${err(e)}`); }
+  for (const f of q?.features || []) {
+    let caps = null;
+    try { caps = featureCaps({ policy: q.policy }, f); } catch { caps = null; }
+    out.features.push({ id: f.id, state: f.state, hold_kind: f.hold_kind ?? null, usage: featureUsage(f), caps });
+    out.counts[f.state] = (out.counts[f.state] || 0) + 1;
+  }
+  let dayCap = null;
+  try {
+    const lc = loadLocalConfig(ctx.fh, { classifierReal: ctx.deps.classifierReal === true || CLASSIFIER_STATUS === 'real' });
+    if (lc.errors.length) out.errors.push(`local config: ${lc.errors.length} error(s)`); else dayCap = lc.config.budgets.day_tokens;
+  } catch (e) { out.errors.push(`local config: ${err(e)}`); }
+  try { out.day = { ...dayUsage(ctx.fh, new Date(ctx.deps.clock.now())), cap: dayCap }; } catch (e) { out.errors.push(`usage: ${err(e)}`); }
+  try { out.attention = listAttention(ctx.fh, ctx.key).length; } catch (e) { out.errors.push(`attention: ${err(e)}`); }
+  return out;
+}
+export function cmdStatus(ctx) {
+  const s = statusFacts(ctx);
+  if (ctx.args.opt.json === true) { ctx.out(JSON.stringify(s, null, 2)); return 0; }
+  const cap = (n) => (n === null || n === undefined ? '-' : n);
+  ctx.out(`repo: ${s.repo}`);
+  ctx.out(`run: ${s.run?.status ?? 'none'}`);
+  if (['running', 'paused'].includes(s.run?.status) && s.driver !== 'running') ctx.out('driver: not running');
+  if (s.run?.reason) ctx.out(`reason: ${s.run.reason}`);
+  if (s.run?.current) ctx.out(`current: ${s.run.current.feature ? `${s.run.current.feature} ${s.run.current.state}` : 'queue'} -> ${s.run.current.action}`);
+  if (s.next_resume) ctx.out(`next resume: ${s.next_resume}`);
+  ctx.out(`lock: ${s.lock}${s.stop_requested ? `; stop requested (${s.stop_requested.now ? 'now' : 'graceful'})` : ''}`);
+  for (const f of s.features) ctx.out(`${f.id} ${f.state}${f.hold_kind ? ` (${f.hold_kind})` : ''} tokens ${f.usage.tokens}/${cap(f.caps?.tokens)} turns ${f.usage.turns}/${cap(f.caps?.turns)}`);
+  if (s.day) ctx.out(`day: tokens ${s.day.tokens}/${cap(s.day.cap)}`);
+  ctx.out(`attention: ${s.attention}`);
+  for (const e of s.errors) ctx.out(`warning: ${e}`);
+  return 0;
+}
+
 // ---- entry -------------------------------------------------------------------------------------------------------------------------
 const HELP = `usage: factory scenarios [--only IDS] [--approve ID --by NAME] [--dir D] [--base B]
-       factory run [--only IDS] [--limit N] [--dir D] [--base B]`;
-export const COMMANDS = { scenarios: cmdScenarios, run: cmdRun };
+       factory run [--only IDS] [--limit N] [--continue] [--raise-budget ID[=TOKENS]] [--dir D] [--base B]
+       factory stop [--now] [--dir D]       stop the running factory run (graceful: after the current step; --now: also the CI wait)
+       factory status [--json] [--dir D]    run state, features, usage against caps, next resume time, attention`;
+export const COMMANDS = { scenarios: cmdScenarios, run: cmdRun, stop: cmdStop, status: cmdStatus };
+const NO_LOCK = new Set(['stop', 'status']); // they identify the repository but take no lock and never touch the clone
 
 export async function main(argv, deps = {}) {
   let ctx;
@@ -1016,7 +1701,7 @@ export async function main(argv, deps = {}) {
     const { cmd } = ctx.args;
     if (!cmd || cmd === 'help') { ctx.out(HELP); return cmd ? 0 : 1; }
     if (!COMMANDS[cmd]) refuse(`unknown command "${String(cmd).slice(0, 20)}"`, HELP);
-    prepare(ctx);
+    if (NO_LOCK.has(cmd)) prepareLight(ctx); else prepare(ctx);
     return await COMMANDS[cmd](ctx);
   } catch (e) {
     const out = ctx?.out || ((l) => process.stdout.write(`${l}\n`));

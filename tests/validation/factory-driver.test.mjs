@@ -594,10 +594,10 @@ test('Driver actions: ci_passed | verification fail | -> verify_failed; deliver 
   assert.deepEqual(D.nextAction(fixing, null, RUN), { do: 'build', brief: 'symptom_fix' });
 });
 
-test('Driver actions: ci_passed | usage limit | stays ci_passed, run paused', () => {
-  const a = D.nextAction(feat('ci_passed'), S('usage_limit', { resetAt: '2026-11-20T15:00:00.000Z' }), RUN);
-  assert.deepEqual(a, { do: 'stop', kind: 'usage_limit', reason: 'usage limit reached: the run stops and every state is left as it is', resetAt: '2026-11-20T15:00:00.000Z' });
-  for (const st of ['building', 'fixing']) assert.equal(D.nextAction(feat(st, { history: hist('ci_failed', 'fixing') }), S('usage_limit'), RUN).do, 'stop', st);
+test('Driver actions: ci_passed | usage limit | stays ci_passed, interrupted handling (Phase 2)', () => {
+  const a = D.nextAction(feat('ci_passed'), S('usage_limit', { limit: 'session', resetAt: '2026-11-20T15:00:00.000Z' }), RUN);
+  assert.deepEqual(a, { do: 'interrupt', kind: 'usage_limit', limit: 'session', resetAt: '2026-11-20T15:00:00.000Z' });
+  for (const st of ['building', 'fixing']) assert.equal(D.nextAction(feat(st, { history: hist('ci_failed', 'fixing') }), S('usage_limit', { limit: 'rate' }), RUN).do, 'interrupt', st);
 });
 
 test('Driver actions: verified | merge stale / updated / behind | back to pr_open, CI and verification again', () => {
@@ -631,10 +631,12 @@ test('Driver actions: all exit-2 results are handled; only the ones marked "stop
   assert.equal(D.nextAction(feat('awaiting_human'), R('ci', 'unconfirmed'), RUN).do, 'stop');
 });
 
-test('Driver actions: interruptions (usage limit, timeout) of a session stop the run and leave the branch as it is (until Phase 2)', () => {
-  for (const k of ['usage_limit', 'timeout', 'no_result', 'other']) {
+test('Driver actions: interruptions (usage limit, timeout) go to interrupted handling (Phase 2); a session without a result stops the run', () => {
+  assert.equal(D.nextAction(feat('building'), S('usage_limit', { limit: 'session' }), RUN).do, 'interrupt');
+  assert.deepEqual(D.nextAction(feat('building'), S('timeout'), RUN), { do: 'interrupt', kind: 'timeout' });
+  for (const k of ['no_result', 'other']) {
     const a = D.nextAction(feat('building'), S(k), RUN);
-    assert.equal(a.do, 'stop', k); assert.ok(['usage_limit', 'interrupted'].includes(a.kind), k);
+    assert.equal(a.do, 'stop', k); assert.equal(a.kind, 'interrupted', k);
   }
 });
 
@@ -703,10 +705,10 @@ test('driver: sessionResult normalises runSession + readBuilderResult into a dri
   assert.deepEqual(D.sessionResult(ok, { status: 'blocked', question: 'no_result' }), { step: 'session', kind: 'blocked', question: 'no_result' });
   assert.deepEqual(D.sessionResult(ok, null), { step: 'session', kind: 'blocked', question: 'no_result' });
   const at = '2026-11-20T15:00:00.000Z';
-  for (const k of ['session', 'weekly', 'model', 'rate']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k, resetAt: at } }, { status: 'done' }), { step: 'session', kind: 'usage_limit', resetAt: at });
+  for (const k of ['session', 'weekly', 'model', 'rate']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k, resetAt: at } }, { status: 'done' }), { step: 'session', kind: 'usage_limit', limit: k, resetAt: at });
   for (const bad of ['R', '2026-13-45T99:00:00Z', 'tomorrow', 5, {}, null, undefined, '2026-11-20T15:00:00.000Z<script>'])
-    assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'session', resetAt: bad } }), { step: 'session', kind: 'usage_limit', resetAt: null }, String(bad));
-  assert.equal(D.nextAction(feat('building'), S('usage_limit', { resetAt: 'not a date' }), RUN).resetAt, null);
+    assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'session', resetAt: bad } }), { step: 'session', kind: 'usage_limit', limit: 'session', resetAt: null }, String(bad));
+  assert.equal(D.nextAction(feat('building'), S('usage_limit', { limit: 'session', resetAt: 'not a date' }), RUN).resetAt, null);
   for (const k of ['max_turns', 'timeout', 'no_result', 'other', 'spawn_failed', 'unsafe_binary']) assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: k } }, { status: 'done' }), { step: 'session', kind: k }, k);
   assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'settings_unsafe', keys: ['hooks'] } }), { step: 'session', kind: 'settings_unsafe', keys: ['hooks'] });
   assert.deepEqual(D.sessionResult({ ok: false, failure: { kind: 'brand_new' } }), { step: 'session', kind: 'other' });
@@ -718,6 +720,10 @@ test('driver: fixKind reads the state before the last "fixing" from the history;
   assert.equal(D.fixKind(feat('fixing', { history: hist('pr_open', 'ci_failed', 'fixing') })), 'ci_fix');
   assert.equal(D.fixKind(feat('fixing', { history: hist('ci_failed', 'fixing', 'pr_open', 'ci_passed', 'verify_failed', 'fixing') })), 'symptom_fix');
   assert.equal(D.fixKind(feat('fixing', { history: hist('fixing') })), null);
+  // A released budget hold (deliver unhold: awaiting_human -> fixing) continues the fix step it was taken from.
+  assert.equal(D.fixKind(feat('fixing', { history: hist('pr_open', 'ci_failed', 'fixing', 'awaiting_human', 'fixing') })), 'ci_fix');
+  assert.equal(D.fixKind(feat('fixing', { history: hist('ci_passed', 'verify_failed', 'fixing', 'awaiting_human', 'fixing', 'awaiting_human', 'fixing') })), 'symptom_fix');
+  assert.equal(D.fixKind(feat('fixing', { history: hist('pr_open', 'awaiting_human', 'fixing') })), null, 'awaiting_human -> fixing without a fixing step before it');
   assert.equal(D.fixKind(feat('fixing', { history: 'x' })), null);
   for (const st of ['pr_open', 'ci_passed', 'verified']) assert.equal(D.canHold(st), true, st);
   for (const st of ['queued', 'building', 'built', 'ci_failed', 'fixing', 'verify_failed', 'awaiting_human', 'blocked', 'merged', 'skipped', 'garbage', '__proto__']) assert.equal(D.canHold(st), false, st);
@@ -858,65 +864,12 @@ test('driver: pure: inputs are never mutated', () => {
 // the fake claude (mode "factory") and the fake gh. The origin is a local bare repo reached through a per-process url.insteadOf.
 // ================================================================================================================================
 import { spawnSync } from 'node:child_process';
-const SCRIPTS = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts');
-const HARNESS = path.join(REPO, 'tests', 'fixtures', 'factory-harness.mjs');
-const FAKE_GH = path.join(REPO, 'tests', 'validation', 'fixtures-gh', 'gh.mjs');
-const FAKE_CLAUDE = path.join(REPO, 'tests', 'fixtures', 'fake-claude', 'claude');
 const FX = await import(pathToFileURL(path.join(SCRIPTS, 'factory.mjs')).href);
 const SC = await import(pathToFileURL(path.join(LIB, 'scenarios.mjs')).href);
 const RR = await import(pathToFileURL(path.join(LIB, 'runrecord.mjs')).href);
 const VD = await import(pathToFileURL(path.join(LIB, 'verdict.mjs')).href);
 
-const fspec = (id, title) => `---\ntype: feature-spec\nid: ${id}\nopportunity: OPP-001\nstatus: ready\n---\n# ${title}\n\n## Acceptance criteria\n\n| ID | Criterion |\n|---|---|\n| AC-1 | Given items When listing Then they are returned |\n\n## Edge cases\n\n- EC-1: an empty list returns an empty array\n\n## HTTP contract\n\n- \`GET /api/items\`\n- \`POST /api/items\`\n`;
-const HIDDEN = 'hidden-alpha-item';
-const AUTHOR_OK = JSON.stringify({ scenarios: [
-  { id: 'S-1', covers: ['AC-1'], kind: 'api', setup: [{ method: 'POST', path: '/api/items', body: { name: `${HIDDEN} {{CANARY}}` } }], request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }, { json_path: '$.items[*].name', contains: `${HIDDEN} {{CANARY}}` }] },
-  { id: 'S-2', covers: ['EC-1'], kind: 'api', request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }] },
-] });
-const BASE_CONFIG = { protected_branches: [], merge: { mode: 'squash' }, checks: { required: ['ci'] }, readiness: { min_level: 4 }, verification: { required: true } };
-
-// A bare origin with two ready API features, a fake gh (protection requiring factory/verified), the fake claude as `claude`.
-function world(t, { config = BASE_CONFIG, specs = { 'FEATURE-001': 'Items one', 'FEATURE-002': 'Items two' }, fake = {}, gh = {}, test = {} } = {}) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'factory-run-')));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const origin = path.join(root, 'origin.git'), work = path.join(root, 'work'), bin = path.join(root, 'bin'), home = path.join(root, 'home'), fhome = path.join(root, 'fhome');
-  for (const d of [bin, home, path.join(home, '.claude')]) fs.mkdirSync(d, { recursive: true });
-  fs.mkdirSync(fhome, { mode: 0o700 });
-  fs.copyFileSync(FAKE_GH, path.join(bin, 'gh.mjs'));
-  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nexec node "${path.join(bin, 'gh.mjs')}" "$@"\n`, { mode: 0o755 });
-  fs.symlinkSync(FAKE_CLAUDE, path.join(bin, 'claude'));
-  const rw = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_0: 'git@github.com:o/r.git', GIT_CONFIG_KEY_1: `url.${origin}.insteadOf`, GIT_CONFIG_VALUE_1: 'ssh://git@github.com/o/r.git' };
-  const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, ...rw, HOME: home } }); if (r.status !== 0) throw new Error(`git ${a.join(' ')}: ${r.stderr}`); return r.stdout.trim(); };
-  sh(root, 'init', '-q', '--bare', '-b', 'main', origin);
-  sh(root, 'clone', '-q', origin, work);
-  sh(work, 'config', 'user.email', 't@x'); sh(work, 'config', 'user.name', 't');
-  sh(work, 'remote', 'set-url', 'origin', 'git@github.com:o/r.git');
-  fs.mkdirSync(path.join(work, '.product/features'), { recursive: true });
-  for (const [id, title] of Object.entries(specs)) fs.writeFileSync(path.join(work, `.product/features/${id}.md`), fspec(id, title));
-  fs.writeFileSync(path.join(work, '.product/delivery.json'), JSON.stringify(config, null, 2));
-  fs.mkdirSync(path.join(work, '.github/workflows'), { recursive: true });
-  fs.writeFileSync(path.join(work, '.github/workflows/ci.yml'), 'name: ci\n');
-  fs.writeFileSync(path.join(work, 'README.md'), 'hi\n');
-  sh(work, 'checkout', '-q', '-b', 'main'); sh(work, 'add', '-A'); sh(work, 'commit', '-q', '-m', 'init'); sh(work, 'push', '-q', '-u', 'origin', 'main');
-  const state = path.join(root, 'gh.json');
-  fs.writeFileSync(state, JSON.stringify({ origin, prs: [], calls: [], required: [{ name: 'ci', bucket: 'pass' }], checkQueue: [[{ name: 'ci', bucket: 'pass', link: 'http://ci/1', state: 'SUCCESS' }]], protection: { required_status_checks: { contexts: ['ci', 'factory/verified'] } }, enforceProtection: true, ...gh }));
-  const log = path.join(root, 'claude.log');
-  fs.writeFileSync(path.join(bin, 'fake.json'), JSON.stringify({ mode: 'factory', log, author: { 'FEATURE-001': AUTHOR_OK, 'FEATURE-002': AUTHOR_OK }, ...fake }));
-  const env = { ...process.env, ...rw, HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_GH_STATE: state, SKILL_RUNLOG: 'off', FACTORY_HOME: fhome, FACTORY_TEST: JSON.stringify(test) };
-  delete env.FACTORY_BUILDER_HOME;
-  const factory = (args, extra = {}) => { const r = spawnSync(process.execPath, [HARNESS, ...args, '--dir', work], { encoding: 'utf8', env: { ...env, ...extra }, timeout: 240000 }); return { code: r.status, out: r.stdout, err: r.stderr, signal: r.signal }; };
-  const ghState = () => JSON.parse(fs.readFileSync(state, 'utf8'));
-  const setGh = (fn) => { const s = ghState(); fn(s); fs.writeFileSync(state, JSON.stringify(s)); };
-  const setFake = (fn) => { const p = path.join(bin, 'fake.json'); const s = JSON.parse(fs.readFileSync(p, 'utf8')); fn(s); fs.writeFileSync(p, JSON.stringify(s)); };
-  const sessions = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
-  const queueFile = path.join(fhome, 'queues', 'o__r.json');
-  const queue = () => JSON.parse(fs.readFileSync(queueFile, 'utf8'));
-  const clone = path.join(fhome, 'clones', 'o__r');
-  const records = () => { const f = path.join(clone, '.skill-runs', 'factory-runs.jsonl'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []; };
-  const inHome = (fn) => { const prev = process.env.FACTORY_HOME; process.env.FACTORY_HOME = fhome; try { return fn(); } finally { if (prev === undefined) delete process.env.FACTORY_HOME; else process.env.FACTORY_HOME = prev; } };
-  return { root, origin, work, bin, home, fhome, env, sh, factory, ghState, setGh, setFake, sessions, queue, queueFile, clone, records, inHome, builder: path.join(`${fhome}-builder`, 'o__r') };
-}
-const noText = (s, extra = []) => { for (const x of [HIDDEN, 'fx-', '/api/items', ...extra]) assert.ok(!String(s).includes(x), `leaks ${x}: ${String(s).slice(0, 400)}`); };
+import { SCRIPTS, fspec, HIDDEN, AUTHOR_OK, BASE_CONFIG, world, noText, readiness, good, ready, builderRuns, promptOf, verifyCalls } from './factory-world.mjs';
 
 test('factory scenarios: authors, lints and stores approved (auto) scenarios per ready feature; output has IDs and counts only', (t) => {
   const w = world(t);
@@ -1049,20 +1002,6 @@ test('run record: verification fields and session usage are IDs and counts only;
 });
 
 // ---- factory run --------------------------------------------------------------------------------------------------------------------
-const crypto = await import('node:crypto');
-// A stored readiness result at level 4 for the config now on origin/main (deliver init's gate re-checks C1, C2, C4 and C5).
-function readiness(w, level = 4) {
-  const raw = fs.readFileSync(path.join(w.work, '.product/delivery.json'));
-  const doc = { helper_version: '0.1.0', base: 'main', base_sha: w.sh(w.work, 'rev-parse', 'HEAD'), config_hash: `sha256:${crypto.createHash('sha256').update(raw).digest('hex')}`, level,
-    results: ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8'].map((id) => ({ id, status: 'pass', reason: '' })), fixes: [], at: new Date().toISOString() };
-  fs.mkdirSync(path.join(w.fhome, 'readiness'), { recursive: true });
-  fs.writeFileSync(path.join(w.fhome, 'readiness', 'o__r.json'), JSON.stringify(doc));
-}
-const good = (id, extra = {}) => ({ files: { [`src/${id}.txt`]: 'good\n', ...extra }, spec_complete: true, commit: true, pr_body: `Implements ${id}.\n` });
-const ready = (t, opts = {}) => { const w = world(t, opts); readiness(w); const s = w.factory(['scenarios']); assert.equal(s.code, 0, s.out + s.err); return w; };
-const builderRuns = (w, id) => w.sessions().filter((s) => !s.argv.includes('--tools') && s.argv[s.argv.indexOf('-p') + 1].includes(id));
-const promptOf = (s) => s.argv[s.argv.indexOf('-p') + 1];
-const verifyCalls = (w) => { const f = path.join(w.fhome, 'verify-calls.log'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean) : []; };
 
 test('factory run: two API features delivered end to end; factory/verified posted on the merged head before the merge', (t) => {
   const w = ready(t, { fake: { plan: { 'FEATURE-001': [good('FEATURE-001')], 'FEATURE-002': [good('FEATURE-002')] } } });
@@ -1112,7 +1051,7 @@ test('factory run: a wrong build fails verification; the symptom-fix session get
   assert.deepEqual(rec.antigaming, []); assert.equal(rec.override_note, false);
   assert.equal(rec.sessions.length, 2);
   assert.deepEqual(rec.sessions[0], { role: 'builder', id: '00000000-0000-4000-8000-000000000001', in: 120, out: 45, cache_create: 300, cache_read: 9000, turns: 2 });
-  const raw = fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8');
+  const raw = fs.readFileSync(w.recordsFile, 'utf8');
   for (const x of [doc.canary, HIDDEN, '/api/items', 'json_path', w.root]) assert.ok(!raw.includes(x), `the run record leaks ${x}`);
 });
 
@@ -1341,7 +1280,8 @@ test('I-1: a branch tracking .delivery (symlink) or .skill-runs is blocked befor
   for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
   assert.match(r.out, /attention: FEATURE-001 blocked/); assert.match(r.out, /attention: FEATURE-002 blocked/);
   for (const p of ['.delivery', '.delivery/.gitignore']) { let st = null; try { st = fs.lstatSync(path.join(w.clone, p)); } catch { /* absent */ } assert.ok(!st || !st.isSymbolicLink(), `${p} in the driver clone is not a link`); }
-  assert.ok(!fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'run records not overwritten');
+  assert.ok(!fs.readFileSync(w.recordsFile, 'utf8').includes('forged'), 'run records not overwritten');
+  assert.ok(!fs.existsSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl')) || !fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'the branch-planted records file did not land in the clone');
   assert.equal(w.ghState().prs.length, 0);
 });
 
@@ -1457,8 +1397,9 @@ test('I-5: dot entries that may alias a driver-owned name on APFS (U+017F, zero-
   assert.equal(r.code, 2, r.out + r.err);
   assert.deepEqual(w.queue().features.map((f) => f.state), ['blocked', 'blocked', 'blocked', 'blocked']);
   for (const f of w.queue().features) assert.match(f.reason, /tracks \.delivery, \.implementation or \.skill-runs/);
-  const recs = fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8');
+  const recs = fs.readFileSync(w.recordsFile, 'utf8');
   assert.ok(!recs.includes('forged'));
+  assert.ok(!fs.existsSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl')) || !fs.readFileSync(path.join(w.clone, '.skill-runs', 'factory-runs.jsonl'), 'utf8').includes('forged'), 'the branch-planted records file did not land in the clone');
   assert.equal(recs.trim().split('\n').length, 4, 'one blocked record per feature, none lost');
   assert.equal(w.ghState().prs.length, 0);
 });

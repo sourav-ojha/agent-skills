@@ -233,6 +233,22 @@ export function holderState(holder, sys) {
   if (tagOf(now) !== tagOf(holder.start)) return 'unverifiable';
   return now === holder.start ? 'live' : 'gone';
 }
+// inspect(repoKey, { home?, sys? }) -> { state: 'absent' | 'live' | 'stale' | 'unreadable', pid }: who holds the lock, read-only (it
+// never creates, takes over or removes anything). live: the recorded pid+start is alive, or cannot be verified (another start source,
+// or the process table cannot be read): held, as acquire() would treat it. stale: that exact pid+start is provably gone. unreadable:
+// not a valid lock (or not a regular file). For `factory status` and the interactive deliver guard.
+export function inspect(repoKey, { home = factoryHome(), sys = SYSTEM } = {}) {
+  checkKey(repoKey);
+  const file = path.join(lockDir(path.resolve(String(home))), `${repoKey}.lock`);
+  let r;
+  try { r = readLock(file); } catch { return { state: 'unreadable', pid: null }; }
+  if (r.state === 'absent') return { state: 'absent', pid: null };
+  if (r.state !== 'ok') return { state: 'unreadable', pid: null };
+  let h;
+  try { h = holderState(r.doc, sys); } catch { h = 'unverifiable'; }
+  return { state: h === 'gone' ? 'stale' : 'live', pid: r.doc.pid };
+}
+
 export function acquire(repoKey, { home = factoryHome(), sys = SYSTEM, register = registerCleanup } = {}) {
   checkKey(repoKey);
   const absHome = path.resolve(String(home));

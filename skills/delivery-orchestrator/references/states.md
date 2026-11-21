@@ -31,6 +31,8 @@ A feature held by an anti-gaming rule (`hold_kind: antigaming`) is released with
 
 `hold ID --reason R [--kind K] [--sha S --ids G1,G4]` parks a feature in `awaiting_human` for the factory driver (exit 2). It works only from a trusted queue under `FACTORY_HOME` and only from a state that can go to `awaiting_human`; `--kind antigaming` needs `--sha` and `--ids`, which become `hold_sha`/`hold_ids`. The driver writes three transitions to its queue directly (`ci_passed` → `verified`, `ci_passed` → `verify_failed`, and the reopen to `pr_open`); none of those writes a run record. Crash and resume rules: [factory-driver.md](factory-driver.md#resume-rules).
 
+Budget holds (run control): `building` and `fixing` may also go to `awaiting_human`, only through `hold ID --reason R --kind budget` (any other kind from those states is refused, and the driver's own `hold` actions there still stop the run with an attention entry). The feature records `hold_kind: budget` and `budget_hold: { from: <state> }`. `unhold ID --to building|fixing` (driver only, a queue under `FACTORY_HOME`) resumes it: it requires `awaiting_human` with `hold_kind: budget`, clears `budget_hold` and `hold_kind`, moves to `--to`, and sets `interrupted: { kind: budget, step: build|fix, ts }` so the driver restarts that step. Dependents of a budget-held feature are skipped like those of any `awaiting_human` feature.
+
 The helper refuses any other jump (for example `queued` → `merged`), so the file cannot claim a merge that did not go through the merge command.
 
 ## Things the helper checks for you

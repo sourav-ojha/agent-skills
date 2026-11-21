@@ -1,0 +1,1 @@
+Continue the interrupted {{STEP}} step of {{FEATURE_ID}}. The earlier session ended early (usage limit, budget, stop or timeout); the driver committed its unfinished work on the branch as a `wip({{FEATURE_ID}})` commit. Do not start over: continue from the current branch and the `.implementation/{{FEATURE_ID}}/` ledger; finish with `result.json`.

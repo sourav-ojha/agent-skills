@@ -104,14 +104,15 @@ The implementer gains a `--fix-brief <file>` input for the two fix kinds.
 | pr_open | `ci` unconfirmed (no required check reported) | feature is `awaiting_human` (existing stop rule); attention entry; run stops |
 | ci_passed | verification pass | post `factory/verified` status, `gh pr edit` to add the verified line, → `verified` |
 | ci_passed | verification fail | → `verify_failed`; `deliver fix`, builder session (symptom fix), `deliver push` |
-| ci_passed | usage limit | stays `ci_passed`, run paused |
+| building, fixing | session usage limit, budget, stop or timeout | interrupted handling (Phase 2): WIP commit, wait or stop, continue brief; not the crash rules |
+| ci_passed (verification), `factory scenarios` | usage limit or timeout of a session | interrupted handling (Phase 2): stays `ci_passed` (or the scenario step), run paused or stopped (a stop or the day cap in `factory scenarios`, and a stop in the CI wait, are handled the same way) |
 | verified | `merge` stale / updated / behind | back to `pr_open`, CI and verification again |
 | verified | `merge` held | `awaiting_human`, attention entry |
 | any | fix rounds exhausted | `deliver block` |
 
 All exit-2 results are handled by this table; only the ones marked "stop" end the run.
 
-Interruptions (usage limit, budget, stop, timeout) of a builder, author or evaluator session in any state are handled by Phase 2's interruption rules (work committed as WIP, continue brief, no fix round used), not by the crash rules below. Until Phase 2 ships, an interruption stops the run and leaves the branch as it is.
+Interruptions (usage limit, budget, stop, timeout) of a builder, author or evaluator session in any state are handled by Phase 2's interruption rules (work committed as WIP, continue brief, no fix round used), not by the crash rules below. Phase 2 is implemented: [run-control.md](../../../skills/delivery-orchestrator/references/run-control.md).
 
 ### Crash and resume
 

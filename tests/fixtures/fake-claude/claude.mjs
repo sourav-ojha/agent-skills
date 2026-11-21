@@ -60,7 +60,16 @@ function writeResult(obj) {
 //   prompt), or a step from it when it is an array.
 //   builder session: runs step N of fake.json plan[<ID>] (N counts this feature's builder sessions, kept in <FAKE_CLAUDE_DIR>/
 //   count-<ID>; the last step repeats). A step: { files: {path: text}, spec_complete, commit, status: done|blocked|usage|none,
-//   question, pr_body, sleep_ms }.
+//   question, pr_body, sleep_ms, tokens } (tokens: the result's input_tokens, for budget tests).
+//   times: N (this step is used for N sessions in a row: "first N sessions then the next step").
+//   index_lock: true (leaves .git/index.lock behind, as a session killed in the middle of a git command can).
+//   touch: <absolute path> (creates that file after the edits), linger_ms (sleeps after the edits), escape_port (with escape_ms:
+//   the escaped process listens on 127.0.0.1:<port>), app_port (a listening child kept in the session's process group).
+//   require_files: [paths] (the session reports blocked "missing <path>" when one is absent: proves a continued session sees edits).
+//   status "usage" with limit: session|weekly|model|rate and resets_at: <epoch s>|null emits a rejected rate_limit_event of that
+//   kind (rate: a 429 "Rate limit reached" instead); without limit it is the session-limit text "resets 3:45pm".
+//   status "error": an is_error result whose text no classifier rule knows (kind other); status "exit": no result event (no_result).
+//   checkout: <branch> (the session switches the clone to a new branch of that name before its edits: HEAD off the feature branch).
 function factory() {
   const argv = process.argv.slice(2);
   const prompt = argv[argv.indexOf('-p') + 1] || '';
@@ -69,6 +78,7 @@ function factory() {
   const dir = process.env.FAKE_CLAUDE_DIR || '.';
   const step = (list) => {
     if (!Array.isArray(list)) return list;
+    list = list.flatMap((x) => (x && Number.isInteger(x.times) && x.times > 1 ? Array(x.times).fill(x) : [x]));
     const cf = path.join(dir, `count-${argv.includes('--tools') ? 'author-' : ''}${id}`);
     const n = Number(fs.existsSync(cf) ? fs.readFileSync(cf, 'utf8') : 0);
     fs.writeFileSync(cf, String(n + 1));
@@ -84,10 +94,17 @@ function factory() {
       await result({ result: String(t ?? '{}').split('{{CANARY}}').join(canary) });
       return 0;
     }
-    const s = step(fromFile.plan?.[id]) || { status: 'done' };
+    let s = step(fromFile.plan?.[id]) || { status: 'done' };
+    const missing = (s.require_files || []).find((p) => !fs.existsSync(path.join(process.cwd(), p)));
+    if (missing) s = { status: 'blocked', question: `missing ${missing}` };
     if (s.sleep_ms) await sleep(s.sleep_ms);
     // escape_ms: leaves a process in its own session (setsid) with cwd in the clone, out of the session's process group.
-    if (s.escape_ms) spawn(process.execPath, ['-e', `setTimeout(() => {}, ${Number(s.escape_ms)})`], { cwd: process.cwd(), detached: true, stdio: 'ignore' }).unref();
+    // escape_port: that escaped process also listens on 127.0.0.1:<port> (an app left running by the session).
+    // app_port: a child left in the session's own process group (not escaped) listening on 127.0.0.1:<port>, cwd in the clone (an
+    // app the session started and still runs); it lives as long as the session's group does.
+    if (s.app_port) spawn(process.execPath, ['-e', `require('net').createServer().listen(${Number(s.app_port)}, '127.0.0.1');setInterval(() => {}, 1000)`], { cwd: process.cwd(), stdio: 'ignore' }).unref();
+    if (s.escape_ms) spawn(process.execPath, ['-e', `${s.escape_port ? `require('net').createServer().listen(${Number(s.escape_port)}, '127.0.0.1');` : ''}setTimeout(() => process.exit(0), ${Number(s.escape_ms)})`], { cwd: process.cwd(), detached: true, stdio: 'ignore' }).unref();
+    if (s.checkout) spawnSync('git', ['checkout', '-q', '-b', String(s.checkout)], { cwd: process.cwd() });
     for (const [p, text] of Object.entries(s.files || {})) { fs.mkdirSync(path.dirname(path.join(process.cwd(), p)), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), p), text); }
     if (s.spec_complete) {
       const sp = path.join(process.cwd(), '.product', 'features', `${id}.md`);
@@ -101,10 +118,24 @@ function factory() {
       g('commit', '-q', '-m', `feat: ${id}`);
     }
     if (s.dirty_file) fs.writeFileSync(path.join(process.cwd(), s.dirty_file), 'uncommitted\n');
+    if (s.index_lock) fs.writeFileSync(path.join(process.cwd(), '.git', 'index.lock'), ''); // a session killed mid-git leaves this
+    // touch: creates that (absolute) file, e.g. the run's stop flag mid-session; linger_ms: sleeps after the edits are on disk, so a
+    // stop or kill lands while the session still runs with uncommitted work.
+    if (s.touch) { fs.mkdirSync(path.dirname(s.touch), { recursive: true }); fs.writeFileSync(s.touch, ''); }
+    if (s.linger_ms) await sleep(s.linger_ms);
     await assistant('msg_1', 'working'); await assistant('msg_2', 'done');
+    if (s.status === 'usage' && s.limit === 'rate') { await result({ is_error: true, api_error_status: 429, result: 'API Error: Rate limit reached', terminal_reason: 'api_error' }); return 1; }
+    if (s.status === 'usage' && s.limit) {
+      const type = { session: 'five_hour', weekly: 'seven_day', model: 'seven_day_opus' }[s.limit];
+      await out({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: type, ...(s.resets_at ? { resetsAt: s.resets_at } : {}) }, session_id: SID });
+      await result({ is_error: true, api_error_status: 429, result: 'You have hit a usage limit', terminal_reason: 'api_error' });
+      return 1;
+    }
     if (s.status === 'usage') { await result({ is_error: true, api_error_status: 429, result: "You've hit your session limit · resets 3:45pm", terminal_reason: 'api_error' }); return 1; }
+    if (s.status === 'error') { await result({ is_error: true, result: 'API Error: the upstream service misbehaved', terminal_reason: 'api_error' }); return 1; }
+    if (s.status === 'exit') return 1;
     if (s.status !== 'none') writeResult(s.status === 'blocked' ? { status: 'blocked', question: s.question || 'Which database?' } : { status: 'done', summary: 'implemented' });
-    await result();
+    await result(Number.isInteger(s.tokens) ? { usage: { ...usage, input_tokens: s.tokens } } : {});
     return 0;
   })();
 }
