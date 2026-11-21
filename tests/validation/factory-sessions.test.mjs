@@ -761,14 +761,17 @@ test('readBuilderResult: tag characters, Arabic letter mark, Mongolian vowel sep
   assert.equal(S.readBuilderResult(c, 'FEATURE-30').question, 'abcdefghijk');
 });
 
+const whenStarted = async (f) => { const end = Date.now() + 10000; while (f.entries().length === 0 && Date.now() < end) await new Promise((r) => setTimeout(r, 20)); };
+
 test('runSession abort: the flag set after 200 ms ends the session as stopped within 2 s and the group is gone', async (t) => {
   const f = fake(t, { mode: 'timeout' });
   const { cwd, settingsFile } = setup(t);
-  const t0 = Date.now(); let flag = false; setTimeout(() => { flag = true; }, 200).unref();
+  let flag = false; let flagAt = 0;
+  (async () => { await whenStarted(f); await new Promise((r) => setTimeout(r, 200)); flagAt = Date.now(); flag = true; })();
   const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 20, shouldAbort: () => flag });
   assert.equal(r.ok, false); assert.equal(r.timedOut, false);
   assert.deepEqual(r.failure, { kind: 'stopped', resetAt: null });
-  assert.ok(Date.now() - t0 < 2000, 'abort should end the session quickly');
+  assert.ok(flagAt > 0 && Date.now() - flagAt < 2000, 'abort should end the session quickly');
   assert.ok(await waitDead(f.entries()[0].pid, 2000));
 });
 
@@ -776,8 +779,7 @@ test('runSession abort: a Date.now jump of +1 hour mid-session does not trigger 
   const f = fake(t, { mode: 'timeout' });
   const { cwd, settingsFile } = setup(t);
   const realNow = Date.now; let jumped = false; let flag = false;
-  setTimeout(() => { Date.now = () => realNow() + 3600e3; jumped = true; }, 100).unref();
-  setTimeout(() => { flag = true; }, 700).unref();
+  (async () => { await whenStarted(f); await new Promise((r) => setTimeout(r, 100)); Date.now = () => realNow() + 3600e3; jumped = true; await new Promise((r) => setTimeout(r, 600)); flag = true; })();
   try {
     const r = await S.runSession({ role: 'builder', cwd, prompt: 'x', settingsFile, maxTurns: 5, timeoutS: 30, claudeBin: f.bin, killGraceMs: 1000, abortPollMs: 20, shouldAbort: () => flag });
     assert.ok(jumped);
