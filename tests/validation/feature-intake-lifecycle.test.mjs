@@ -417,7 +417,7 @@ test('validate fails a child whose Traces misses a parent AC', () => {
   write(filled(child).replace('| FEATURE-001 AC-1 |  |', '| FEATURE-001 AC-1 | AC-1 |').replace('| FEATURE-001 AC-2 |  |', '| FEATURE-001 AC-2 | AC-1 |'));
   v = validateId(dir, 'FEATURE-003');
   assert.equal(v.code, 0, v.errors.join('\n'));
-  assert.deepEqual(v.warnings, []);
+  assert.deepEqual(v.warnings.filter((w) => /Traces/.test(w)), []);
   approveId(dir, 'FEATURE-003');
   assert.equal(validateId(dir, 'FEATURE-003').code, 0);
   // a filled child with an empty child cell cannot be approved
@@ -589,4 +589,25 @@ test('approve succeeds on a spec whose Approval history section has no table yet
   assert.equal(historyRows(after).length, 1);
   assert.equal(JSON.parse(r.out).content_hash, contentHash(after));
   assert.equal(validateErrors(dir).code, 0, validateErrors(dir).errors.join('\n'));
+});
+
+// follow-up: a dependency that is still a draft cannot be queued, so `deliver init` would refuse the whole queue.
+test('a draft dependency is a warning on validate, check and approve, never an error', () => {
+  const dir = project();
+  const dep = draft().replace(/^id: FEATURE-001$/m, 'id: FEATURE-002').replace(/^title: .*$/m, 'title: Dependency');
+  fs.writeFileSync(specPath(dir, 'FEATURE-002'), dep);
+  writeSpec(dir, draft().replace(/^depends_on:.*$/m, 'depends_on: FEATURE-002'));
+  const warn = (w) => /FEATURE-002/.test(w) && /draft/.test(w) && /queue/.test(w);
+  const v = fi(dir, ['validate', 'FEATURE-001', '--json']);
+  assert.equal(v.code, 0, v.out);
+  assert.ok(JSON.parse(v.out).warnings.some(warn), v.out);
+  const c = fi(dir, ['check', 'FEATURE-001', '--json']);
+  assert.equal(c.code, 0, c.out);
+  assert.ok(JSON.parse(c.out).warnings.some(warn), c.out);
+  const a = fi(dir, ['approve', 'FEATURE-001', '--by', 'Sourav', '--note', 'ok']);
+  assert.equal(a.code, 0, a.err + a.out);
+  assert.ok(JSON.parse(a.out).warnings.some(warn), a.out);
+  // once the dependency is approved the warning is gone
+  assert.equal(fi(dir, ['approve', 'FEATURE-002', '--by', 'Sourav', '--note', 'ok']).code, 0);
+  assert.deepEqual(JSON.parse(fi(dir, ['validate', 'FEATURE-001', '--json']).out).warnings, []);
 });

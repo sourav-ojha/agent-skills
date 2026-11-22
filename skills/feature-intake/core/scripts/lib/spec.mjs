@@ -104,6 +104,7 @@ export function validateSpec(text, ctx = {}) {
     if (!FEATURE_ID.test(d)) errors.push(`depends_on has invalid id "${d}"`);
     else if (d === fm.id) errors.push(`depends_on names the spec itself (${d})`);
     else if (ctx.specs && !ctx.specs.has(d)) errors.push(`depends_on names ${d}, which does not exist`);
+    else if (ctx.specs && ['draft', 'ready'].includes(fm.status) && ctx.specs.get(d).status === 'draft') warnings.push(`depends_on ${d} is still a draft; the delivery queue refuses a ready spec whose dependency is not ready or implemented, so approve ${d} first`);
   }
   if (ctx.specs && fm.status !== 'superseded' && FEATURE_ID.test(fm.id || '')) {
     const graph = new Map([...ctx.specs].filter(([, s]) => s.status !== 'superseded').map(([d, s]) => [d, parseDeps(s.fm?.depends_on)]));

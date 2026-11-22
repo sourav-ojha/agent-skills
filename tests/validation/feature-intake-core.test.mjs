@@ -400,3 +400,37 @@ test('fi check warns (not fails) on a CRLF spec', () => {
   const j = fiJson(dir, ['check', 'FEATURE-001']);
   assert.ok(j.json.warnings.some((w) => /CRLF/.test(w)), j.out);
 });
+
+// follow-up residuals ------------------------------------------------------------------------------------------------------
+test('a positional ending in "json" or "rewire" is a positional, not a boolean flag', () => {
+  const dir = withSpec(draftMinimal());
+  // `./json` has "json" after its first two characters; it must be taken as the (unknown) spec path, not as --json
+  const r = fi(dir, ['validate', './json']);
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.err, /\.\/json/, `the unknown path must be named, got: ${r.err}`);
+  assert.equal(fi(dir, ['validate', 'FEATURE-001', '--json']).code, 0);
+});
+
+test('fi new --source with a "{{" in the file name still yields a spec that can pass check', () => {
+  const dir = project();
+  const src = path.join(tmpDir('fi-src-'), 'idea{{x}}.md');
+  fs.writeFileSync(src, 'Add a health check endpoint.\n');
+  const r = fi(dir, ['new', '--title', 'Health check', '--source', src]);
+  assert.equal(r.code, 0, r.err + r.out);
+  const t = fs.readFileSync(path.join(features(dir), 'FEATURE-001.md'), 'utf8');
+  assert.match(t.match(/^source_ref:.*$/m)[0], /^source_ref: /);
+  assert.doesNotMatch(t.match(/^source_ref:.*$/m)[0], /\{\{/);
+});
+
+test('reopen on a ready spec with no Approval history table adds the table and the reopen row', () => {
+  const ready = fixture('valid-minimal.md');
+  const noTable = ready.replace(/\| Date \| Action[\s\S]*?\|------[^\n]*\n/, '');
+  assert.notEqual(noTable, ready);
+  const dir = withSpec(noTable);
+  const r = fi(dir, ['reopen', 'FEATURE-001', '--note', 'why', '--by', 'Sourav']);
+  assert.equal(r.code, 0, r.err + r.out);
+  const t = fs.readFileSync(path.join(features(dir), 'FEATURE-001.md'), 'utf8');
+  assert.match(t, /^status: draft$/m);
+  assert.match(t, /\| Date \| Action \|/);
+  assert.match(t, /\| reopen \| Sourav \| why \|/);
+});

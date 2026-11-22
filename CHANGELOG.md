@@ -10,6 +10,7 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - `SKILL.md`, references (intake procedure, writing criteria, codebase analysis, risk marking), Claude Code adapter, `docs/guides/feature-intake.md` and the routing table (intake, brainstorming, product-intelligence, implementer T0) in the guides. `npm run package:feature-intake`.
 - product-intelligence's validator accepts `origin: intake` specs (contract checks only; an intake spec naming an opportunity is an error).
 - Changed: a product-intelligence spec whose `origin:` is anything other than `product-intelligence` or `intake` is now a validation error (`unknown origin`).
+- `fi validate`, `check` and `approve` warn (never fail) when a draft or ready spec depends on a spec that is still a draft; the delivery queue would refuse the whole run until that dependency is approved.
 - Known limit: a forged approval row with a recomputed hash is possible for anyone who can write the file; the factory's `criteria_hash` binding is the second line of defence.
 
 ### Added (delivery-orchestrator: factory phase 2, run control)

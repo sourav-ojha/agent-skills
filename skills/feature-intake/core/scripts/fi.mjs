@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Feature Intake helper CLI. Zero dependencies (Node 20+). Deterministic: it allocates IDs, writes the spec skeleton, validates
-// the spec contract and checks readiness. It never interprets prose; the agent writes the content.
+// the spec contract, checks readiness and runs the lifecycle (approve, reopen, supersede, split). It never interprets prose; the
+// agent writes the content.
 // Writes only <dir>/.product/features/ (plus the metadata-only run log in <dir>/.skill-runs/).
 // Exit codes: 0 ok, 1 error or invalid (nothing changed), 2 valid but not ready (check).
 import fs from 'node:fs';
@@ -41,7 +42,7 @@ function parseArgs(argv) {
       const list = [];
       while (i + 1 < argv.length && !argv[i + 1].startsWith('--')) list.push(argv[++i]);
       flags.into = list;
-    } else if (BOOLEAN_FLAGS.has(a.slice(2))) {
+    } else if (a.startsWith('--') && BOOLEAN_FLAGS.has(a.slice(2))) {
       flags[a.slice(2)] = true;
     } else if (a.startsWith('--')) {
       const next = argv[i + 1];
@@ -148,7 +149,7 @@ function cmdNew() {
     try { bytes = flags.source === '-' ? fs.readFileSync(0) : fs.readFileSync(path.resolve(flags.source)); } catch (e) { die(`cannot read --source: ${e.message}`); }
     if (!bytes.length) die(`--source is empty (0 bytes)${flags.source === '-' ? ' on standard input' : `: ${flags.source}`}; pass the source document, or leave --source out for an idea from chat`);
     sourceSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-    sourceRef = flags.source === '-' ? 'stdin' : clean(path.basename(flags.source));
+    sourceRef = flags.source === '-' ? 'stdin' : clean(path.basename(flags.source)).replaceAll('{{', '{ {'); // a literal "{{" would read as an unfilled placeholder
     for (const [id, s] of specs) {
       if (s.fm.source_sha === sourceSha) { extra.id = id; extra.existing = true; return out({ existing: true, id }); }
     }
@@ -272,7 +273,7 @@ function cmdApprove() {
   if (after.errors.length) die(`internal: the approved spec would not validate (${after.errors[0]}); nothing written`);
   writeOwned(file, next);
   extra.status = 'ready';
-  out({ id, status: 'ready', content_hash: hash, criteria_hash: criteriaHash(canonicalSpec(next)), note: 'Approved. Author hidden scenarios after this point: any later edit needs reopen and approve again.' });
+  out({ id, status: 'ready', content_hash: hash, criteria_hash: criteriaHash(canonicalSpec(next)), warnings: v.warnings, note: 'Approved. Author hidden scenarios after this point: any later edit needs reopen and approve again.' });
 }
 
 function cmdReopen() {
