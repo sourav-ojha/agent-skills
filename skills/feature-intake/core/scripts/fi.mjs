@@ -123,8 +123,12 @@ function cmdNew() {
   }
   let tpl;
   try { tpl = read(TEMPLATE); } catch (e) { die(`cannot read the spec template (${e.message}); reinstall the skill`); }
-  fs.mkdirSync(fdir, { recursive: true });
-  if (isLink(path.join(dir, '.product')) || isLink(fdir)) die('.product or .product/features is a symbolic link; refusing to write through it');
+  // Create each level ourselves, checking for a link before and after, so nothing is ever created through a symlink.
+  for (const d of [path.join(dir, '.product'), fdir]) {
+    if (isLink(d)) die(`${path.relative(dir, d)} is a symbolic link; refusing to write through it`);
+    try { fs.mkdirSync(d); } catch (e) { if (e.code !== 'EEXIST') die(`cannot create ${path.relative(dir, d)}: ${e.message}`); }
+    if (isLink(d) || !fs.statSync(d).isDirectory()) die(`${path.relative(dir, d)} is not a plain directory; refusing to write through it`);
+  }
   const used = [...fs.readdirSync(fdir).map((f) => /^FEATURE-(\d+)\.md$/.exec(f)?.[1]).filter(Boolean).map(Number), ...registryFeatures()];
   let n = Math.max(0, ...used) + 1;
   for (let tries = 0; ; tries++, n++) {

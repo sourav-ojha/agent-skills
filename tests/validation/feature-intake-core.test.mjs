@@ -284,6 +284,18 @@ test('fi never writes outside .product/features', () => {
   fi(dir, ['check', 'FEATURE-999']);
   assert.deepEqual(snapshot(dir), before);
   assert.equal(id, 'FEATURE-003');
+
+  // A symlinked .product or .product/features is refused before anything is created at the link target.
+  for (const link of ['.product', '.product/features']) {
+    const proj = tmpDir('fi-');
+    const target = tmpDir('fi-target-');
+    if (link === '.product/features') fs.mkdirSync(path.join(proj, '.product'));
+    fs.symlinkSync(target, path.join(proj, link));
+    const r = fi(proj, ['new', '--title', 'Through a link']);
+    assert.equal(r.code, 1, `${link}: ${r.out}`);
+    assert.match(r.err, /symbolic link/, link);
+    assert.deepEqual(fs.readdirSync(target), [], `${link}: something was created at the link target`);
+  }
 });
 
 test('every fi command logs one run event with outcome', () => {
