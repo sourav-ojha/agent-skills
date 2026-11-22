@@ -7,6 +7,7 @@ One guide per skill, or per small family of skills that are used together. Each 
 | I want to… | Use | Guide |
 |---|---|---|
 | Decide *what* to build (market, competitors, prioritised ideas, specs) | `product-intelligence` | [product-intelligence](product-intelligence.md) |
+| Turn an idea, requirement, bug or plan I already understand into an approved spec | `feature-intake` | [feature-intake](feature-intake.md) |
 | Build an approved spec or a raw idea, with tests and evidence | `implementer` | [implementer](implementer.md) |
 | Deliver every ready spec unattended: PR, CI, squash merge, next | `delivery-orchestrator` | [delivery-orchestrator](delivery-orchestrator.md) |
 | Explore an idea, plan it, execute the plan step by step | `brainstorming` → `writing-plans` → `executing-plans` / `subagent-driven-development` | [build-workflow](build-workflow.md) |
@@ -24,7 +25,10 @@ One guide per skill, or per small family of skills that are used together. Each 
 
 ```
 product-intelligence ──specs──► implementer ──► PR review ──► merge
- (what to build)                (build it)      (review-and-quality)
+ (what to build)          ▲     (build it)      (review-and-quality)
+                          │          │
+ feature-intake ──specs───┘          │
+ (you know what to build)            │
         ▲                            │
         └──── delivery written back to the spec (status: Implemented) ────┘
 
@@ -68,10 +72,10 @@ any skill runs ──► .skill-runs/ logs + transcripts ──► skill-insight
 | Parallelism | tasks on disjoint files, each in its own worktree | fresh sub-agent per task, review after each |
 | Strength | acceptance criteria, evidence, delivery written back to the spec | design thinking up front, per-task review gates |
 
-They are alternatives, not layers. Use `implementer` when you have specs from product-intelligence; use the build workflow when the design is still open.
+They are alternatives, not layers. Use `implementer` when you have specs (from product-intelligence or feature-intake); use the build workflow when the design is still open.
 
 ## Where each skill comes from
 
-Some skills are authored here (`product-intelligence`, `implementer`, `delivery-orchestrator`, `experience-audit`, `growth-strategy`, `skill-insights`), some are vendored from other repositories, and some are imported unchanged from the author's own set. `skills.lock.json` records the origin of each one. The guides for vendored skills describe how they are used in this setup, not their upstream docs.
+Some skills are authored here (`product-intelligence`, `feature-intake`, `implementer`, `delivery-orchestrator`, `experience-audit`, `growth-strategy`, `skill-insights`), some are vendored from other repositories, and some are imported unchanged from the author's own set. `skills.lock.json` records the origin of each one. The guides for vendored skills describe how they are used in this setup, not their upstream docs.
 
 Install any skill with `npx skills add sourav-ojha/agent-skills --skill <name> -a claude-code` and update with `npx skills update`. See [installation](../installation.md).

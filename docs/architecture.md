@@ -72,6 +72,11 @@ growth-strategy (`skills/growth-strategy/`, design: [spec](superpowers/specs/202
 - Two gates in code: an approved, hash-checked baseline before any phase can close, and decisions bound to an independent review of the current plan hash.
 - Read-only integration contracts with product-intelligence and experience-audit, handoff files for the implementer written once so its close-out is kept, and no automation of publishing, posting or submissions.
 
+feature-intake (`skills/feature-intake/`, design: [spec](superpowers/specs/2026-11-22-feature-intake-design.md)) is the second writer of the feature-spec contract, beside product-intelligence `handoff`:
+- One contract, two writers: the four factory headings, the `AC-n`/`EC-n`/`ER-n` grammar, a trailing `## Delivery log` and the frontmatter keys the queue reads. Specs carry `origin: intake`; product-intelligence's validator checks only the shared basics for them (frontmatter keys, file name, no opportunity) and `fi validate` checks the rest.
+- The `fi` helper owns IDs (shared namespace with product-intelligence's registry), validation, readiness rules R1 to R9 and the lifecycle (`approve`, `reopen`, `supersede`, `split`); the agent writes the content. `criteria.mjs` is copied byte-identical from delivery-orchestrator, `runlog.mjs` from the others.
+- Approval is a hash-bound history row written only on the user's own words; any later edit outside the mutable regions fails validation until reopen and approve. The factory's `criteria_hash` binding stays the second line of defence. No vendored skill is changed: routing lives in the skill and the guides.
+
 ## Extending
 
 New skills go in `skills/<name>/` with the same shape (SKILL.md, references, templates, optional core/adapters). Share *conventions*, not code: copy small helpers rather than introducing a shared package that breaks single-skill installs. See [development.md](development.md).

@@ -3,7 +3,7 @@
 Takes every ready feature spec and delivers them one by one without you: **branch → [implementer](implementer.md) → PR → wait for CI → squash merge → next**. It is the hands-off end of the pipeline that starts with [product-intelligence](product-intelligence.md).
 
 ## When to use it
-- You have several specs with `status: ready` (what product-intelligence `handoff` writes) and want them built, reviewed by CI and merged without babysitting.
+- You have several specs with `status: ready` (what product-intelligence `handoff` writes, or a [feature-intake](feature-intake.md) spec after you approved it) and want them built, reviewed by CI and merged without babysitting.
 - Not for: one feature you want to watch (use [implementer](implementer.md)), or designs that are still open (see [build-workflow](build-workflow.md)).
 
 ## Before you start

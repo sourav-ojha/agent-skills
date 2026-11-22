@@ -23,6 +23,9 @@ brainstorming ─► writing-plans ─► choose how to execute ─► finishing
                                        └► phased-review (you code, it reviews per phase)
 ```
 
+## When to use feature-intake instead
+If the design is already settled and you want the work delivered by the [implementer](implementer.md) or the [delivery-orchestrator](delivery-orchestrator.md), skip this chain and use [feature-intake](feature-intake.md): it turns the idea, requirement, bug or plan into one approved spec with testable criteria. Stay with this chain while the design is still open; brainstorming is unchanged and does not hand off to intake by itself.
+
 ## Choosing the execution style
 
 | Situation | Pick |
