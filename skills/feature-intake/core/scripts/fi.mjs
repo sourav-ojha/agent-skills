@@ -8,7 +8,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { parseSpec, validateSpec, readiness, parseDeps, RISKS, FEATURE_ID } from './lib/spec.mjs';
+import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, historyCell, RISKS, FEATURE_ID } from './lib/spec.mjs';
+import { canonicalSpec, criteriaHash } from './lib/criteria.mjs';
 
 const TEMPLATE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'templates', 'feature-specification.md');
 const USAGE = `Feature Intake helper
@@ -18,6 +19,10 @@ usage: node fi.mjs <command> [--dir <project>] [--json]
                     allocate the next FEATURE-NNN and write a draft skeleton (same --source twice returns the existing id)
   validate ID|FILE  check frontmatter and the spec contract (exit 1 when invalid)
   check ID|FILE     validate, then the readiness rules R1-R8 (exit 2 when valid but not ready)
+  approve ID --by NAME --note "<the user's words>"
+                    draft that passes check -> ready; records who, the note and the content hash in the Approval history
+  reopen ID --note "<why>" [--by NAME]
+                    ready with delivery: none -> draft (to edit an approved spec); records a reopen row
   status            list every spec: id, status, delivery, risk, title`;
 
 function parseArgs(argv) {
@@ -191,6 +196,60 @@ function cmdCheck() {
   if (!r.ok) process.exitCode = 2;
 }
 
+// approve / reopen: only a FEATURE id inside .product/features/, never through a symbolic link; written via a temp file + rename.
+function resolveOwned() {
+  const id = rest[0];
+  if (typeof id !== 'string' || !FEATURE_ID.test(id)) die(`usage: ${cmd} FEATURE-NNN (a spec in .product/features/, not a file path)`);
+  for (const p of [path.join(dir, '.product'), fdir, path.join(fdir, `${id}.md`)]) {
+    if (isLink(p)) die(`${path.relative(dir, p)} is a symbolic link; refusing to write through it`);
+  }
+  return resolveSpec(id);
+}
+function writeOwned(file, text) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text, { flag: 'wx' });
+    fs.renameSync(tmp, file);
+  } catch (e) { try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ } die(`cannot write ${path.basename(file)}: ${e.message}`); }
+}
+const historyDate = () => (/^\d{4}-\d\d-\d\d$/.test(process.env.FI_TODAY || '') ? process.env.FI_TODAY : new Date().toISOString().slice(0, 10));
+const textFlag = (name, max) => (typeof flags[name] === 'string' ? historyCell(flags[name], max) : '');
+const LOCKED = ['implemented', 'validated', 'superseded'];
+
+function cmdApprove() {
+  const by = textFlag('by', 100); const note = textFlag('note', 300);
+  if (!by || !note) die('usage: approve FEATURE-NNN --by NAME --note "<the user\'s words>" (both required, non-empty)');
+  const { file, id, text } = resolveOwned();
+  const { fm } = parseSpec(text);
+  if (fm.status === 'ready') die(`${id} is already ready; to change it run reopen, edit, then approve`);
+  if (fm.status !== 'draft') die(`${id} is ${fm.status || 'missing a status'}; approve only runs on a draft${LOCKED.includes(fm.status) ? ` (a spec that is ${fm.status} is no longer edited)` : ''}`);
+  const specs = loadSpecs();
+  const v = validateSpec(text, { id, specs });
+  if (v.errors.length) { report(id, v); die(`${id} is invalid; fix it before approving`); }
+  const r = readiness(text, { id, specs });
+  if (!r.ok) { for (const f of r.failures) console.log(`not ready  ${f}`); die(`${id} is not ready to approve (${r.failures.length} readiness rule(s) unmet)`); }
+  const hash = contentHash(text); // the Approval history is excluded, so the new row does not change it
+  const next = setFrontmatter(appendHistory(text, { date: historyDate(), action: 'approve', by, note, hash }), { status: 'ready' });
+  const after = validateSpec(next, { id, specs });
+  if (after.errors.length) die(`internal: the approved spec would not validate (${after.errors[0]}); nothing written`);
+  writeOwned(file, next);
+  extra.status = 'ready';
+  out({ id, status: 'ready', content_hash: hash, criteria_hash: criteriaHash(canonicalSpec(next)), note: 'Approved. Author hidden scenarios after this point: any later edit needs reopen and approve again.' });
+}
+
+function cmdReopen() {
+  const note = textFlag('note', 300); const by = textFlag('by', 100) || '-';
+  if (!note) die('usage: reopen FEATURE-NNN --note "<why>" [--by NAME] (--note required, non-empty)');
+  const { file, id, text } = resolveOwned();
+  const { fm } = parseSpec(text);
+  if (fm.status !== 'ready') die(`${id} is ${fm.status || 'missing a status'}; reopen only runs on a ready spec${LOCKED.includes(fm.status) ? ` (a spec that is ${fm.status} is no longer edited)` : ''}`);
+  if (fm.delivery !== 'none') die(`${id} has delivery: ${fm.delivery || '(missing)'}; reopen needs delivery: none (delivered work is not re-specified in place)`);
+  const hash = contentHash(text);
+  writeOwned(file, setFrontmatter(appendHistory(text, { date: historyDate(), action: 'reopen', by, note, hash }), { status: 'draft' }));
+  extra.status = 'draft';
+  out({ id, status: 'draft', content_hash: hash, note: 'Reopened. Edit the spec, run check, then approve again.' });
+}
+
 function cmdStatus() {
   const rows = [...loadSpecs()].map(([id, s]) => ({
     id,
@@ -206,7 +265,7 @@ function cmdStatus() {
   for (const r of rows) console.log(`${r.id}  ${r.status.padEnd(11)} delivery:${r.delivery.padEnd(8)} risk:${r.risk.padEnd(8)} ${r.title}`);
 }
 
-const commands = { new: cmdNew, validate: cmdValidate, check: cmdCheck, status: cmdStatus };
+const commands = { new: cmdNew, validate: cmdValidate, check: cmdCheck, approve: cmdApprove, reopen: cmdReopen, status: cmdStatus };
 if (!cmd || cmd === 'help' || !Object.hasOwn(commands, cmd)) {
   console.log(USAGE);
   process.exit(cmd && cmd !== 'help' ? 1 : 0);

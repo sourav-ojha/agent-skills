@@ -93,6 +93,12 @@ export function validateSpec(text, ctx = {}) {
   const cr = extractCriteria(text);
   for (const e of cr.errors) if (!layout.includes(e)) errors.push(`criteria: ${e}`);
   if (['ready', 'implemented', 'validated'].includes(fm.status) && String(text).includes('{{')) errors.push(`status is ${fm.status} but unfilled {{placeholders}} remain`);
+  if (['ready', 'implemented', 'validated'].includes(fm.status)) {
+    const rows = historyRows(text); const approval = lastApproval(text);
+    if (!approval) errors.push(`ready without approval record: status is ${fm.status} but the Approval history has no approve row (run fi approve)`);
+    else if (rows.at(-1).action !== 'approve') errors.push(`ready without approval record: status is ${fm.status} but the last Approval history row is "${rows.at(-1).action}" (run fi approve)`);
+    else if (approval.hash !== contentHash(text)) errors.push(`modified_since_approval: the spec changed after it was approved on ${approval.at} by ${approval.by} (run fi reopen, edit, then fi approve)`);
+  }
   return { errors, warnings };
 }
 
@@ -133,4 +139,67 @@ export function contentHash(text) {
   let e = lines.findIndex((l, i) => i > s && isH2(l));
   if (e === -1) e = lines.length;
   return criteriaHash(canonicalSpec([...lines.slice(0, s), ...lines.slice(e)].join('\n')));
+}
+
+// ---- Approval history ----------------------------------------------------------------------------------------------------
+const HISTORY_HEADER = ['| Date | Action | By | Note | Content hash |', '|------|--------|----|------|--------------|'];
+
+// Table cells, split on unescaped "|" and unescaped ("\|" -> "|", "\\" -> "\").
+function cells(line) {
+  const out = []; let cur = '';
+  const t = line.trim().replace(/^\|/, '');
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === '\\' && i + 1 < t.length) { cur += t[++i]; continue; }
+    if (t[i] === '|') { out.push(cur.trim()); cur = ''; continue; }
+    cur += t[i];
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+// One table cell from free text: control characters and newlines become spaces, "\" and "|" are escaped.
+export const historyCell = (s, max = 300) => String(s).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max).replace(/[\\|]/g, '\\$&');
+
+function historyBounds(lines) {
+  const s = lines.findIndex((l) => isH2(l) && h2Title(l).startsWith('approval history'));
+  if (s === -1) return null;
+  let e = lines.findIndex((l, i) => i > s && isH2(l));
+  if (e === -1) e = lines.length;
+  return { s, e };
+}
+
+// Data rows of the Approval history table, in file order: { date, action, by, note, hash }.
+function historyRows(text) {
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+  const b = historyBounds(lines);
+  if (!b) return [];
+  return lines.slice(b.s + 1, b.e).filter((l) => /^\s*\|/.test(l)).map(cells)
+    .filter((c) => c.length >= 5 && /^\d{4}-\d\d-\d\d$/.test(c[0]))
+    .map(([date, action, by, note, hash]) => ({ date, action, by, note, hash }));
+}
+
+// The last `approve` row, or null.
+export function lastApproval(text) {
+  const row = historyRows(text).filter((r) => r.action === 'approve').at(-1);
+  return row ? { at: row.date, by: row.by, hash: row.hash } : null;
+}
+
+// Insert one row at the end of the Approval history table; every other byte is unchanged. A missing section is created
+// before a `## Delivery log`, else at the end. Row values are written as given (escape free text with historyCell).
+export function appendHistory(text, row) {
+  const line = `| ${row.date} | ${row.action} | ${row.by} | ${row.note} | ${row.hash} |`;
+  const lines = String(text).split('\n');
+  const b = historyBounds(lines.map((l) => l.replace(/\r$/, '')));
+  if (b) {
+    let last = -1;
+    for (let i = b.s + 1; i < b.e; i++) if (/^\s*\|/.test(lines[i])) last = i;
+    if (last === -1) lines.splice(b.s + 1, 0, '', ...HISTORY_HEADER, line);
+    else lines.splice(last + 1, 0, line);
+    return lines.join('\n');
+  }
+  const block = ['## Approval history', '', ...HISTORY_HEADER, line, ''];
+  const log = lines.findIndex((l) => /^## Delivery log[ \t]*\r?$/.test(l));
+  if (log !== -1) { lines.splice(log, 0, ...block); return lines.join('\n'); }
+  const t = String(text);
+  const sep = t === '' || t.endsWith('\n\n') ? '' : t.endsWith('\n') ? '\n' : '\n\n';
+  return t + sep + block.join('\n');
 }
