@@ -92,6 +92,19 @@ export function validateSpec(text, ctx = {}) {
   errors.push(...layout.map((p) => `layout: ${p}`));
   const cr = extractCriteria(text);
   for (const e of cr.errors) if (!layout.includes(e)) errors.push(`criteria: ${e}`);
+  if (has('superseded_by')) {
+    for (const d of parseDeps(fm.superseded_by)) {
+      if (!FEATURE_ID.test(d)) errors.push(`superseded_by has invalid id "${d}"`);
+      else if (d === fm.id) errors.push(`superseded_by names the spec itself (${d})`);
+      else if (ctx.specs && !ctx.specs.has(d)) errors.push(`superseded_by names ${d}, which does not exist`);
+    }
+  }
+  if (has('parent')) {
+    const t = traceCheck(body, fm, cr, ctx);
+    errors.push(...t.errors);
+    const empty = t.empty.map((a) => `Traces: parent criterion ${fm.parent} ${a} has no child criterion yet`);
+    if (fm.status === 'draft') warnings.push(...empty); else errors.push(...empty);
+  }
   if (['ready', 'implemented', 'validated'].includes(fm.status) && String(text).includes('{{')) errors.push(`status is ${fm.status} but unfilled {{placeholders}} remain`);
   if (['ready', 'implemented', 'validated'].includes(fm.status)) {
     const rows = historyRows(text); const approval = lastApproval(text);
@@ -100,6 +113,44 @@ export function validateSpec(text, ctx = {}) {
     else if (approval.hash !== contentHash(text)) errors.push(`modified_since_approval: the spec changed after it was approved on ${approval.at} by ${approval.by} (run fi reopen, edit, then fi approve)`);
   }
   return { errors, warnings };
+}
+
+// ---- Traces (split children) ----------------------------------------------------------------------------------------------
+// `## Traces` rows are `| <parent id> AC-n | <child AC ids, comma separated> |`. The parent id prefixes the first cell because a
+// row starting with a bare AC id outside Acceptance criteria is a contract error for the factory's extractor.
+export const TRACES_HEADER = ['| Parent criterion | Child criterion |', '|------------------|-----------------|'];
+const TRACE_PARENT = /^(FEATURE-\d+)\s+(AC-\d+)$/;
+
+// Errors for a spec with `parent:`, plus the parent AC ids whose child cell is still empty (an error or a warning by status).
+function traceCheck(body, fm, cr, ctx) {
+  const errors = []; const empty = [];
+  if (!FEATURE_ID.test(fm.parent)) return { errors: [`parent "${fm.parent}" is not a FEATURE id`], empty };
+  if (fm.parent === fm.id) return { errors: [`parent names the spec itself (${fm.parent})`], empty };
+  const sec = section(body, 'Traces');
+  if (sec === null) return { errors: [`a spec with parent: ${fm.parent} needs a "## Traces" section mapping every parent criterion`], empty };
+  const own = new Set(cr.ac.map((a) => a.id));
+  const mapped = new Set();
+  for (const line of sec.split('\n')) {
+    if (!/^\s*\|/.test(line) || /^\s*\|[\s:|-]*$/.test(line) || line.trim() === TRACES_HEADER[0]) continue;
+    const [p = '', c = ''] = cells(line);
+    const m = TRACE_PARENT.exec(p);
+    if (!m) { errors.push(`Traces row does not start with "${fm.parent} AC-<n>": ${line.trim().slice(0, 80)}`); continue; }
+    if (m[1] !== fm.parent) { errors.push(`Traces row names ${m[1]}, not the parent ${fm.parent}: ${line.trim().slice(0, 80)}`); continue; }
+    mapped.add(m[2]);
+    const kids = c.split(/[,\s]+/).filter(Boolean);
+    if (!kids.length) { empty.push(m[2]); continue; }
+    for (const k of kids) if (!own.has(k)) errors.push(`Traces maps ${fm.parent} ${m[2]} to ${k}, which is not an acceptance criterion of this spec`);
+  }
+  if (ctx.specs) {
+    const parent = ctx.specs.get(fm.parent);
+    if (!parent) errors.push(`parent ${fm.parent} does not exist`);
+    else {
+      const pac = extractCriteria(parent.text).ac.map((a) => a.id);
+      for (const a of pac) if (!mapped.has(a)) errors.push(`Traces misses parent criterion ${fm.parent} ${a}`);
+      for (const a of mapped) if (!pac.includes(a)) errors.push(`Traces names ${fm.parent} ${a}, which is not a criterion of the parent`);
+    }
+  }
+  return { errors, empty };
 }
 
 // Mechanical readiness for approval. Never sets a status; only the user's approval does.
@@ -127,6 +178,10 @@ export function readiness(text, ctx = {}) {
     const dep = ctx.specs?.get(d);
     if (!dep) failures.push(`R8 dependency ${d} does not exist`);
     else if (dep.status === 'superseded') failures.push(`R8 dependency ${d} is superseded`);
+  }
+  if (Object.hasOwn(fm, 'parent')) {
+    const { empty } = traceCheck(body, fm, cr, ctx);
+    if (empty.length) failures.push(`R9 Traces has no child criterion for parent criterion(s) ${empty.join(', ')}`);
   }
   return { ok: failures.length === 0, failures };
 }

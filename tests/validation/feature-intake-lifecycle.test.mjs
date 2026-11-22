@@ -232,3 +232,256 @@ test('approve twice refuses', () => {
   assert.match(r.err, /already ready/);
   assert.equal(readSpec(dir), before);
 });
+
+// ---- M3b: supersede and split ---------------------------------------------------------------------------------------------
+const { discover, buildQueue } = await import(path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'lib', 'queue.mjs'));
+const fdirOf = (dir) => path.join(dir, '.product', 'features');
+const readId = (dir, id) => fs.readFileSync(specPath(dir, id), 'utf8');
+const fmOf = (text) => Object.fromEntries((/^---\n([\s\S]*?)\n---/.exec(text)[1]).split('\n').map((l) => /^([\w-]+):[ \t]*(.*)$/.exec(l)).filter(Boolean).map((m) => [m[1], m[2]]));
+// A ready-to-approve draft with the given id, title and depends_on.
+const draftAs = (id, { deps = '', title = `Spec ${id}` } = {}) => draft()
+  .replace(/^id: FEATURE-001$/m, `id: ${id}`).replace(/^title: .*$/m, `title: ${title}`).replace(/^depends_on:$/m, deps ? `depends_on: ${deps}` : 'depends_on:');
+function multi(specs) {
+  const dir = tmpDir('fi-multi-');
+  fs.mkdirSync(fdirOf(dir), { recursive: true });
+  for (const [id, opts] of Object.entries(specs)) fs.writeFileSync(specPath(dir, id), draftAs(id, opts));
+  return dir;
+}
+const approveId = (dir, id) => { const r = fi(dir, ['approve', id, '--by', 'Sourav', '--note', 'ok']); assert.equal(r.code, 0, r.err + r.out); };
+const snapshot = (dir) => Object.fromEntries(fs.readdirSync(fdirOf(dir)).sort().map((f) => [f, fs.readFileSync(path.join(fdirOf(dir), f), 'utf8')]));
+const validateId = (dir, id) => { const r = fi(dir, ['validate', id, '--json']); return { code: r.code, ...JSON.parse(r.out) }; };
+
+test('supersede marks status and superseded_by', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {} });
+  const r = fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002']);
+  assert.equal(r.code, 0, r.err + r.out);
+  const fm = fmOf(readId(dir, 'FEATURE-001'));
+  assert.equal(fm.status, 'superseded');
+  assert.equal(fm.superseded_by, 'FEATURE-002');
+  assert.equal(validateId(dir, 'FEATURE-001').code, 0);
+  // a ready (approved) spec can be superseded too, and stays valid
+  const d2 = multi({ 'FEATURE-001': {}, 'FEATURE-002': {} });
+  approveId(d2, 'FEATURE-001');
+  assert.equal(fi(d2, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002']).code, 0);
+  assert.equal(fmOf(readId(d2, 'FEATURE-001')).status, 'superseded');
+  assert.equal(validateId(d2, 'FEATURE-001').code, 0);
+  // refusals change nothing: by itself, by a missing spec, by a superseded spec, already superseded, no --by
+  const d3 = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': {} });
+  assert.equal(fi(d3, ['supersede', 'FEATURE-002', '--by', 'FEATURE-003']).code, 0);
+  const before = snapshot(d3);
+  for (const args of [['FEATURE-001', '--by', 'FEATURE-001'], ['FEATURE-001', '--by', 'FEATURE-009'], ['FEATURE-001', '--by', 'FEATURE-002'],
+    ['FEATURE-002', '--by', 'FEATURE-001'], ['FEATURE-001'], ['FEATURE-001', '--by']]) {
+    assert.equal(fi(d3, ['supersede', ...args]).code, 1, JSON.stringify(args));
+    assert.deepEqual(snapshot(d3), before, JSON.stringify(args));
+  }
+  // superseded_by must name existing specs
+  fs.rmSync(specPath(d3, 'FEATURE-003'));
+  assert.ok(validateId(d3, 'FEATURE-002').errors.some((e) => /superseded_by.*FEATURE-003/.test(e)));
+});
+
+test('supersede refuses and lists dependents', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' }, 'FEATURE-004': { deps: 'FEATURE-001' }, 'FEATURE-005': { deps: 'FEATURE-001' } });
+  fs.writeFileSync(specPath(dir, 'FEATURE-005'), readId(dir, 'FEATURE-005').replace('status: draft', 'status: superseded'));
+  const before = snapshot(dir);
+  const r = fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /FEATURE-003/);
+  assert.match(r.err, /FEATURE-004/);
+  assert.doesNotMatch(r.err, /FEATURE-005/, 'a superseded dependent is not a dependent');
+  assert.match(r.err, /--rewire/);
+  assert.deepEqual(snapshot(dir), before);
+});
+
+test('--rewire edits draft dependents only', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' }, 'FEATURE-004': { deps: 'FEATURE-001, FEATURE-002' }, 'FEATURE-005': { deps: 'FEATURE-001' }, 'FEATURE-006': {} });
+  fs.writeFileSync(specPath(dir, 'FEATURE-005'), readId(dir, 'FEATURE-005').replace('status: draft', 'status: superseded'));
+  const before = snapshot(dir);
+  const r = fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002', '--rewire']);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.equal(fmOf(readId(dir, 'FEATURE-003')).depends_on, 'FEATURE-002');
+  assert.equal(fmOf(readId(dir, 'FEATURE-004')).depends_on, 'FEATURE-002');
+  // only the depends_on line changed in a rewired dependent; superseded and unrelated specs are untouched
+  assert.equal(readId(dir, 'FEATURE-003'), before['FEATURE-003.md'].replace('depends_on: FEATURE-001', 'depends_on: FEATURE-002'));
+  assert.equal(readId(dir, 'FEATURE-005'), before['FEATURE-005.md']);
+  assert.equal(readId(dir, 'FEATURE-006'), before['FEATURE-006.md']);
+  assert.deepEqual(JSON.parse(r.out).rewired, ['FEATURE-003', 'FEATURE-004']);
+  for (const id of ['FEATURE-001', 'FEATURE-003', 'FEATURE-004']) assert.equal(validateId(dir, id).code, 0, id);
+});
+
+test('--rewire still refuses a ready dependent', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' }, 'FEATURE-004': { deps: 'FEATURE-001' } });
+  approveId(dir, 'FEATURE-003');
+  const before = snapshot(dir);
+  const r = fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002', '--rewire']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /FEATURE-003/);
+  assert.match(r.err, /reopen/);
+  assert.deepEqual(snapshot(dir), before, 'nothing is written, not even the draft dependent');
+});
+
+test('queue built after supersede+rewire has no unmet dependency', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' } });
+  approveId(dir, 'FEATURE-001');
+  approveId(dir, 'FEATURE-002');
+  assert.equal(fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002', '--rewire']).code, 0);
+  approveId(dir, 'FEATURE-003');
+  const specs = discover(fdirOf(dir));
+  const q = buildQueue(specs);
+  assert.deepEqual(q.map((f) => f.id), ['FEATURE-002', 'FEATURE-003']);
+  assert.deepEqual(q.find((f) => f.id === 'FEATURE-003').deps, ['FEATURE-002']);
+  // without the rewire the same queue would fail on the superseded dependency
+  const stale = specs.map((s) => (s.id === 'FEATURE-003' ? { ...s, deps: ['FEATURE-001'] } : s));
+  assert.throws(() => buildQueue(stale), /FEATURE-003 depends on FEATURE-001/);
+});
+
+test('supersede refuses a delivered spec', () => {
+  for (const [status, delivery] of [['implemented', 'complete'], ['validated', 'complete'], ['ready', 'partial']]) {
+    const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {} });
+    approveId(dir, 'FEATURE-001');
+    fs.writeFileSync(specPath(dir, 'FEATURE-001'), readId(dir, 'FEATURE-001').replace('status: ready', `status: ${status}`).replace('delivery: none', `delivery: ${delivery}`));
+    const before = snapshot(dir);
+    for (const cmd of [['supersede', 'FEATURE-001', '--by', 'FEATURE-002'], ['split', 'FEATURE-001', '--into', 'A', 'B']]) {
+      const r = fi(dir, cmd);
+      assert.equal(r.code, 1, `${status}/${delivery} ${cmd[0]}`);
+      assert.match(r.err, /deliver/);
+      assert.deepEqual(snapshot(dir), before);
+    }
+  }
+});
+
+// A two-criterion parent (AC-1, AC-2) that depends on FEATURE-002 and has risk elevated.
+function splitProject() {
+  const dir = multi({ 'FEATURE-002': {} });
+  const parent = draftAs('FEATURE-001', { deps: 'FEATURE-002', title: 'Health check' }).replace('risk: low', 'risk: elevated')
+    .replace(/(\| AC-1 \|[^\n]*\n)/, '$1| AC-2 | FR-1 | **Given** the service is running **When** a client sends HEAD to the health route **Then** it receives HTTP 200 with no body |\n');
+  fs.writeFileSync(specPath(dir, 'FEATURE-001'), parent);
+  return dir;
+}
+// A split child with its skeleton body replaced by the filled fixture body (its frontmatter and Traces table kept).
+const filled = (child) => {
+  const fmBlock = /^---\n[\s\S]*?\n---\n/.exec(child)[0];
+  const traces = /## Traces\n[\s\S]*?(?=## 13\.)/.exec(child)[0];
+  return fmBlock + draft().replace(/^---\n[\s\S]*?\n---\n/, '').replace('## 13. Approval history', `${traces}## 13. Approval history`);
+};
+const traceRows = (text) => text.split('\n').filter((l) => /^\| FEATURE-\d+ AC-\d+ \|/.test(l));
+
+test('split creates N children, parent superseded, Traces lists every parent AC', () => {
+  const dir = splitProject();
+  const r = fi(dir, ['split', 'FEATURE-001', '--into', 'Health route', 'Health HEAD support', 'Health docs']);
+  assert.equal(r.code, 0, r.err + r.out);
+  const res = JSON.parse(r.out);
+  assert.deepEqual(res.children, ['FEATURE-003', 'FEATURE-004', 'FEATURE-005']);
+  const parent = fmOf(readId(dir, 'FEATURE-001'));
+  assert.equal(parent.status, 'superseded');
+  assert.equal(parent.superseded_by, 'FEATURE-003, FEATURE-004, FEATURE-005');
+  assert.equal(validateId(dir, 'FEATURE-001').code, 0);
+  const titles = ['Health route', 'Health HEAD support', 'Health docs'];
+  res.children.forEach((id, i) => {
+    const text = readId(dir, id);
+    const fm = fmOf(text);
+    assert.equal(fm.id, id);
+    assert.equal(fm.title, titles[i]);
+    assert.equal(fm.status, 'draft');
+    assert.equal(fm.origin, 'intake');
+    assert.equal(fm.parent, 'FEATURE-001');
+    assert.equal(fm.depends_on, 'FEATURE-002');
+    assert.equal(fm.risk, 'elevated');
+    assert.equal(fm.source_sha, 'none');
+    assert.match(text, /\n## Traces\n\n\| Parent criterion \| Child criterion \|\n/);
+    assert.deepEqual(traceRows(text), ['| FEATURE-001 AC-1 |  |', '| FEATURE-001 AC-2 |  |']);
+    assert.ok(text.indexOf('## Traces') < text.indexOf('Approval history'));
+    const v = validateId(dir, id);
+    assert.equal(v.code, 0, `${id}: ${v.errors.join('\n')}`);
+    assert.equal(v.warnings.filter((w) => /Traces/.test(w)).length, 2, 'an empty child cell is a warning on a draft');
+  });
+});
+
+test('validate fails a child whose Traces misses a parent AC', () => {
+  const dir = splitProject();
+  assert.equal(fi(dir, ['split', 'FEATURE-001', '--into', 'A', 'B']).code, 0);
+  const child = readId(dir, 'FEATURE-003');
+  const write = (t) => fs.writeFileSync(specPath(dir, 'FEATURE-003'), t);
+  write(child.replace('| FEATURE-001 AC-2 |  |\n', ''));
+  let v = validateId(dir, 'FEATURE-003');
+  assert.equal(v.code, 1);
+  assert.ok(v.errors.some((e) => /Traces/.test(e) && /AC-2/.test(e)), v.errors.join('\n'));
+  // a child criterion that does not exist in the child
+  write(child.replace('| FEATURE-001 AC-1 |  |', '| FEATURE-001 AC-1 | AC-1 |').replace('| FEATURE-001 AC-2 |  |', '| FEATURE-001 AC-2 | AC-9 |'));
+  v = validateId(dir, 'FEATURE-003');
+  assert.equal(v.code, 1);
+  assert.ok(v.errors.some((e) => /AC-9/.test(e)), v.errors.join('\n'));
+  // no Traces section at all
+  write(child.replace(/## Traces\n[\s\S]*?(?=## 13\.)/, ''));
+  assert.ok(validateId(dir, 'FEATURE-003').errors.some((e) => /Traces/.test(e)));
+  // fully mapped: valid, and once filled, approving it through the real flow keeps it valid
+  write(filled(child).replace('| FEATURE-001 AC-1 |  |', '| FEATURE-001 AC-1 | AC-1 |').replace('| FEATURE-001 AC-2 |  |', '| FEATURE-001 AC-2 | AC-1 |'));
+  v = validateId(dir, 'FEATURE-003');
+  assert.equal(v.code, 0, v.errors.join('\n'));
+  assert.deepEqual(v.warnings, []);
+  approveId(dir, 'FEATURE-003');
+  assert.equal(validateId(dir, 'FEATURE-003').code, 0);
+  // a filled child with an empty child cell cannot be approved
+  fs.writeFileSync(specPath(dir, 'FEATURE-004'), filled(readId(dir, 'FEATURE-004')));
+  const r = fi(dir, ['approve', 'FEATURE-004', '--by', 'Sourav', '--note', 'ok']);
+  assert.equal(r.code, 1);
+  assert.match(r.out + r.err, /Traces/);
+});
+
+test('split refuses a ready parent', () => {
+  const dir = splitProject();
+  approveId(dir, 'FEATURE-001');
+  const before = snapshot(dir);
+  const r = fi(dir, ['split', 'FEATURE-001', '--into', 'A', 'B']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /draft/);
+  assert.deepEqual(snapshot(dir), before);
+  // fewer than two titles, or duplicate titles, are refused
+  const d2 = splitProject();
+  const b2 = snapshot(d2);
+  for (const into of [['A'], ['A', 'A'], []]) {
+    assert.equal(fi(d2, ['split', 'FEATURE-001', '--into', ...into]).code, 1, JSON.stringify(into));
+    assert.deepEqual(snapshot(d2), b2);
+  }
+  // same dependents rule as supersede
+  fs.writeFileSync(specPath(d2, 'FEATURE-006'), draftAs('FEATURE-006', { deps: 'FEATURE-001' }));
+  const b3 = snapshot(d2);
+  const r2 = fi(d2, ['split', 'FEATURE-001', '--into', 'A', 'B']);
+  assert.equal(r2.code, 1);
+  assert.match(r2.err, /FEATURE-006/);
+  assert.deepEqual(snapshot(d2), b3);
+  const r3 = fi(d2, ['split', 'FEATURE-001', '--into', 'A', 'B', '--rewire']);
+  assert.equal(r3.code, 0, r3.err + r3.out);
+  assert.equal(fmOf(readId(d2, 'FEATURE-006')).depends_on, 'FEATURE-007, FEATURE-008');
+});
+
+test('split is idempotent on titles', () => {
+  const dir = splitProject();
+  const first = fi(dir, ['split', 'FEATURE-001', '--into', 'A', 'B']);
+  assert.equal(first.code, 0, first.err + first.out);
+  const before = snapshot(dir);
+  const again = fi(dir, ['split', 'FEATURE-001', '--into', 'A', 'B']);
+  assert.equal(again.code, 0, again.err + again.out);
+  assert.deepEqual(JSON.parse(again.out).children, JSON.parse(first.out).children);
+  assert.equal(JSON.parse(again.out).existing, true);
+  assert.deepEqual(snapshot(dir), before, 'creates nothing');
+  // different titles on an already split parent are refused
+  assert.equal(fi(dir, ['split', 'FEATURE-001', '--into', 'A', 'C']).code, 1);
+  assert.deepEqual(snapshot(dir), before);
+});
+
+test('split removes the children it created when a create fails', () => {
+  const dir = splitProject();
+  const before = snapshot(dir);
+  // Fail the second exclusive create of a spec file, as a full disk or a permission error would.
+  const preload = path.join(tmpDir('fi-preload-'), 'fail-second-create.mjs');
+  fs.writeFileSync(preload, `import fs from 'node:fs';
+const orig = fs.writeFileSync; let n = 0;
+fs.writeFileSync = function (p, ...a) {
+  if (a[1]?.flag === 'wx' && /FEATURE-\\d+\\.md$/.test(String(p)) && ++n === 2) { const e = new Error('EIO: simulated failure'); e.code = 'EIO'; throw e; }
+  return orig.call(this, p, ...a);
+};\n`);
+  const r = spawnSync('node', ['--import', preload, FI, 'split', 'FEATURE-001', '--into', 'A', 'B', '--dir', dir], { encoding: 'utf8', env: { ...process.env, SKILL_RUNLOG: '', FI_TODAY: TODAY } });
+  assert.equal(r.status, 1, r.stderr + r.stdout);
+  assert.match(r.stderr, /simulated/);
+  assert.deepEqual(snapshot(dir), before, 'the first child is removed and the parent is unchanged');
+});

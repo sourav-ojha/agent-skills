@@ -8,8 +8,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, historyCell, RISKS, FEATURE_ID } from './lib/spec.mjs';
-import { canonicalSpec, criteriaHash } from './lib/criteria.mjs';
+import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, historyCell, RISKS, FEATURE_ID, TRACES_HEADER } from './lib/spec.mjs';
+import { canonicalSpec, criteriaHash, extractCriteria } from './lib/criteria.mjs';
 
 const TEMPLATE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'templates', 'feature-specification.md');
 const USAGE = `Feature Intake helper
@@ -23,13 +23,23 @@ usage: node fi.mjs <command> [--dir <project>] [--json]
                     draft that passes check -> ready; records who, the note and the content hash in the Approval history
   reopen ID --note "<why>" [--by NAME]
                     ready with delivery: none -> draft (to edit an approved spec); records a reopen row
+  supersede ID --by NEW [--rewire]
+                    draft or ready ID (delivery: none) -> superseded with superseded_by: NEW. Refuses while specs depend on
+                    ID, listing them; --rewire points draft dependents at NEW (a ready dependent must be reopened first)
+  split ID --into "Title A" "Title B" [...] [--rewire]
+                    draft ID -> one draft child per title (parent: ID, a ## Traces table of the parent's criteria,
+                    depends_on and risk copied), then ID superseded by the children. Same titles again return the children
   status            list every spec: id, status, delivery, risk, title`;
 
 function parseArgs(argv) {
   const pos = []; const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) {
+    if (a === '--into') { // a list: every following token up to the next flag
+      const list = [];
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('--')) list.push(argv[++i]);
+      flags.into = list;
+    } else if (a.startsWith('--')) {
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('--')) flags[a.slice(2)] = true;
       else { flags[a.slice(2)] = next; i++; }
@@ -89,6 +99,13 @@ function registryFeatures() {
   return ids;
 }
 
+// The next free FEATURE number: one past the highest spec file and product-intelligence registry entry.
+function nextNumber() {
+  const used = [...fs.readdirSync(fdir).map((f) => /^FEATURE-(\d+)\.md$/.exec(f)?.[1]).filter(Boolean).map(Number), ...registryFeatures()];
+  return Math.max(0, ...used) + 1;
+}
+const featureId = (n) => `FEATURE-${String(n).padStart(3, '0')}`;
+
 function setFrontmatter(text, updates) {
   const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
   if (!m) die('template has no frontmatter; reinstall the skill');
@@ -134,10 +151,9 @@ function cmdNew() {
     try { fs.mkdirSync(d); } catch (e) { if (e.code !== 'EEXIST') die(`cannot create ${path.relative(dir, d)}: ${e.message}`); }
     if (isLink(d) || !fs.statSync(d).isDirectory()) die(`${path.relative(dir, d)} is not a plain directory; refusing to write through it`);
   }
-  const used = [...fs.readdirSync(fdir).map((f) => /^FEATURE-(\d+)\.md$/.exec(f)?.[1]).filter(Boolean).map(Number), ...registryFeatures()];
-  let n = Math.max(0, ...used) + 1;
+  let n = nextNumber();
   for (let tries = 0; ; tries++, n++) {
-    const id = `FEATURE-${String(n).padStart(3, '0')}`;
+    const id = featureId(n);
     const text = setFrontmatter(tpl, { id, title: fmValue(title), risk, depends_on: deps.join(', '), source_sha: sourceSha, ...(sourceRef ? { source_ref: fmValue(sourceRef) } : {}) })
       .replace(/\{\{title\}\}/g, () => title);
     try {
@@ -196,21 +212,29 @@ function cmdCheck() {
   if (!r.ok) process.exitCode = 2;
 }
 
-// approve / reopen: only a FEATURE id inside .product/features/, never through a symbolic link; written via a temp file + rename.
-function resolveOwned() {
-  const id = rest[0];
-  if (typeof id !== 'string' || !FEATURE_ID.test(id)) die(`usage: ${cmd} FEATURE-NNN (a spec in .product/features/, not a file path)`);
+// approve / reopen / supersede / split: only a FEATURE id inside .product/features/, never through a symbolic link; written via a
+// temp file + rename (new children: exclusive create).
+function refuseLinks(id) {
   for (const p of [path.join(dir, '.product'), fdir, path.join(fdir, `${id}.md`)]) {
     if (isLink(p)) die(`${path.relative(dir, p)} is a symbolic link; refusing to write through it`);
   }
+}
+function resolveOwned() {
+  const id = rest[0];
+  if (typeof id !== 'string' || !FEATURE_ID.test(id)) die(`usage: ${cmd} FEATURE-NNN (a spec in .product/features/, not a file path)`);
+  refuseLinks(id);
   return resolveSpec(id);
 }
-function writeOwned(file, text) {
+// Throws on failure (callers that must undo other writes catch it); writeOwned dies instead.
+function replaceOwned(file, text) {
   const tmp = `${file}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, text, { flag: 'wx' });
     fs.renameSync(tmp, file);
-  } catch (e) { try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ } die(`cannot write ${path.basename(file)}: ${e.message}`); }
+  } catch (e) { try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ } throw new Error(`cannot write ${path.basename(file)}: ${e.message}`); }
+}
+function writeOwned(file, text) {
+  try { replaceOwned(file, text); } catch (e) { die(e.message); }
 }
 const historyDate = () => (/^\d{4}-\d\d-\d\d$/.test(process.env.FI_TODAY || '') ? process.env.FI_TODAY : new Date().toISOString().slice(0, 10));
 const textFlag = (name, max) => (typeof flags[name] === 'string' ? historyCell(flags[name], max) : '');
@@ -250,6 +274,116 @@ function cmdReopen() {
   out({ id, status: 'draft', content_hash: hash, note: 'Reopened. Edit the spec, run check, then approve again.' });
 }
 
+// ---- supersede / split ----------------------------------------------------------------------------------------------------
+function refuseDelivered(id, fm) {
+  if (['implemented', 'validated'].includes(fm.status) || (fm.delivery || 'none') !== 'none') {
+    die(`${id} is ${fm.status} with delivery: ${fm.delivery || '(missing)'}; delivered work is never superseded or split (put the change in a new FEATURE)`);
+  }
+}
+
+// Specs (not superseded) whose depends_on names `id`. Without --rewire their existence refuses the command; with it every one
+// must be a draft (editing depends_on changes a ready spec's content hash). Returns [[file, rewired text, dependent id], ...]
+// built by `rewire(replacement)` once the replacement ids are known. Nothing is written here.
+function dependents(specs, id, what) {
+  const deps = [...specs].filter(([d, s]) => d !== id && s.status !== 'superseded' && parseDeps(s.fm.depends_on).includes(id));
+  if (deps.length && !flags.rewire) die(`${id} has dependents: ${deps.map(([d]) => d).join(', ')}; rerun with --rewire to point their depends_on at ${what}, or edit them first`);
+  const locked = deps.filter(([, s]) => s.status !== 'draft');
+  if (locked.length) die(`--rewire edits draft dependents only; ${locked.map(([d, s]) => `${d} (${s.status})`).join(', ')} depend on ${id}: run fi reopen on each ready one first (a delivered dependent cannot be rewired)`);
+  for (const [d] of deps) refuseLinks(d); // before anything is written
+  return (replacement) => deps.map(([d, s]) => {
+    const next = [...new Set(parseDeps(s.fm.depends_on).flatMap((x) => (x === id ? replacement : [x])))].filter((x) => x !== d);
+    return [s.file, setFrontmatter(s.text, { depends_on: next.join(', ') }), d];
+  });
+}
+
+function cmdSupersede() {
+  const by = flags.by;
+  if (typeof by !== 'string' || !FEATURE_ID.test(by)) die('usage: supersede FEATURE-NNN --by FEATURE-NNN [--rewire]');
+  const { file, id, text } = resolveOwned();
+  const { fm } = parseSpec(text);
+  refuseDelivered(id, fm);
+  if (!['draft', 'ready'].includes(fm.status)) die(`${id} is ${fm.status || 'missing a status'}${fm.superseded_by ? ` by ${fm.superseded_by}` : ''}; supersede runs on a draft or ready spec`);
+  if (by === id) die(`${id} cannot supersede itself`);
+  const specs = loadSpecs();
+  const target = specs.get(by);
+  if (!target) die(`--by names ${by}, which does not exist in .product/features/`);
+  if (target.status === 'superseded') die(`--by names ${by}, which is itself superseded; name the spec that replaced it`);
+  const rewired = dependents(specs, id, by)([by]);
+  // Dependents first: if a later write fails they already point at the live spec, never at a superseded one.
+  for (const [f, t] of rewired) writeOwned(f, t);
+  writeOwned(file, setFrontmatter(text, { status: 'superseded', superseded_by: by }));
+  extra.status = 'superseded'; extra.rewired = rewired.length;
+  out({ id, status: 'superseded', superseded_by: by, rewired: rewired.map(([, , d]) => d) });
+}
+
+const fmRead = (v) => v.replace(/^(["'])(.*)\1$/, '$2'); // what parseSpec reads back from a value fmValue wrote
+
+function cmdSplit() {
+  const titles = (Array.isArray(flags.into) ? flags.into : []).map(clean);
+  if (titles.length < 2 || titles.some((t) => !t)) die('usage: split FEATURE-NNN --into "Title A" "Title B" [...] [--rewire] (two or more non-empty titles)');
+  if (new Set(titles).size !== titles.length) die('split titles must be distinct');
+  const { file, id, text } = resolveOwned();
+  const { fm } = parseSpec(text);
+  refuseDelivered(id, fm);
+  const specs = loadSpecs();
+  if (fm.status === 'superseded') {
+    // Idempotent re-run: the children are found by parent: ID and title; nothing is written.
+    const found = titles.map((t) => [...specs].find(([, s]) => s.fm.parent === id && s.fm.title === fmRead(fmValue(t)))?.[0]);
+    if (found.every(Boolean)) { extra.existing = true; return out({ existing: true, id, children: found }); }
+    die(`${id} is already superseded${fm.superseded_by ? ` by ${fm.superseded_by}` : ''} and these titles do not match its children; split runs only on a draft`);
+  }
+  if (fm.status !== 'draft') die(`${id} is ${fm.status || 'missing a status'}; split runs only on a draft${fm.status === 'ready' ? ' (run fi reopen first)' : ''}`);
+  const cr = extractCriteria(text);
+  if (!cr.ok || !cr.ac.length) die(`${id}: acceptance criteria do not extract cleanly (${cr.errors[0] || 'no AC-<n> rows'}); fix them before splitting`);
+  const rewire = dependents(specs, id, 'the children');
+  let tpl;
+  try { tpl = read(TEMPLATE); } catch (e) { die(`cannot read the spec template (${e.message}); reinstall the skill`); }
+  const traces = ['## Traces', '', ...TRACES_HEADER, ...cr.ac.map((a) => `| ${id} ${a.id} |  |`), '', ''].join('\n');
+  const childText = (cid, title) => {
+    const t = setFrontmatter(tpl, { id: cid, title: fmValue(title), risk: fm.risk, depends_on: parseDeps(fm.depends_on).join(', '), source_sha: 'none', parent: id })
+      .replace(/\{\{title\}\}/g, () => title);
+    const at = t.search(/^## (?:\d+\.\s*)?Approval history/m);
+    if (at === -1) die('template has no Approval history section; reinstall the skill');
+    return t.slice(0, at) + traces + t.slice(at);
+  };
+  const created = [];
+  const undo = (msg) => {
+    for (const f of created) { try { fs.rmSync(f, { force: true }); } catch { /* best effort */ } }
+    die(`${msg}; nothing changed (removed ${created.length} child spec(s) created by this run)`);
+  };
+  const children = [];
+  let n = nextNumber();
+  for (const title of titles) {
+    for (let tries = 0; ; tries++, n++) {
+      const cid = featureId(n);
+      const t = childText(cid, title);
+      const v = validateSpec(t, { id: cid, specs });
+      if (v.errors.length) undo(`internal: child ${cid} would not validate (${v.errors[0]})`);
+      const f = path.join(fdir, `${cid}.md`);
+      try {
+        fs.writeFileSync(f, t, { flag: 'wx' }); // exclusive create: never overwrites, never follows a link
+      } catch (e) {
+        if (e.code === 'EEXIST' && tries < 1000) continue;
+        undo(`cannot create ${cid}.md: ${e.message}`);
+      }
+      created.push(f); children.push(cid); n++;
+      break;
+    }
+  }
+  const rewired = rewire(children);
+  const parentText = setFrontmatter(text, { status: 'superseded', superseded_by: children.join(', ') });
+  const done = [];
+  try {
+    for (const [f, t, d] of rewired) { replaceOwned(f, t); done.push(d); }
+    replaceOwned(file, parentText);
+  } catch (e) {
+    for (const d of done) { try { replaceOwned(specs.get(d).file, specs.get(d).text); } catch { /* best effort */ } }
+    undo(e.message);
+  }
+  extra.status = 'superseded'; extra.children = children.length; extra.rewired = rewired.length;
+  out({ id, status: 'superseded', children, rewired: rewired.map(([, , d]) => d), note: 'Drafts created. Fill each child, map every parent criterion in its ## Traces table, run check, then approve.' });
+}
+
 function cmdStatus() {
   const rows = [...loadSpecs()].map(([id, s]) => ({
     id,
@@ -265,7 +399,7 @@ function cmdStatus() {
   for (const r of rows) console.log(`${r.id}  ${r.status.padEnd(11)} delivery:${r.delivery.padEnd(8)} risk:${r.risk.padEnd(8)} ${r.title}`);
 }
 
-const commands = { new: cmdNew, validate: cmdValidate, check: cmdCheck, approve: cmdApprove, reopen: cmdReopen, status: cmdStatus };
+const commands = { new: cmdNew, validate: cmdValidate, check: cmdCheck, approve: cmdApprove, reopen: cmdReopen, supersede: cmdSupersede, split: cmdSplit, status: cmdStatus };
 if (!cmd || cmd === 'help' || !Object.hasOwn(commands, cmd)) {
   console.log(USAGE);
   process.exit(cmd && cmd !== 'help' ? 1 : 0);
