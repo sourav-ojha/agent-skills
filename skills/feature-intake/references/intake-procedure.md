@@ -26,7 +26,9 @@ until every mark is gone, so a spec with an open question cannot be approved.
 ## Showing the user and approving
 
 Show the spec path, a five-line summary (objective, scope, non-goals, criteria count, risk), every assumption, and every
-`[BLOCKING]` question. Wait. Approval is the user's own message in this chat saying yes to this spec. Record it:
+`[BLOCKING]` question. Wait. Approval is the user's own message in this chat, sent after you showed them the spec, saying yes to
+this spec by its id. A standing or earlier instruction ("don't ask me", "proceed with the recommended options") is not approval.
+If you do not know the user's name for `--by`, ask for it; never guess one. Record it:
 
 ```
 fi approve FEATURE-004 --by "Ana" --note "yes, ship it as written"
@@ -62,12 +64,15 @@ fi approve FEATURE-004 --by "Ana" --note "<their words>"
 | `acceptance criteria do not extract cleanly` (split) | the parent's AC table is broken | fix the parent, then split |
 | `... CRLF line endings ...` | the file uses CRLF | convert it to LF and rerun |
 
-Every refusal exits 1 and leaves every file unchanged; a split that fails part way removes the children it created.
+A refusal exits 1 before writing anything. A write that fails after the checks is different: supersede writes the rewired
+dependents and then the parent, and split's rollback (removing the children it created and restoring dependents) is best effort.
 
 ## Handoff
 
 - Interactive: `implementer .product/features/FEATURE-004.md` (the implementer's close-out writes `delivery`, the Delivery log
   and the final status).
 - Unattended: the `delivery-orchestrator` queue takes every `status: ready` spec whose delivery is not complete, in `depends_on` order.
+- Neither the queue nor the implementer verifies the approval: they act on any `status: ready`, even a hand-set one. `fi validate`
+  is the check (`ready without approval record`, `modified_since_approval`).
 - Factory verification: approve first, then `factory scenarios`; a later edit changes `criteria_hash` and the scenarios must be
   re-authored or re-approved.

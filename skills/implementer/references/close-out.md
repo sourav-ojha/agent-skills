@@ -29,7 +29,8 @@ Frontmatter (`.product/features/FEATURE-NNN.md` and similar):
   `delivery` and append the log row as above, but do not run `pi transition`: there is no opportunity to transition. Say so in the report.
 - `origin: intake` specs are hash-approved: the close-out must touch only the `status` and `delivery` frontmatter lines and the trailing
   `## Delivery log` (keep it the last section). Any other edit invalidates the approval (`modified_since_approval`); if the feature-intake
-  skill is installed, run `fi validate <ID>` after the edit.
+  skill is installed, run `fi validate <ID>` after the edit (as before starting: neither the implementer nor the queue verifies the approval
+  on its own).
 - Never set `validated` or `Validated`: that needs real-world confirmation by the user.
 - Do not hand-edit `.product/opportunities.md` statuses; only `pi transition` does that. If `pi validate` exists, run it after the edit.
 

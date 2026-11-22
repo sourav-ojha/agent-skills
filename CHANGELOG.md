@@ -9,6 +9,7 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 - Helper `fi.mjs`: `new` (exclusive-create ID allocation shared with the product-intelligence registry; the same `--source` returns the same ID), `validate` (frontmatter, headings, criteria grammar, dependencies and cycles, Delivery log last), `check` (readiness R1 to R9, exit 2 when valid but not ready), `approve` (user's words and name, content hash), `reopen`, `supersede` and `split` (with `## Traces`, `--rewire` for draft dependents, cycle refusal, all-or-nothing writes), `status`. Edits after approval fail with `modified_since_approval`; lifecycle edits refuse CRLF files and symbolic links.
 - `SKILL.md`, references (intake procedure, writing criteria, codebase analysis, risk marking), Claude Code adapter, `docs/guides/feature-intake.md` and the routing table (intake, brainstorming, product-intelligence, implementer T0) in the guides. `npm run package:feature-intake`.
 - product-intelligence's validator accepts `origin: intake` specs (contract checks only; an intake spec naming an opportunity is an error).
+- Changed: a product-intelligence spec whose `origin:` is anything other than `product-intelligence` or `intake` is now a validation error (`unknown origin`).
 - Known limit: a forged approval row with a recomputed hash is possible for anyone who can write the file; the factory's `criteria_hash` binding is the second line of defence.
 
 ### Added (delivery-orchestrator: factory phase 2, run control)

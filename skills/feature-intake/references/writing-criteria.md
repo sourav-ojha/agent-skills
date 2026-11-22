@@ -46,7 +46,7 @@ Headings are `## ` lines; a leading `N. ` is allowed. Do not rename the four fac
 ## Other sections
 
 - **Scope and non-goals** needs a line starting `Non-goals:` with real content (R5).
-- **Testing and verification** names at least one backticked command and the AC ids it proves (R6), e.g. ``Run `npm test -- export` (AC-1, AC-2)``.
+- **Testing and verification** names at least one backticked command (R6 checks only that) and, by convention, the AC ids it proves, e.g. ``Run `npm test -- export` (AC-1, AC-2)``.
 - **Security and performance**: for `risk: high` a line starting `Lens:` (R7); see [risk-marking.md](risk-marking.md).
 - **Assumptions and unresolved decisions**: one line per assumption; `[BLOCKING]` only for an open decision (R4).
 

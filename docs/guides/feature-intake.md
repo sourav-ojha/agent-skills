@@ -1,6 +1,6 @@
 # Guide: feature-intake
 
-Turns something you already know you want built (an idea, a PRD, a bug report, a plan, an experience-audit fix, a growth item) into one implementation-ready spec, `.product/features/FEATURE-NNN.md`, that the [implementer](implementer.md) and the [delivery-orchestrator](delivery-orchestrator.md) read. It reads your code read-only and writes only the spec. Nothing becomes `ready` until you say yes in the chat.
+Turns something you already know you want built (an idea, a PRD, a bug report, a plan, an experience-audit fix, a growth item) into one implementation-ready spec, `.product/features/FEATURE-NNN.md`, that the [implementer](implementer.md) and the [delivery-orchestrator](delivery-orchestrator.md) read. It reads your code read-only and writes only the spec. The helper sets `ready` only through `fi approve` on your yes in the chat; the delivery queue and the implementer do not check that approval themselves (`fi validate` does).
 
 ## When to use it
 
@@ -23,7 +23,7 @@ Or in plain words: "turn this bug into a feature spec", "intake this PRD", "writ
 2. The agent reads the relevant code (read-only) and fills every section: context, objective, existing implementation, scope and non-goals, requirements, Given/When/Then acceptance criteria, edge cases, error scenarios, an optional HTTP contract, technical and security notes, the test command, assumptions.
 3. `fi validate` checks the contract the downstream tools rely on; `fi check` checks readiness (rules R1 to R9: no placeholders, criteria that extract, every requirement covered, no open `[BLOCKING]` decision, non-goals, a test command, a `Lens:` note for `risk: high`, live dependencies, complete traces for split specs).
 4. It shows you the spec, every assumption it made, and any `[BLOCKING]` question. It asks only what the code and docs cannot answer.
-5. On your yes, `fi approve --by <you> --note "<your words>"` sets `status: ready` and records the date, your name, your words and a content hash.
+5. On your yes, `fi approve --by <you> --note "<your words>"` sets `status: ready` and records the date, your name, your words and a content hash. Only a yes to this spec, given after you were shown it, counts; an earlier "don't ask me" or "proceed with the recommended options" is not approval.
 
 ## You are asked only for
 Decisions that change what you asked for and that the code and docs cannot settle (marked `[BLOCKING]`), and the approval itself. Every other choice is a logged assumption you can correct before approving.
@@ -42,7 +42,7 @@ Decisions that change what you asked for and that the code and docs cannot settl
 - Edit CRLF files: keep specs on LF line endings.
 
 ## Limits
-Approval is tamper-evident, not tamper-proof: someone who can write the file can forge an approval row with a recomputed hash. The factory's `criteria_hash` binding is the second line of defence; reading the spec before saying yes is the first. Claude Code adapter only for now; the skill itself is agent-neutral.
+Approval is tamper-evident, not tamper-proof: someone who can write the file can forge an approval row with a recomputed hash. The factory's `criteria_hash` binding is the second line of defence; reading the spec before saying yes is the first. The delivery queue and the implementer act on any `status: ready` spec, including one set by hand without approval; only `fi validate` reports `ready without approval record` or `modified_since_approval`, so run it before a hand-off. Claude Code adapter only for now; the skill itself is agent-neutral.
 
 ## Combine with
 - **[implementer](implementer.md)** and **[delivery-orchestrator](delivery-orchestrator.md)** downstream: same spec contract as product-intelligence specs.
