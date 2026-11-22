@@ -287,6 +287,15 @@ export function validateProject(dir, { today = todayStr() } = {}) {
       const { data, body, error } = splitFrontmatter(text);
       if (error) errors.push(`${label}: ${error}`);
       if (!/^FEATURE-\d{3,}\.md$/.test(f)) errors.push(`${label}: filename must be FEATURE-NNN.md`);
+      if ('origin' in data && !artifacts.feature.origins.includes(data.origin)) errors.push(`${label}: unknown origin "${data.origin}"`);
+      if (data.origin === 'intake') {
+        // feature-intake specs have no opportunity and follow their own contract; only the shared basics are checked here
+        for (const k of artifacts.feature.intake_frontmatter_required) if (!(k in data)) errors.push(`${label}: missing frontmatter "${k}"`);
+        if (data.id && `${data.id}.md` !== f) errors.push(`${label}: id "${data.id}" does not match filename`);
+        if (data.status && !artifacts.feature.status_values.includes(data.status)) errors.push(`${label}: invalid status "${data.status}"`);
+        if (data.opportunity && data.opportunity !== 'none') errors.push(`${label}: origin: intake specs have no opportunity (found "${data.opportunity}")`);
+        continue;
+      }
       for (const k of artifacts.feature.frontmatter_required) if (!(k in data)) errors.push(`${label}: missing frontmatter "${k}"`);
       if (data.id && `${data.id}.md` !== f) errors.push(`${label}: id "${data.id}" does not match filename`);
       if (data.status && !artifacts.feature.status_values.includes(data.status)) errors.push(`${label}: invalid status "${data.status}"`);
