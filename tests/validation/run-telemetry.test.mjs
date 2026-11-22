@@ -32,6 +32,7 @@ test('AC1 runlog: appends one metadata line, self-ignoring dir, caps strings, ne
 test('AC1 the runlog copies in each skill stay identical', () => {
   const read = (s) => fs.readFileSync(path.join(REPO, 'skills', s, 'core/scripts/lib/runlog.mjs'), 'utf8');
   assert.equal(read('implementer'), read('product-intelligence'));
+  for (const s of ['feature-intake']) assert.equal(read(s), read('implementer'), `${s} runlog.mjs differs from implementer's`);
 });
 
 test('AC2 impl logs one event per command with outcome; failures logged; free text never logged', () => {

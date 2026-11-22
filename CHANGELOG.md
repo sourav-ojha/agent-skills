@@ -4,6 +4,14 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (feature-intake 0.1.0)
+- New skill `feature-intake`: turns an idea, PRD, bug report, existing plan, experience-audit fix or growth item into one implementation-ready spec (`.product/features/FEATURE-NNN.md`, `origin: intake`) in the same contract product-intelligence specs use, so the implementer, the delivery queue and the factory read it unchanged. Design: `docs/superpowers/specs/2026-11-22-feature-intake-design.md`.
+- Helper `fi.mjs`: `new` (exclusive-create ID allocation shared with the product-intelligence registry; the same `--source` returns the same ID), `validate` (frontmatter, headings, criteria grammar, dependencies and cycles, Delivery log last), `check` (readiness R1 to R9, exit 2 when valid but not ready), `approve` (user's words and name, content hash), `reopen`, `supersede` and `split` (with `## Traces`, `--rewire` for draft dependents, cycle refusal, all-or-nothing writes), `status`. Edits after approval fail with `modified_since_approval`; lifecycle edits refuse CRLF files and symbolic links.
+- `SKILL.md`, references (intake procedure, writing criteria, codebase analysis, risk marking), Claude Code adapter, `docs/guides/feature-intake.md` and the routing table (intake, brainstorming, product-intelligence, implementer T0) in the guides. `npm run package:feature-intake`.
+- product-intelligence's validator accepts `origin: intake` specs (contract checks only; an intake spec naming an opportunity is an error).
+- Changed: a product-intelligence spec whose `origin:` is anything other than `product-intelligence` or `intake` is now a validation error (`unknown origin`).
+- Known limit: a forged approval row with a recomputed hash is possible for anyone who can write the file; the factory's `criteria_hash` binding is the second line of defence.
+
 ### Added (delivery-orchestrator: factory phase 2, run control)
 - P2.1 autonomy levels: `autonomy.level` `L0` (PRs only) or `L1` (merge on green) in `.product/delivery.json`, mapped from `merge.mode` when absent (a disagreement is an error; `L2` and `L3` are rejected). `--merge` is ignored only under an explicit `L0`. The template now uses `L1`.
 - P2.2 hard-stop matrix `lib/hardstops.mjs`: seven rows, each with a mechanism and a proof (a test, or a saved isolation-probe result). `probe.mjs` gains FACTORY_HOME write routes and a network route, `--save`, `--from` and `--control`; proofs are bound to the target, `FACTORY_HOME` and the builder-settings sha. `factory run` prints unproven rows at start and keeps one attention row.

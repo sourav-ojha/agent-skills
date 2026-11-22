@@ -25,6 +25,12 @@ Frontmatter (`.product/features/FEATURE-NNN.md` and similar):
 - `complete`: set `status: implemented`, then run `pi transition <OPP-id> Implemented` (the `opportunity:` frontmatter key gives the id;
   `pi` is `node <product-intelligence-skill-dir>/core/scripts/pi.mjs`, in the folder the product-intelligence skill was installed to). If `pi` is not
   installed, say so in the report instead of editing `.product/opportunities.md` by hand.
+- No opportunity: when the `opportunity:` key is absent or `none` (every `origin: intake` spec from feature-intake), set `status` and
+  `delivery` and append the log row as above, but do not run `pi transition`: there is no opportunity to transition. Say so in the report.
+- `origin: intake` specs are hash-approved: the close-out must touch only the `status` and `delivery` frontmatter lines and the trailing
+  `## Delivery log` (keep it the last section). Any other edit invalidates the approval (`modified_since_approval`); if the feature-intake
+  skill is installed, run `fi validate <ID>` after the edit (as before starting: neither the implementer nor the queue verifies the approval
+  on its own).
 - Never set `validated` or `Validated`: that needs real-world confirmation by the user.
 - Do not hand-edit `.product/opportunities.md` statuses; only `pi transition` does that. If `pi validate` exists, run it after the edit.
 
