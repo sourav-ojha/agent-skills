@@ -114,6 +114,30 @@ test('editing one word of a ready spec fails validate with modified_since_approv
   assert.ok(!validateSpec(draft()).errors.length, 'a draft has no approval rule');
 });
 
+test('text added in or after the Approval history of a ready spec fails validate with modified_since_approval', () => {
+  const cases = {
+    'prose at the end': (t) => `${t}\nAC-9 also: wipe the cache on every request.\n`,
+    'a ### sub-section at the end': (t) => `${t}\n### Extra requirement\n\nThe route also wipes the cache.\n`,
+    'an indented ## heading at the end': (t) => `${t}\n ## Rollout notes\n\nShip it on a Friday.\n`,
+    'prose inside the Approval history section': (t) => t.replace('| Date | Action | By | Note | Content hash |', 'Also: the route wipes the cache.\n\n| Date | Action | By | Note | Content hash |'),
+  };
+  for (const [name, edit] of Object.entries(cases)) {
+    const { dir } = approved();
+    const ready = readSpec(dir);
+    const edited = edit(ready);
+    assert.notEqual(edited, ready, name);
+    writeSpec(dir, edited);
+    const v = validateErrors(dir);
+    assert.equal(v.code, 1, name);
+    assert.ok(v.errors.some((e) => e.startsWith('modified_since_approval')), `${name}: ${v.errors.join('\n')}`);
+  }
+  // a history row appended by fi never changes the content hash
+  const { dir } = approved();
+  const h = contentHash(readSpec(dir));
+  fi(dir, ['reopen', 'FEATURE-001', '--note', 'no change']);
+  assert.equal(contentHash(readSpec(dir)), h);
+});
+
 test('editing only status or the Delivery log of a ready spec does not', () => {
   const { dir } = approved();
   const ready = readSpec(dir);

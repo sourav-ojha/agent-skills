@@ -131,14 +131,15 @@ export function readiness(text, ctx = {}) {
   return { ok: failures.length === 0, failures };
 }
 
-// Hash of the spec content with the Approval history section removed (and the factory's mutable regions excluded).
+// Hash of the spec with ONLY the Approval history data rows removed (the rows historyRows returns), so appending a row never
+// changes it. Everything else is hashed: the `## Approval history` heading, the table header and separator, and any other
+// text in or after that section. The factory's mutable regions (`status`/`delivery` lines, trailing `## Delivery log`) are
+// excluded as canonicalSpec does. Anyone who can write the file can still forge an approve row with a recomputed hash; the
+// factory's criteria_hash (which covers the history rows too) is the second line of defence.
 export function contentHash(text) {
   const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
-  const s = lines.findIndex((l) => isH2(l) && h2Title(l).startsWith('approval history'));
-  if (s === -1) return criteriaHash(canonicalSpec(lines.join('\n')));
-  let e = lines.findIndex((l, i) => i > s && isH2(l));
-  if (e === -1) e = lines.length;
-  return criteriaHash(canonicalSpec([...lines.slice(0, s), ...lines.slice(e)].join('\n')));
+  const rows = new Set(historyRowIndexes(lines));
+  return criteriaHash(canonicalSpec(lines.filter((_, i) => !rows.has(i)).join('\n')));
 }
 
 // ---- Approval history ----------------------------------------------------------------------------------------------------
@@ -167,14 +168,20 @@ function historyBounds(lines) {
   return { s, e };
 }
 
+const isHistoryRow = (l) => /^\s*\|/.test(l) && /^\d{4}-\d\d-\d\d$/.test(cells(l)[0] || '') && cells(l).length >= 5;
+// Line indexes of the Approval history data rows (table rows whose first cell is a date).
+function historyRowIndexes(lines) {
+  const b = historyBounds(lines);
+  if (!b) return [];
+  const out = [];
+  for (let i = b.s + 1; i < b.e; i++) if (isHistoryRow(lines[i])) out.push(i);
+  return out;
+}
+
 // Data rows of the Approval history table, in file order: { date, action, by, note, hash }.
 function historyRows(text) {
   const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
-  const b = historyBounds(lines);
-  if (!b) return [];
-  return lines.slice(b.s + 1, b.e).filter((l) => /^\s*\|/.test(l)).map(cells)
-    .filter((c) => c.length >= 5 && /^\d{4}-\d\d-\d\d$/.test(c[0]))
-    .map(([date, action, by, note, hash]) => ({ date, action, by, note, hash }));
+  return historyRowIndexes(lines).map((i) => cells(lines[i])).map(([date, action, by, note, hash]) => ({ date, action, by, note, hash }));
 }
 
 // The last `approve` row, or null.
