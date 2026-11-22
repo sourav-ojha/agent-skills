@@ -63,6 +63,11 @@
       "origin": "authored",
       "path": "skills/experience-audit"
     },
+    "feature-intake": {
+      "kind": "skill",
+      "origin": "authored",
+      "path": "skills/feature-intake"
+    },
     "finishing-a-development-branch": {
       "kind": "skill",
       "origin": "vendored",
