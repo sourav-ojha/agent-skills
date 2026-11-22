@@ -48,3 +48,17 @@ test('intake spec is not subject to the 19-section check', () => {
   const res = validateJson(withIntake());
   assert.ok(!res.errors.some((e) => e.includes('FEATURE-099') && /section/i.test(e)), res.errors.join('\n'));
 });
+
+test('an origin: product-intelligence spec still gets the full pi checks', () => {
+  const dir = projectFrom('a');
+  edit(dir, '.product/features/FEATURE-001.md', (t) => {
+    const next = t.replace(/^type: feature-spec$/m, 'type: feature-spec\norigin: product-intelligence');
+    assert.notEqual(next, t);
+    return next;
+  });
+  assert.deepEqual(validateJson(dir).errors, baseline.a.errors, 'the explicit origin alone changes nothing');
+  edit(dir, '.product/features/FEATURE-001.md', (t) => t.replace(/^opportunity: OPP-001$/m, 'opportunity: OPP-999').replace(/^## 2\. Problem statement$/m, '## Problem missing'));
+  const res = validateJson(dir);
+  assert.ok(hasError(res, 'opportunity "OPP-999" not in registry'), res.errors.join('\n'));
+  assert.ok(res.errors.some((e) => e.includes('FEATURE-001') && /section/i.test(e)), res.errors.join('\n'));
+});

@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, historyCell, dependencyCycle, RISKS, FEATURE_ID, TRACES_HEADER } from './lib/spec.mjs';
+import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, ensureHistoryTable, historyCell, dependencyCycle, RISKS, FEATURE_ID, TRACES_HEADER } from './lib/spec.mjs';
 import { canonicalSpec, criteriaHash, extractCriteria } from './lib/criteria.mjs';
 
 const TEMPLATE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'templates', 'feature-specification.md');
@@ -18,7 +18,7 @@ usage: node fi.mjs <command> [--dir <project>] [--json]
   new --title T [--risk low|elevated|high] [--source FILE|-] [--depends-on FEATURE-001,FEATURE-002]
                     allocate the next FEATURE-NNN and write a draft skeleton (same --source twice returns the existing id)
   validate ID|FILE  check frontmatter and the spec contract (exit 1 when invalid)
-  check ID|FILE     validate, then the readiness rules R1-R8 (exit 2 when valid but not ready)
+  check ID|FILE     validate, then the readiness rules R1-R9 (exit 2 when valid but not ready)
   approve ID --by NAME --note "<the user's words>"
                     draft that passes check -> ready; records who, the note and the content hash in the Approval history
   reopen ID --note "<why>" [--by NAME]
@@ -31,6 +31,8 @@ usage: node fi.mjs <command> [--dir <project>] [--json]
                     depends_on and risk copied), then ID superseded by the children. Same titles again return the children
   status            list every spec: id, status, delivery, risk, title`;
 
+const BOOLEAN_FLAGS = new Set(['json', 'rewire']); // never take a value, so `--json FEATURE-001` keeps the id
+
 function parseArgs(argv) {
   const pos = []; const flags = {};
   for (let i = 0; i < argv.length; i++) {
@@ -39,6 +41,8 @@ function parseArgs(argv) {
       const list = [];
       while (i + 1 < argv.length && !argv[i + 1].startsWith('--')) list.push(argv[++i]);
       flags.into = list;
+    } else if (BOOLEAN_FLAGS.has(a.slice(2))) {
+      flags[a.slice(2)] = true;
     } else if (a.startsWith('--')) {
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('--')) flags[a.slice(2)] = true;
@@ -127,6 +131,7 @@ function setFrontmatter(text, updates, name = 'the spec template') {
 function cmdNew() {
   const title = typeof flags.title === 'string' ? clean(flags.title) : '';
   if (!title) die('usage: new --title "<title>" [--risk low|elevated|high] [--source FILE|-] [--depends-on FEATURE-001,FEATURE-002]');
+  if (title.includes('{{')) die('the title must not contain "{{" (it would read as an unfilled placeholder and the spec could never pass check)');
   const risk = flags.risk === undefined ? 'low' : flags.risk;
   if (!RISKS.includes(risk)) die(`--risk must be one of ${RISKS.join(', ')}`);
   if (flags['depends-on'] === true) die('--depends-on needs a comma-separated list of FEATURE ids');
@@ -141,6 +146,7 @@ function cmdNew() {
     if (flags.source === true) die('--source needs a file path, or - for standard input');
     let bytes;
     try { bytes = flags.source === '-' ? fs.readFileSync(0) : fs.readFileSync(path.resolve(flags.source)); } catch (e) { die(`cannot read --source: ${e.message}`); }
+    if (!bytes.length) die(`--source is empty (0 bytes)${flags.source === '-' ? ' on standard input' : `: ${flags.source}`}; pass the source document, or leave --source out for an idea from chat`);
     sourceSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
     sourceRef = flags.source === '-' ? 'stdin' : clean(path.basename(flags.source));
     for (const [id, s] of specs) {
@@ -196,7 +202,7 @@ function cmdValidate() {
 }
 
 function cmdCheck() {
-  const { id, text } = resolveSpec(rest[0]);
+  const { file, id, text } = resolveSpec(rest[0]);
   const specs = loadSpecs();
   const v = validateSpec(text, { id, specs });
   extra.errors = v.errors.length;
@@ -206,10 +212,12 @@ function cmdCheck() {
     process.exitCode = 1;
     return;
   }
+  if (/\r\n/.test(text)) v.warnings.push(`${id ? `${id}.md` : path.basename(file)} has CRLF line endings; approve, reopen, supersede and split need LF line endings (convert the file before running them)`);
   const r = readiness(text, { id, specs });
   extra.ready = r.ok; extra.failures = r.failures.length;
   if (flags.json) out({ id: id || null, valid: true, ready: r.ok, failures: r.failures, warnings: v.warnings });
   else {
+    for (const w of v.warnings) console.log(`warning ${w}`);
     for (const f of r.failures) console.log(`not ready  ${f}`);
     console.log(r.ok ? `${id || 'spec'}: ready to approve` : `${id || 'spec'}: ${r.failures.length} readiness rule(s) unmet`);
   }
@@ -256,8 +264,10 @@ function cmdApprove() {
   if (v.errors.length) { report(id, v); die(`${id} is invalid; fix it before approving`); }
   const r = readiness(text, { id, specs });
   if (!r.ok) { for (const f of r.failures) console.log(`not ready  ${f}`); die(`${id} is not ready to approve (${r.failures.length} readiness rule(s) unmet)`); }
-  const hash = contentHash(text); // the Approval history is excluded, so the new row does not change it
-  const next = setFrontmatter(appendHistory(text, { date: historyDate(), action: 'approve', by, note, hash }), { status: 'ready' });
+  // The table header is hashed, so a missing one is added before hashing; the new data row itself never changes the hash.
+  const base = ensureHistoryTable(text);
+  const hash = contentHash(base);
+  const next = setFrontmatter(appendHistory(base, { date: historyDate(), action: 'approve', by, note, hash }), { status: 'ready' }, `${id}.md`);
   const after = validateSpec(next, { id, specs });
   if (after.errors.length) die(`internal: the approved spec would not validate (${after.errors[0]}); nothing written`);
   writeOwned(file, next);
@@ -272,8 +282,9 @@ function cmdReopen() {
   const { fm } = parseSpec(text);
   if (fm.status !== 'ready') die(`${id} is ${fm.status || 'missing a status'}; reopen only runs on a ready spec${LOCKED.includes(fm.status) ? ` (a spec that is ${fm.status} is no longer edited)` : ''}`);
   if (fm.delivery !== 'none') die(`${id} has delivery: ${fm.delivery || '(missing)'}; reopen needs delivery: none (delivered work is not re-specified in place)`);
-  const hash = contentHash(text);
-  writeOwned(file, setFrontmatter(appendHistory(text, { date: historyDate(), action: 'reopen', by, note, hash }), { status: 'draft' }));
+  const base = ensureHistoryTable(text);
+  const hash = contentHash(base);
+  writeOwned(file, setFrontmatter(appendHistory(base, { date: historyDate(), action: 'reopen', by, note, hash }), { status: 'draft' }, `${id}.md`));
   extra.status = 'draft';
   out({ id, status: 'draft', content_hash: hash, note: 'Reopened. Edit the spec, run check, then approve again.' });
 }

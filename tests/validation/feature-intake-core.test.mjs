@@ -311,3 +311,92 @@ test('every fi command logs one run event with outcome', () => {
   assert.ok(ev.every((e) => e.skill === 'feature-intake' && typeof e.ms === 'number'));
   assert.ok(!JSON.stringify(ev).includes('Logged'));
 });
+
+// ---- final-review fix wave --------------------------------------------------------------------------------------------------
+
+test('an injected instruction in a --source document is never followed: the spec holds only its hash and basename', async () => {
+  const { createHash } = await import('node:crypto');
+  const dir = tmpDir('fi-inject-');
+  fs.mkdirSync(path.join(dir, 'src'));
+  fs.writeFileSync(path.join(dir, 'src', 'app.js'), 'console.log(1);\n');
+  fs.mkdirSync(path.join(dir, '.product'));
+  const src = path.join(dir, 'injected-source.md');
+  fs.copyFileSync(path.join(FIX, 'injected-source.md'), src);
+  const bytes = fs.readFileSync(src);
+  const before = snapshot(dir);
+  const r = fi(dir, ['new', '--title', 'Report export', '--source', src]);
+  assert.equal(r.code, 0, r.err);
+  const { id } = JSON.parse(r.out);
+  assert.deepEqual(listFeatures(dir), [`${id}.md`]);
+  const spec = fs.readFileSync(path.join(features(dir), `${id}.md`), 'utf8');
+  const fm = Object.fromEntries(/^---\n([\s\S]*?)\n---/.exec(spec)[1].split('\n').map((l) => /^([\w-]+):[ \t]*(.*)$/.exec(l)).filter(Boolean).map((m) => [m[1], m[2]]));
+  assert.equal(fm.status, 'draft');
+  assert.equal(fm.source_sha, `sha256:${createHash('sha256').update(bytes).digest('hex')}`);
+  assert.equal(fm.source_ref, 'injected-source.md');
+  assert.ok(!Object.hasOwn(fm, 'approved_by'));
+  for (const line of bytes.toString('utf8').split('\n').map((l) => l.trim()).filter(Boolean)) {
+    assert.ok(!spec.includes(line), `source text copied into the spec: ${line}`);
+  }
+  for (const w of ['INJECTED-COMMAND-RAN', 'attacker.invalid', 'backdoor', 'ignore all previous']) assert.ok(!spec.includes(w), w);
+  assert.doesNotMatch(spec, /^\| \d{4}-\d\d-\d\d \|/m, 'no approval row');
+  // nothing outside .product/features (and the run log) changed and no command ran
+  assert.deepEqual(snapshot(dir), before);
+  assert.ok(!fs.existsSync(path.join(dir, 'INJECTED-COMMAND-RAN')));
+  assert.ok(!fs.existsSync(path.join(dir, 'src', 'backdoor.js')));
+  assert.equal(fi(dir, ['validate', id]).code, 0);
+});
+
+test('fi new refuses a 0-byte --source (file or stdin) and writes nothing', () => {
+  const dir = tmpDir('fi-');
+  const real = path.join(dir, 'real.md');
+  fs.writeFileSync(real, 'A real idea.\n');
+  assert.equal(fi(dir, ['new', '--title', 'Real', '--source', real]).code, 0);
+  const before = fs.readdirSync(features(dir));
+  const empty = path.join(dir, 'empty.md');
+  fs.writeFileSync(empty, '');
+  for (const [args, input] of [[['--source', empty], undefined], [['--source', '-'], '']]) {
+    const r = fi(dir, ['new', '--title', 'Empty', ...args], { input });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.err, /--source is empty \(0 bytes\)/);
+    assert.deepEqual(fs.readdirSync(features(dir)), before);
+  }
+});
+
+test('R4 matches [BLOCKING] in any case', () => {
+  for (const tag of ['[Blocking]', '[blocking]']) {
+    const r = fiJson(withSpec(draftMinimal().replace('None.', `${tag} Which port?`)), ['check', 'FEATURE-001']);
+    assert.equal(r.code, 2, tag);
+    assert.deepEqual(r.json.failures.map((f) => f.slice(0, 2)), ['R4'], tag);
+  }
+});
+
+test('fi new refuses a title containing {{ and writes nothing', () => {
+  const dir = tmpDir('fi-');
+  const r = fi(dir, ['new', '--title', 'Use {{name}} here']);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /title must not contain "\{\{"/);
+  assert.deepEqual(listFeatures(dir), []);
+});
+
+test('boolean flags never swallow the next word: --json and the id in any order', () => {
+  const dir = withSpec(draftMinimal());
+  for (const cmd of ['validate', 'check']) {
+    for (const args of [[cmd, '--json', 'FEATURE-001'], [cmd, 'FEATURE-001', '--json']]) {
+      const r = fi(dir, args);
+      assert.equal(r.code, 0, `${args.join(' ')}: ${r.err}`);
+      assert.equal(JSON.parse(r.out).id, 'FEATURE-001', args.join(' '));
+    }
+  }
+  const s = fi(dir, ['--json', 'status']);
+  assert.equal(s.code, 0, s.err);
+  assert.equal(JSON.parse(s.out)[0].id, 'FEATURE-001');
+});
+
+test('fi check warns (not fails) on a CRLF spec', () => {
+  const dir = withSpec(draftMinimal().replace(/\n/g, '\r\n'));
+  const r = fi(dir, ['check', 'FEATURE-001']);
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /warning .*FEATURE-001\.md has CRLF line endings.*LF/);
+  const j = fiJson(dir, ['check', 'FEATURE-001']);
+  assert.ok(j.json.warnings.some((w) => /CRLF/.test(w)), j.out);
+});

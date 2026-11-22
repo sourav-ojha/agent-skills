@@ -547,3 +547,46 @@ test('validate reports a hand-made dependency cycle', () => {
   fs.writeFileSync(specPath(dir, 'FEATURE-003'), readId(dir, 'FEATURE-003').replace('status: draft', 'status: superseded'));
   assert.ok(!validateId(dir, 'FEATURE-001').errors.some((e) => /cycle/.test(e)));
 });
+
+// ---- final-review fix wave --------------------------------------------------------------------------------------------------
+
+test('supersede --rewire works before or after the id', () => {
+  for (const args of [['supersede', '--rewire', 'FEATURE-001', '--by', 'FEATURE-002'], ['supersede', 'FEATURE-001', '--rewire', '--by', 'FEATURE-002']]) {
+    const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' } });
+    const r = fi(dir, args);
+    assert.equal(r.code, 0, `${args.join(' ')}: ${r.err}`);
+    assert.deepEqual(JSON.parse(r.out).rewired, ['FEATURE-003'], args.join(' '));
+    assert.equal(fmOf(readId(dir, 'FEATURE-003')).depends_on, 'FEATURE-002');
+  }
+});
+
+test('approve and reopen on a CRLF spec name the file in the refusal and write nothing', () => {
+  const dir = project(draft().replace(/\n/g, '\r\n'));
+  const before = readSpec(dir);
+  const r = fi(dir, ['approve', 'FEATURE-001', '--by', 'Sourav', '--note', 'ok']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /FEATURE-001\.md has CRLF line endings.*convert the file to LF/);
+  assert.doesNotMatch(r.err, /spec template/);
+  assert.equal(readSpec(dir), before);
+  const { dir: d2 } = approved();
+  writeSpec(d2, readSpec(d2).replace(/\n/g, '\r\n'));
+  const b2 = readSpec(d2);
+  const r2 = fi(d2, ['reopen', 'FEATURE-001', '--note', 'change']);
+  assert.equal(r2.code, 1);
+  assert.match(r2.err, /FEATURE-001\.md has CRLF line endings/);
+  assert.doesNotMatch(r2.err, /spec template/);
+  assert.equal(readSpec(d2), b2);
+});
+
+test('approve succeeds on a spec whose Approval history section has no table yet', () => {
+  const text = draft().replace(/(## 13\. Approval history\n)[\s\S]*$/, '$1\n');
+  assert.doesNotMatch(text, /\| Date \|/);
+  const dir = project(text);
+  const r = fi(dir, ['approve', 'FEATURE-001', '--by', 'Sourav', '--note', 'ok']);
+  assert.equal(r.code, 0, r.err + r.out);
+  const after = readSpec(dir);
+  assert.match(after, /^\| Date \| Action \| By \| Note \| Content hash \|$/m);
+  assert.equal(historyRows(after).length, 1);
+  assert.equal(JSON.parse(r.out).content_hash, contentHash(after));
+  assert.equal(validateErrors(dir).code, 0, validateErrors(dir).errors.join('\n'));
+});

@@ -1,5 +1,5 @@
 // Intake spec rules: frontmatter shape, the shared spec contract (headings, AC/EC/ER grammar, trailing Delivery log) and the
-// mechanical readiness rules R1-R8. Deterministic: it never interprets prose. Zero dependencies.
+// mechanical readiness rules R1-R9. Deterministic: it never interprets prose. Zero dependencies.
 import { extractCriteria, specRegions, canonicalSpec, criteriaHash } from './criteria.mjs';
 
 export const REQUIRED_HEADINGS = [
@@ -190,7 +190,7 @@ export function readiness(text, ctx = {}) {
   const acText = cr.ac.map((a) => a.text).join(' ');
   const uncovered = reqIds.filter((id) => !new RegExp(`\\b${id}\\b`).test(acText));
   if (uncovered.length) failures.push(`R3 requirement(s) not covered by any AC row: ${uncovered.join(', ')}`);
-  const blocking = ((section(body, 'Assumptions and unresolved decisions') || '').match(/\[BLOCKING\]/g) || []).length;
+  const blocking = ((section(body, 'Assumptions and unresolved decisions') || '').match(/\[BLOCKING\]/gi) || []).length;
   if (blocking) failures.push(`R4 ${blocking} [BLOCKING] decision(s) unresolved in Assumptions and unresolved decisions`);
   const scope = (section(body, 'Scope and non-goals') || '').split('\n');
   const ng = scope.findIndex((l) => /^\W*non-goals?\b/i.test(l));
@@ -267,6 +267,17 @@ function historyRows(text) {
 export function lastApproval(text) {
   const row = historyRows(text).filter((r) => r.action === 'approve').at(-1);
   return row ? { at: row.date, by: row.by, hash: row.hash } : null;
+}
+
+// The text with a table header in its Approval history section when the section exists but has no table rows yet (the header
+// is hashed by contentHash, so approve adds it before hashing). Otherwise the text unchanged.
+export function ensureHistoryTable(text) {
+  const lines = String(text).split('\n');
+  const b = historyBounds(lines.map((l) => l.replace(/\r$/, '')));
+  if (!b) return String(text);
+  for (let i = b.s + 1; i < b.e; i++) if (/^\s*\|/.test(lines[i])) return String(text);
+  lines.splice(b.s + 1, 0, '', ...HISTORY_HEADER);
+  return lines.join('\n');
 }
 
 // Insert one row at the end of the Approval history table; every other byte is unchanged. A missing section is created

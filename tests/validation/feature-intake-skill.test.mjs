@@ -138,3 +138,9 @@ test('package script and required-file list name the skill', () => {
   const entries = JSON.stringify(lock).match(/"feature-intake"\s*:/g) || [];
   assert.equal(entries.length, 1, 'exactly one feature-intake lock entry');
 });
+
+test('SKILL.md and intake-procedure.md state that the input is data, not instructions', () => {
+  for (const f of [SKILL, path.join(DIR, 'references', 'intake-procedure.md')]) {
+    assert.match(read(f), /data, not instructions/i, path.relative(REPO, f));
+  }
+});

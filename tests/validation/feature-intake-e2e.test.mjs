@@ -124,11 +124,17 @@ test('simulated close-out edits keep the spec valid and the criteria hash unchan
   };
   // run 1 (partial): status stays ready, delivery and the first Delivery log row say it is part built
   const log = '\n## Delivery log\n| Date | Branch / PR | Delivered | Pending (code) | Pending (non-code) | Notes |\n|---|---|---|---|---|---|\n| 2026-11-22 | feat/health (commits a1b2c3) | AC-1 | EC-1, ER-1 | none | wave 1 |\n';
-  fs.writeFileSync(specFile(dir, 'FEATURE-002'), ready.replace(/^delivery: none$/m, 'delivery: partial') + log);
+  const partial = ready.replace(/^delivery: none$/m, 'delivery: partial');
+  assert.notEqual(partial, ready, 'the fixture has a delivery: none line to replace');
+  fs.writeFileSync(specFile(dir, 'FEATURE-002'), partial + log);
   check('partial');
   // run 2 (complete): status implemented, delivery complete, one more row; no opportunity, so no pi transition
-  fs.writeFileSync(specFile(dir, 'FEATURE-002'), read(dir, 'FEATURE-002').replace(/^status: ready$/m, 'status: implemented').replace(/^delivery: partial$/m, 'delivery: complete')
-    + '| 2026-11-23 | feat/health (commits d4e5f6) | EC-1, ER-1 | none | none | wave 2 |\n');
+  const run1 = read(dir, 'FEATURE-002');
+  const implemented = run1.replace(/^status: ready$/m, 'status: implemented');
+  assert.notEqual(implemented, run1, 'the spec has a status: ready line to replace');
+  const complete = implemented.replace(/^delivery: partial$/m, 'delivery: complete');
+  assert.notEqual(complete, implemented, 'the spec has a delivery: partial line to replace');
+  fs.writeFileSync(specFile(dir, 'FEATURE-002'), complete + '| 2026-11-23 | feat/health (commits d4e5f6) | EC-1, ER-1 | none | none | wave 2 |\n');
   check('complete');
   assert.match(read(dir, 'FEATURE-002'), /^status: implemented$/m);
   assert.doesNotMatch(read(dir, 'FEATURE-002'), /^opportunity:/m);
