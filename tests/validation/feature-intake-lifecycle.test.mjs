@@ -485,3 +485,65 @@ fs.writeFileSync = function (p, ...a) {
   assert.match(r.stderr, /simulated/);
   assert.deepEqual(snapshot(dir), before, 'the first child is removed and the parent is unchanged');
 });
+
+const crlf = (dir, id) => fs.writeFileSync(specPath(dir, id), readId(dir, id).replace(/\r?\n/g, '\r\n'));
+
+test('split on a CRLF parent or with a CRLF dependent writes nothing', () => {
+  const dir = splitProject();
+  crlf(dir, 'FEATURE-001');
+  assert.equal(validateId(dir, 'FEATURE-001').code, 0, 'a CRLF draft is otherwise valid');
+  const before = snapshot(dir);
+  const r = fi(dir, ['split', 'FEATURE-001', '--into', 'A', 'B']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /FEATURE-001\.md has CRLF line endings.*convert the file to LF/);
+  assert.deepEqual(snapshot(dir), before, 'no orphan children, parent unchanged');
+  // a CRLF draft dependent under --rewire
+  const d2 = splitProject();
+  fs.writeFileSync(specPath(d2, 'FEATURE-006'), draftAs('FEATURE-006', { deps: 'FEATURE-001' }));
+  crlf(d2, 'FEATURE-006');
+  const b2 = snapshot(d2);
+  const r2 = fi(d2, ['split', 'FEATURE-001', '--into', 'A', 'B', '--rewire']);
+  assert.equal(r2.code, 1);
+  assert.match(r2.err, /FEATURE-006\.md has CRLF line endings/);
+  assert.deepEqual(snapshot(d2), b2);
+});
+
+test('supersede --rewire with a CRLF dependent or a CRLF spec writes nothing', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' }, 'FEATURE-004': { deps: 'FEATURE-001' } });
+  crlf(dir, 'FEATURE-004');
+  const before = snapshot(dir);
+  const r = fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002', '--rewire']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /FEATURE-004\.md has CRLF line endings.*convert the file to LF/);
+  assert.deepEqual(snapshot(dir), before, 'FEATURE-003 is not rewired either');
+  // the superseded spec itself is CRLF: its LF dependent is not rewired first
+  const d2 = multi({ 'FEATURE-001': {}, 'FEATURE-002': {}, 'FEATURE-003': { deps: 'FEATURE-001' } });
+  crlf(d2, 'FEATURE-001');
+  const b2 = snapshot(d2);
+  const r2 = fi(d2, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002', '--rewire']);
+  assert.equal(r2.code, 1);
+  assert.match(r2.err, /FEATURE-001\.md has CRLF line endings/);
+  assert.deepEqual(snapshot(d2), b2);
+});
+
+test('--rewire refuses a dependency cycle', () => {
+  const dir = multi({ 'FEATURE-001': {}, 'FEATURE-002': { deps: 'FEATURE-003' }, 'FEATURE-003': { deps: 'FEATURE-001' } });
+  const before = snapshot(dir);
+  const r = fi(dir, ['supersede', 'FEATURE-001', '--by', 'FEATURE-002', '--rewire']);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /dependency cycle FEATURE-003 -> FEATURE-002 -> FEATURE-003/);
+  assert.deepEqual(snapshot(dir), before);
+});
+
+test('validate reports a hand-made dependency cycle', () => {
+  const dir = multi({ 'FEATURE-001': { deps: 'FEATURE-002' }, 'FEATURE-002': { deps: 'FEATURE-003' }, 'FEATURE-003': { deps: 'FEATURE-001' }, 'FEATURE-004': { deps: 'FEATURE-001' } });
+  const v = validateId(dir, 'FEATURE-001');
+  assert.equal(v.code, 1);
+  assert.ok(v.errors.includes('dependency cycle FEATURE-001 -> FEATURE-002 -> FEATURE-003 -> FEATURE-001; the delivery queue cannot order these specs'), v.errors.join('\n'));
+  assert.equal(validateId(dir, 'FEATURE-002').code, 1);
+  assert.equal(validateId(dir, 'FEATURE-004').code, 0, 'depending on a cycle is not itself a cycle');
+  assert.equal(fi(dir, ['approve', 'FEATURE-001', '--by', 'Sourav', '--note', 'ok']).code, 1, 'a cycle blocks approval');
+  // a superseded spec breaks the cycle
+  fs.writeFileSync(specPath(dir, 'FEATURE-003'), readId(dir, 'FEATURE-003').replace('status: draft', 'status: superseded'));
+  assert.ok(!validateId(dir, 'FEATURE-001').errors.some((e) => /cycle/.test(e)));
+});

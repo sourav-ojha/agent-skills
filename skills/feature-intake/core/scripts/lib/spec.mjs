@@ -22,6 +22,24 @@ export function parseDeps(v) {
   return String(v).replace(/^\[|\]$/g, '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
 }
 
+// A depends_on path from `start` back to itself in `graph` (Map id -> dependency ids), e.g. [A, B, A], or null. Ids that are
+// not in the graph (missing or superseded specs) end a path.
+export function dependencyCycle(graph, start) {
+  const stack = [start]; const seen = new Set([start]);
+  const walk = (id) => {
+    for (const d of graph.get(id) || []) {
+      if (d === start) return [...stack, start];
+      if (seen.has(d) || !graph.has(d)) continue;
+      seen.add(d); stack.push(d);
+      const c = walk(d);
+      if (c) return c;
+      stack.pop();
+    }
+    return null;
+  };
+  return walk(start);
+}
+
 export function parseSpec(text) {
   const t = String(text).replace(/\r\n/g, '\n');
   const fm = {}; const problems = [];
@@ -86,6 +104,12 @@ export function validateSpec(text, ctx = {}) {
     if (!FEATURE_ID.test(d)) errors.push(`depends_on has invalid id "${d}"`);
     else if (d === fm.id) errors.push(`depends_on names the spec itself (${d})`);
     else if (ctx.specs && !ctx.specs.has(d)) errors.push(`depends_on names ${d}, which does not exist`);
+  }
+  if (ctx.specs && fm.status !== 'superseded' && FEATURE_ID.test(fm.id || '')) {
+    const graph = new Map([...ctx.specs].filter(([, s]) => s.status !== 'superseded').map(([d, s]) => [d, parseDeps(s.fm?.depends_on)]));
+    graph.set(fm.id, parseDeps(fm.depends_on));
+    const c = dependencyCycle(graph, fm.id);
+    if (c) errors.push(`dependency cycle ${c.join(' -> ')}; the delivery queue cannot order these specs`);
   }
   errors.push(...headingErrors(body));
   const layout = specRegions(text).problems;

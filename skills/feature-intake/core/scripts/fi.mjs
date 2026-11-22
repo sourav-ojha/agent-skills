@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { logEvent, runId } from './lib/runlog.mjs';
-import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, historyCell, RISKS, FEATURE_ID, TRACES_HEADER } from './lib/spec.mjs';
+import { parseSpec, validateSpec, readiness, parseDeps, contentHash, appendHistory, historyCell, dependencyCycle, RISKS, FEATURE_ID, TRACES_HEADER } from './lib/spec.mjs';
 import { canonicalSpec, criteriaHash, extractCriteria } from './lib/criteria.mjs';
 
 const TEMPLATE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'templates', 'feature-specification.md');
@@ -106,9 +106,13 @@ function nextNumber() {
 }
 const featureId = (n) => `FEATURE-${String(n).padStart(3, '0')}`;
 
-function setFrontmatter(text, updates) {
+// Throws (never exits) so a caller that already wrote something can undo it first. `name` is the file named in the error.
+function setFrontmatter(text, updates, name = 'the spec template') {
   const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
-  if (!m) die('template has no frontmatter; reinstall the skill');
+  if (!m) {
+    if (/^---\r\n/.test(text)) throw new Error(`${name} has CRLF line endings, which are not supported for frontmatter edits; convert the file to LF line endings and rerun`);
+    throw new Error(`${name} has no "---" frontmatter block that fi can edit`);
+  }
   const rest = { ...updates };
   const lines = m[1].split('\n').map((l) => {
     const k = /^([A-Za-z_][\w-]*):/.exec(l)?.[1];
@@ -290,10 +294,23 @@ function dependents(specs, id, what) {
   const locked = deps.filter(([, s]) => s.status !== 'draft');
   if (locked.length) die(`--rewire edits draft dependents only; ${locked.map(([d, s]) => `${d} (${s.status})`).join(', ')} depend on ${id}: run fi reopen on each ready one first (a delivered dependent cannot be rewired)`);
   for (const [d] of deps) refuseLinks(d); // before anything is written
+  // [[file, new text, id, new deps], ...]; throws on a file whose frontmatter cannot be edited.
   return (replacement) => deps.map(([d, s]) => {
     const next = [...new Set(parseDeps(s.fm.depends_on).flatMap((x) => (x === id ? replacement : [x])))].filter((x) => x !== d);
-    return [s.file, setFrontmatter(s.text, { depends_on: next.join(', ') }), d];
+    return [s.file, setFrontmatter(s.text, { depends_on: next.join(', ') }, `${d}.md`), d, next];
   });
+}
+
+// Throws when the rewired graph has a dependency cycle through a changed spec. `drop` leaves the graph (it becomes
+// superseded); `add` and `rewired` give new or changed edges. Only non-superseded specs count, as in validate.
+function refuseCycles(specs, drop, add, rewired) {
+  const graph = new Map([...specs].filter(([d, s]) => d !== drop && s.status !== 'superseded').map(([d, s]) => [d, parseDeps(s.fm.depends_on)]));
+  for (const [d, deps] of add) graph.set(d, deps);
+  for (const [, , d, deps] of rewired) graph.set(d, deps);
+  for (const d of [...add.map(([x]) => x), ...rewired.map(([, , x]) => x)]) {
+    const c = dependencyCycle(graph, d);
+    if (c) throw new Error(`--rewire would create a dependency cycle ${c.join(' -> ')}; change the depends_on of these specs by hand first`);
+  }
 }
 
 function cmdSupersede() {
@@ -308,10 +325,17 @@ function cmdSupersede() {
   const target = specs.get(by);
   if (!target) die(`--by names ${by}, which does not exist in .product/features/`);
   if (target.status === 'superseded') die(`--by names ${by}, which is itself superseded; name the spec that replaced it`);
-  const rewired = dependents(specs, id, by)([by]);
+  const rewire = dependents(specs, id, by);
+  // Every new text is built and checked in memory before the first write.
+  let rewired; let parentText;
+  try {
+    rewired = rewire([by]);
+    refuseCycles(specs, id, [], rewired);
+    parentText = setFrontmatter(text, { status: 'superseded', superseded_by: by }, `${id}.md`);
+  } catch (e) { die(`${e.message}; nothing changed`); }
   // Dependents first: if a later write fails they already point at the live spec, never at a superseded one.
   for (const [f, t] of rewired) writeOwned(f, t);
-  writeOwned(file, setFrontmatter(text, { status: 'superseded', superseded_by: by }));
+  writeOwned(file, parentText);
   extra.status = 'superseded'; extra.rewired = rewired.length;
   out({ id, status: 'superseded', superseded_by: by, rewired: rewired.map(([, , d]) => d) });
 }
@@ -346,13 +370,24 @@ function cmdSplit() {
     if (at === -1) die('template has no Approval history section; reinstall the skill');
     return t.slice(0, at) + traces + t.slice(at);
   };
+  // Build and check every text in memory with the ids the children will most likely get, before the first create.
+  const plan = (kids) => {
+    const rewired = rewire(kids);
+    refuseCycles(specs, id, kids.map((k) => [k, parseDeps(fm.depends_on)]), rewired);
+    return { rewired, parentText: setFrontmatter(text, { status: 'superseded', superseded_by: kids.join(', ') }, `${id}.md`) };
+  };
+  const n0 = nextNumber();
+  try {
+    plan(titles.map((_, i) => featureId(n0 + i)));
+    titles.forEach((t, i) => childText(featureId(n0 + i), t));
+  } catch (e) { die(`${e.message}; nothing changed`); }
   const created = [];
   const undo = (msg) => {
     for (const f of created) { try { fs.rmSync(f, { force: true }); } catch { /* best effort */ } }
     die(`${msg}; nothing changed (removed ${created.length} child spec(s) created by this run)`);
   };
   const children = [];
-  let n = nextNumber();
+  let n = n0;
   for (const title of titles) {
     for (let tries = 0; ; tries++, n++) {
       const cid = featureId(n);
@@ -370,10 +405,12 @@ function cmdSplit() {
       break;
     }
   }
-  const rewired = rewire(children);
-  const parentText = setFrontmatter(text, { status: 'superseded', superseded_by: children.join(', ') });
   const done = [];
+  let rewired = [];
   try {
+    const p = plan(children); // the same as the check above unless a concurrent run took an id
+    rewired = p.rewired;
+    const parentText = p.parentText;
     for (const [f, t, d] of rewired) { replaceOwned(f, t); done.push(d); }
     replaceOwned(file, parentText);
   } catch (e) {
