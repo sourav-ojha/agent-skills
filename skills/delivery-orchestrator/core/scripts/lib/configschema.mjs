@@ -15,9 +15,9 @@ const T = { run: ['deliver readiness', 'factory run'] };
 
 export const SCHEMA = [
   // repo
-  e('github.account', 'repo', 'text', { default: null, nullable: true, example: 'work-login', maxLen: 39, what: 'The gh login to use when several accounts are logged in.', why: 'Its token is used for every gh call, so the right account opens and merges the PRs. Empty uses the active gh account.', readBy: ['deliver init', 'factory run'] }),
-  e('github.host', 'repo', 'text', { default: 'github.com', maxLen: 100, what: 'The GitHub host name.', why: 'Change it only for GitHub Enterprise. factory run requires it to match the origin remote host.', readBy: ['deliver init', 'factory run'], factory: 'must equal the origin host' }),
-  e('base', 'repo', 'text', { default: null, nullable: true, example: 'develop', what: 'The branch every feature starts from and every PR targets.', why: 'Empty uses the repository default branch. If it matches a protected branch, PRs are opened but never merged.', readBy: ['deliver init', 'factory run'] }),
+  e('github.account', 'repo', 'text', { default: null, nullable: true, example: 'work-login', maxLen: 39, what: 'The gh login to use when several accounts are logged in.', why: 'Its token is used for every gh call (and for git over https), held in memory only; the helper checks the token is that account and can write to the repo. For SSH remotes git uses your SSH key, so the setting applies to gh only. Empty uses the active gh account.', readBy: ['deliver init', 'factory run'] }),
+  e('github.host', 'repo', 'text', { default: 'github.com', maxLen: 100, what: 'The GitHub host name.', why: 'Change it only for GitHub Enterprise.', readBy: ['deliver init', 'factory run'], factory: 'must equal the origin remote host' }),
+  e('base', 'repo', 'text', { default: null, nullable: true, example: 'develop', what: 'The branch every feature starts from and every PR targets.', why: 'Always its latest tip, fast-forwarded before each feature. Empty uses the repository default branch. If it matches a protected branch, PRs are opened but never merged.', readBy: ['deliver init', 'factory run'] }),
   e('branch_prefix', 'repo', 'text', { default: 'feat/', what: 'Prefix for feature branch names, lower-case and ending in a slash.', why: 'Keeps feature branches easy to find and to filter in CI. An empty string means no prefix.', readBy: ['deliver init'] }),
   e('features_dir', 'repo', 'relpath', { default: '.product/features', what: 'Folder inside the repository where FEATURE-NNN.md specs live.', why: 'The orchestrator reads feature specs from here. It must be a relative path with no "..".', readBy: ['deliver init', 'deliver intake'] }),
 
@@ -54,7 +54,7 @@ export const SCHEMA = [
   e('verification.test_globs', 'tests', 'list', { default: [], max: 50, what: 'Path globs that identify test files.', why: 'Verification uses them to tell test files from product code when checking a change.', readBy: ['factory run'] }),
 
   // budgets
-  int('budgets.feature.tokens', 'budgets', 10000, 1000000000, 3000000, { sensitive: true, what: 'Token cap per feature for factory run.', why: 'A runaway guard. Tokens counted are input, output and cache creation. Raising it lets a feature spend more.', readBy: ['factory run'] }),
+  int('budgets.feature.tokens', 'budgets', 10000, 1000000000, 3000000, { sensitive: true, what: 'Token cap per feature for factory run.', why: 'A runaway guard. Tokens counted are input, output and cache creation. Raising it lets a feature spend more. See [run-control.md](run-control.md).', readBy: ['factory run'] }),
   int('budgets.feature.turns', 'budgets', 10, 5000, 400, { sensitive: true, what: 'Agent turn cap per feature for factory run.', why: 'A runaway guard. Raising it lets a feature run longer before it is stopped.', readBy: ['factory run'] }),
 
   // verification
@@ -129,11 +129,11 @@ export function renderDocs(file = P) {
   for (const g of GROUPS) {
     const rows = SCHEMA.filter((x) => x.file === file && x.group === g);
     if (!rows.length) continue;
-    out.push(`**${g}**`, '', '| Key | Meaning | Default |', '|---|---|---|');
+    out.push(`**${g}**`, '', '| Key | Meaning | Allowed | Default |', '|---|---|---|---|');
     for (const e of rows) {
       const vals = e.values ? ` Values: ${e.values.map((x) => `\`${x.v}\` (${x.d})`).join(', ')}.` : '';
       const note = e.factory ? ` factory run: ${e.factory}.` : '';
-      out.push(`| \`${e.path}\`${e.sensitive ? ' (sensitive)' : ''} | ${cell(`${e.what} ${e.why}${vals}${note}`)} | ${dflt(e)} |`);
+      out.push(`| \`${e.path}\`${e.sensitive ? ' (sensitive)' : ''} | ${cell(`${e.what} ${e.why}${vals}${note}`)} | ${cell(e.values ? e.values.map((x) => x.v).join(', ') : typeText(e))} | ${dflt(e)} |`);
     }
     out.push('');
   }

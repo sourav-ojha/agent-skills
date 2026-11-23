@@ -156,7 +156,23 @@ test('explain shows values, what, default and SENSITIVE', () => {
   const r = run('explain', 'autonomy.level');
   assert.equal(r.status, 0, r.stderr);
   for (const t of ['L0', 'L1', s.entry('autonomy.level').what, 'default: "L0"', 'SENSITIVE']) assert.ok(r.stdout.includes(t), t);
-  assert.equal(JSON.parse(run('explain', 'autonomy.level', '--json').stdout).path, 'autonomy.level');
+  assert.equal(JSON.parse(run('explain', 'autonomy.level', '--json').stdout).path, 'autonomy.level');  assert.ok(r.stdout.includes('read by: deliver init, factory run'));
+  assert.ok(r.stdout.includes('factory run: must be L0 or L1; merging needs L1'));
+});
+
+test('explain renders factory, alias, range and example lines', () => {
+  assert.ok(run('explain', 'app.ready').stdout.includes(`factory run: ${s.entry('app.ready').factory}`));
+  assert.ok(run('explain', 'app.ready').stdout.includes(`example: ${JSON.stringify(s.entry('app.ready').example)}`));
+  assert.ok(run('explain', 'merge.mode').stdout.includes('alias:   older spelling of autonomy.level'));
+  assert.ok(run('explain', 'limits.max_fix_rounds').stdout.includes('type:    an integer, 0 to 5'));
+  assert.ok(run('explain', 'github.account').stdout.includes('example: "work-login"'));
+  assert.ok(run('explain', 'github.account').stdout.includes('null:    allowed (unset)'));
+});
+
+test('generated docs carry every numeric range and list cap', () => {
+  const md = run('explain', '--docs').stdout;
+  for (const e of s.SCHEMA.filter((x) => x.file === 'project' && x.type === 'int')) assert.ok(md.includes(`an integer, ${e.min} to ${e.max}`), e.path);
+  assert.ok(md.includes('up to 50 items'));
 });
 
 test('explain --list lists every key grouped, one line each; --local lists the local keys', () => {
