@@ -129,3 +129,57 @@ test('nearest returns up to three closest valid keys', () => {
   assert.ok(!s.nearest('keep_awak', 'local').includes('autonomy.level'));
   assert.equal(s.nearest('limits.max_failure', 'project', 1).length, 1);
 });
+
+// --- config explain (CLI) and generated docs ---
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+
+const DELIVER = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts', 'deliver.mjs');
+const CONFIG_MD = path.join(REPO, 'skills', 'delivery-orchestrator', 'references', 'config.md');
+const run = (...args) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-explain-'));
+  const r = spawnSync('node', [DELIVER, 'config', ...args, '--dir', dir], { encoding: 'utf8' });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return r;
+};
+const block = (name) => {
+  const md = fs.readFileSync(CONFIG_MD, 'utf8');
+  const a = `<!-- config-schema:${name}:start -->\n`;
+  const i = md.indexOf(a);
+  const j = md.indexOf(`\n<!-- config-schema:${name}:end -->`);
+  assert.ok(i >= 0 && j > i, `markers for ${name}`);
+  return md.slice(i + a.length, j);
+};
+
+test('explain shows values, what, default and SENSITIVE', () => {
+  const r = run('explain', 'autonomy.level');
+  assert.equal(r.status, 0, r.stderr);
+  for (const t of ['L0', 'L1', s.entry('autonomy.level').what, 'default: "L0"', 'SENSITIVE']) assert.ok(r.stdout.includes(t), t);
+  assert.equal(JSON.parse(run('explain', 'autonomy.level', '--json').stdout).path, 'autonomy.level');
+});
+
+test('explain --list lists every key grouped, one line each; --local lists the local keys', () => {
+  const lines = run('explain', '--list').stdout.split('\n').filter((l) => l.startsWith('  '));
+  assert.equal(lines.length, s.keysOf('project').length);
+  for (const k of s.keysOf('project')) assert.ok(lines.some((l) => l.trim().startsWith(k)), k);
+  const loc = run('explain', '--list', '--local').stdout.split('\n').filter((l) => l.startsWith('  '));
+  assert.equal(loc.length, 6);
+  assert.equal(run('explain', 'keep_awake', '--local').status, 0);
+  assert.equal(run('explain', 'keep_awake').status, 1);
+});
+
+test('explain on a mistyped key exits 1 and names the nearest key', () => {
+  const r = run('explain', 'app.redy');
+  assert.equal(r.status, 1);
+  assert.ok(r.stderr.includes('app.ready'), r.stderr);
+});
+
+test('explain --docs equals the generated blocks in references/config.md', () => {
+  assert.equal(run('explain', '--docs').stdout.trimEnd(), block('project'));
+  assert.equal(run('explain', '--docs', '--local').stdout.trimEnd(), block('local'));
+});
+
+test('config subcommands not built yet exit 1', () => {
+  for (const sub of ['init', 'edit', 'set', 'unset']) assert.equal(run(sub).status, 1, sub);
+});

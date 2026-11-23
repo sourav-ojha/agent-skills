@@ -101,3 +101,52 @@ const distance = (a, b) => {
 export function nearest(path, file = P, n = 3) {
   return keysOf(file).map((k, i) => ({ k, i, d: distance(String(path), k) })).sort((a, b) => a.d - b.d || a.i - b.i).slice(0, n).map((x) => x.k);
 }
+
+const show = (v) => (v === null ? 'null (unset)' : JSON.stringify(v));
+const range = (e) => (e.type === 'int' ? `an integer, ${e.min} to ${e.max}` : null);
+const TYPES = { bool: 'true or false', enum: 'one of the values below', text: 'text', relpath: 'a relative path inside the repository', url: 'a local http URL', argv: 'an argument list (array of strings)', list: 'a list of strings', local_checks: 'a list of { name, command, timeout_s }', ready: '{ url or log_pattern, timeout_s }', 'object-null': 'an object, or absent' };
+const typeText = (e) => range(e) || (e.maxLen ? `${TYPES[e.type]}, up to ${e.maxLen} characters` : e.max && e.type === 'list' ? `${TYPES[e.type]}, up to ${e.max} items` : TYPES[e.type] || e.type);
+
+// Plain-text description of one key, for `config explain <key>`.
+export function renderExplain(e) {
+  const lines = [e.path + (e.sensitive ? '   SENSITIVE' : ''), `  ${e.what}`, `  type:    ${typeText(e)}`, `  default: ${show(e.default)}`];
+  if (e.values) { lines.push('  values:'); for (const x of e.values) lines.push(`    ${x.v}   ${x.d}`); }
+  if (e.alias) lines.push(`  alias:   older spelling of ${e.alias.to}`);
+  if (e.nullable) lines.push('  null:    allowed (unset)');
+  if (e.example !== undefined) lines.push(`  example: ${JSON.stringify(e.example)}`);
+  lines.push(`  why:     ${e.why}`, `  read by: ${e.readBy.join(', ')}`);
+  if (e.factory) lines.push(`  factory run: ${e.factory}`);
+  if (e.sensitive) lines.push('  SENSITIVE: loosening it needs a person at a terminal; set refuses without one.');
+  return lines.join('\n');
+}
+
+const cell = (s) => String(s).replace(/\|/g, '\\|');
+const dflt = (e) => (e.default === null ? '`null`' : `\`${JSON.stringify(e.default)}\``);
+
+// One markdown table per group; the text between the markers in references/config.md.
+export function renderDocs(file = P) {
+  const out = [];
+  for (const g of GROUPS) {
+    const rows = SCHEMA.filter((x) => x.file === file && x.group === g);
+    if (!rows.length) continue;
+    out.push(`**${g}**`, '', '| Key | Meaning | Default |', '|---|---|---|');
+    for (const e of rows) {
+      const vals = e.values ? ` Values: ${e.values.map((x) => `\`${x.v}\` (${x.d})`).join(', ')}.` : '';
+      const note = e.factory ? ` factory run: ${e.factory}.` : '';
+      out.push(`| \`${e.path}\`${e.sensitive ? ' (sensitive)' : ''} | ${cell(`${e.what} ${e.why}${vals}${note}`)} | ${dflt(e)} |`);
+    }
+    out.push('');
+  }
+  return out.join('\n').replace(/\n+$/, '');
+}
+
+// One line per key, grouped, for `config explain --list`.
+export function renderList(file = P) {
+  const out = [];
+  for (const g of GROUPS) {
+    const rows = SCHEMA.filter((x) => x.file === file && x.group === g);
+    if (!rows.length) continue;
+    out.push(`${g}`, ...rows.map((e) => `  ${e.path}${e.sensitive ? ' *' : ''}   ${e.what}`));
+  }
+  return out.join('\n');
+}
