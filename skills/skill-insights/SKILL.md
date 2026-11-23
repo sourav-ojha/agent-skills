@@ -5,7 +5,7 @@ license: MIT
 compatibility: "Needs shell and Node.js 20+ (22.5+ for Antigravity CLI). Read-only: reads the host's session transcripts; writes nothing unless asked."
 argument-hint: "[inventory | report | runs --skill <name> | review <report file>]"
 metadata:
-  version: "0.3.0"
+  version: "0.3.1"
   category: tooling
 ---
 

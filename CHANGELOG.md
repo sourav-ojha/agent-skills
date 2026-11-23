@@ -4,6 +4,12 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed (skill-insights 0.3.1)
+- Reports no longer count skills that were only opened: a window with no model turn of its own and nothing but its opening read is `surveyOnly`. It is left out of `inventory`/`report`/`runs` and listed on its own line (an agent browsing `SKILL.md` files to choose one used to show up as invocations).
+- agy: a `run_command` that writes files (redirect to a file, `tee`, `sed -i`, `git checkout`/`apply`/`reset`, `mv`/`cp`/`rm` and similar) clears the "read and not edited since" memory, so re-reads after a shell edit are no longer counted as repeated.
+- `report` shows the longest run per skill and the worst run's repeated file reads, and flags a skill when one run holds 80% or more of its minutes (that run is usually a long session after the skill loaded, not the skill's own cost).
+- Known limit: Claude Code shell edits (`Bash`) are still not seen as writes.
+
 ### Added (skill-insights 0.3.0: Antigravity CLI)
 - `si --host antigravity` (`inventory`, `report`, `runs`) analyses Antigravity CLI (`agy`) conversations from `~/.gemini/antigravity-cli/conversations/*.db`. New files: `lib/proto.mjs` (schemaless protobuf reader), `lib/agy.mjs` (steps to the same entries the Claude Code parser makes), `lib/agyio.mjs` (read-only SQLite via `node:sqlite`, Node 22.5+), `adapters/antigravity/README.md`. Claude Code stays the default host and its parser is unchanged.
 - A skill run is the first read of `.../skills/<name>/SKILL.md` (agy has no `Skill` tool); tokens come from model-response steps; errors are step status 7; sub-conversations are left out of top-level counts.
