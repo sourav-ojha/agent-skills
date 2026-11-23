@@ -240,7 +240,7 @@ function readConfigFile() {
 C.config = async () => {
   if (['init', 'edit', 'explain', 'set', 'unset'].includes(arg)) {
     const io = { out: (t) => console.log(t), err: (t) => console.error(`error: ${t}`), ask: async () => { throw new Error('no prompt available'); } };
-    process.exitCode = await runConfigCommand({ sub: arg, args: pos.slice(2), opt, root, home: os.homedir(), io, tty: !!(process.stdin.isTTY && process.stdout.isTTY) });
+    process.exitCode = await runConfigCommand({ sub: arg, args: pos.slice(2), opt, root, home: factoryHome(), io, tty: !!(process.stdin.isTTY && process.stdout.isTTY) });
     return;
   }
   const p = path.join(root, CONFIG_PATH);
