@@ -687,3 +687,34 @@ test('parseAnswer: number accepts fractions inside the range only', () => {
   for (const t of ['12.5', '-1', 'x', '1e2', '1.']) assert.equal(W.parseAnswer(e, t).action, 'invalid', t);
   assert.match(W.parseAnswer(e, '13').message, /a number, 0 to 12/);
 });
+
+// ---- hardening --------------------------------------------------------------------------------------------------------
+test('CLI without a TTY: unset checks.required and unset app.start exit 1 and leave the file bytes alone', () => {
+  const { dir, file } = project({ checks: { required: ['unit-tests'] }, app: { start: ['npm', 'start'] } });
+  const before = fs.readFileSync(file);
+  for (const k of ['checks.required', 'app.start']) {
+    const r = cli(dir, 'unset', k);
+    assert.equal(r.code, 1, `${k}: ${r.err}`);
+    assert.deepEqual(fs.readFileSync(file), before, k);
+  }
+});
+
+test('init --from-draft with autonomy.level L1: answering no at the final gate exits 1 and writes nothing', async () => {
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  const draft = path.join(dir, 'd.json');
+  fs.writeFileSync(draft, JSON.stringify({ autonomy: { level: 'L1' } }));
+  const r = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draft }, yes: 'no' });
+  assert.equal(r.code, 1, r.out);
+  assert.ok(r.asked.some((p) => /autonomy\.level .*Type yes/.test(p)), 'the final gate asked about autonomy.level');
+  assert.equal(r.asked.some((p) => /^Write /.test(p)), false);
+  assert.equal(fs.existsSync(file), false);
+});
+// edit has no equivalent: its base is the file as read, and a loosening is either typed-yes in the walk (confirmed for that
+// exact value) or absent, so no unconfirmed loosening can reach the final gate from `edit` through runConfigCommand.
+
+test('parseAnswer: number rejects Infinity, 1e999 and hex, and accepts a leading-dot fraction', () => {
+  const e = entry('max_wait_h', 'local');
+  for (const t of ['Infinity', '1e999', '0x10', '-0', '+1']) assert.equal(W.parseAnswer(e, t).action, 'invalid', t);
+  assert.deepEqual(W.parseAnswer(e, '.5'), { action: 'set', value: 0.5 });
+});

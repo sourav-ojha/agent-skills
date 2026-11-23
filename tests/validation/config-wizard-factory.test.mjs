@@ -277,3 +277,26 @@ test('a symlinked <home>/config.json is refused on read and write (set and edit)
   assert.equal(i.code, 1); assert.match(i.out, /symlink/);
   assert.equal(fs.readFileSync(target, 'utf8'), '{}\n');
 });
+
+// ---- hardening: local config ---------------------------------------------------------------------------------------------
+test('init --local --from-draft with wait_for_reset: true reaches the Write prompt, y exits 1 and no file is created', async () => {
+  const h = newHome();
+  const draft = path.join(tmpDir('cfg-draft-'), 'd.json');
+  fs.writeFileSync(draft, JSON.stringify({ wait_for_reset: true }));
+  const r = await localRun(h, 'init', [], { opt: { 'from-draft': draft }, confirm: 'y' });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /fixtures only/);
+  assert.equal(fs.existsSync(path.join(h, 'config.json')), false);
+});
+
+test('a symlinked FACTORY_HOME folder is refused by set --local and edit --local, and nothing is written through it', async () => {
+  const real = path.join(tmpDir('cfg-real-'), 'real');
+  fs.mkdirSync(real, { recursive: true });
+  const link = path.join(tmpDir('cfg-link-'), 'fh');
+  fs.symlinkSync(real, link);
+  const s = localCli(link, 'set', 'max_wait_h', '2');
+  assert.equal(s.code, 1); assert.match(s.err, /symlink/);
+  const e = await localRun(link, 'edit', ['2']);
+  assert.equal(e.code, 1);
+  assert.equal(fs.existsSync(path.join(real, 'config.json')), false); // (the CLI's own .skill-runs log may appear; the config may not)
+});
