@@ -415,16 +415,40 @@ test('walk: local_checks keep / replace / clear', async () => {
   assert.deepEqual(keep.doc.local_checks, lc);
 });
 
-test('wizard.mjs imports nothing delivery-specific', () => {
+test('wizard.mjs has no import at all', () => {
   const src = fs.readFileSync(path.join(SCRIPTS, 'lib', 'wizard.mjs'), 'utf8');
-  assert.deepEqual(src.split('\n').filter((l) => /^\s*(import\b|.*\bfrom\s+['"]|.*import\()/.test(l) && /config|localconfig|schema|edit/i.test(l)), []);
+  assert.deepEqual(src.split('\n').filter((l) => /^\s*import\b|\bimport\s*\(|\brequire\s*\(/.test(l) && !/^\s*\/\//.test(l)), []);
   assert.ok(src.split('\n').length <= 350);
 });
 
-// Walk answers run out as "keep"; the "Write <path>?" confirm gets `confirm`.
-const wiz = async (dir, sub, args, answers, { opt = {}, tty = true, confirm = 'y' } = {}) => {
+test('walk: app.ready timeout is validated like an int, and q quits', async () => {
+  const doc = { app: { base_url: 'http://127.0.0.1:3000' } };
+  const r = await walk(doc, ['1', '', 'abc', '9999', '30'], { only: 'app.ready' });
+  assert.deepEqual(r.doc.app.ready, { url: 'http://127.0.0.1:3000', timeout_s: 30 });
+  assert.ok(r.out.some((l) => /1 to 600/.test(l)));
+  const q = await walk(doc, ['2', 'q'], { only: 'app.ready' });
+  assert.equal(q.quit, true); assert.equal(q.doc.app.ready, undefined);
+  const qt = await walk(doc, ['1', '', 'q'], { only: 'app.ready' });
+  assert.equal(qt.quit, true);
+});
+
+test('walk: local_checks replace with a JSON line', async () => {
+  const line = JSON.stringify([{ name: 'lint', command: ['npm', 'run', 'lint'], timeout_s: 60 }]);
+  const r = await walk({}, [line, 'yes'], { only: 'local_checks' });
+  assert.equal(r.doc.local_checks[0].name, 'lint'); assert.deepEqual(r.changed, ['local_checks']);
+});
+
+// Walk answers run out as "keep"; the "Write <path>?" confirm gets `confirm`; a "Type yes" prompt not covered by the
+// answers gets `yes` when given; `during(prompt)` runs before each answer; `eof` makes every ask return null.
+const wiz = async (dir, sub, args, answers, { opt = {}, tty = true, confirm = 'y', yes, during, eof } = {}) => {
   const out = [], asked = [], rest = [...answers];
-  const io = { out: (t) => out.push(t), err: (t) => out.push(t), ask: async (p) => { asked.push(p); return /^Write /.test(p) ? confirm : (rest.length ? rest.shift() : ''); } };
+  const io = { out: (t) => out.push(t), err: (t) => out.push(t), ask: async (p) => {
+    asked.push(p); during?.(p);
+    if (eof) return null;
+    if (/^Write /.test(p)) return confirm;
+    if (yes !== undefined && /Type yes to apply/.test(p) && !rest.length) return yes;
+    return rest.length ? rest.shift() : '';
+  } };
   const code = await runConfigCommand({ sub, args, opt, root: dir, home: path.join(dir, 'fhome'), tty, io });
   return { code, out: out.join('\n'), asked };
 };
@@ -456,7 +480,7 @@ test('init --from-draft starts from the draft and walks its failing keys first',
   const r = await wiz(dir, 'init', [], ['3'], { opt: { 'from-draft': draft } });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /limits\.max_fix_rounds/);
-  assert.match(r.asked[0], /./);
+  assert.equal(/^(\S+) {3}\(current:/m.exec(r.out)[1], 'limits.max_fix_rounds'); // the failing key comes first
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, '.product', 'delivery.json'), 'utf8')), { base: 'develop', limits: { max_fix_rounds: 3 } });
 });
 
@@ -506,4 +530,91 @@ test('init and edit without a TTY exit 1 and point to config set', () => {
     const r = cli(dir, sub);
     assert.equal(r.code, 1, sub); assert.match(r.err, /config set/);
   }
+});
+
+const draftFile = (dir, doc) => { const f = path.join(dir, 'draft.json'); fs.writeFileSync(f, JSON.stringify(doc)); return f; };
+
+test('init --from-draft: loosening values in the draft need a typed yes before anything is written', async () => {
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  const draft = draftFile(dir, { autonomy: { level: 'L1' }, merge: { allow_tier3: true }, local_checks: [{ name: 'x', command: ['true'] }] });
+  const no = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draft } });
+  assert.equal(no.code, 1, no.out); assert.match(no.out, /autonomy\.level|not confirmed/); assert.equal(fs.existsSync(file), false);
+  assert.match(no.out, /sensitive changes: .*autonomy\.level/);
+  const ok = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draft }, yes: 'yes' });
+  assert.equal(ok.code, 0, ok.out);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).autonomy.level, 'L1');
+  assert.equal(ok.asked.filter((p) => /Type yes/.test(p)).length, 3); // one prompt per reason
+});
+
+test('init --from-draft: an alias spelling (merge.mode squash) is gated too; tightening and defaults are not', async () => {
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  const alias = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draftFile(dir, { merge: { mode: 'squash' } }) } });
+  assert.equal(alias.code, 1); assert.equal(fs.existsSync(file), false);
+  const safe = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draftFile(dir, { autonomy: { level: 'L0' }, limits: { max_fix_rounds: 1 }, base: 'develop' }) } });
+  assert.equal(safe.code, 0, safe.out); assert.equal(safe.asked.some((p) => /Type yes/.test(p)), false);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).limits.max_fix_rounds, 1);
+});
+
+test('init --from-draft with an unknown key is refused up front with the parser text', async () => {
+  const dir = tmpDir('cfg-init-');
+  const r = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draftFile(dir, { zzz: 1 }) } });
+  assert.equal(r.code, 1); assert.match(r.out, /unknown key "zzz"/); assert.equal(r.asked.length, 0);
+});
+
+test('edit: unchanged sensitive values already in the file do not re-prompt', async () => {
+  const { dir } = project({ autonomy: { level: 'L1' }, base: 'develop' });
+  const r = await wiz(dir, 'edit', ['base'], ['main']);
+  assert.equal(r.code, 0, r.out); assert.equal(r.asked.some((p) => /Type yes/.test(p)), false);
+});
+
+test('edit: a side effect alone (merge.mode dropped) still gets the diff, validation and the write', async () => {
+  const { dir, file } = project({ merge: { mode: 'pr-only' }, autonomy: { level: 'L0' } });
+  const r = await wiz(dir, 'edit', ['autonomy.level'], ['1']);
+  assert.equal(r.code, 0, r.out); assert.match(r.out, /- {3}"merge"/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { autonomy: { level: 'L0' } });
+});
+
+test('edit: a file changed on disk between the walk and the write is refused and left as it was', async () => {
+  const { dir, file } = project({ version: 1 });
+  const other = '{\n  "version": 1,\n  "base": "other"\n}\n';
+  const r = await wiz(dir, 'edit', ['base'], ['develop'], { during: (p) => { if (/^Write /.test(p)) fs.writeFileSync(file, other); } });
+  assert.equal(r.code, 1); assert.match(r.out, /changed on disk/);
+  assert.equal(fs.readFileSync(file, 'utf8'), other);
+});
+
+test('init: a file created during the walk is refused and left as it was', async () => {
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  const mine = '{"version":1}\n';
+  const r = await wiz(dir, 'init', [], ['', '', 'develop'], { during: (p) => { if (/^Write /.test(p)) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, mine); } } });
+  assert.equal(r.code, 1); assert.match(r.out, /changed on disk/);
+  assert.equal(fs.readFileSync(file, 'utf8'), mine);
+});
+
+test('edit on a file with unknown keys shows the errors and still fixes a valid key', async () => {
+  const { dir, file } = project({ zzz: 1, base: 'develop' });
+  const r = await wiz(dir, 'edit', ['base'], ['main']);
+  assert.equal(r.code, 0, r.out); assert.match(r.out, /unknown key "zzz"/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { zzz: 1, base: 'main' });
+});
+
+test('closed input exits 1 with nothing written; q and n exit 0', async () => {
+  const { dir, file } = project({ version: 1 });
+  const before = fs.readFileSync(file);
+  const eof = await wiz(dir, 'edit', [], [], { eof: true });
+  assert.equal(eof.code, 1); assert.match(eof.out, /input closed; nothing written/);
+  const eofConfirm = await wiz(dir, 'edit', ['base'], ['develop'], { confirm: null });
+  assert.equal(eofConfirm.code, 1); assert.match(eofConfirm.out, /input closed/);
+  assert.deepEqual(fs.readFileSync(file), before);
+  assert.equal((await wiz(dir, 'edit', [], ['q'])).code, 0);
+});
+
+test('readDraft opens without following symlinks', async () => {
+  const dir = tmpDir('cfg-init-');
+  const real = path.join(dir, 'd.json'); fs.writeFileSync(real, '{}');
+  const link = path.join(dir, 'l.json'); fs.symlinkSync(real, link);
+  const r = await wiz(dir, 'init', [], [], { opt: { 'from-draft': link } });
+  assert.equal(r.code, 1); assert.match(r.out, /symlink/);
 });

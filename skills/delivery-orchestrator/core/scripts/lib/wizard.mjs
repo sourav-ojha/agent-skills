@@ -108,11 +108,12 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
   const scope = only ? entries.filter((x) => (exact ? x.path === only : x.group === only || x.path === only)) : entries;
   const queue = [...first.filter((p) => byPath.has(p)), ...scope.map((x) => x.path)];
   const objectNull = entries.filter((x) => x.type === 'object-null').map((x) => x.path);
-  const done = new Set(), skipped = new Set(), pulled = new Set(), changed = [];
+  const done = new Set(), skipped = new Set(), pulled = new Set(), changed = [], confirmed = [];
+  let closed = false, quitting = false;
   let cur = clone(doc);
-  const quit = () => ({ doc: cur, changed, quit: true });
+  const quit = () => ({ doc: cur, changed, confirmed, quit: true, closed });
 
-  const ask = async (p) => { const a = await io.ask(p); return a === undefined || a === null ? 'q' : a; };
+  const ask = async (p) => { const a = await io.ask(p); if (a === undefined || a === null) { closed = true; return 'q'; } return a; };
   const apply = async (e, next) => {
     if (e.path === 'autonomy.level') next = drop(next, 'merge.mode'); // one spelling of the setting only
     const v = validateChange(cur, next);
@@ -121,6 +122,7 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
     if (reason) {
       io.out(`  SENSITIVE: this ${reason}.`);
       if (String(await ask('  Type yes to apply: ')).trim() !== 'yes') { io.out('  kept the old value'); return true; }
+      confirmed.push(e.path);
     }
     if (!same(get(cur, e.path), get(next, e.path)) && !changed.includes(e.path)) changed.push(e.path);
     if (e.path === 'verification.required' && get(next, e.path) === true && get(cur, e.path) !== true) {
@@ -129,14 +131,21 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
     cur = next;
     return true;
   };
-  // app.ready: pick url or log_pattern, then its value, then timeout_s; the other key is dropped.
+  // app.ready: pick url or log_pattern, then its value, then timeout_s (1-600); the other key is dropped. Returns null on quit or no value.
   const readyValue = async (kind, old) => {
     const port = portOf(get(cur, 'app.base_url'));
     const dflt = kind === 'url' && port ? `http://127.0.0.1:${port}` : undefined;
     const val = String(await ask(`  ${kind}${dflt ? ` [${dflt}]` : ''}: `)).trim() || dflt;
+    if (val === 'q') { quitting = true; return null; }
     if (!val) return null;
-    const t = String(await ask(`  timeout_s [${old?.timeout_s ?? 120}]: `)).trim();
-    return { [kind]: val, timeout_s: t === '' ? (old?.timeout_s ?? 120) : Number(t) };
+    const t = { path: 'timeout_s', type: 'int', min: 1, max: 600 };
+    for (;;) {
+      const r = parseAnswer(t, await ask(`  timeout_s [${old?.timeout_s ?? 120}]: `), undefined);
+      if (r.action === 'quit') { quitting = true; return null; }
+      if (r.action === 'keep') return { [kind]: val, timeout_s: old?.timeout_s ?? 120 };
+      if (r.action === 'set') return { [kind]: val, timeout_s: r.value };
+      io.out(`  ${r.message || 'enter a number, or Enter to keep'}`);
+    }
   };
 
   while (queue.length) {
@@ -147,7 +156,7 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
     if (parent && get(cur, parent) === undefined) continue; // children exist only once the parent is present
     if (e.type === 'object-null' && get(cur, p) !== undefined) { done.add(p); continue; }
     done.add(p);
-    if (pulled.has(p) && p === 'readiness.min_level' && get(cur, p) === undefined) { cur = put(cur, p, 4); changed.push(p); }
+    if (pulled.has(p) && p === 'readiness.min_level' && get(cur, p) === undefined) await apply(e, put(cur, p, 4)); // the level the factory needs
     for (;;) {
       io.out(renderPrompt(e, get(cur, p)));
       const r = parseAnswer(e, await ask('> '), get(cur, p));
@@ -160,11 +169,11 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
       if (r.action === 'unset') next = drop(cur, p);
       else if (r.action === 'choose') {
         const v = await readyValue(r.value, get(cur, p));
-        if (!v) { io.out('  a value is needed'); continue; }
+        if (!v) { if (quitting || closed) return quit(); io.out('  a value is needed'); continue; }
         next = put(cur, p, v);
       } else next = put(cur, p, r.value);
       if (await apply(e, next)) break;
     }
   }
-  return { doc: cur, changed, quit: false };
+  return { doc: cur, changed, confirmed, quit: false, closed };
 }

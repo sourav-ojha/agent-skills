@@ -79,15 +79,19 @@ const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // Draft file for `init --from-draft`: a regular JSON file under 64 KiB, never a symlink.
 function readDraft(f) {
-  let st;
-  try { st = fs.lstatSync(f); } catch (x) { throw new Error(`cannot read draft ${f}: ${x.message}`); }
-  if (st.isSymbolicLink()) throw new Error(`draft ${f} is a symlink; refusing to use it`);
-  if (!st.isFile()) throw new Error(`draft ${f} is not a regular file`);
-  if (st.size > 65536) throw new Error(`draft ${f} is over 64 KiB`);
-  let d;
-  try { d = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (x) { throw new Error(`draft ${f} is not valid JSON: ${x.message}`); }
-  if (!isPlain(d)) throw new Error(`draft ${f} must be a JSON object`);
-  return d;
+  let fd;
+  try { fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (x) {
+    throw new Error(x.code === 'ELOOP' ? `draft ${f} is a symlink; refusing to use it` : `cannot read draft ${f}: ${x.message}`);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`draft ${f} is not a regular file`);
+    if (st.size > 65536) throw new Error(`draft ${f} is over 64 KiB`);
+    let d;
+    try { d = JSON.parse(fs.readFileSync(fd, 'utf8')); } catch (x) { throw new Error(`draft ${f} is not valid JSON: ${x.message}`); }
+    if (!isPlain(d)) throw new Error(`draft ${f} must be a JSON object`);
+    return d;
+  } finally { fs.closeSync(fd); }
 }
 
 // Keys named by parser errors ("key: message"), mapped to the nearest schema key at or above them.
@@ -121,6 +125,8 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   }
   const empty = {};
   const problems = validateChange(empty, start, kind).errors;
+  const unknown = problems.filter((m) => m.startsWith('config:'));
+  if (sub === 'init' && unknown.length) { io.err(`draft not used: ${unknown.join('; ')}`); return 1; }
   if (problems.length) io.out(`${file} has problems:\n${problems.map((m) => `  ${m}`).join('\n')}`);
   const entries = GROUPS.flatMap((g) => SCHEMA.filter((x) => x.file === kind && x.group === g));
   const r = await walk({
@@ -128,18 +134,32 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
     validateChange: (b, a) => validateChange(b, a, kind),
     loosens: (e, b, a) => loosens(e, effective(b, kind), effective(a, kind)),
   });
-  if (r.quit) { io.out('nothing written'); return 0; }
+  const closedMsg = () => { io.err('input closed; nothing written'); return 1; };
+  if (r.quit) { if (r.closed) return closedMsg(); io.out('nothing written'); return 0; }
   const base = sub === 'init' ? empty : cur.doc;
-  const diff = sub === 'init' ? JSON.stringify(r.doc, null, 2).split('\n').map((l) => `+ ${l}`) : diffLines(base, r.doc);
-  if (!diff.length || (sub === 'edit' && JSON.stringify(r.doc) === JSON.stringify(cur.doc))) { io.out('no changes; nothing written'); return 0; }
-  if (sub === 'init' || r.changed.length) {
-    const v = validateChange(base, r.doc, kind);
-    if (!v.ok) { io.err(`not written: ${v.errors.join('; ')}`); return 1; }
+  if (JSON.stringify(r.doc) === JSON.stringify(base)) { io.out('no changes; nothing written'); return 0; }
+  const v = validateChange(base, r.doc, kind);
+  if (!v.ok) { io.err(`not written: ${v.errors.join('; ')}`); return 1; }
+  // Every sensitive loosening between the file as it is on disk (empty for init) and the result needs a typed yes,
+  // including values that came in from a draft or were already in the file before this walk touched them.
+  const risky = [], seen = new Set();
+  // Alias spellings go last, so the real key is the one named.
+  for (const e of entries.filter((x) => x.sensitive).sort((p, q) => !!p.alias - !!q.alias)) {
+    const reason = loosens(e, effective(base, kind), effective(r.doc, kind));
+    if (!reason || seen.has(reason)) continue;
+    seen.add(reason);
+    risky.push({ key: e.path, reason, done: r.confirmed.includes(e.path) || (e.alias && r.confirmed.includes(e.alias.to)) });
   }
-  io.out(diff.join('\n'));
-  const risky = r.changed.filter((k) => entry(k, kind)?.sensitive);
-  if (risky.length) io.out(`sensitive changes: ${risky.join(', ')}`);
-  const yn = String(await io.ask(`Write ${file}? (y/n) `)).trim().toLowerCase();
+  io.out(sub === 'init' ? JSON.stringify(r.doc, null, 2).split('\n').map((l) => `+ ${l}`).join('\n') : diffLines(base, r.doc).join('\n'));
+  if (risky.length) io.out(`sensitive changes: ${risky.map((x) => x.key).join(', ')}`);
+  for (const x of risky.filter((y) => !y.done)) {
+    const a = await io.ask(`${x.key} ${x.reason}. Type yes to apply: `);
+    if (a === null || a === undefined) return closedMsg();
+    if (String(a).trim() !== 'yes') { io.err(`not written: ${x.key} was not confirmed`); return 1; }
+  }
+  const yAns = await io.ask(`Write ${file}? (y/n) `);
+  if (yAns === null || yAns === undefined) return closedMsg();
+  const yn = String(yAns).trim().toLowerCase();
   if (yn !== 'y' && yn !== 'yes') { io.out('nothing written'); return 0; }
   try { writeDoc(file, r.doc, { sha: cur.sha, mode: opt.local ? 0o600 : 0o644 }); } catch (x) { io.err(x.message); return 1; }
   io.out(`wrote ${file}`);
