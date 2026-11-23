@@ -21,6 +21,19 @@ Set the rules once per project. Create the file with `deliver config --write`, e
 }
 ```
 
+## Changing the file with the wizard
+
+The key tables below are generated from the schema (`lib/configschema.mjs`); do not edit the text between the `config-schema` markers, run `deliver config explain --docs` to see what it should say.
+
+| Command | What it does |
+|---|---|
+| `deliver config explain [key\|--list\|--docs] [--json]` | Type, allowed values, default, what the key does, why it matters, which rule reads it. |
+| `deliver config set <key> <json-value>` / `deliver config unset <key>` | One validated change, no prompts. A loosening needs a terminal and a typed `yes`. |
+| `deliver config init [--from-draft FILE]` | Create the file: load the draft (plain config JSON, up to 64 KiB, not a symlink), walk the keys, show a diff, ask once. |
+| `deliver config edit [key\|group] [--profile basic\|factory]` | Walk all keys, one group or one key. `--profile factory` walks the keys `factory run` needs and ends with a checklist. |
+
+`init` and `edit` need a terminal. Add `--local` to any of them to work on `~/.factory/config.json` instead (`--profile factory` is project-only). Prompt answers: Enter keeps the value, a number picks a choice, `?` explains, `-` unsets, `s` skips the group, `q` quits without writing. Sensitive changes (anything that widens what runs unattended or weakens a gate) ask for a typed `yes` per key before the write. The commands only write the config file, atomically, and never run git: commit it and merge it to the base branch afterwards.
+
 Every key is optional. An unknown key or a wrong type is an error, so a typo cannot silently weaken a rule.
 
 <!-- config-schema:project:start -->

@@ -31,6 +31,25 @@ Edit it, commit it and merge it to your base branch. The main settings:
 
 Full reference: [`references/config.md`](../../skills/delivery-orchestrator/references/config.md). Note the default: a repo whose base branch is `main` is treated as protected, so it opens PRs but does not merge until you pick a non-protected base (usually `develop`) or deliberately list your own `protected_branches`.
 
+## Editing the config
+Every command below works on `.product/delivery.json`; add `--local` for the per-machine `~/.factory/config.json`. None of them runs git: commit the file and merge it to the base branch yourself.
+
+```bash
+deliver config explain --list              # every key, one line each
+deliver config explain autonomy.level      # type, allowed values, default, what it does, which rule reads it
+deliver config init --from-draft draft.json   # create the file (needs a terminal)
+deliver config edit [key|group]            # change values with prompts (needs a terminal)
+deliver config edit --profile factory      # only the keys factory run needs, then a checklist
+deliver config set base develop            # one change, no prompts; the value is JSON
+deliver config unset hold_paths
+```
+
+**Let an AI draft it.** The wizard does not read your repository, so it cannot find your test command, port or CI check names. Ask your AI assistant: "Read this repo (package files, CI workflows, README). Write `draft.json` with the `.product/delivery.json` keys that apply (the file allows no extra keys), and tell me in your reply which file and line each value came from. Do not guess a value you cannot point to. Then run `deliver config init --from-draft draft.json`." `init` shows the draft, walks the keys that fail validation first, shows a diff and asks before writing. Check the evidence yourself before you type `y`.
+
+**What needs a person.** Changes that widen what runs unattended or weaken a gate (merging with `L1`, `merge.allow_tier3`, `checks.allow_without_ci`, fewer `protected_branches` or `hold_paths`, `local_checks`, the commands in `app.*` and `tests.*`, fewer `checks.required`, higher `budgets`) need you to type `yes` at a terminal, once per key, also when the value came from a draft. `set` and `unset` refuse these without a terminal, so an agent can tighten a rule but not loosen one. `init` and `edit` always need a terminal.
+
+`deliver config` still shows the effective values and errors. The parser decides what is valid; the wizard only runs it on the candidate file before writing.
+
 ## Start small
 ```
 /delivery-orchestrator --dry-run        # show the queue, change nothing

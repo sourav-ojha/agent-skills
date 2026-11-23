@@ -1,6 +1,8 @@
 # Config wizard: `deliver config init | edit | explain | set`
 
-Status: draft for approval. Nothing is built until this is approved. Written against `main` + PR 23.
+Status: implemented on `feat/config-wizard` (commits 35b8cfc..827838b, then the docs commit). Written against `main` + PR 23.
+
+Revision (as built): the final sensitive gate prompts once per key (not one combined prompt) and asks again when the final value differs from the value the person confirmed during the walk; a `number` type (fractions inside a range, used for the local `max_wait_h` and `max_wait_weekly_h`) was added to the schema and the wizard; the D1 refinement (keep the errors a change introduces) is already noted under Decision D1.
 
 ## Intent
 `.product/delivery.json` has about 40 keys, each with its own type, range and cross-rules. Today a person gets a template (`deliver config --write`) and a read-only view (`deliver config`), and learns the allowed values by reading `references/config.md` or by hitting a parser error. This design adds a guided way to create and change the file, driven by one schema that also feeds validation, help and docs, so the three can no longer drift.

@@ -213,3 +213,44 @@ test('number entries render as "a number, min to max" in explain and the docs', 
   assert.ok(run('explain', 'max_wait_h', '--local').stdout.includes('type:    a number, 0 to 12'));
   assert.ok(run('explain', '--docs', '--local').stdout.includes('a number, 0 to 168'));
 });
+
+// ---- docs, changelog and the audit of other configs ------------------------------------------------------------------
+const readRepo = (...p) => fs.readFileSync(path.join(REPO, ...p), 'utf8');
+const unreleased = () => readRepo('CHANGELOG.md').split(/^## /m).find((x) => x.startsWith('[Unreleased]'));
+
+test('the guide and SKILL.md mention config explain and config edit', () => {
+  for (const f of [['docs', 'guides', 'delivery-orchestrator.md'], ['skills', 'delivery-orchestrator', 'SKILL.md']]) {
+    const t = readRepo(...f);
+    assert.match(t, /config explain/, f.join('/'));
+    assert.match(t, /config edit/, f.join('/'));
+  }
+  assert.match(readRepo('skills', 'delivery-orchestrator', 'SKILL.md'), /references\/config\.md/);
+});
+
+test('references/config.md explains the wizard commands outside the generated blocks', () => {
+  const t = readRepo('skills', 'delivery-orchestrator', 'references', 'config.md').replace(/<!-- config-schema:[^>]*:start -->[\s\S]*?<!-- config-schema:[^>]*:end -->/g, '');
+  for (const c of ['config init', 'config edit', 'config explain', 'config set', 'config unset', '--local', '--from-draft']) assert.ok(t.includes(c), c);
+});
+
+test('CHANGELOG [Unreleased] has a config wizard section naming the five commands', () => {
+  const u = unreleased();
+  assert.ok(u, 'no [Unreleased] section');
+  const i = u.indexOf('### Added (delivery-orchestrator: config wizard)');
+  assert.ok(i >= 0, 'no config wizard section');
+  assert.equal(u.slice(0, i).includes('### Added (feature-intake'), false, 'the new section goes above the existing ones');
+  const sec = u.slice(i).split(/^### /m)[1];
+  for (const c of ['config init', 'config edit', 'config explain', 'config set', 'config unset']) assert.ok(sec.includes(c), c);
+});
+
+test('the config audit exists and names every config file it lists', () => {
+  const t = readRepo('docs', 'superpowers', 'specs', '2026-11-23-config-wizard-audit.md');
+  assert.match(t, /skills\/product-intelligence\/core\/schemas\/config\.schema\.json/);
+  const listed = [...t.matchAll(/`(skills\/[^`\s]+\.json)`/g)].map((m) => m[1]);
+  assert.ok(listed.length >= 5, 'lists the config files');
+  for (const f of listed) assert.ok(fs.existsSync(path.join(REPO, f)), `${f} does not exist`);
+  assert.match(t, /wizard\.mjs/); assert.match(t, /byte-identical/);
+});
+
+test('the design spec is marked implemented', () => {
+  assert.match(readRepo('docs', 'superpowers', 'specs', '2026-11-23-config-wizard-design.md'), /^Status: implemented/m);
+});
