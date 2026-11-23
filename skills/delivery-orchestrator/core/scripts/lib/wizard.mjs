@@ -108,7 +108,7 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
   const scope = only ? entries.filter((x) => (exact ? x.path === only : x.group === only || x.path === only)) : entries;
   const queue = [...first.filter((p) => byPath.has(p)), ...scope.map((x) => x.path)];
   const objectNull = entries.filter((x) => x.type === 'object-null').map((x) => x.path);
-  const done = new Set(), skipped = new Set(), pulled = new Set(), changed = [], confirmed = [];
+  const done = new Set(), skipped = new Set(), pulled = new Set(), changed = [], confirmed = {};
   let closed = false, quitting = false;
   let cur = clone(doc);
   const quit = () => ({ doc: cur, changed, confirmed, quit: true, closed });
@@ -122,7 +122,7 @@ export async function walk({ entries, doc, io, validateChange, loosens, only, fi
     if (reason) {
       io.out(`  SENSITIVE: this ${reason}.`);
       if (String(await ask('  Type yes to apply: ')).trim() !== 'yes') { io.out('  kept the old value'); return true; }
-      confirmed.push(e.path);
+      confirmed[e.path] = JSON.stringify(get(next, e.path) ?? null); // the value the person typed yes for
     }
     if (!same(get(cur, e.path), get(next, e.path)) && !changed.includes(e.path)) changed.push(e.path);
     if (e.path === 'verification.required' && get(next, e.path) === true && get(cur, e.path) !== true) {

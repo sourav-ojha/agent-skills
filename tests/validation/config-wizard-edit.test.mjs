@@ -9,7 +9,8 @@ import { REPO, tmpDir } from './helpers.mjs';
 const SCRIPTS = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scripts');
 const DELIVER = path.join(SCRIPTS, 'deliver.mjs');
 const E = await import(path.join(SCRIPTS, 'lib', 'configedit.mjs'));
-const { runConfigCommand } = await import(path.join(SCRIPTS, 'lib', 'configcmd.mjs'));
+const C = await import(path.join(SCRIPTS, 'lib', 'configcmd.mjs'));
+const { runConfigCommand } = C;
 const { entry, SCHEMA } = await import(path.join(SCRIPTS, 'lib', 'configschema.mjs'));
 
 const project = (doc) => {
@@ -544,7 +545,7 @@ test('init --from-draft: loosening values in the draft need a typed yes before a
   const ok = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draft }, yes: 'yes' });
   assert.equal(ok.code, 0, ok.out);
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).autonomy.level, 'L1');
-  assert.equal(ok.asked.filter((p) => /Type yes/.test(p)).length, 3); // one prompt per reason
+  assert.equal(ok.asked.filter((p) => /Type yes/.test(p)).length, 3); // one prompt per key
 });
 
 test('init --from-draft: an alias spelling (merge.mode squash) is gated too; tightening and defaults are not', async () => {
@@ -617,4 +618,63 @@ test('readDraft opens without following symlinks', async () => {
   const link = path.join(dir, 'l.json'); fs.symlinkSync(real, link);
   const r = await wiz(dir, 'init', [], [], { opt: { 'from-draft': link } });
   assert.equal(r.code, 1); assert.match(r.out, /symlink/);
+});
+
+// ---- final sensitive gate: one prompt per key ------------------------------------------------------------------------
+const gated = async (doc, { yes = 'yes' } = {}) => {
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  const no = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draftFile(dir, doc) } });
+  const wrote = fs.existsSync(file);
+  const ok = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draftFile(dir, doc) }, yes });
+  return { no, wrote, ok, file };
+};
+
+test('gate: two argv keys in a draft need a yes each, and declining the second writes nothing', async () => {
+  const doc = { app: { start: ['npm', 'start'] }, tests: { all: ['evil'] } };
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  let m = 0;
+  const io = { out: () => {}, err: () => {}, ask: async (p) => { if (/Type yes/.test(p)) return ++m === 1 ? 'yes' : 'no'; return /^Write /.test(p) ? 'y' : ''; } };
+  const code = await runConfigCommand({ sub: 'init', args: [], opt: { 'from-draft': draftFile(dir, doc) }, root: dir, home: path.join(dir, 'fhome'), tty: true, io });
+  assert.equal(code, 1); assert.equal(m, 2); assert.equal(fs.existsSync(file), false);
+  const all = await wiz(dir, 'init', [], [], { opt: { 'from-draft': draftFile(dir, doc) }, yes: 'yes' });
+  assert.equal(all.code, 0, all.out); assert.match(all.out, /sensitive changes: app\.start: changes a command.*tests\.all: changes a command/);
+});
+
+test('gate: raised budgets and shortened protected_branches in a draft prompt', async () => {
+  for (const doc of [{ budgets: { feature: { tokens: 4000000 } } }, { protected_branches: ['main'] }]) {
+    const g = await gated(doc);
+    assert.equal(g.no.code, 1, JSON.stringify(doc)); assert.equal(g.wrote, false);
+    assert.equal(g.ok.code, 0, g.ok.out); assert.deepEqual(JSON.parse(fs.readFileSync(g.file, 'utf8')), doc);
+  }
+});
+
+test('gate: edit removing a required check prompts and leaves the file alone when declined', async () => {
+  const { dir, file } = project({ checks: { required: ['a', 'b'] } });
+  const before = fs.readFileSync(file);
+  const declined = await wiz(dir, 'edit', ['checks.required'], ['- b', 'no']);
+  assert.equal(declined.code, 0); assert.deepEqual(fs.readFileSync(file), before); // kept the old value: no change
+  const r = await wiz(dir, 'edit', ['checks.required'], ['- b', 'yes']);
+  assert.equal(r.code, 0, r.out); assert.equal(r.asked.filter((p) => /Type yes/.test(p)).length + r.asked.filter((p) => /^> /.test(p)).length, 2);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).checks.required, ['a']);
+});
+
+test('gateKeys: one entry per key; a confirmed value only counts for the same final value', () => {
+  const entries = SCHEMA.filter((x) => x.file === 'project');
+  const base = {};
+  const final = { app: { start: ['a'] }, tests: { all: ['b'] }, autonomy: { level: 'L1' } };
+  const keys = (confirmed, f = final) => C.gateKeys(entries, base, f, confirmed, 'project');
+  assert.deepEqual(keys({}).map((x) => x.key).sort(), ['app.start', 'autonomy.level', 'tests.all']);
+  assert.equal(keys({}).filter((x) => x.reason === 'changes a command that runs as you').length, 2); // same reason, two gates
+  assert.deepEqual(keys({ 'app.start': JSON.stringify(['a']) }).filter((x) => x.done).map((x) => x.key), ['app.start']);
+  assert.deepEqual(keys({ 'app.start': JSON.stringify(['other']) }).filter((x) => x.done), []); // typed yes for a different value
+  assert.equal(keys({}, { merge: { mode: 'squash' } }).length, 1); // alias spelling gates as autonomy.level
+  assert.equal(keys({}, { merge: { mode: 'squash' } })[0].key, 'autonomy.level');
+});
+
+test('closed input during the walk exits 1 even after a quit-like answer path', async () => {
+  const { dir } = project({ version: 1 });
+  const r = await wiz(dir, 'edit', ['autonomy.level'], [], { eof: true });
+  assert.equal(r.code, 1); assert.match(r.out, /input closed/);
 });

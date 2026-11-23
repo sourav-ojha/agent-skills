@@ -100,6 +100,18 @@ const failingKeys = (errors, kind) => [...new Set(errors.map((m) => {
   return keysOf(kind).filter((p) => k === p || k.startsWith(`${p}.`)).sort((a, b) => b.length - a.length)[0];
 }).filter(Boolean))];
 
+// One gate entry per sensitive key whose effective value loosens between `base` and `final`; never merged by reason text.
+// `done` only when the person typed yes during the walk for exactly the value that is now in the document.
+export function gateKeys(entries, base, final, confirmed, kind) {
+  const out = new Map();
+  for (const e of entries.filter((x) => x.sensitive).sort((p, q) => !!p.alias - !!q.alias)) { // alias spellings last
+    const key = e.alias ? e.alias.to : e.path;
+    const reason = out.has(key) ? null : loosens(e, effective(base, kind), effective(final, kind));
+    if (reason) out.set(key, { key, reason, done: confirmed[key] !== undefined && confirmed[key] === JSON.stringify(getPath(final, key) ?? null) });
+  }
+  return [...out.values()];
+}
+
 // init and edit: walk the keys, show the diff, ask once, write.
 async function wizard({ sub, args, opt, root, home, io, tty }) {
   const kind = opt.local ? 'local' : 'project';
@@ -135,23 +147,17 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
     loosens: (e, b, a) => loosens(e, effective(b, kind), effective(a, kind)),
   });
   const closedMsg = () => { io.err('input closed; nothing written'); return 1; };
-  if (r.quit) { if (r.closed) return closedMsg(); io.out('nothing written'); return 0; }
+  if (r.closed) return closedMsg();
+  if (r.quit) { io.out('nothing written'); return 0; }
   const base = sub === 'init' ? empty : cur.doc;
   if (JSON.stringify(r.doc) === JSON.stringify(base)) { io.out('no changes; nothing written'); return 0; }
   const v = validateChange(base, r.doc, kind);
   if (!v.ok) { io.err(`not written: ${v.errors.join('; ')}`); return 1; }
   // Every sensitive loosening between the file as it is on disk (empty for init) and the result needs a typed yes,
   // including values that came in from a draft or were already in the file before this walk touched them.
-  const risky = [], seen = new Set();
-  // Alias spellings go last, so the real key is the one named.
-  for (const e of entries.filter((x) => x.sensitive).sort((p, q) => !!p.alias - !!q.alias)) {
-    const reason = loosens(e, effective(base, kind), effective(r.doc, kind));
-    if (!reason || seen.has(reason)) continue;
-    seen.add(reason);
-    risky.push({ key: e.path, reason, done: r.confirmed.includes(e.path) || (e.alias && r.confirmed.includes(e.alias.to)) });
-  }
+  const risky = gateKeys(entries, base, r.doc, r.confirmed, kind);
   io.out(sub === 'init' ? JSON.stringify(r.doc, null, 2).split('\n').map((l) => `+ ${l}`).join('\n') : diffLines(base, r.doc).join('\n'));
-  if (risky.length) io.out(`sensitive changes: ${risky.map((x) => x.key).join(', ')}`);
+  if (risky.length) io.out(`sensitive changes: ${risky.map((x) => `${x.key}: ${x.reason}`).join('; ')}`);
   for (const x of risky.filter((y) => !y.done)) {
     const a = await io.ask(`${x.key} ${x.reason}. Type yes to apply: `);
     if (a === null || a === undefined) return closedMsg();
