@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-// skill-insights: read-only analysis of Claude Code session transcripts. Zero dependencies. Never prints paths or message text.
-// usage: node si.mjs <inventory|runs|report|export|runs-factory> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--json]
+// skill-insights: read-only analysis of Claude Code or Antigravity CLI (agy) sessions. Zero dependencies. Never prints paths or message text.
+// usage: node si.mjs <inventory|runs|report|export|runs-factory> [--host claude-code|antigravity] [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--json]
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseSession } from './lib/transcripts.mjs';
+import { readConversations, workspaces } from './lib/agyio.mjs';
 import { windows, inventory, dedupeSessions } from './lib/analyze.mjs';
 import { parseRunLog, summarizeRuns } from './lib/runs.mjs';
 import { joinTokens, coverage, latestPerFeature } from './lib/factory.mjs';
@@ -23,11 +24,27 @@ for (let i = 1; i < argv.length; i++) {
 const die = (m) => { console.error(`si: ${m}`); process.exit(1); };
 if (!['inventory', 'runs', 'report', 'export', 'runs-factory'].includes(cmd)) die('usage: si.mjs <inventory|runs|report|export|runs-factory> [--projects-dir D] [--skills-dir D ...] [--since YYYY-MM-DD] [--skill NAME] [--dir PROJECT] [--out FILE] [--no-notes] [--json]\n  runs-factory [--dir PROJECT | --repo OWNER/NAME] [--out FILE]   join <PROJECT>/.skill-runs/factory-runs.jsonl, or (driver mode) $FACTORY_HOME/records/<owner>__<repo>.jsonl, (latest per feature) to transcript tokens, subagents included');
 const home = os.homedir();
-const projectsDir = path.resolve(opt.projectsDir || path.join(home, '.claude', 'projects'));
-const skillDirs = (opt.skillsDir.length ? opt.skillsDir : [path.join(home, '.claude', 'skills')]).map((d) => path.resolve(d));
-if (cmd !== 'export' && cmd !== 'runs-factory' && !fs.existsSync(projectsDir)) die('projects dir not found (use --projects-dir)');
+const host = opt.host || 'claude-code';
+if (!['claude-code', 'antigravity'].includes(host)) die('--host must be claude-code or antigravity');
+const agyHome = path.join(home, '.gemini', 'antigravity-cli');
+const projectsDir = path.resolve(opt.projectsDir || (host === 'antigravity' ? path.join(agyHome, 'conversations') : path.join(home, '.claude', 'projects')));
+const defaultSkills = host === 'antigravity' ? [path.join(home, '.gemini', 'antigravity', 'skills'), path.join(home, '.agents', 'skills')] : [path.join(home, '.claude', 'skills')];
+const skillDirs = (opt.skillsDir.length ? opt.skillsDir : defaultSkills).map((d) => path.resolve(d));
+if (cmd !== 'export' && cmd !== 'runs-factory' && !fs.existsSync(projectsDir)) die(`${host === 'antigravity' ? 'conversations' : 'projects'} dir not found (use --projects-dir)`);
 const hash = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 6);
 
+// agy: one SQLite file per conversation; the project is the conversation's workspace. Sub-conversations are subagents.
+async function loadAgySessions({ subagents = false } = {}) {
+  const ws = workspaces(path.dirname(projectsDir));
+  const out = [];
+  for (const c of await readConversations(projectsDir)) {
+    if (!c.entries.length || (c.parent && !subagents)) continue;
+    const date = new Date(c.entries[0].ts).toISOString().slice(0, 10);
+    if (opt.since && date < opt.since) continue;
+    out.push({ project: hash(ws.get(c.id) || ws.get(c.parent) || 'agy'), sessionId: hash(c.id), date, ...(c.parent ? { subagent: true } : {}), entries: c.entries, skippedLines: c.skippedLines });
+  }
+  return dedupeSessions(out);
+}
 function loadSessions(onlyDir, { subagents = false } = {}) {
   const out = [];
   for (const p of fs.readdirSync(projectsDir, { withFileTypes: true })) {
@@ -172,7 +189,7 @@ function runsFactory() {
 
 if (cmd === 'export') { exportBundle(); process.exit(0); }
 if (cmd === 'runs-factory') { runsFactory(); process.exit(0); }
-const sessions = loadSessions();
+const sessions = host === 'antigravity' ? await loadAgySessions() : loadSessions();
 if (!sessions.length) { console.log('no sessions found (0 sessions in range)'); process.exit(0); }
 
 if (cmd === 'inventory') {

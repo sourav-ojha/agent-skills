@@ -4,6 +4,11 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (skill-insights 0.3.0: Antigravity CLI)
+- `si --host antigravity` (`inventory`, `report`, `runs`) analyses Antigravity CLI (`agy`) conversations from `~/.gemini/antigravity-cli/conversations/*.db`. New files: `lib/proto.mjs` (schemaless protobuf reader), `lib/agy.mjs` (steps to the same entries the Claude Code parser makes), `lib/agyio.mjs` (read-only SQLite via `node:sqlite`, Node 22.5+), `adapters/antigravity/README.md`. Claude Code stays the default host and its parser is unchanged.
+- A skill run is the first read of `.../skills/<name>/SKILL.md` (agy has no `Skill` tool); tokens come from model-response steps; errors are step status 7; sub-conversations are left out of top-level counts.
+- Known limits: agy's storage format is undocumented (field numbers were read off real conversations) and may change between versions; `export` and `runs-factory` stay Claude Code only; a session that reads many `SKILL.md` files to survey them counts each as an invocation.
+
 ### Added (delivery-orchestrator: config wizard)
 - Five commands on `deliver config`: `config explain [key|--list|--docs] [--json]` (type, allowed values, default, what it does, why it matters, which factory rule reads it), `config set <key> <json-value>` and `config unset <key>` (one validated change, no prompts, for scripts and agents), `config init [--from-draft FILE]` (create the file, optionally from an AI-written draft, then walk the keys) and `config edit [key|group] [--profile basic|factory]` (walk all keys, one group or one key). `config` and `config --write` behave as before; an unknown subcommand (a typo such as `config edti`) exits 1 with the list, and `deliver help` lists all five with their flags.
 - One schema, `lib/configschema.mjs`, is the single source for prompts, `explain`, the key list and the generated key tables in `references/config.md` (between the `config-schema` markers). A parity test runs `parseConfig` and `parseLocalConfig` against every entry (accepted values, range edges, wrong types, key sets, defaults) so a change to one side only fails the build; a second test fails when the committed tables differ from `explain --docs`.

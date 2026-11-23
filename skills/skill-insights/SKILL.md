@@ -1,11 +1,11 @@
 ---
 name: skill-insights
-description: Analyze how agent skills actually performed from Claude Code session transcripts, then propose improvements to the skills themselves. Reports per-skill token cost, wall time, tool errors, repeated reads and large outputs, which skills are really used (to prune bloated global skills), and standalone vs combined use. Use when the user wants to improve, audit, compare or clean up skills, asks what skills they use, or brings a run report to review.
+description: Analyze how agent skills actually performed from Claude Code or Antigravity CLI (agy) session history, then propose improvements to the skills themselves. Reports per-skill token cost, wall time, tool errors, repeated reads and large outputs, which skills are really used (to prune bloated global skills), and standalone vs combined use. Use when the user wants to improve, audit, compare or clean up skills, asks what skills they use, or brings a run report to review.
 license: MIT
-compatibility: "Needs shell and Node.js 20+. Read-only: reads the host's session transcripts; writes nothing unless asked."
+compatibility: "Needs shell and Node.js 20+ (22.5+ for Antigravity CLI). Read-only: reads the host's session transcripts; writes nothing unless asked."
 argument-hint: "[inventory | report | runs --skill <name> | review <report file>]"
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
   category: tooling
 ---
 
@@ -26,7 +26,7 @@ You measure skills, you do not run them. Everything is read-only and private: th
 | Package one project's skill runs to bring for review | `si export [--dir <project>] [--out file]` |
 | Tokens per delivered feature (delivery-orchestrator run records) | `si runs-factory [--dir <project>] [--out file]` |
 
-Defaults (transcript and skills folders) are in the host adapter. Add each skills folder you care about (project and
+Defaults (transcript and skills folders) are in the host adapter. Claude Code is the default host; for Antigravity CLI add `--host antigravity` (see adapters/antigravity/README.md). Add each skills folder you care about (project and
 global) with `--skills-dir` so "never used" is accurate. Use `--since` to avoid ancient history skewing results.
 
 ## Improve a skill (the point of this skill)
