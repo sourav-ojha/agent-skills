@@ -4,6 +4,7 @@
 // exit codes: 0 ok, 1 error (nothing changed), 2 outcome that needs the agent or a person (blocked, CI failed, awaiting human)
 import fs from 'node:fs';
 import os from 'node:os';
+import readline from 'node:readline/promises';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { logEvent, runId } from './lib/runlog.mjs';
@@ -239,8 +240,17 @@ function readConfigFile() {
 
 C.config = async () => {
   if (['init', 'edit', 'explain', 'set', 'unset'].includes(arg)) {
+    const tty = !!(process.stdin.isTTY && process.stdout.isTTY);
     const io = { out: (t) => console.log(t), err: (t) => console.error(`error: ${t}`), ask: async () => { throw new Error('no prompt available'); } };
-    process.exitCode = await runConfigCommand({ sub: arg, args: pos.slice(2), opt, root, home: factoryHome(), io, tty: !!(process.stdin.isTTY && process.stdout.isTTY) });
+    let rl;
+    if (tty) {
+      // One line per question; end of input answers null so a closed terminal quits instead of hanging.
+      rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      let closed = false, waiting = null;
+      rl.on('close', () => { closed = true; waiting?.(null); });
+      io.ask = (p) => (closed ? Promise.resolve(null) : new Promise((res) => { waiting = res; rl.question(p).then(res, () => res(null)); }));
+    }
+    try { process.exitCode = await runConfigCommand({ sub: arg, args: pos.slice(2), opt, root, home: factoryHome(), io, tty }); } finally { rl?.close(); }
     return;
   }
   const p = path.join(root, CONFIG_PATH);

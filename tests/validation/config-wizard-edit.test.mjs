@@ -295,3 +295,215 @@ test('a sensitive key without an explicit rule fails closed; every sensitive key
     assert.ok(E.loosens(e, o(t, bv), o(t, av)), e.path);
   }
 });
+
+// ---- wizard: parseAnswer, walk, init, edit -------------------------------------------------------------------------
+const W = await import(path.join(SCRIPTS, 'lib', 'wizard.mjs'));
+const { GROUPS } = await import(path.join(SCRIPTS, 'lib', 'configschema.mjs'));
+const ENTRIES = GROUPS.flatMap((g) => SCHEMA.filter((x) => x.file === 'project' && x.group === g));
+const scripted = (answers) => {
+  const out = [], asked = [];
+  return { out, asked, io: { out: (t) => out.push(t), err: (t) => out.push(t), ask: async (p) => { asked.push(p); return answers.shift(); } } };
+};
+const walk = (doc, answers, extra = {}) => {
+  const s = scripted([...answers]);
+  const p = W.walk({ entries: ENTRIES, doc, io: s.io, validateChange: (b, a) => E.validateChange(b, a, 'project'), loosens: (e, b, a) => E.loosens(e, E.effective(b, 'project'), E.effective(a, 'project')), ...extra });
+  return p.then((r) => ({ ...r, ...s }));
+};
+
+test('parseAnswer: keep, choose, unset, help, skip, quit', () => {
+  const lvl = entry('autonomy.level');
+  assert.equal(W.parseAnswer(lvl, '', 'L0').action, 'keep');
+  assert.deepEqual(W.parseAnswer(lvl, '2', 'L0'), { action: 'set', value: 'L1' });
+  const bad = W.parseAnswer(lvl, '9', 'L0');
+  assert.equal(bad.action, 'invalid'); assert.match(bad.message, /1-2/);
+  assert.equal(W.parseAnswer(entry('base'), '-', 'x').action, 'unset');
+  assert.equal(W.parseAnswer(lvl, '-', 'L0').action, 'invalid');
+  assert.equal(W.parseAnswer(lvl, '?', 'L0').action, 'help');
+  assert.equal(W.parseAnswer(lvl, 's', 'L0').action, 'skip-group');
+  assert.equal(W.parseAnswer(lvl, 'q', 'L0').action, 'quit');
+});
+
+test('parseAnswer: int bounds, text length, list and argv forms', () => {
+  const n = entry('limits.max_fix_rounds');
+  assert.deepEqual(W.parseAnswer(n, '3', 2), { action: 'set', value: 3 });
+  for (const t of ['abc', '9', '-1']) { const r = W.parseAnswer(n, t, 2); assert.equal(r.action, 'invalid', t); assert.match(r.message, /0 to 5/); }
+  assert.equal(W.parseAnswer(entry('implementer_notes'), 'x'.repeat(501), '').action, 'invalid');
+  assert.deepEqual(W.parseAnswer(entry('hold_paths'), '["a/","b"]', []), { action: 'set', value: ['a/', 'b'] });
+  assert.deepEqual(W.parseAnswer(entry('hold_paths'), '+ c/', ['a/']), { action: 'set', value: ['a/', 'c/'] });
+  assert.deepEqual(W.parseAnswer(entry('hold_paths'), '- a/', ['a/', 'b']), { action: 'set', value: ['b'] });
+  assert.equal(W.parseAnswer(entry('hold_paths'), '- zzz', ['a/']).action, 'invalid');
+  assert.deepEqual(W.parseAnswer(entry('app.start'), '["npm","start"]', null), { action: 'set', value: ['npm', 'start'] });
+  assert.equal(W.parseAnswer(entry('hold_paths'), '[1', []).action, 'invalid');
+  assert.deepEqual(W.parseAnswer(entry('app.base_url'), '4000', null), { action: 'set', value: 'http://127.0.0.1:4000' });
+  assert.equal(W.parseAnswer(entry('app.base_url'), 'http://localhost:4000/x', null).value, 'http://localhost:4000/x');
+  assert.equal(W.parseAnswer(entry('app.base_url'), 'https://example.com', null).action, 'invalid');
+});
+
+test('renderPrompt shows the design layout', () => {
+  const t = W.renderPrompt(entry('autonomy.level'), 'L0');
+  assert.match(t, /^autonomy\.level {3}\(current: L0, default: L0\) {3}SENSITIVE/);
+  assert.match(t, /1\) L0 {3}PRs only; nothing is merged/);
+  assert.match(t, /Enter keep {3}1-2 choose {3}\? more {3}s skip group {3}q quit without saving/);
+  assert.match(W.renderPrompt(entry('base'), undefined), /- unset/);
+});
+
+test('walk: keeping everything changes nothing', async () => {
+  const doc = { version: 1, base: 'develop' };
+  const r = await walk(doc, new Array(200).fill(''));
+  assert.deepEqual(r.changed, []); assert.deepEqual(r.doc, doc); assert.equal(r.quit, false);
+});
+
+test('walk: a loosening needs the literal yes; any other answer keeps the old value', async () => {
+  const no = await walk({ autonomy: { level: 'L0' } }, ['2', 'no'], { only: 'autonomy.level' });
+  assert.equal(no.doc.autonomy.level, 'L0'); assert.deepEqual(no.changed, []);
+  assert.ok(no.out.some((l) => /squash-merge without a person/.test(l)));
+  const yes = await walk({ autonomy: { level: 'L0' } }, ['2', 'yes'], { only: 'autonomy.level' });
+  assert.equal(yes.doc.autonomy.level, 'L1'); assert.deepEqual(yes.changed, ['autonomy.level']);
+  const tight = await walk({ autonomy: { level: 'L1' } }, ['1'], { only: 'autonomy.level' });
+  assert.equal(tight.doc.autonomy.level, 'L0'); assert.equal(tight.asked.length, 1);
+});
+
+test('walk: q quits, an invalid answer re-asks the same key, s skips the group', async () => {
+  const q = await walk({}, ['q']);
+  assert.equal(q.quit, true);
+  const re = await walk({}, ['9', '3'], { only: 'limits.max_fix_rounds' });
+  assert.equal(re.doc.limits.max_fix_rounds, 3); assert.equal(re.asked.length, 2);
+  const quoted = await walk({}, ['"x"'], { only: 'github.host' });
+  assert.equal(quoted.doc.github.host, 'x');
+  const skip = await walk({}, ['s', 'q']);
+  assert.ok(skip.out.join('\n').includes('protected_branches')); // went on to the next group
+  assert.equal(skip.asked.length, 2);
+});
+
+test('walk: a validateChange rejection re-asks', async () => {
+  const r = await walk({}, ['/etc', '..', 'docs'], { only: 'features_dir' });
+  assert.equal(r.doc.features_dir, 'docs'); assert.equal(r.asked.length, 3);
+});
+
+test('walk cross-key: app.ready, app.base_url port, autonomy.level drops merge.mode', async () => {
+  const a = await walk({ app: { base_url: 'http://127.0.0.1:3000', ready: { log_pattern: 'up', timeout_s: 30 } } }, ['1', '', '45'], { only: 'app.ready' });
+  assert.deepEqual(a.doc.app.ready, { url: 'http://127.0.0.1:3000', timeout_s: 45 });
+  assert.ok(a.asked.some((x) => x.includes('3000'))); // the base_url port is offered
+  const b = await walk({}, ['4000'], { only: 'app.base_url' });
+  assert.equal(b.doc.app.base_url, 'http://127.0.0.1:4000');
+  const c = await walk({ merge: { mode: 'pr-only' }, autonomy: { level: 'L0' } }, ['1'], { only: 'autonomy.level' });
+  assert.equal(c.doc.merge, undefined); assert.equal(c.doc.autonomy.level, 'L0');
+  const d = await walk({ app: { ready: { url: 'http://127.0.0.1:3000' } } }, ['2', 'Listening on', ''], { only: 'app.ready' });
+  assert.deepEqual(d.doc.app.ready, { log_pattern: 'Listening on', timeout_s: 120 });
+});
+
+test('walk: readiness children only when present or opted in; verification.required pulls factory keys', async () => {
+  const off = await walk({}, ['n'], { only: 'readiness' });
+  assert.equal(off.doc.readiness, undefined); assert.equal(off.asked.length, 1);
+  const on = await walk({}, ['y', '', ''], { only: 'readiness' });
+  assert.deepEqual(on.doc.readiness, {});
+  assert.equal(on.asked.length, 3);
+  const pulled = await walk({}, ['1', '["npm","start"]', 'yes', '4000', '1', '', '', 'y', '', ''], { only: 'verification.required' });
+  assert.equal(pulled.doc.verification.required, true);
+  assert.deepEqual(pulled.doc.app.start, ['npm', 'start']);
+  assert.equal(pulled.doc.app.base_url, 'http://127.0.0.1:4000');
+  assert.equal(pulled.doc.app.ready.url, 'http://127.0.0.1:4000');
+  assert.equal(pulled.doc.readiness.min_level, 4);
+  assert.ok(pulled.changed.includes('readiness.min_level'));
+});
+
+test('walk: local_checks keep / replace / clear', async () => {
+  const lc = [{ name: 'lint', command: ['npm', 'run', 'lint'], timeout_s: 60 }];
+  const clear = await walk({ local_checks: lc }, ['clear'], { only: 'local_checks' });
+  assert.deepEqual(clear.doc.local_checks, []);
+  const keep = await walk({ local_checks: lc }, [''], { only: 'local_checks' });
+  assert.deepEqual(keep.doc.local_checks, lc);
+});
+
+test('wizard.mjs imports nothing delivery-specific', () => {
+  const src = fs.readFileSync(path.join(SCRIPTS, 'lib', 'wizard.mjs'), 'utf8');
+  assert.deepEqual(src.split('\n').filter((l) => /^\s*(import\b|.*\bfrom\s+['"]|.*import\()/.test(l) && /config|localconfig|schema|edit/i.test(l)), []);
+  assert.ok(src.split('\n').length <= 350);
+});
+
+// Walk answers run out as "keep"; the "Write <path>?" confirm gets `confirm`.
+const wiz = async (dir, sub, args, answers, { opt = {}, tty = true, confirm = 'y' } = {}) => {
+  const out = [], asked = [], rest = [...answers];
+  const io = { out: (t) => out.push(t), err: (t) => out.push(t), ask: async (p) => { asked.push(p); return /^Write /.test(p) ? confirm : (rest.length ? rest.shift() : ''); } };
+  const code = await runConfigCommand({ sub, args, opt, root: dir, home: path.join(dir, 'fhome'), tty, io });
+  return { code, out: out.join('\n'), asked };
+};
+
+test('init: refuses when the file exists and names edit', async () => {
+  const { dir, file } = project({ version: 1 });
+  const r = await wiz(dir, 'init', [], []);
+  assert.equal(r.code, 1); assert.match(r.out, /edit/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{\n  "version": 1\n}\n');
+});
+
+test('init: walks, shows the diff, writes on y; n writes nothing; q writes nothing', async () => {
+  const dir = tmpDir('cfg-init-');
+  const file = path.join(dir, '.product', 'delivery.json');
+  const no = await wiz(dir, 'init', [], [], { confirm: 'n' });
+  assert.equal(no.code, 0); assert.match(no.out, /nothing written/); assert.equal(fs.existsSync(file), false);
+  const q = await wiz(dir, 'init', [], ['q']);
+  assert.equal(q.code, 0); assert.equal(fs.existsSync(file), false);
+  const walked = await wiz(dir, 'init', [], ['', '', 'develop']); // github.account, github.host, base
+  assert.equal(walked.code, 0, walked.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { base: 'develop' });
+  assert.match(walked.out, /\+ {3}"base": "develop"/); assert.match(walked.out, /commit/); assert.match(walked.out, /merge/);
+});
+
+test('init --from-draft starts from the draft and walks its failing keys first', async () => {
+  const dir = tmpDir('cfg-init-');
+  const draft = path.join(dir, 'draft.json');
+  fs.writeFileSync(draft, JSON.stringify({ base: 'develop', limits: { max_fix_rounds: 9 } }));
+  const r = await wiz(dir, 'init', [], ['3'], { opt: { 'from-draft': draft } });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /limits\.max_fix_rounds/);
+  assert.match(r.asked[0], /./);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, '.product', 'delivery.json'), 'utf8')), { base: 'develop', limits: { max_fix_rounds: 3 } });
+});
+
+test('init --from-draft refuses a symlink, a big file, invalid JSON and a missing file', async () => {
+  const dir = tmpDir('cfg-init-');
+  const real = path.join(dir, 'd.json'); fs.writeFileSync(real, '{}');
+  const link = path.join(dir, 'l.json'); fs.symlinkSync(real, link);
+  const big = path.join(dir, 'b.json'); fs.writeFileSync(big, JSON.stringify({ implementer_notes: 'x'.repeat(70000) }));
+  const bad = path.join(dir, 'x.json'); fs.writeFileSync(bad, '{nope');
+  for (const f of [link, big, bad, path.join(dir, 'missing.json')]) {
+    const r = await wiz(dir, 'init', [], [], { opt: { 'from-draft': f } });
+    assert.equal(r.code, 1, f);
+  }
+  assert.equal(fs.existsSync(path.join(dir, '.product', 'delivery.json')), false);
+});
+
+test('edit <key> walks one key; edit <group> walks one group; edit writes only on y', async () => {
+  const { dir, file } = project({ version: 1 });
+  const one = await wiz(dir, 'edit', ['autonomy.level'], ['2', 'yes']);
+  assert.equal(one.code, 0, one.out); assert.equal(one.asked.length, 3);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).autonomy.level, 'L1');
+  assert.match(one.out, /sensitive/i);
+  const repo = await wiz(dir, 'edit', ['repo'], []);
+  assert.equal(repo.code, 0); assert.equal(repo.asked.length, 5); assert.match(repo.out, /no changes/);
+  const nope = await wiz(dir, 'edit', ['autonomy.levl'], []);
+  assert.equal(nope.code, 1); assert.match(nope.out, /autonomy\.level/);
+  const before = fs.readFileSync(file);
+  const decline = await wiz(dir, 'edit', ['base'], ['main'], { confirm: 'n' });
+  assert.equal(decline.code, 0); assert.deepEqual(fs.readFileSync(file), before);
+});
+
+test('edit on an invalid existing file walks the failing keys first; invalid JSON exits 1 naming the file', async () => {
+  const { dir, file } = project({ base: 'develop', limits: { max_fix_rounds: 9 } });
+  const r = await wiz(dir, 'edit', [], ['4']);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /limits\.max_fix_rounds/);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).limits.max_fix_rounds, 4);
+  const broken = project('{nope');
+  const b = await wiz(broken.dir, 'edit', [], []);
+  assert.equal(b.code, 1); assert.match(b.out, /delivery\.json/);
+  assert.equal(fs.readFileSync(broken.file, 'utf8'), '{nope');
+});
+
+test('init and edit without a TTY exit 1 and point to config set', () => {
+  const { dir } = project({ version: 1 });
+  for (const sub of ['init', 'edit']) {
+    const r = cli(dir, sub);
+    assert.equal(r.code, 1, sub); assert.match(r.err, /config set/);
+  }
+});

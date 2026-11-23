@@ -1,8 +1,10 @@
 // `deliver config <sub>`: the command logic, kept out of deliver.mjs. Returns an exit code; never calls process.exit.
+import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_PATH } from './config.mjs';
-import { readDoc, getPath, setPath, unsetPath, validateChange, remainingErrors, effective, loosens, writeDoc, parseValue } from './configedit.mjs';
-import { entry, keysOf, nearest, renderExplain, renderDocs, renderList } from './configschema.mjs';
+import { readDoc, getPath, setPath, unsetPath, validateChange, remainingErrors, effective, loosens, writeDoc, parseValue, diffLines } from './configedit.mjs';
+import { SCHEMA, GROUPS, entry, keysOf, nearest, renderExplain, renderDocs, renderList } from './configschema.mjs';
+import { walk } from './wizard.mjs';
 
 function explain({ args, opt, io }) {
   const file = opt.local ? 'local' : 'project';
@@ -75,9 +77,80 @@ async function change({ sub, args, opt, root, home, io, tty }) {
 }
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+// Draft file for `init --from-draft`: a regular JSON file under 64 KiB, never a symlink.
+function readDraft(f) {
+  let st;
+  try { st = fs.lstatSync(f); } catch (x) { throw new Error(`cannot read draft ${f}: ${x.message}`); }
+  if (st.isSymbolicLink()) throw new Error(`draft ${f} is a symlink; refusing to use it`);
+  if (!st.isFile()) throw new Error(`draft ${f} is not a regular file`);
+  if (st.size > 65536) throw new Error(`draft ${f} is over 64 KiB`);
+  let d;
+  try { d = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (x) { throw new Error(`draft ${f} is not valid JSON: ${x.message}`); }
+  if (!isPlain(d)) throw new Error(`draft ${f} must be a JSON object`);
+  return d;
+}
+
+// Keys named by parser errors ("key: message"), mapped to the nearest schema key at or above them.
+const failingKeys = (errors, kind) => [...new Set(errors.map((m) => {
+  const k = m.split(':')[0];
+  return keysOf(kind).filter((p) => k === p || k.startsWith(`${p}.`)).sort((a, b) => b.length - a.length)[0];
+}).filter(Boolean))];
+
+// init and edit: walk the keys, show the diff, ask once, write.
+async function wizard({ sub, args, opt, root, home, io, tty }) {
+  const kind = opt.local ? 'local' : 'project';
+  if (!tty) { io.err(`config ${sub} needs a terminal; from a script use "deliver config set <key> <json-value>"`); return 1; }
+  if (opt.profile === 'factory') { io.err('--profile factory: not implemented yet'); return 1; }
+  if (opt.profile !== undefined && opt.profile !== 'basic') { io.err(`unknown profile "${opt.profile}" (basic)`); return 1; }
+  const file = opt.local ? path.join(home, 'config.json') : path.join(root, CONFIG_PATH);
+  let cur, start;
+  try { cur = readDoc(file); } catch (x) { io.err(x.message); return 1; }
+  if (!isPlain(cur.doc)) { io.err(`${file} must be a JSON object`); return 1; }
+  if (sub === 'init') {
+    if (cur.exists) { io.err(`${file} already exists; use "deliver config edit"`); return 1; }
+    try { start = opt['from-draft'] ? readDraft(opt['from-draft']) : {}; } catch (x) { io.err(x.message); return 1; }
+  } else {
+    if (!cur.exists) { io.err(`${file} does not exist; use "deliver config init"`); return 1; }
+    start = cur.doc;
+  }
+  const only = args[0];
+  if (only && !keysOf(kind).includes(only) && !GROUPS.includes(only)) {
+    const near = nearest(only, kind, 3);
+    io.err(`unknown key or group "${only}"${near.length ? `; did you mean ${near.join(', ')}?` : ''}`);
+    return 1;
+  }
+  const empty = {};
+  const problems = validateChange(empty, start, kind).errors;
+  if (problems.length) io.out(`${file} has problems:\n${problems.map((m) => `  ${m}`).join('\n')}`);
+  const entries = GROUPS.flatMap((g) => SCHEMA.filter((x) => x.file === kind && x.group === g));
+  const r = await walk({
+    entries, doc: start, io, only, first: only ? [] : failingKeys(problems, kind),
+    validateChange: (b, a) => validateChange(b, a, kind),
+    loosens: (e, b, a) => loosens(e, effective(b, kind), effective(a, kind)),
+  });
+  if (r.quit) { io.out('nothing written'); return 0; }
+  const base = sub === 'init' ? empty : cur.doc;
+  const diff = sub === 'init' ? JSON.stringify(r.doc, null, 2).split('\n').map((l) => `+ ${l}`) : diffLines(base, r.doc);
+  if (!diff.length || (sub === 'edit' && JSON.stringify(r.doc) === JSON.stringify(cur.doc))) { io.out('no changes; nothing written'); return 0; }
+  if (sub === 'init' || r.changed.length) {
+    const v = validateChange(base, r.doc, kind);
+    if (!v.ok) { io.err(`not written: ${v.errors.join('; ')}`); return 1; }
+  }
+  io.out(diff.join('\n'));
+  const risky = r.changed.filter((k) => entry(k, kind)?.sensitive);
+  if (risky.length) io.out(`sensitive changes: ${risky.join(', ')}`);
+  const yn = String(await io.ask(`Write ${file}? (y/n) `)).trim().toLowerCase();
+  if (yn !== 'y' && yn !== 'yes') { io.out('nothing written'); return 0; }
+  try { writeDoc(file, r.doc, { sha: cur.sha, mode: opt.local ? 0o600 : 0o644 }); } catch (x) { io.err(x.message); return 1; }
+  io.out(`wrote ${file}`);
+  io.out(opt.local ? 'next: nothing to commit; the next factory run reads this file' : `next: commit ${CONFIG_PATH} and merge it to the base branch`);
+  return 0;
+}
+
 export async function runConfigCommand({ sub, args = [], opt = {}, root, home, io, tty }) {
   if (sub === 'explain') return explain({ args, opt, io });
   if (sub === 'set' || sub === 'unset') return change({ sub, args, opt, root, home, io, tty });
+  if (sub === 'init' || sub === 'edit') return wizard({ sub, args, opt, root, home, io, tty });
   io.err(`config ${sub}: not implemented yet`);
   return 1;
 }
