@@ -52,7 +52,7 @@ async function change({ sub, args, opt, root, home, io, tty }) {
   } catch (x) { io.err(x.message); return 1; }
   const oldV = getPath(before, target);
   const newV = getPath(after, target);
-  if (JSON.stringify(after) === JSON.stringify(before) && (sub === 'unset' || oldV === newV)) {
+  if (JSON.stringify(after) === JSON.stringify(before) && (sub === 'unset' || JSON.stringify(oldV) === JSON.stringify(newV))) {
     io.out(JSON.stringify({ file, key, old: oldV ?? null, new: newV ?? null, changed: false, note: sub === 'unset' ? 'not set; nothing to do' : 'already that value', warnings: remainingErrors(before, after, kind) }));
     return 0;
   }
@@ -67,9 +67,10 @@ async function change({ sub, args, opt, root, home, io, tty }) {
   try { writeDoc(file, after, { sha: cur.sha, mode: opt.local ? 0o600 : 0o644 }); } catch (x) { io.err(x.message); return 1; }
   let again;
   try { again = readDoc(file); } catch (x) { io.err(`wrote ${file} but could not read it back: ${x.message}`); return 1; }
+  if (JSON.stringify(again.doc) !== JSON.stringify(after)) { io.err(`${file} changed during the write; check its contents`); return 1; }
   const re = validateChange(before, again.doc, kind);
   if (!re.ok) { io.err(`wrote ${file} but it now reports: ${re.errors.join('; ')}`); return 1; }
-  io.out(JSON.stringify({ file, key: target, old: oldV ?? null, new: newV ?? null, warnings: remainingErrors(before, again.doc, kind) }));
+  io.out(JSON.stringify({ file, key: target, old: oldV ?? null, new: newV ?? null, changed: true, warnings: remainingErrors(before, again.doc, kind) }));
   return 0;
 }
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

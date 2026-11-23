@@ -92,7 +92,12 @@ export function loosens(e, before, after) {
       const raised = (a === null && b !== null && b !== undefined) || (typeof a === 'number' && typeof b === 'number' && a > b);
       return raised ? `raises the ${p} cap, so runs can spend more` : null;
     }
-    default: return null;
+    case 'checks.required': { const gone = added(a, b); return gone.length ? `removes required checks (${gone.join(', ')})` : null; }
+    case 'verification.test_globs': { const gone = added(a, b); return gone.length ? `removes test globs (${gone.join(', ')}), so fewer files count as tests` : null; }
+    default:
+      if (e.type === 'argv') return JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a command that runs as you' : null;
+      // Fail closed for a sensitive key without an explicit rule: any change to its effective value needs a person.
+      return e.sensitive && JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a sensitive setting' : null;
   }
 }
 
@@ -117,6 +122,7 @@ export function writeDoc(file, doc, { sha, mode }) {
   fs.mkdirSync(dir, { recursive: true });
   if (isLink(dir)) throw new Error(`refusing to write: ${dir} is a symlink`);
   if (isLink(file)) throw new Error(`refusing to write: ${file} is a symlink`);
+  // Small race window remains between this check and the rename; the rename itself is atomic.
   let now = null;
   try { now = sha256(fs.readFileSync(file)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   if (now !== (sha ?? null)) throw new Error(`refusing to write: ${file} changed on disk since it was read`);

@@ -48,7 +48,7 @@ Every key is optional. An unknown key or a wrong type is an error, so a typo can
 
 | Key | Meaning | Allowed | Default |
 |---|---|---|---|
-| `checks.required` | CI check names that must be reported and pass. Empty uses the base branch required checks from branch protection. Names must match exactly. factory run: must not name factory/verified. | a list of strings, up to 100 items | `[]` |
+| `checks.required` (sensitive) | CI check names that must be reported and pass. Empty uses the base branch required checks from branch protection. Names must match exactly. factory run: must not name factory/verified. | a list of strings, up to 100 items | `[]` |
 | `checks.ignored` (sensitive) | CI check globs that never fail or hold a feature. For suites the project does not have or does not trust. GitHub branch protection can still block a merge. | a list of strings, up to 100 items | `[]` |
 | `checks.allow_without_ci` (sensitive) | Allow merging on local evidence when no CI check exists. Without CI there is no independent check on the change. Leave off unless the project truly has no CI. | true or false | `false` |
 | `local_checks` (sensitive) | Commands the orchestrator runs itself before a PR is opened. Each is a name, an argument list and a timeout of 1-3600 seconds (default 900). They run as you, outside the sandbox, so read them like a CI script. factory run: must be empty; run them in CI instead. | a list of { name, command, timeout_s } | `[]` |
@@ -60,23 +60,23 @@ Every key is optional. An unknown key or a wrong type is an error, so a typo can
 
 | Key | Meaning | Allowed | Default |
 |---|---|---|---|
-| `app.setup` | Command that prepares the app locally, as an argument list. Run once before the app starts, for installs or migrations. An argument list, never a shell string; up to 30 arguments. | an argument list (array of strings) | `null` |
-| `app.start` | Command that starts the app locally, as an argument list. Verification starts the app with it. The app gets HOST=127.0.0.1 and PORT, and must listen on 127.0.0.1. | an argument list (array of strings) | `null` |
-| `app.stop` | Command that stops the app, as an argument list. Used after verification. If empty the started process is signalled instead. | an argument list (array of strings) | `null` |
+| `app.setup` (sensitive) | Command that prepares the app locally, as an argument list. Run once before the app starts, for installs or migrations. An argument list, never a shell string; up to 30 arguments. | an argument list (array of strings) | `null` |
+| `app.start` (sensitive) | Command that starts the app locally, as an argument list. Verification starts the app with it. The app gets HOST=127.0.0.1 and PORT, and must listen on 127.0.0.1. | an argument list (array of strings) | `null` |
+| `app.stop` (sensitive) | Command that stops the app, as an argument list. Used after verification. If empty the started process is signalled instead. | an argument list (array of strings) | `null` |
 | `app.base_url` | Where the running app answers, on localhost or 127.0.0.1 only. Must be http://localhost:<port> or http://127.0.0.1:<port>. Never https and never another host. factory run: needs a port. | a local http URL | `null` |
 | `app.ready` | How to tell the app is up: a local URL or a log pattern, plus a timeout. Exactly one of url or log_pattern (a regex up to 200 characters). timeout_s is 1-600 and defaults to 120. factory run: a url must use the same port as app.base_url. | { url or log_pattern, timeout_s } | `null` |
 | `app.logs_dir` | Folder inside the repository where the app writes logs. A relative path with no "..". Verification reads app logs from here. | a relative path inside the repository | `null` |
-| `app.seed` | Command that seeds the app with data, as an argument list. Run after the app is up so scenarios start from known data. | an argument list (array of strings) | `null` |
+| `app.seed` (sensitive) | Command that seeds the app with data, as an argument list. Run after the app is up so scenarios start from known data. | an argument list (array of strings) | `null` |
 | `app.env_example` | Path of the example environment file inside the repository. A relative path with no "..". Used to tell the app which variables it needs. | a relative path inside the repository | `null` |
 
 **tests**
 
 | Key | Meaning | Allowed | Default |
 |---|---|---|---|
-| `tests.setup` | Command that prepares the test suite, as an argument list. Run before the full suite, for installs or fixtures. An argument list; up to 30 arguments. | an argument list (array of strings) | `null` |
-| `tests.all` | Command that runs the full test suite, as an argument list. Readiness runs this to see whether the suite passes. An argument list; up to 30 arguments. | an argument list (array of strings) | `null` |
+| `tests.setup` (sensitive) | Command that prepares the test suite, as an argument list. Run before the full suite, for installs or fixtures. An argument list; up to 30 arguments. | an argument list (array of strings) | `null` |
+| `tests.all` (sensitive) | Command that runs the full test suite, as an argument list. Readiness runs this to see whether the suite passes. An argument list; up to 30 arguments. | an argument list (array of strings) | `null` |
 | `tests.timeout_s` | Time limit in seconds for the full test suite. A suite that runs longer is stopped and counted as failed. | an integer, 1 to 3600 | `900` |
-| `verification.test_globs` | Path globs that identify test files. Verification uses them to tell test files from product code when checking a change. | a list of strings, up to 50 items | `[]` |
+| `verification.test_globs` (sensitive) | Path globs that identify test files. Verification uses them to tell test files from product code when checking a change. | a list of strings, up to 50 items | `[]` |
 
 **budgets**
 

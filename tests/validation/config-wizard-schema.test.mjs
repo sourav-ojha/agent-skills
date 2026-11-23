@@ -101,7 +101,7 @@ test('paths are unique, groups are in walk order, sensitive keys are marked', ()
   const keyOf = (e) => `${e.file}:${e.path}`;
   assert.equal(new Set(all.map(keyOf)).size, all.length);
   assert.deepEqual(s.GROUPS, ['repo', 'merge', 'ci', 'app', 'tests', 'budgets', 'verification', 'readiness', 'notes', 'local']);
-  const sensitive = ['autonomy.level', 'merge.mode', 'merge.allow_tier3', 'checks.allow_without_ci', 'checks.ignored', 'protected_branches', 'hold_paths', 'local_checks', 'verification.required', 'verification.scenario_approval', 'budgets.feature.tokens', 'budgets.feature.turns'];
+  const sensitive = ['autonomy.level', 'merge.mode', 'merge.allow_tier3', 'checks.allow_without_ci', 'checks.ignored', 'protected_branches', 'hold_paths', 'local_checks', 'verification.required', 'verification.scenario_approval', 'budgets.feature.tokens', 'budgets.feature.turns', 'app.setup', 'app.start', 'app.stop', 'app.seed', 'tests.setup', 'tests.all', 'checks.required', 'verification.test_globs'];
   assert.deepEqual(all.filter((e) => e.sensitive).map((e) => e.path).sort(), [...sensitive, 'budgets.day_tokens'].sort());
 });
 

@@ -10,7 +10,7 @@ const SCRIPTS = path.join(REPO, 'skills', 'delivery-orchestrator', 'core', 'scri
 const DELIVER = path.join(SCRIPTS, 'deliver.mjs');
 const E = await import(path.join(SCRIPTS, 'lib', 'configedit.mjs'));
 const { runConfigCommand } = await import(path.join(SCRIPTS, 'lib', 'configcmd.mjs'));
-const { entry } = await import(path.join(SCRIPTS, 'lib', 'configschema.mjs'));
+const { entry, SCHEMA } = await import(path.join(SCRIPTS, 'lib', 'configschema.mjs'));
 
 const project = (doc) => {
   const dir = tmpDir('cfg-edit-');
@@ -54,7 +54,7 @@ test('wrong-typed values are refused with the parser message and the file is unc
   for (const [k, v] of [['budgets.feature.tokens', '"5"'], ['checks.required', '"x"']]) {
     const r = cli(dir, 'set', k, v);
     assert.equal(r.code, 1, k);
-    assert.match(r.err, /budgets|checks/);
+    assert.match(r.err, k.startsWith('budgets') ? /an integer/ : /list/);
     assert.deepEqual(fs.readFileSync(file), before);
   }
 });
@@ -65,6 +65,7 @@ test('a mistyped key is refused with the nearest keys and nothing is written', (
   const r = cli(dir, 'set', 'autonomy.levl', 'L0');
   assert.equal(r.code, 1);
   assert.match(r.err, /autonomy\.level/);
+  assert.ok(r.err.split('did you mean ')[1].split(',').length <= 3);
   assert.deepEqual(fs.readFileSync(file), before);
 });
 
@@ -244,4 +245,53 @@ test('pure helpers', () => {
   assert.deepEqual(E.diffLines({ a: 1 }, { a: 2 }), ['-   "a": 1', '+   "a": 2']);
   assert.equal(E.validateChange({ version: 1 }, { version: 1, base: 5 }, 'project').ok, false);
   assert.equal(E.validateChange({ bogus: 1 }, { bogus: 1, base: 'x' }, 'project').ok, true);
+});
+
+test('set to the value a list already has exits 0, changed:false, file untouched', () => {
+  const { dir, file } = project({ version: 1, protected_branches: ['main'] });
+  const b = fs.readFileSync(file), st = fs.statSync(file);
+  const r = cli(dir, 'set', 'protected_branches', '["main"]');
+  assert.equal(r.code, 0, r.err);
+  assert.equal(JSON.parse(r.out).changed, false);
+  const st2 = fs.statSync(file);
+  assert.deepEqual(fs.readFileSync(file), b);
+  assert.equal(st2.ino, st.ino); assert.equal(st2.mtimeMs, st.mtimeMs);
+  assert.equal(JSON.parse(cli(dir, 'set', 'base', 'x').out).changed, true);
+});
+
+test('command, required-check and test-glob changes are loosenings', () => {
+  const L = (p, b, a) => E.loosens(entry(p), b, a);
+  const cmd = (k, v) => { const [g, n] = k.split('.'); return { [g]: { [n]: v } }; };
+  for (const k of ['app.setup', 'app.start', 'app.stop', 'app.seed', 'tests.setup', 'tests.all']) {
+    assert.equal(L(k, cmd(k, null), cmd(k, ['a'])), 'changes a command that runs as you', k);
+    assert.ok(L(k, cmd(k, ['a']), cmd(k, ['b'])), k);
+    assert.ok(L(k, cmd(k, ['a']), cmd(k, null)), k);
+    assert.equal(L(k, cmd(k, ['a']), cmd(k, ['a'])), null, k);
+  }
+  assert.ok(L('checks.required', { checks: { required: ['a', 'b'] } }, { checks: { required: ['a'] } }));
+  assert.ok(L('checks.required', { checks: { required: ['a'] } }, { checks: { required: [] } }));
+  assert.equal(L('checks.required', { checks: { required: [] } }, { checks: { required: ['a'] } }), null);
+  assert.ok(L('verification.test_globs', { verification: { test_globs: ['t/'] } }, { verification: { test_globs: [] } }));
+  assert.equal(L('verification.test_globs', { verification: { test_globs: [] } }, { verification: { test_globs: ['t/'] } }), null);
+});
+
+test('a sensitive key without an explicit rule fails closed; every sensitive key has a loosening example', () => {
+  assert.equal(E.loosens({ path: 'x.y', type: 'bool', sensitive: true }, { x: { y: false } }, { x: { y: true } }), 'changes a sensitive setting');
+  assert.equal(E.loosens({ path: 'x.y', type: 'bool', sensitive: false }, { x: { y: false } }, { x: { y: true } }), null);
+  const o = (p, v) => p.split('.').reduceRight((acc, k) => ({ [k]: acc }), v);
+  const ex = {
+    'autonomy.level': ['L0', 'L1'], 'merge.mode': ['pr-only', 'squash'], 'merge.allow_tier3': [false, true], 'checks.allow_without_ci': [false, true],
+    protected_branches: [['main'], []], hold_paths: [['a/'], []], 'checks.required': [['a'], []], 'checks.ignored': [[], ['a']],
+    local_checks: [[], [{ name: 'a', command: ['x'], timeout_s: 9 }]], 'verification.test_globs': [['t/'], []],
+    'verification.required': [true, false], 'verification.scenario_approval': ['human', 'auto'],
+    'budgets.feature.tokens': [1000000, 2000000], 'budgets.feature.turns': [100, 200], 'budgets.day_tokens': [20000000, 30000000],
+    'app.setup': [['a'], ['b']], 'app.start': [['a'], ['b']], 'app.stop': [['a'], ['b']], 'app.seed': [['a'], ['b']], 'tests.setup': [['a'], ['b']], 'tests.all': [['a'], ['b']],
+  };
+  for (const e of SCHEMA.filter((x) => x.sensitive)) {
+    assert.ok(ex[e.path], `sensitive key ${e.path} needs a loosening example`);
+    const [b, a] = ex[e.path];
+    const t = e.alias ? e.alias.to : e.path;
+    const [bv, av] = e.alias ? [e.alias.map[b], e.alias.map[a]] : [b, a];
+    assert.ok(E.loosens(e, o(t, bv), o(t, av)), e.path);
+  }
 });

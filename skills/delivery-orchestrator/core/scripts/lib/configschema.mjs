@@ -10,7 +10,7 @@ const L = 'local';
 const e = (path, group, type, rest) => ({ path, file: P, group, type, nullable: false, sensitive: false, ...rest });
 const local = (path, type, rest) => ({ path, file: L, group: 'local', type, nullable: false, sensitive: false, ...rest });
 const int = (path, group, min, max, dflt, rest) => e(path, group, 'int', { min, max, default: dflt, ...rest });
-const argv = (path, what, why, example, readBy) => e(path, 'app', 'argv', { default: null, nullable: true, example, what, why, readBy });
+const argv = (path, what, why, example, readBy) => e(path, 'app', 'argv', { default: null, nullable: true, sensitive: true, example, what, why, readBy });
 const T = { run: ['deliver readiness', 'factory run'] };
 
 export const SCHEMA = [
@@ -29,7 +29,7 @@ export const SCHEMA = [
   e('hold_paths', 'merge', 'list', { default: [], max: 50, sensitive: true, what: 'Path globs whose change needs a person to review before merge.', why: 'A trailing slash means the whole folder. CI files, CODEOWNERS and this config file are always held.', readBy: ['deliver init', 'factory run'] }),
 
   // ci
-  e('checks.required', 'ci', 'list', { default: [], max: 100, what: 'CI check names that must be reported and pass.', why: 'Empty uses the base branch required checks from branch protection. Names must match exactly.', readBy: ['deliver init', 'factory run'], factory: 'must not name factory/verified' }),
+  e('checks.required', 'ci', 'list', { default: [], max: 100, sensitive: true, what: 'CI check names that must be reported and pass.', why: 'Empty uses the base branch required checks from branch protection. Names must match exactly.', readBy: ['deliver init', 'factory run'], factory: 'must not name factory/verified' }),
   e('checks.ignored', 'ci', 'list', { default: [], max: 100, sensitive: true, what: 'CI check globs that never fail or hold a feature.', why: 'For suites the project does not have or does not trust. GitHub branch protection can still block a merge.', readBy: ['deliver init', 'factory run'] }),
   e('checks.allow_without_ci', 'ci', 'bool', { default: false, sensitive: true, what: 'Allow merging on local evidence when no CI check exists.', why: 'Without CI there is no independent check on the change. Leave off unless the project truly has no CI.', readBy: ['deliver init', 'factory run'] }),
   e('local_checks', 'ci', 'local_checks', { default: [], max: 10, sensitive: true, children: ['name', 'command', 'timeout_s'], what: 'Commands the orchestrator runs itself before a PR is opened.', why: 'Each is a name, an argument list and a timeout of 1-3600 seconds (default 900). They run as you, outside the sandbox, so read them like a CI script.', readBy: ['deliver init'], factory: 'must be empty; run them in CI instead' }),
@@ -51,7 +51,7 @@ export const SCHEMA = [
   { ...argv('tests.setup', 'Command that prepares the test suite, as an argument list.', 'Run before the full suite, for installs or fixtures. An argument list; up to 30 arguments.', ['npm', 'ci'], T.run), group: 'tests' },
   { ...argv('tests.all', 'Command that runs the full test suite, as an argument list.', 'Readiness runs this to see whether the suite passes. An argument list; up to 30 arguments.', ['npm', 'test'], T.run), group: 'tests' },
   int('tests.timeout_s', 'tests', 1, 3600, 900, { what: 'Time limit in seconds for the full test suite.', why: 'A suite that runs longer is stopped and counted as failed.', readBy: T.run }),
-  e('verification.test_globs', 'tests', 'list', { default: [], max: 50, what: 'Path globs that identify test files.', why: 'Verification uses them to tell test files from product code when checking a change.', readBy: ['factory run'] }),
+  e('verification.test_globs', 'tests', 'list', { default: [], max: 50, sensitive: true, what: 'Path globs that identify test files.', why: 'Verification uses them to tell test files from product code when checking a change.', readBy: ['factory run'] }),
 
   // budgets
   int('budgets.feature.tokens', 'budgets', 10000, 1000000000, 3000000, { sensitive: true, what: 'Token cap per feature for factory run.', why: 'A runaway guard. Tokens counted are input, output and cache creation. Raising it lets a feature spend more. See [run-control.md](run-control.md).', readBy: ['factory run'] }),
