@@ -5,6 +5,7 @@ import { CONFIG_PATH } from './config.mjs';
 import { readDoc, getPath, setPath, unsetPath, validateChange, remainingErrors, effective, loosens, writeDoc, parseValue, diffLines } from './configedit.mjs';
 import { SCHEMA, GROUPS, entry, keysOf, nearest, renderExplain, renderDocs, renderList } from './configschema.mjs';
 import { walk } from './wizard.mjs';
+import { FACTORY_KEYS, fileProblems, fileNotes, outsideFile } from './factorycheck.mjs';
 
 function explain({ args, opt, io }) {
   const file = opt.local ? 'local' : 'project';
@@ -112,12 +113,25 @@ export function gateKeys(entries, base, final, confirmed, kind) {
   return [...out.values()];
 }
 
+// What `factory run` would refuse for from this file alone, then what only the repository and the machine can show.
+function checklist(io, doc) {
+  const lines = ['factory checklist:'];
+  const problems = fileProblems(effective(doc, 'project'));
+  if (!problems.length) lines.push('  this file meets the checks factory run makes from the file alone');
+  for (const x of problems) lines.push(`  ${x.id}: ${x.why}`, `    fix: ${x.fix}`);
+  for (const x of fileNotes(effective(doc, 'project'))) lines.push(`  note: ${x.why}`);
+  lines.push('check outside this file:');
+  for (const x of outsideFile()) lines.push(`  - ${x.what}`, `    run: ${x.command}`);
+  io.out(lines.join('\n'));
+}
+
 // init and edit: walk the keys, show the diff, ask once, write.
 async function wizard({ sub, args, opt, root, home, io, tty }) {
   const kind = opt.local ? 'local' : 'project';
   if (!tty) { io.err(`config ${sub} needs a terminal; from a script use "deliver config set <key> <json-value>"`); return 1; }
-  if (opt.profile === 'factory') { io.err('--profile factory: not implemented yet'); return 1; }
-  if (opt.profile !== undefined && opt.profile !== 'basic') { io.err(`unknown profile "${opt.profile}" (basic)`); return 1; }
+  if (opt.profile !== undefined && !['basic', 'factory'].includes(opt.profile)) { io.err(`unknown profile "${opt.profile}"; use basic or factory`); return 1; }
+  const factory = opt.profile === 'factory';
+  if (factory && opt.local) { io.err('--profile factory edits the project file; leave out --local'); return 1; }
   const file = opt.local ? path.join(home, 'config.json') : path.join(root, CONFIG_PATH);
   let cur, start;
   try { cur = readDoc(file); } catch (x) { io.err(x.message); return 1; }
@@ -141,16 +155,18 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   if (sub === 'init' && unknown.length) { io.err(`draft not used: ${unknown.join('; ')}`); return 1; }
   if (problems.length) io.out(`${file} has problems:\n${problems.map((m) => `  ${m}`).join('\n')}`);
   const entries = GROUPS.flatMap((g) => SCHEMA.filter((x) => x.file === kind && x.group === g));
+  // The factory profile walks its own keys in its own order (readiness is the opt-in switch for readiness.min_level).
+  const walked = factory ? ['verification.required', 'readiness', ...FACTORY_KEYS.slice(1)].map((k) => entry(k, kind)).filter(Boolean) : entries;
   const r = await walk({
-    entries, doc: start, io, only, first: only ? [] : failingKeys(problems, kind),
+    entries: walked, doc: start, io, only, first: only ? [] : failingKeys(problems, kind),
     validateChange: (b, a) => validateChange(b, a, kind),
     loosens: (e, b, a) => loosens(e, effective(b, kind), effective(a, kind)),
   });
   const closedMsg = () => { io.err('input closed; nothing written'); return 1; };
   if (r.closed) return closedMsg();
-  if (r.quit) { io.out('nothing written'); return 0; }
   const base = sub === 'init' ? empty : cur.doc;
-  if (JSON.stringify(r.doc) === JSON.stringify(base)) { io.out('no changes; nothing written'); return 0; }
+  if (r.quit) { io.out('nothing written'); if (factory) checklist(io, base); return 0; }
+  if (JSON.stringify(r.doc) === JSON.stringify(base)) { io.out('no changes; nothing written'); if (factory) checklist(io, base); return 0; }
   const v = validateChange(base, r.doc, kind);
   if (!v.ok) { io.err(`not written: ${v.errors.join('; ')}`); return 1; }
   // Every sensitive loosening between the file as it is on disk (empty for init) and the result needs a typed yes,
@@ -166,10 +182,11 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   const yAns = await io.ask(`Write ${file}? (y/n) `);
   if (yAns === null || yAns === undefined) return closedMsg();
   const yn = String(yAns).trim().toLowerCase();
-  if (yn !== 'y' && yn !== 'yes') { io.out('nothing written'); return 0; }
+  if (yn !== 'y' && yn !== 'yes') { io.out('nothing written'); if (factory) checklist(io, base); return 0; }
   try { writeDoc(file, r.doc, { sha: cur.sha, mode: opt.local ? 0o600 : 0o644 }); } catch (x) { io.err(x.message); return 1; }
   io.out(`wrote ${file}`);
   io.out(opt.local ? 'next: nothing to commit; the next factory run reads this file' : `next: commit ${CONFIG_PATH} and merge it to the base branch`);
+  if (factory) checklist(io, r.doc);
   return 0;
 }
 
