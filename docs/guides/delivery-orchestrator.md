@@ -31,6 +31,31 @@ Edit it, commit it and merge it to your base branch. The main settings:
 
 Full reference: [`references/config.md`](../../skills/delivery-orchestrator/references/config.md). Note the default: a repo whose base branch is `main` is treated as protected, so it opens PRs but does not merge until you pick a non-protected base (usually `develop`) or deliberately list your own `protected_branches`.
 
+## Editing the config
+Every command below works on `.product/delivery.json`. Add `--local` to `explain`, `set`, `unset`, `init` or `edit` for the per-machine `~/.factory/config.json`; the one exception is `edit --profile factory`, which edits the project file only. None of them runs git: commit the project file and merge it to the base branch yourself.
+
+```bash
+deliver config explain --list              # every key, one line each
+deliver config explain autonomy.level      # type, allowed values, default, what it does, which rule reads it
+deliver config init --from-draft draft.json   # create the file (needs a terminal)
+deliver config edit [key|group]            # change values with prompts (needs a terminal)
+deliver config edit --profile factory      # only the keys factory run needs, then a checklist
+deliver config set base develop            # one change, no prompts; the value is JSON
+deliver config unset hold_paths
+```
+
+**Let an AI draft it.** The wizard does not read your repository, so it cannot find your test command, port or CI check names. Ask your AI assistant: "Read this repo (package files, CI workflows, README). Write `draft.json` with the `.product/delivery.json` keys that apply (the file allows no extra keys), and tell me in your reply which file and line each value came from. Do not guess a value you cannot point to. Then tell me to run `deliver config init --from-draft draft.json`." (`init` needs a terminal, so you run it, not the assistant.) `init` shows the draft, walks the keys that fail validation first, shows a diff and asks before writing. Check the evidence yourself before you type `y`.
+
+**What needs a person.** Changes that widen what runs unattended or weaken a gate (merging with `L1`, `merge.allow_tier3`, `checks.allow_without_ci`, fewer `protected_branches` or `hold_paths`, `local_checks`, the commands in `app.*` and `tests.*`, fewer `checks.required` or a named list where it was empty, higher `budgets`) need you to type `yes` at a terminal, once per key, also when the value came from a draft. So does any change to a sensitive key whose current value is invalid, because the parser then uses a substitute and the change cannot be judged. `set` and `unset` will not loosen a rule unless a person confirms at a terminal. `init` and `edit` always need a terminal.
+
+This is a guardrail for agents that have no terminal, not a security boundary: a pseudo-terminal can satisfy the terminal check, and an agent can edit the JSON file directly. The real control is that `.product/delivery.json` must be committed and identical to `origin/<base>` before a run, so a person reviews the diff when it is merged. `--local` (`~/.factory/config.json`) has no commit step, so nobody reviews a change to it.
+
+Not everything is gated by `set`: removing the `readiness` block or lowering `readiness.min_level` is not, because `factory run` enforces level 4 itself and the change shows up in the config diff a person reviews.
+
+Answering anything other than `yes`: during the walk it keeps the old value and the walk goes on (exit 0 if you then write or quit). At the final gate, for values that came from a draft or were already in the file, it stops: the command exits 1 naming the key, and nothing is written.
+
+`deliver config` still shows the effective values and errors. The parser decides what is valid; the wizard only runs it on the candidate file before writing.
+
 ## Start small
 ```
 /delivery-orchestrator --dry-run        # show the queue, change nothing

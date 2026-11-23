@@ -30,7 +30,7 @@ State lives in `.delivery/queue.json` (self-ignoring, never committed). Exit cod
 
 ## Start
 
-The project's rules live in `.product/delivery.json` (GitHub account, base branch, protected branches, which checks must pass or are ignored, local test commands, hold paths): [references/config.md](references/config.md). `deliver config` shows them; `deliver config --write` creates the file from a template. They must be committed to the base branch before a run.
+The project's rules live in `.product/delivery.json` (GitHub account, base branch, protected branches, which checks must pass or are ignored, local test commands, hold paths): [references/config.md](references/config.md). `deliver config` shows them; `deliver config --write` creates the file from a template. They must be committed to the base branch before a run. To change them: `deliver config explain <key>` says what a key does, `deliver config edit` (a person, at a terminal) or `deliver config set <key> <json-value>` (scripts) change it, and `deliver config init --from-draft FILE` creates the file from a draft you wrote. `set` and `unset` will not loosen a gate unless a person confirms at a terminal; that is a guardrail for agents, not a security boundary (the committed file, reviewed when it is merged, is the control; `--local` has no such review).
 
 1. Check: a git repository, `gh auth status` succeeds, the `implementer` skill is installed (if not, stop and say so), the working tree is clean.
 2. `deliver init --dry-run [flags]` and show the queue (id, title, order) and the effective rules it prints (account, base, whether merging is on, protected base, checks, local checks). Surface any `warnings`. Empty: report "no spec with `status: ready`" and suggest product-intelligence `handoff`.
