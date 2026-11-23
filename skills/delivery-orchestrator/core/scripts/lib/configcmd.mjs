@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_PATH } from './config.mjs';
 import { readDoc, getPath, setPath, unsetPath, validateChange, remainingErrors, effective, loosens, writeDoc, parseValue, diffLines } from './configedit.mjs';
-import { SCHEMA, GROUPS, entry, keysOf, nearest, renderExplain, renderDocs, renderList } from './configschema.mjs';
+import { SCHEMA, GROUPS, entry, keysOf, nearest, renderExplain, renderDocs, renderList, unavailable } from './configschema.mjs';
 import { walk } from './wizard.mjs';
 import { FACTORY_KEYS, fileProblems, fileNotes, outsideFile } from './factorycheck.mjs';
 
@@ -137,10 +137,10 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   try { cur = readDoc(file); } catch (x) { io.err(x.message); return 1; }
   if (!isPlain(cur.doc)) { io.err(`${file} must be a JSON object`); return 1; }
   if (sub === 'init') {
-    if (cur.exists) { io.err(`${file} already exists; use "deliver config edit"`); return 1; }
+    if (cur.exists) { io.err(`${file} already exists; use "deliver config edit${opt.local ? ' --local' : ''}"`); return 1; }
     try { start = opt['from-draft'] ? readDraft(opt['from-draft']) : {}; } catch (x) { io.err(x.message); return 1; }
   } else {
-    if (!cur.exists) { io.err(`${file} does not exist; use "deliver config init"`); return 1; }
+    if (!cur.exists) { io.err(`${file} does not exist; use "deliver config init${opt.local ? ' --local' : ''}"`); return 1; }
     start = cur.doc;
   }
   const only = args[0];
@@ -155,8 +155,14 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   if (sub === 'init' && unknown.length) { io.err(`draft not used: ${unknown.join('; ')}`); return 1; }
   if (problems.length) io.out(`${file} has problems:\n${problems.map((m) => `  ${m}`).join('\n')}`);
   const entries = GROUPS.flatMap((g) => SCHEMA.filter((x) => x.file === kind && x.group === g));
+  // A key this build cannot accept is never offered; say so once.
+  const off = entries.filter((x) => unavailable(x));
+  for (const x of off) {
+    if (only === x.path) { io.err(`${x.path} is unavailable: ${unavailable(x)}`); return 1; }
+    io.out(`${x.path} is unavailable: ${unavailable(x)}; skipped`);
+  }
   // The factory profile walks its own keys in its own order (readiness is the opt-in switch for readiness.min_level).
-  const walked = factory ? ['verification.required', 'readiness', ...FACTORY_KEYS.slice(1)].map((k) => entry(k, kind)).filter(Boolean) : entries;
+  const walked = factory ? ['verification.required', 'readiness', ...FACTORY_KEYS.slice(1)].map((k) => entry(k, kind)).filter(Boolean) : entries.filter((x) => !unavailable(x));
   const r = await walk({
     entries: walked, doc: start, io, only, first: only ? [] : failingKeys(problems, kind),
     validateChange: (b, a) => validateChange(b, a, kind),

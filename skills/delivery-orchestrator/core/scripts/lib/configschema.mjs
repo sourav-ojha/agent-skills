@@ -2,6 +2,8 @@
 // this module says what to show (allowed values, ranges, descriptions). tests/validation/config-wizard-schema.test.mjs
 // fails when the two disagree. Zero dependencies.
 
+import { CLASSIFIER_STATUS } from './limits.mjs';
+
 // Walk order of the wizard.
 export const GROUPS = ['repo', 'merge', 'ci', 'app', 'tests', 'budgets', 'verification', 'readiness', 'notes', 'local'];
 
@@ -10,6 +12,7 @@ const L = 'local';
 const e = (path, group, type, rest) => ({ path, file: P, group, type, nullable: false, sensitive: false, ...rest });
 const local = (path, type, rest) => ({ path, file: L, group: 'local', type, nullable: false, sensitive: false, ...rest });
 const int = (path, group, min, max, dflt, rest) => e(path, group, 'int', { min, max, default: dflt, ...rest });
+const num = (path, min, max, dflt, rest) => local(path, 'number', { min, max, default: dflt, ...rest });
 const argv = (path, what, why, example, readBy) => e(path, 'app', 'argv', { default: null, nullable: true, sensitive: true, example, what, why, readBy });
 const T = { run: ['deliver readiness', 'factory run'] };
 
@@ -77,8 +80,8 @@ export const SCHEMA = [
 
   // local (~/.factory/config.json)
   local('wait_for_reset', 'bool', { default: false, sensitive: false, what: 'Wait for a usage limit to reset instead of stopping.', why: 'Currently refused: the limit detector is only tested on fixtures, so true is an error.', readBy: ['factory run'] }),
-  local('max_wait_h', 'int', { min: 0, max: 12, default: 6, what: 'Longest wait in hours for a usage limit to reset.', why: 'A longer reset stops the run instead of waiting.', readBy: ['factory run'] }),
-  local('max_wait_weekly_h', 'int', { min: 0, max: 168, default: 0, what: 'Longest wait in hours for a weekly usage limit to reset.', why: '0 means a weekly limit always stops the run.', readBy: ['factory run'] }),
+  num('max_wait_h', 0, 12, 6, { what: 'Longest wait in hours for a usage limit to reset.', why: 'A longer reset stops the run instead of waiting.', readBy: ['factory run'] }),
+  num('max_wait_weekly_h', 0, 168, 0, { what: 'Longest wait in hours for a weekly usage limit to reset.', why: '0 means a weekly limit always stops the run.', readBy: ['factory run'] }),
   local('keep_awake', 'bool', { default: true, what: 'Keep the machine awake while a run is going.', why: 'A sleeping laptop pauses the run and can break running sessions.', readBy: ['factory run'] }),
   local('fallback_model', 'text', { default: null, nullable: true, example: 'claude-sonnet-4-5', what: 'Model to switch to when the main model is out of quota.', why: 'Empty means the run stops instead of switching.', readBy: ['factory run'] }),
   local('budgets.day_tokens', 'int', { min: 10000, max: 1000000000, default: null, nullable: true, example: 20000000, sensitive: true, what: 'Token cap per day across all runs on this machine.', why: 'Empty means no daily cap. Raising it lets runs spend more in a day.', readBy: ['factory run'] }),
@@ -103,7 +106,11 @@ export function nearest(path, file = P, n = 3) {
 }
 
 const show = (v) => (v === null ? 'null (unset)' : JSON.stringify(v));
-const range = (e) => (e.type === 'int' ? `an integer, ${e.min} to ${e.max}` : null);
+const range = (e) => (e.type === 'int' ? `an integer, ${e.min} to ${e.max}` : e.type === 'number' ? `a number, ${e.min} to ${e.max}` : null);
+
+// Why a key cannot be set in this build, or null. Only wait_for_reset: the parser refuses true until the classifier is real.
+export const unavailable = (e) => (e.file === L && e.path === 'wait_for_reset' && CLASSIFIER_STATUS !== 'real'
+  ? 'the usage-limit classifier is fixtures only (not yet validated against a real limit event)' : null);
 const TYPES = { bool: 'true or false', enum: 'one of the values below', text: 'text', relpath: 'a relative path inside the repository', url: 'a local http URL', argv: 'an argument list (array of strings)', list: 'a list of strings', local_checks: 'a list of { name, command, timeout_s }', ready: '{ url or log_pattern, timeout_s }', 'object-null': 'an object, or absent' };
 const typeText = (e) => range(e) || (e.maxLen ? `${TYPES[e.type]}, up to ${e.maxLen} characters` : e.max && e.type === 'list' ? `${TYPES[e.type]}, up to ${e.max} items` : TYPES[e.type] || e.type);
 
@@ -114,6 +121,8 @@ export function renderExplain(e) {
   if (e.alias) lines.push(`  alias:   older spelling of ${e.alias.to}`);
   if (e.nullable) lines.push('  null:    allowed (unset)');
   if (e.example !== undefined) lines.push(`  example: ${JSON.stringify(e.example)}`);
+  const off = unavailable(e);
+  if (off) lines.push(`  unavailable: ${off}`);
   lines.push(`  why:     ${e.why}`, `  read by: ${e.readBy.join(', ')}`);
   if (e.factory) lines.push(`  factory run: ${e.factory}`);
   if (e.sensitive) lines.push('  SENSITIVE: loosening it needs a person at a terminal; set refuses without one.');
@@ -146,7 +155,7 @@ export function renderList(file = P) {
   for (const g of GROUPS) {
     const rows = SCHEMA.filter((x) => x.file === file && x.group === g);
     if (!rows.length) continue;
-    out.push(`${g}`, ...rows.map((e) => `  ${e.path}${e.sensitive ? ' *' : ''}   ${e.what}`));
+    out.push(`${g}`, ...rows.map((e) => `  ${e.path}${e.sensitive ? ' *' : ''}   ${e.what}${unavailable(e) ? ' (unavailable: classifier is fixtures only)' : ''}`));
   }
   return out.join('\n');
 }

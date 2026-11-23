@@ -126,3 +126,154 @@ test('edit --profile: closed input exits 1 without the checklist; bad profile ex
   assert.equal(bad.code, 1); assert.match(bad.out, /basic/); assert.match(bad.out, /factory/);
   assert.equal(bad.asked.length, 0);
 });
+
+// ---- Task 5 review leftovers: loosening, --local refusal, declined write ---------------------------------------------
+test('edit --profile factory: a loosening needs a typed yes; anything else keeps the old value and leaves the bytes', async () => {
+  const { dir, file } = project(GOOD);
+  const before = fs.readFileSync(file);
+  const no = await edit(dir, ['false', 'no'], { confirm: 'y' });
+  assert.equal(no.code, 0, no.out);
+  assert.match(no.out, /turns off the verification gate/); assert.match(no.out, /kept the old value/);
+  assert.deepEqual(fs.readFileSync(file), before);
+  const yes = await edit(dir, ['false', 'yes'], { confirm: 'y' });
+  assert.equal(yes.code, 0, yes.out);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).verification.required, false);
+});
+
+test('edit --profile factory: --local is refused with exit 1 and a message', async () => {
+  const { dir } = project({});
+  const out = [];
+  const code = await runConfigCommand({ sub: 'edit', args: [], opt: { profile: 'factory', local: true }, root: dir, home: path.join(dir, 'fhome'), tty: true, io: { out: (t) => out.push(t), err: (t) => out.push(t), ask: async () => '' } });
+  assert.equal(code, 1); assert.match(out.join('\n'), /--profile factory/);
+});
+
+test('edit --profile factory: a declined final write still prints the checklist, exits 0, bytes unchanged', async () => {
+  const { dir, file } = project({});
+  const before = fs.readFileSync(file);
+  const r = await edit(dir, ['true'], { confirm: 'n' });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /nothing written/); assert.match(r.out, /factory checklist:/); assert.match(r.out, /check outside this file:/);
+  assert.deepEqual(fs.readFileSync(file), before);
+});
+
+// ---- local config (--local) ---------------------------------------------------------------------------------------------
+const { spawnSync } = await import('node:child_process');
+const L = await imp('lib', 'limits.mjs');
+const localCli = (home, ...args) => {
+  const r = spawnSync('node', [path.join(SCRIPTS, 'deliver.mjs'), 'config', ...args, '--local', '--dir', home], { encoding: 'utf8', env: { ...process.env, FACTORY_HOME: home } });
+  return { code: r.status, out: r.stdout, err: r.stderr };
+};
+const localRun = async (home, sub, answers, { args = [], opt = {}, confirm = 'y', yes } = {}) => {
+  const out = [], asked = [], rest = [...answers];
+  const io = { out: (t) => out.push(t), err: (t) => out.push(t), ask: async (p) => {
+    asked.push(p);
+    if (/^Write /.test(p)) return confirm;
+    if (/Type yes to apply/.test(p) && yes !== undefined) return yes;
+    return rest.length ? rest.shift() : '';
+  } };
+  const code = await runConfigCommand({ sub, args, opt: { local: true, ...opt }, root: home, home, tty: true, io });
+  return { code, out: out.join('\n'), asked };
+};
+const newHome = () => path.join(tmpDir('cfg-local-'), 'fh');
+
+test('classifier is fixtures only in this build (the unavailable tests below assume it)', () => assert.notEqual(L.CLASSIFIER_STATUS, 'real'));
+
+test('explain --local wait_for_reset says it is unavailable and why; --list marks it', () => {
+  const h = newHome();
+  const r = localCli(h, 'explain', 'wait_for_reset');
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /unavailable/i); assert.match(r.out, /fixtures only/);
+  const list = localCli(h, 'explain', '--list').out.split('\n').find((l) => l.includes('wait_for_reset'));
+  assert.match(list, /unavailable/);
+  assert.doesNotMatch(localCli(h, 'explain', 'keep_awake').out, /unavailable/);
+});
+
+test('set --local: max_wait_h writes 0600; wait_for_reset true is refused with the parser text and writes nothing', () => {
+  const h = newHome();
+  assert.equal(localCli(h, 'set', 'max_wait_h', '3').code, 0);
+  const f = path.join(h, 'config.json');
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  const before = fs.readFileSync(f);
+  const r = localCli(h, 'set', 'wait_for_reset', 'true');
+  assert.equal(r.code, 1); assert.match(r.err, /fixtures only/);
+  assert.deepEqual(fs.readFileSync(f), before);
+});
+
+test('edit --local walks only local keys, skips wait_for_reset with one line, accepts fractional hours, writes 0600', async () => {
+  const h = newHome();
+  fs.mkdirSync(h, { recursive: true });
+  const f = path.join(h, 'config.json');
+  fs.writeFileSync(f, '{\n  "keep_awake": true\n}\n');
+  const r = await localRun(h, 'edit', ['3', '0.5']);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /wait_for_reset is unavailable: .*fixtures only/);
+  assert.equal(r.out.match(/unavailable/g).length, 1);
+  assert.doesNotMatch(r.out, /^wait_for_reset {3}\(current/m);
+  for (const k of ['max_wait_h', 'max_wait_weekly_h', 'keep_awake', 'fallback_model', 'budgets.day_tokens']) assert.match(r.out, new RegExp(`^${k.replace('.', '\\.')}   \\(current`, 'm'), k);
+  for (const k of ['base', 'autonomy.level', 'app.start']) assert.doesNotMatch(r.out, new RegExp(`^${k.replace('.', '\\.')}\\b`, 'm'), k);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { keep_awake: true, max_wait_h: 3, max_wait_weekly_h: 0.5 });
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  assert.match(r.out, /nothing to commit/);
+});
+
+test('edit --local wait_for_reset (named) is refused as unavailable; init --local refuses an existing file naming edit --local', async () => {
+  const h = newHome();
+  fs.mkdirSync(h, { recursive: true });
+  fs.writeFileSync(path.join(h, 'config.json'), '{}\n');
+  const named = await localRun(h, 'edit', [], { args: ['wait_for_reset'] });
+  assert.equal(named.code, 1); assert.match(named.out, /unavailable/); assert.equal(named.asked.length, 0);
+  const init = await localRun(h, 'init', []);
+  assert.equal(init.code, 1); assert.match(init.out, /edit --local/);
+});
+
+test('init --local creates the folder and a 0600 file; --from-draft works for local', async () => {
+  const h = newHome();
+  const draft = path.join(tmpDir('cfg-draft-'), 'd.json');
+  fs.writeFileSync(draft, JSON.stringify({ max_wait_h: 2, fallback_model: 'm1' }));
+  const r = await localRun(h, 'init', [], { opt: { 'from-draft': draft } });
+  assert.equal(r.code, 0, r.out);
+  const f = path.join(h, 'config.json');
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, 'utf8')), { max_wait_h: 2, fallback_model: 'm1' });
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  const bad = path.join(path.dirname(draft), 'bad.json');
+  fs.writeFileSync(bad, JSON.stringify({ wait_for_reset: true }));
+  const h2 = newHome();
+  const r2 = await localRun(h2, 'init', ['q'], { opt: { 'from-draft': bad } });
+  assert.equal(fs.existsSync(path.join(h2, 'config.json')), false);
+  assert.match(r2.out, /fixtures only/);
+});
+
+test('edit --local: raising or unsetting budgets.day_tokens needs a typed yes; lowering does not', async () => {
+  const h = newHome();
+  fs.mkdirSync(h, { recursive: true });
+  const f = path.join(h, 'config.json');
+  const seed = () => fs.writeFileSync(f, `${JSON.stringify({ budgets: { day_tokens: 20000000 } }, null, 2)}\n`);
+  seed();
+  const before = fs.readFileSync(f);
+  const refused = await localRun(h, 'edit', ['30000000'], { args: ['budgets.day_tokens'], yes: 'no' });
+  assert.equal(refused.code, 0); assert.match(refused.out, /raises the budgets\.day_tokens cap/); assert.match(refused.out, /kept the old value/);
+  assert.deepEqual(fs.readFileSync(f), before);
+  const unset = await localRun(h, 'edit', ['-'], { args: ['budgets.day_tokens'], yes: 'no' });
+  assert.equal(unset.code, 0); assert.match(unset.out, /kept the old value/); assert.deepEqual(fs.readFileSync(f), before);
+  const ok = await localRun(h, 'edit', ['30000000'], { args: ['budgets.day_tokens'], yes: 'yes' });
+  assert.equal(ok.code, 0, ok.out);
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).budgets.day_tokens, 30000000);
+  const lower = await localRun(h, 'edit', ['10000000'], { args: ['budgets.day_tokens'], yes: 'no' });
+  assert.equal(lower.code, 0, lower.out);
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).budgets.day_tokens, 10000000);
+});
+
+test('a symlinked <home>/config.json is refused on read and write (set and edit)', async () => {
+  const h = newHome();
+  fs.mkdirSync(h, { recursive: true });
+  const target = path.join(tmpDir('cfg-target-'), 'real.json');
+  fs.writeFileSync(target, '{}\n');
+  fs.symlinkSync(target, path.join(h, 'config.json'));
+  const s = localCli(h, 'set', 'max_wait_h', '2');
+  assert.equal(s.code, 1); assert.match(s.err, /symlink/);
+  const e = await localRun(h, 'edit', ['2']);
+  assert.equal(e.code, 1); assert.match(e.out, /symlink/);
+  const i = await localRun(h, 'init', ['2']);
+  assert.equal(i.code, 1); assert.match(i.out, /symlink/);
+  assert.equal(fs.readFileSync(target, 'utf8'), '{}\n');
+});

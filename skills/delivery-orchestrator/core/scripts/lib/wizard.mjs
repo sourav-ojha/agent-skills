@@ -50,6 +50,10 @@ export function parseAnswer(e, text, current) {
       const n = /^-?\d+$/.test(t) ? Number(t) : NaN;
       return Number.isInteger(n) && n >= e.min && n <= e.max ? set(n) : bad(`must be an integer, ${e.min} to ${e.max}`);
     }
+    case 'number': {
+      const n = /^(\d+(\.\d+)?|\.\d+)$/.test(t) ? Number(t) : NaN;
+      return Number.isFinite(n) && n >= e.min && n <= e.max ? set(n) : bad(`must be a number, ${e.min} to ${e.max}`);
+    }
     case 'argv': case 'list': {
       if (t.startsWith('[')) {
         let v;
@@ -82,7 +86,7 @@ export function parseAnswer(e, text, current) {
 }
 
 const shown = (v) => (v === undefined ? 'not set' : typeof v === 'string' ? v : JSON.stringify(v));
-const HINT = { enum: (e) => `1-${e.values.length} choose`, bool: () => '1 true  2 false  choose', int: (e) => `${e.min}-${e.max}`, url: () => 'port number', ready: () => '1-2 choose', 'object-null': (e) => `Enable ${e.path} checks? y/n`, argv: () => '+ item  - item  or JSON array', list: () => '+ item  - item  or JSON array', local_checks: () => 'JSON array  clear' };
+const HINT = { enum: (e) => `1-${e.values.length} choose`, bool: () => '1 true  2 false  choose', int: (e) => `${e.min}-${e.max}`, number: (e) => `${e.min}-${e.max}, fractions allowed`, url: () => 'port number', ready: () => '1-2 choose', 'object-null': (e) => `Enable ${e.path} checks? y/n`, argv: () => '+ item  - item  or JSON array', list: () => '+ item  - item  or JSON array', local_checks: () => 'JSON array  clear' };
 
 // The prompt text for one key (the typed line is read separately).
 export function renderPrompt(e, current) {

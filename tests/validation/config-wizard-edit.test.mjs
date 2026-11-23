@@ -678,3 +678,12 @@ test('closed input during the walk exits 1 even after a quit-like answer path', 
   const r = await wiz(dir, 'edit', ['autonomy.level'], [], { eof: true });
   assert.equal(r.code, 1); assert.match(r.out, /input closed/);
 });
+
+test('parseAnswer: number accepts fractions inside the range only', () => {
+  const e = entry('max_wait_h', 'local');
+  assert.deepEqual(W.parseAnswer(e, '0.5'), { action: 'set', value: 0.5 });
+  assert.deepEqual(W.parseAnswer(e, '12'), { action: 'set', value: 12 });
+  assert.deepEqual(W.parseAnswer(e, '0'), { action: 'set', value: 0 });
+  for (const t of ['12.5', '-1', 'x', '1e2', '1.']) assert.equal(W.parseAnswer(e, t).action, 'invalid', t);
+  assert.match(W.parseAnswer(e, '13').message, /a number, 0 to 12/);
+});

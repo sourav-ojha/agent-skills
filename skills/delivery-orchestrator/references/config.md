@@ -131,8 +131,8 @@ Local run-control settings (`wait_for_reset`, `max_wait_h`, `max_wait_weekly_h`,
 | Key | Meaning | Allowed | Default |
 |---|---|---|---|
 | `wait_for_reset` | Wait for a usage limit to reset instead of stopping. Currently refused: the limit detector is only tested on fixtures, so true is an error. | true or false | `false` |
-| `max_wait_h` | Longest wait in hours for a usage limit to reset. A longer reset stops the run instead of waiting. | an integer, 0 to 12 | `6` |
-| `max_wait_weekly_h` | Longest wait in hours for a weekly usage limit to reset. 0 means a weekly limit always stops the run. | an integer, 0 to 168 | `0` |
+| `max_wait_h` | Longest wait in hours for a usage limit to reset. A longer reset stops the run instead of waiting. | a number, 0 to 12 | `6` |
+| `max_wait_weekly_h` | Longest wait in hours for a weekly usage limit to reset. 0 means a weekly limit always stops the run. | a number, 0 to 168 | `0` |
 | `keep_awake` | Keep the machine awake while a run is going. A sleeping laptop pauses the run and can break running sessions. | true or false | `true` |
 | `fallback_model` | Model to switch to when the main model is out of quota. Empty means the run stops instead of switching. | text | `null` |
 | `budgets.day_tokens` (sensitive) | Token cap per day across all runs on this machine. Empty means no daily cap. Raising it lets runs spend more in a day. | an integer, 10000 to 1000000000 | `null` |

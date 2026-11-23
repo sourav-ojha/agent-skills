@@ -12,7 +12,7 @@ const { parseLocalConfig, KEYS } = await import(path.join(LIB, 'localconfig.mjs'
 const parse = (e, doc) => (e.file === 'local' ? parseLocalConfig(doc, { classifierReal: true }) : parseConfig(doc));
 const setAt = (p, v) => { const doc = {}; let o = doc; const ps = p.split('.'); ps.slice(0, -1).forEach((k) => { o = o[k] = {}; }); o[ps.at(-1)] = v; return doc; };
 const sample = (e) => (e.default === null ? e.example : e.default);
-const wrong = (e) => (['bool', 'int'].includes(e.type) ? {} : 5);
+const wrong = (e) => (['bool', 'int', 'number'].includes(e.type) ? {} : 5);
 const all = [...s.SCHEMA];
 const failsOn = (e, value) => parse(e, setAt(e.path, value)).errors.some((m) => m.includes(e.path));
 
@@ -198,4 +198,18 @@ test('explain --docs equals the generated blocks in references/config.md', () =>
 
 test('config subcommands not built yet exit 1', () => {
   for (const sub of ['init', 'edit', 'set', 'unset']) assert.equal(run(sub).status, 1, sub);
+});
+
+test('number entries: parser accepts min, max and a fraction, rejects just outside and non-numbers', () => {
+  const nums = s.SCHEMA.filter((x) => x.type === 'number');
+  assert.deepEqual(nums.map((x) => x.path).sort(), ['max_wait_h', 'max_wait_weekly_h']);
+  for (const e of nums) {
+    for (const v of [e.min, e.max, (e.min + e.max) / 2 + 0.25, 0.5]) assert.deepEqual(parse(e, setAt(e.path, v)).errors, [], `${e.path}=${v}`);
+    for (const v of [e.min - 0.001, e.max + 0.001, 'x', null, {}, true]) assert.ok(failsOn(e, v), `${e.path} accepted ${JSON.stringify(v)}`);
+  }
+});
+
+test('number entries render as "a number, min to max" in explain and the docs', () => {
+  assert.ok(run('explain', 'max_wait_h', '--local').stdout.includes('type:    a number, 0 to 12'));
+  assert.ok(run('explain', '--docs', '--local').stdout.includes('a number, 0 to 168'));
 });
