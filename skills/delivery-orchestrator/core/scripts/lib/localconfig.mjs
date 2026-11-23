@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MAX_BYTES = 64 * 1024;
-const KEYS = ['wait_for_reset', 'max_wait_h', 'max_wait_weekly_h', 'keep_awake', 'fallback_model', 'budgets'];
+export const KEYS = ['wait_for_reset', 'max_wait_h', 'max_wait_weekly_h', 'keep_awake', 'fallback_model', 'budgets'];
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 const defaults = () => ({ wait_for_reset: false, max_wait_h: 6, max_wait_weekly_h: 0, keep_awake: true, fallback_model: null, budgets: { day_tokens: null } });
 
