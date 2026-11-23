@@ -342,7 +342,7 @@ const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,99}$/;
 const absNoCtrl = (v) => typeof v === 'string' && path.isAbsolute(v) && !CTRL.test(v) && path.normalize(v) === v;
 const bad = (msg) => { throw new TypeError(msg); };
 
-const OPTIONS = ['role', 'cwd', 'prompt', 'settingsFile', 'configDir', 'maxTurns', 'timeoutS', 'model', 'claudeBin', 'baseEnv', 'killGraceMs', 'maxLineChars', 'onSpawn', 'tmpDir', 'home', 'shouldAbort', 'abortPollMs'];
+const OPTIONS = ['role', 'cwd', 'prompt', 'settingsFile', 'configDir', 'maxTurns', 'timeoutS', 'model', 'claudeBin', 'baseEnv', 'killGraceMs', 'maxLineChars', 'onSpawn', 'tmpDir', 'home', 'shouldAbort', 'abortPollMs', 'now'];
 function checkArgs(o) {
   if (!o || typeof o !== 'object') bad('runSession needs an options object');
   for (const k of Object.keys(o)) if (!OPTIONS.includes(k)) bad(`unknown option ${cleanKey(k)}`);
@@ -398,8 +398,10 @@ const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 // eat the budget) -> SIGTERM to the process group, SIGKILL after killGraceMs.
 export async function runSession(opts) {
   checkArgs(opts);
-  const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineChars = DEFAULT_MAX_LINE_CHARS, onSpawn, tmpDir, shouldAbort, abortPollMs = 5000 } = opts;
+  const { role, cwd, configDir, timeoutS, claudeBin = 'claude', baseEnv = process.env, killGraceMs = 5000, maxLineChars = DEFAULT_MAX_LINE_CHARS, onSpawn, tmpDir, shouldAbort, abortPollMs = 5000, now: nowMs } = opts;
   const argv = buildArgv(opts);
+  // The clock the limit classifier reads a "resets 3:45pm" text against: the caller's (the factory's injectable clock), else the real one.
+  const classifyNow = new Date(Number.isFinite(nowMs) ? nowMs : Date.now());
   // `home` (default: the parent's HOME, as materialiseSettings uses) becomes the child's HOME and the lint's home.
   const home = opts.home ?? defaultHome(baseEnv);
   const env = scrubEnv({ ...baseEnv, HOME: home }, { configDir: role === 'author' ? configDir : undefined, tmpDir, cwd });
@@ -460,12 +462,12 @@ export async function runSession(opts) {
         // result is missing or a plain is_error result.
         const specific = r && typeof r.subtype === 'string' && r.subtype !== 'success';
         if (r?.subtype === 'error_max_turns') failure = { kind: 'max_turns', resetAt: null };
-        else if (specific) { const c = classifyFailure([{ ...r, is_error: true }]); failure = { kind: c.kind, resetAt: c.resetAt }; }
+        else if (specific) { const c = classifyFailure([{ ...r, is_error: true }], { now: classifyNow }); failure = { kind: c.kind, resetAt: c.resetAt }; }
         else if (st.rejected || r?.is_error === true) {
           const events = [];
           if (st.rejected) events.push(st.rejected);
           events.push({ ...(r ?? {}), is_error: true });
-          const c = classifyFailure(events);
+          const c = classifyFailure(events, { now: classifyNow });
           failure = { kind: c.kind, resetAt: c.resetAt };
         } else if (!r) failure = { kind: 'no_result', resetAt: null };
         else failure = { kind: 'other', resetAt: null };

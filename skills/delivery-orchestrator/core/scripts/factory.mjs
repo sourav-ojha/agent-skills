@@ -538,7 +538,7 @@ async function authorOne(ctx, spec, bc) {
     const v = ctx.policy.verification;
     r = await (ctx.deps.runSession || runSession)({
       role: 'author', cwd, prompt, settingsFile, maxTurns: v.max_turns.author, timeoutS: v.session_timeout_s.author,
-      ...(ctx.modelOverride || v.model.author ? { model: ctx.modelOverride || v.model.author } : {}), home, baseEnv: ctx.env,
+      ...(ctx.modelOverride || v.model.author ? { model: ctx.modelOverride || v.model.author } : {}), home, baseEnv: ctx.env, now: ctx.deps.clock.now(),
       ...sessionStop(ctx),
       onSpawn: (x) => { try { ctx.lock.recordGroup(x.pgid); pgid = x.pgid; } catch { /* recorded best effort */ } },
     });
@@ -1021,7 +1021,7 @@ async function builderSession(ctx, f, act) {
     try { settingsFile = materialiseSettings('builder', { factoryHome: ctx.fh, repoDir: ctx.B, home, runDir }); } catch (e) { if (e?.code === 'settings_unsafe') return { step: 'session', kind: 'settings_unsafe', keys: ['settings'] }; throw e; }
     r = await (ctx.deps.runSession || runSession)({
       role: 'builder', cwd: ctx.B, prompt: brief.prompt, settingsFile, maxTurns: v.max_turns.builder, timeoutS: v.session_timeout_s.builder,
-      ...(ctx.modelOverride || v.model.builder ? { model: ctx.modelOverride || v.model.builder } : {}), home, tmpDir, baseEnv: ctx.env,
+      ...(ctx.modelOverride || v.model.builder ? { model: ctx.modelOverride || v.model.builder } : {}), home, tmpDir, baseEnv: ctx.env, now: ctx.deps.clock.now(),
       ...sessionStop(ctx),
       onSpawn: (x) => { pgid = x.pgid; ctx.lock.recordGroup(x.pgid); },
     });

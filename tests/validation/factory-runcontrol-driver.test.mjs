@@ -421,7 +421,9 @@ test('interrupted-resume loop cap: a driver that keeps dying while continuing an
 test('factory scenarios: an author session hit by a session limit is restarted from scratch after the wait; a stop ends the command cleanly', (t) => {
   const w = world(t, { specs: { 'FEATURE-001': 'Items one' }, test: T(), fake: { author: { 'FEATURE-001': ['usage', AUTHOR_OK] } } });
   writeLocal(w, WAIT_ON);
-  const r = w.factory(['scenarios']);
+  // The fake's limit text is "resets 3:45pm", read in the process-local timezone against the injected NOW (12:00 UTC): pin UTC.
+  const UTC = { TZ: 'UTC' };
+  const r = w.factory(['scenarios'], UTC);
   assert.equal(r.code, 0, r.out + r.err);
   assert.match(r.out, /^paused: usage_limit session until /m);
   assert.match(r.out, /FEATURE-001 scenarios: stored/);
@@ -429,7 +431,7 @@ test('factory scenarios: an author session hit by a session limit is restarted f
   assert.equal(runState(w).status, 'finished', 'scenarios ends the run state after its wait');
   assert.equal(readUsage(w.fhome).tokens, 930, 'the interrupted author session is recorded too');
   const s = world(t, { specs: { 'FEATURE-001': 'Items one' }, test: { now: NOW }, fake: { author: { 'FEATURE-001': ['usage'] } } });
-  const x = s.factory(['scenarios']);
+  const x = s.factory(['scenarios'], UTC);
   assert.equal(x.code, 2, x.out + x.err);
   assert.match(x.out, /^stopped: usage_limit$/m);
   assert.equal(fs.existsSync(path.join(s.fhome, 'runs', 'o__r.json')), false, 'scenarios writes only the run state of its own waits (Task 9)');

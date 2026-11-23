@@ -15,12 +15,16 @@ function explain({ args, opt, io }) {
   if (!key) { io.err('explain needs a key, or --list or --docs'); return 1; }
   const e = entry(key, file);
   if (!e) {
-    const near = nearest(key, file, 3);
-    io.err(`unknown key "${key}"${near.length ? `; did you mean ${near.join(', ')}?` : ''}`);
-    return 1;
+    return unknownKey(io, key, file);
   }
   io.out(opt.json ? JSON.stringify(e, null, 2) : renderExplain(e));
   return 0;
+}
+
+function unknownKey(io, key, kind) {
+  const near = nearest(key, kind, 3);
+  io.err(`unknown key "${key}"${near.length ? `; did you mean ${near.join(', ')}?` : ''}`);
+  return 1;
 }
 
 // Shared by set and unset: resolve the key, build the candidate, validate, guard loosening, write, re-parse.
@@ -30,9 +34,7 @@ async function change({ sub, args, opt, root, home, io, tty }) {
   if (!key || (sub === 'set' && args.length !== 2)) { io.err(sub === 'set' ? 'usage: config set <key> <json-value> [--local]' : 'usage: config unset <key> [--local]'); return 1; }
   const e = entry(key, kind);
   if (!e) {
-    const near = nearest(key, kind, 3);
-    io.err(`unknown key "${key}"${near.length ? `; did you mean ${near.join(', ')}?` : ''}`);
-    return 1;
+    return unknownKey(io, key, kind);
   }
   const file = opt.local ? path.join(home, 'config.json') : path.join(root, CONFIG_PATH);
   let cur;
