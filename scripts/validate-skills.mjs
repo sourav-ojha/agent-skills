@@ -92,7 +92,7 @@ async function validateSkill(dirName) {
     'core/scripts/pi.mjs', 'core/validators/validate-artifacts.mjs', 'core/roles/roles.json', 'agents/openai.yaml',
     'adapters/claude-code/README.md', 'adapters/codex/README.md',
   ];
-  if (dirName === 'skill-insights') for (const f of ['references/metrics.md', 'core/scripts/si.mjs', 'core/scripts/lib/transcripts.mjs', 'core/scripts/lib/analyze.mjs', 'core/scripts/lib/runs.mjs', 'adapters/claude-code/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
+  if (dirName === 'skill-insights') for (const f of ['references/metrics.md', 'core/scripts/si.mjs', 'core/scripts/lib/transcripts.mjs', 'core/scripts/lib/analyze.mjs', 'core/scripts/lib/runs.mjs', 'core/scripts/lib/agy.mjs', 'core/scripts/lib/proto.mjs', 'core/scripts/lib/agyio.mjs', 'adapters/claude-code/README.md', 'adapters/antigravity/README.md']) if (!fs.existsSync(path.join(dir, f))) S('error', `required file missing: ${f}`);
   if (dirName === 'delivery-orchestrator') for (const f of ['references/states.md', 'references/safety.md', 'references/config.md', 'templates/delivery.json', 'core/scripts/deliver.mjs', 'core/scripts/lib/queue.mjs', 'core/scripts/lib/config.mjs', 'core/scripts/lib/runlog.mjs', 'references/readiness.md', 'core/scripts/lib/readiness.mjs', 'core/scripts/lib/proc.mjs', 'core/scripts/lib/runrecord.mjs', 'core/scripts/lib/limits.mjs', 'core/scripts/lib/factoryhome.mjs', 'adapters/claude-code/README.md',
     // factory phase 1a: driver, its libraries, session settings and prompts, references
     'core/scripts/factory.mjs', 'core/scripts/lib/criteria.mjs', 'core/scripts/lib/scenarios.mjs', 'core/scripts/lib/antigaming.mjs',
