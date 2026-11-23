@@ -125,7 +125,7 @@ export function renderExplain(e) {
   if (off) lines.push(`  unavailable: ${off}`);
   lines.push(`  why:     ${e.why}`, `  read by: ${e.readBy.join(', ')}`);
   if (e.factory) lines.push(`  factory run: ${e.factory}`);
-  if (e.sensitive) lines.push('  SENSITIVE: loosening it needs a person at a terminal; set refuses without one.');
+  if (e.sensitive) lines.push('  SENSITIVE: set and unset will not loosen it unless a person confirms at a terminal (a guardrail for agents, not a security boundary: the reviewed commit of the file is the control).');
   return lines.join('\n');
 }
 

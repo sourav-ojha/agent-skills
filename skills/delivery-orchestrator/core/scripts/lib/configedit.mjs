@@ -11,12 +11,15 @@ const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
-// -> { doc, sha, exists }. Throws on invalid JSON, a symlink, or a non-regular file. A missing file is { doc: {}, sha: null }.
+const MAX_BYTES = 64 * 1024; // the same cap as the local loader (localconfig.mjs) and --from-draft
+
+// -> { doc, sha, exists }. Throws on invalid JSON, a symlink, a non-regular file, or one over 64 KiB. A missing file is { doc: {}, sha: null }.
 export function readDoc(file) {
   let st;
   try { st = fs.lstatSync(file); } catch (e) { if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return { doc: {}, sha: null, exists: false }; throw e; }
   if (st.isSymbolicLink()) throw new Error(`${file} is a symlink; refusing to use it`);
   if (!st.isFile()) throw new Error(`${file} is not a regular file`);
+  if (st.size > MAX_BYTES) throw new Error(`${file} is over 64 KiB; refusing to use it`);
   const buf = fs.readFileSync(file);
   let doc;
   try { doc = JSON.parse(buf.toString('utf8')); } catch (e) { throw new Error(`${file} is not valid JSON: ${e.message}`); }
@@ -71,8 +74,35 @@ export function remainingErrors(before, after, kind) {
 
 export const effective = (doc, kind) => parseDoc(doc, kind).config;
 
+// The config paths one parser error is about. Project errors read "path: ...", local ones "path must ..."; an unknown key
+// names the key itself ("checks: unknown key \"x\"" -> checks.x), and the level/mode disagreement names both spellings.
+export function errorPaths(msg) {
+  if (/^autonomy\.level and merge\.mode disagree/.test(msg)) return ['autonomy.level', 'merge.mode'];
+  const u = /^(?:([\w.[\]-]+): )?unknown key "([^"]+)"/.exec(msg);
+  if (u) return [u[1] && u[1] !== 'config' ? `${u[1]}.${u[2]}` : u[2]];
+  const m = /^([A-Za-z_][\w.[\]]*)(?::| )/.exec(msg);
+  return m ? [m[1]] : [];
+}
+// An error at `ep` concerns key `p` when it is the key, one of its parent objects, or a child (local_checks[0].name).
+const concerns = (ep, p) => ep === p || p.startsWith(`${ep}.`) || ep.startsWith(`${p}.`) || ep.startsWith(`${p}[`);
+const INVALID = 'replaces an invalid value of a sensitive setting';
+
+// Fail closed: when the parser already reports an error about a sensitive key, the effective value is a substitute (a default,
+// an empty list, or merge.mode winning over autonomy.level), so comparing effective values can hide a loosening. Then any
+// change to that key's written value needs a person.
+function replacesInvalid(e, { before, after, kind }) {
+  const paths = [e.path, ...(e.alias ? [e.alias.to] : [])];
+  if (paths.some((p) => p === 'autonomy.level' || p === 'merge.mode')) paths.push('autonomy.level', 'merge.mode');
+  const errs = parseDoc(before, kind).errors.flatMap(errorPaths);
+  if (!errs.some((ep) => paths.some((p) => concerns(ep, p)))) return null;
+  const same = (p) => JSON.stringify(getPath(before, p) ?? null) === JSON.stringify(getPath(after, p) ?? null);
+  return paths.every(same) ? null : INVALID;
+}
+
 // `before` and `after` are effective configs (the parser's `config`). Returns a one-line reason, or null.
-export function loosens(e, before, after) {
+// `raw` ({ before, after, kind }: the written documents) adds the fail-closed check for values the parser already rejects.
+export function loosens(e, before, after, raw) {
+  if (raw && e.sensitive) { const r = replacesInvalid(e, raw); if (r) return r; }
   const p = e.alias ? e.alias.to : e.path;
   const b = getPath(before, p), a = getPath(after, p);
   const added = (x, y) => (Array.isArray(y) ? y : []).filter((i) => !(Array.isArray(x) ? x : []).some((j) => JSON.stringify(j) === JSON.stringify(i)));
@@ -92,7 +122,11 @@ export function loosens(e, before, after) {
       const raised = (a === null && b !== null && b !== undefined) || (typeof a === 'number' && typeof b === 'number' && a > b);
       return raised ? `raises the ${p} cap, so runs can spend more` : null;
     }
-    case 'checks.required': { const gone = added(a, b); return gone.length ? `removes required checks (${gone.join(', ')})` : null; }
+    case 'checks.required': {
+      // Empty means "the base branch's required checks from branch protection"; a named list replaces them.
+      if (!(Array.isArray(b) && b.length) && Array.isArray(a) && a.length) return 'replaces the branch-protection required checks with a named list';
+      const gone = added(a, b); return gone.length ? `removes required checks (${gone.join(', ')})` : null;
+    }
     case 'verification.test_globs': { const gone = added(a, b); return gone.length ? `removes test globs (${gone.join(', ')}), so fewer files count as tests` : null; }
     default:
       if (e.type === 'argv') return JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a command that runs as you' : null;
@@ -100,6 +134,9 @@ export function loosens(e, before, after) {
       return e.sensitive && JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a sensitive setting' : null;
   }
 }
+
+// loosens() on two written documents: what set, unset, the walk and the final gate all call.
+export const loosensDocs = (e, before, after, kind) => loosens(e, effective(before, kind), effective(after, kind), { before, after, kind });
 
 // Line diff of the pretty-printed documents: '-' for removed lines, '+' for added.
 export function diffLines(before, after) {

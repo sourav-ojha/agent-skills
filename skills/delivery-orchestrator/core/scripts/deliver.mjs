@@ -21,7 +21,7 @@ import { checkDiff, classify, holdReason } from './lib/antigaming.mjs';
 import { gitSafeOpts, verifyGitConfig, checkRepoMetadata, checkNoReplaceRefs, checkNoHooks, GIT_SAFE_FLAGS } from './lib/gitsafe.mjs';
 import { runChecks, makeCtx, computeLevel, fixItem, CHECKS } from './lib/readiness.mjs';
 import { inspect } from './lib/lock.mjs';
-import { runConfigCommand } from './lib/configcmd.mjs';
+import { runConfigCommand, SUBCOMMANDS } from './lib/configcmd.mjs';
 
 const BOOL = new Set(['merge', 'no-ci', 'merge-t3', 'dry-run', 'yes', 'json', 'write', 'list', 'docs', 'local']);
 const argv = process.argv.slice(2);
@@ -42,7 +42,11 @@ const HELP = `commands: init [--features-dir D] [--only IDS] [--limit N] [--base
   unhold ID --to building|fixing   (factory driver only: resumes a budget hold)
   readiness [--repeat N] [--json]   check the project against the factory readiness levels (writes $FACTORY_HOME/readiness/<repo>.json)
   config [--write]   show and validate the project policy (.product/delivery.json); --write creates it from the template   (all take --dir D)
-  config explain <key> | explain --list | explain --docs [--local] [--json]   describe a config key; --local is ~/.factory/config.json`;
+  config explain <key> | explain --list | explain --docs [--local] [--json]   describe a config key
+  config set <key> <json-value> [--local] | config unset <key> [--local]   change one key; a loosening needs a person to confirm at a terminal
+  config init [--from-draft F] [--local]   create the file by walking the keys (needs a terminal)
+  config edit [<key>|<group>] [--profile basic|factory] [--local]   walk the keys of an existing file (needs a terminal)
+    --local is ~/.factory/config.json (not with --profile factory)`;
 if (!cmd || cmd === 'help') { console.log(HELP); process.exit(0); }
 
 const root = path.resolve(opt.dir || '.');
@@ -239,7 +243,8 @@ function readConfigFile() {
 }
 
 C.config = async () => {
-  if (['init', 'edit', 'explain', 'set', 'unset'].includes(arg)) {
+  if (arg !== undefined && !SUBCOMMANDS.includes(arg)) die(`unknown config subcommand "${arg}"; use one of: ${SUBCOMMANDS.join(', ')} (or no subcommand to show the policy)`);
+  if (SUBCOMMANDS.includes(arg)) {
     const tty = !!(process.stdin.isTTY && process.stdout.isTTY);
     const io = { out: (t) => console.log(t), err: (t) => console.error(`error: ${t}`), ask: async () => { throw new Error('no prompt available'); } };
     let rl;

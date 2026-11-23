@@ -1,7 +1,9 @@
-// What the project file alone can prove about `factory run`'s start refusals (config edit --profile factory). Zero dependencies.
+// What the project file alone can prove about `factory run`'s start refusals (config edit --profile factory). No outside dependencies.
+import { portOf } from './proc.mjs';
 // The `why` text of the shared checks is the text startChecks (factory.mjs) refuses with; a test compares them.
 const VERIFIED = 'factory/verified';
-const port = (u) => { try { return new URL(u).port || null; } catch { return null; } };
+// The same port reading as verify.mjs (an explicit :80 is port 80).
+const port = (u) => { try { return portOf(u); } catch { return null; } };
 
 // The keys `config edit --profile factory` walks, in order (readiness is the opt-in switch for readiness.min_level).
 export const FACTORY_KEYS = ['verification.required', 'readiness.min_level', 'local_checks', 'checks.required', 'app.setup', 'app.start', 'app.stop', 'app.seed', 'app.base_url', 'app.ready', 'app.logs_dir', 'app.env_example', 'tests.setup', 'tests.all', 'tests.timeout_s', 'autonomy.level'];

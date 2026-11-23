@@ -1,6 +1,6 @@
 # Config wizard: `deliver config init | edit | explain | set`
 
-Status: implemented on `feat/config-wizard` (commits 35b8cfc..827838b, then the docs commit). Written against `main` + PR 23.
+Status: implemented on `feat/config-wizard` (commits 35b8cfc..7009854, plus the final fix commit). Written against `main` + PR 23.
 
 Revision (as built): the final sensitive gate prompts once per key (not one combined prompt) and asks again when the final value differs from the value the person confirmed during the walk; a `number` type (fractions inside a range, used for the local `max_wait_h` and `max_wait_weekly_h`) was added to the schema and the wizard; the D1 refinement (keep the errors a change introduces) is already noted under Decision D1.
 
@@ -93,7 +93,7 @@ autonomy.level   (current: L0, default: L0)   SENSITIVE
 A key is `sensitive` when changing it can widen what runs unattended or weaken a gate: `autonomy.level` to L1, `merge.mode` squash, `merge.allow_tier3`, `checks.allow_without_ci`, removing entries from `protected_branches` or `hold_paths`, `local_checks` (runs as the user, outside the sandbox), `verification.required` false, `verification.scenario_approval` auto, and raising `budgets`. Also sensitive (they run a command as the user or weaken a check): any change to `app.setup`, `app.start`, `app.stop`, `app.seed`, `tests.setup`, `tests.all`; removing entries from `checks.required` or `verification.test_globs`. Any other key marked `sensitive` in the schema fails closed: a change to its effective value needs a person.
 Not sensitive (ruling): lowering `readiness.min_level` and raising `limits.*`, `verification.max_turns` or `session_timeout_s`; the factory enforces its own refusals and these are cost caps.
 - In `edit`/`init`: a changed sensitive key prints one line saying what is now allowed and requires typing `yes`.
-- `set`/`unset` on a sensitive key refuse without a TTY (an agent cannot loosen a gate; a person runs `edit`). Tightening (for example L1 to L0) is not sensitive and works from `set`.
+- `set`/`unset` refuse a loosening without a TTY (a person runs `edit`); with a TTY they ask for a typed `yes`. Tightening (for example L1 to L0) is not sensitive and works from `set`. Any change to a sensitive key whose current value the parser rejects counts as a loosening (fail closed: the effective value is a substitute). This is a guardrail for agents without a terminal, not a security boundary (a pty passes the TTY check; an agent can edit the JSON directly); the control is the reviewed commit of the file, identical to `origin/<base>` before a run. `--local` has no commit step and so no review.
 - The summary diff marks sensitive changes.
 
 ### Writing

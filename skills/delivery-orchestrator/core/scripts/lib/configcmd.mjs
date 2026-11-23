@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG_PATH } from './config.mjs';
-import { readDoc, getPath, setPath, unsetPath, validateChange, remainingErrors, effective, loosens, writeDoc, parseValue, diffLines } from './configedit.mjs';
+import { readDoc, getPath, setPath, unsetPath, validateChange, remainingErrors, effective, loosensDocs, errorPaths, writeDoc, parseValue, diffLines } from './configedit.mjs';
 import { SCHEMA, GROUPS, entry, keysOf, nearest, renderExplain, renderDocs, renderList, unavailable } from './configschema.mjs';
 import { walk } from './wizard.mjs';
 import { FACTORY_KEYS, fileProblems, fileNotes, outsideFile } from './factorycheck.mjs';
@@ -34,7 +34,6 @@ async function change({ sub, args, opt, root, home, io, tty }) {
     io.err(`unknown key "${key}"${near.length ? `; did you mean ${near.join(', ')}?` : ''}`);
     return 1;
   }
-  if (e.type === 'object') { io.err(`"${key}" is a group; set one of its keys`); return 1; }
   const file = opt.local ? path.join(home, 'config.json') : path.join(root, CONFIG_PATH);
   let cur;
   try { cur = readDoc(file); } catch (x) { io.err(x.message); return 1; }
@@ -61,7 +60,7 @@ async function change({ sub, args, opt, root, home, io, tty }) {
   }
   const v = validateChange(before, after, kind);
   if (!v.ok) { io.err(`${key}: ${v.errors.join('; ')}`); return 1; }
-  const reason = loosens(e, effective(before, kind), effective(after, kind));
+  const reason = loosensDocs(e, before, after, kind);
   if (reason) {
     if (!tty) { io.err(`${key} ${reason}: a person must run "deliver config edit ${key}${opt.local ? ' --local' : ''}"`); return 1; }
     const ans = await io.ask(`${key} ${reason}. Type yes to apply: `);
@@ -78,10 +77,10 @@ async function change({ sub, args, opt, root, home, io, tty }) {
 }
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-// Draft file for `init --from-draft`: a regular JSON file under 64 KiB, never a symlink.
+// Draft file for `init --from-draft`: a regular JSON file under 64 KiB, never a symlink. O_NONBLOCK so a FIFO cannot hang the open.
 function readDraft(f) {
   let fd;
-  try { fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (x) {
+  try { fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (x) {
     throw new Error(x.code === 'ELOOP' ? `draft ${f} is a symlink; refusing to use it` : `cannot read draft ${f}: ${x.message}`);
   }
   try {
@@ -95,10 +94,10 @@ function readDraft(f) {
   } finally { fs.closeSync(fd); }
 }
 
-// Keys named by parser errors ("key: message"), mapped to the nearest schema key at or above them.
-const failingKeys = (errors, kind) => [...new Set(errors.map((m) => {
-  const k = m.split(':')[0];
-  return keysOf(kind).filter((p) => k === p || k.startsWith(`${p}.`)).sort((a, b) => b.length - a.length)[0];
+// Keys named by parser errors (project "key: message", local "key must ..."), mapped to the nearest schema key at or above them.
+const failingKeys = (errors, kind) => [...new Set(errors.flatMap(errorPaths).map((k) => {
+  const n = k.replace(/\[\d+\]/g, '');
+  return keysOf(kind).filter((p) => n === p || n.startsWith(`${p}.`)).sort((a, b) => b.length - a.length)[0];
 }).filter(Boolean))];
 
 // One gate entry per sensitive key whose effective value loosens between `base` and `final`; never merged by reason text.
@@ -107,7 +106,7 @@ export function gateKeys(entries, base, final, confirmed, kind) {
   const out = new Map();
   for (const e of entries.filter((x) => x.sensitive).sort((p, q) => !!p.alias - !!q.alias)) { // alias spellings last
     const key = e.alias ? e.alias.to : e.path;
-    const reason = out.has(key) ? null : loosens(e, effective(base, kind), effective(final, kind));
+    const reason = out.has(key) ? null : loosensDocs(e, base, final, kind);
     if (reason) out.set(key, { key, reason, done: confirmed[key] !== undefined && confirmed[key] === JSON.stringify(getPath(final, key) ?? null) });
   }
   return [...out.values()];
@@ -143,15 +142,23 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
     if (!cur.exists) { io.err(`${file} does not exist; use "deliver config init${opt.local ? ' --local' : ''}"`); return 1; }
     start = cur.doc;
   }
-  const only = args[0];
+  let only = args[0];
   if (only && !keysOf(kind).includes(only) && !GROUPS.includes(only)) {
     const near = nearest(only, kind, 3);
     io.err(`unknown key or group "${only}"${near.length ? `; did you mean ${near.join(', ')}?` : ''}`);
     return 1;
   }
+  const oe = only ? entry(only, kind) : null;
+  if (oe?.alias) { io.out(`${only} is an alias of ${oe.alias.to} (its older spelling); editing ${oe.alias.to}`); only = oe.alias.to; }
+  // A key inside an opt-in block (readiness.min_level) is never offered while the block is absent; say how to turn it on.
+  const block = only ? SCHEMA.find((x) => x.file === kind && x.type === 'object-null' && only.startsWith(`${x.path}.`)) : null;
+  if (block && getPath(start, block.path) === undefined) {
+    io.err(`${only} applies only when the ${block.path} block is present, and the ${block.path} block is not enabled in ${file}; enable it first with "deliver config edit ${block.path}" (answer y)`);
+    return 1;
+  }
   const empty = {};
   const problems = validateChange(empty, start, kind).errors;
-  const unknown = problems.filter((m) => m.startsWith('config:'));
+  const unknown = problems.filter((m) => m.startsWith('config:') || (kind === 'local' && /^unknown key/.test(m)));
   if (sub === 'init' && unknown.length) { io.err(`draft not used: ${unknown.join('; ')}`); return 1; }
   if (problems.length) io.out(`${file} has problems:\n${problems.map((m) => `  ${m}`).join('\n')}`);
   const entries = GROUPS.flatMap((g) => SCHEMA.filter((x) => x.file === kind && x.group === g));
@@ -166,7 +173,7 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   const r = await walk({
     entries: walked, doc: start, io, only, first: only ? [] : failingKeys(problems, kind),
     validateChange: (b, a) => validateChange(b, a, kind),
-    loosens: (e, b, a) => loosens(e, effective(b, kind), effective(a, kind)),
+    loosens: (e, b, a) => loosensDocs(e, b, a, kind),
   });
   const closedMsg = () => { io.err('input closed; nothing written'); return 1; };
   if (r.closed) return closedMsg();
@@ -196,10 +203,12 @@ async function wizard({ sub, args, opt, root, home, io, tty }) {
   return 0;
 }
 
+export const SUBCOMMANDS = ['explain', 'set', 'unset', 'init', 'edit'];
+
 export async function runConfigCommand({ sub, args = [], opt = {}, root, home, io, tty }) {
   if (sub === 'explain') return explain({ args, opt, io });
   if (sub === 'set' || sub === 'unset') return change({ sub, args, opt, root, home, io, tty });
   if (sub === 'init' || sub === 'edit') return wizard({ sub, args, opt, root, home, io, tty });
-  io.err(`config ${sub}: not implemented yet`);
+  io.err(`unknown config subcommand "${sub}"; use one of: ${SUBCOMMANDS.join(', ')}`);
   return 1;
 }

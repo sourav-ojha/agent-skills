@@ -300,3 +300,13 @@ test('a symlinked FACTORY_HOME folder is refused by set --local and edit --local
   assert.equal(e.code, 1);
   assert.equal(fs.existsSync(path.join(real, 'config.json')), false); // (the CLI's own .skill-runs log may appear; the config may not)
 });
+
+test('pinning: every FACTORY_KEYS entry resolves to a project schema entry', async () => {
+  const { entry } = await imp('lib', 'configschema.mjs');
+  for (const k of FC.FACTORY_KEYS) assert.ok(entry(k, 'project'), k);
+});
+
+test('fileProblems: an explicit :80 is a port, as verify reads it', () => {
+  const p = policyOf(merged({ app: { start: ['x'], base_url: 'http://127.0.0.1:80', ready: { url: 'http://127.0.0.1:80/health', timeout_s: 60 } } }));
+  assert.deepEqual(FC.fileProblems(p).map((x) => x.id), []);
+});

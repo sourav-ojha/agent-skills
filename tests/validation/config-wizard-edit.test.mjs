@@ -271,7 +271,7 @@ test('command, required-check and test-glob changes are loosenings', () => {
   }
   assert.ok(L('checks.required', { checks: { required: ['a', 'b'] } }, { checks: { required: ['a'] } }));
   assert.ok(L('checks.required', { checks: { required: ['a'] } }, { checks: { required: [] } }));
-  assert.equal(L('checks.required', { checks: { required: [] } }, { checks: { required: ['a'] } }), null);
+  assert.equal(L('checks.required', { checks: { required: [] } }, { checks: { required: ['a'] } }), 'replaces the branch-protection required checks with a named list');
   assert.ok(L('verification.test_globs', { verification: { test_globs: ['t/'] } }, { verification: { test_globs: [] } }));
   assert.equal(L('verification.test_globs', { verification: { test_globs: [] } }, { verification: { test_globs: ['t/'] } }), null);
 });
@@ -717,4 +717,157 @@ test('parseAnswer: number rejects Infinity, 1e999 and hex, and accepts a leading
   const e = entry('max_wait_h', 'local');
   for (const t of ['Infinity', '1e999', '0x10', '-0', '+1']) assert.equal(W.parseAnswer(e, t).action, 'invalid', t);
   assert.deepEqual(W.parseAnswer(e, '.5'), { action: 'set', value: 0.5 });
+});
+
+// ---- final review: an invalid value already in the file must not hide a loosening ------------------------------------
+const BAD_LISTS = { protected_branches: ['main', ''], checks: { required: ['test', 'lint', 5] } };
+const BAD_MODE = { autonomy: { level: 'L0' }, merge: { mode: 'squash' } };
+const INVALID = /replaces an invalid value of a sensitive setting/;
+
+test('no TTY: set/unset over an invalid sensitive list is refused as a loosening and leaves the bytes', () => {
+  const { dir, file } = project(BAD_LISTS);
+  const before = fs.readFileSync(file);
+  for (const args of [['set', 'protected_branches', '[]'], ['set', 'checks.required', '[]'], ['unset', 'protected_branches'], ['set', 'protected_branches', '["main"]']]) {
+    const r = cli(dir, ...args);
+    assert.equal(r.code, 1, `${args.join(' ')}: ${r.out}`);
+    assert.match(r.err, INVALID, args.join(' '));
+    assert.match(r.err, /config edit/, args.join(' '));
+    assert.deepEqual(fs.readFileSync(file), before, args.join(' '));
+  }
+});
+
+test('no TTY: set autonomy.level over a level/mode disagreement is refused', () => {
+  const { dir, file } = project(BAD_MODE);
+  const before = fs.readFileSync(file);
+  for (const args of [['set', 'autonomy.level', '"L1"'], ['set', 'merge.mode', '"pr-only"'], ['unset', 'merge.mode']]) {
+    const r = cli(dir, ...args);
+    assert.equal(r.code, 1, `${args.join(' ')}: ${r.out}`);
+    assert.match(r.err, INVALID, args.join(' '));
+    assert.deepEqual(fs.readFileSync(file), before, args.join(' '));
+  }
+});
+
+test('an unrelated non-sensitive set still works in a file with invalid sensitive values', () => {
+  for (const doc of [BAD_LISTS, BAD_MODE]) {
+    const { dir, file } = project(doc);
+    const r = cli(dir, 'set', 'base', 'develop');
+    assert.equal(r.code, 0, r.err);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).base, 'develop');
+    assert.ok(JSON.parse(r.out).warnings.length > 0);
+  }
+});
+
+test('loosens with the raw documents: an indexed child error and the parent object count; non-sensitive entries do not', () => {
+  const L = (p, b, a, kind = 'project') => E.loosensDocs(entry(p, kind), b, a, kind);
+  const bad = { local_checks: [{ name: '', command: ['x'], timeout_s: 9 }] };
+  assert.match(L('local_checks', bad, { local_checks: [] }), INVALID);
+  assert.match(L('checks.required', { checks: 'nope' }, { checks: { required: [] } }), INVALID);
+  assert.equal(L('checks.required', { checks: { required: ['a'], bogus: 1 } }, { checks: { required: ['a', 'b'] } }), null); // unknown sibling key
+  assert.equal(L('hold_paths', BAD_LISTS, { ...BAD_LISTS, hold_paths: [] }), null); // error elsewhere, hold_paths untouched in effect
+  assert.equal(L('base', { base: 5 }, { base: 'x' }), null);
+  assert.match(L('budgets.day_tokens', { budgets: { day_tokens: 5 } }, {}, 'local'), INVALID);
+  assert.match(L('budgets.day_tokens', { budgets: 7 }, { budgets: { day_tokens: 50000 } }, 'local'), INVALID);
+  const g = C.gateKeys(ENTRIES, BAD_LISTS, { ...BAD_LISTS, protected_branches: [] }, {}, 'project');
+  assert.deepEqual(g.map((x) => x.key), ['protected_branches']);
+  assert.match(g[0].reason, INVALID);
+});
+
+test('edit (TTY) repairs an invalid sensitive value after a typed yes; any other answer keeps it', async () => {
+  const { dir, file } = project(BAD_LISTS);
+  const before = fs.readFileSync(file);
+  const no = await wiz(dir, 'edit', ['protected_branches'], ['["main"]', 'no']);
+  assert.equal(no.code, 0, no.out);
+  assert.deepEqual(fs.readFileSync(file), before);
+  const r = await wiz(dir, 'edit', ['protected_branches'], ['["main"]', 'yes']);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, INVALID);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).protected_branches, ['main']);
+  const m = project(BAD_MODE);
+  const fixed = await wiz(m.dir, 'edit', ['autonomy.level'], ['1', 'yes']);
+  assert.equal(fixed.code, 0, fixed.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(m.file, 'utf8')), { autonomy: { level: 'L0' } });
+});
+
+test('checks.required from empty to a named list is a loosening (replaces branch protection)', async () => {
+  assert.equal(E.loosens(entry('checks.required'), { checks: { required: [] } }, { checks: { required: ['a'] } }), 'replaces the branch-protection required checks with a named list');
+  assert.equal(E.loosens(entry('checks.required'), { checks: { required: ['a'] } }, { checks: { required: ['a', 'b'] } }), null);
+  const { dir, file } = project({ version: 1 });
+  const before = fs.readFileSync(file);
+  const r = cli(dir, 'set', 'checks.required', '["test"]');
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /branch-protection required checks/);
+  assert.deepEqual(fs.readFileSync(file), before);
+  const t = await run(dir, 'set', ['checks.required', '["test"]'], { tty: true, answer: 'yes' });
+  assert.equal(t.code, 0, t.err);
+  assert.equal(cli(dir, 'set', 'checks.required', '["test","lint"]').code, 0); // adding to a named list tightens
+});
+
+test('help lists every config subcommand and its flags; an unknown config subcommand exits 1 with the list', () => {
+  const h = spawnSync('node', [DELIVER, 'help'], { encoding: 'utf8' }).stdout;
+  for (const s of ['config set', 'config unset', 'config init', 'config edit', 'config explain', '--from-draft F', '--profile basic|factory', '--list', '--docs', '--json', '--local']) assert.ok(h.includes(s), s);
+  const { dir } = project({ version: 1 });
+  const r = cli(dir, 'edti');
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /explain, set, unset, init, edit/);
+  assert.equal(r.out, '');
+});
+
+test('edit --local on an invalid file walks the failing local key first', async () => {
+  const dir = tmpDir('cfg-local-');
+  const home = path.join(dir, 'fhome');
+  fs.mkdirSync(home);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ keep_awake: 'yes' }));
+  const r = await wiz(dir, 'edit', [], [], { opt: { local: true } });
+  const first = r.out.split('\n').find((l) => /\(current: /.test(l));
+  assert.match(first, /^keep_awake /, r.out);
+});
+
+test('init --local --from-draft with an unknown key is refused up front', async () => {
+  const dir = tmpDir('cfg-local-');
+  const draft = path.join(dir, 'd.json');
+  fs.writeFileSync(draft, JSON.stringify({ max_wait_h: 2, bogus: 1 }));
+  const r = await wiz(dir, 'init', [], [], { opt: { local: true, 'from-draft': draft } });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /draft not used: .*unknown key "bogus"/);
+  assert.equal(r.asked.length, 0);
+});
+
+test('edit merge.mode walks autonomy.level; edit readiness.min_level without readiness says how to enable it', async () => {
+  const { dir, file } = project({ version: 1 });
+  const r = await wiz(dir, 'edit', ['merge.mode'], ['1']);
+  assert.match(r.out, /merge\.mode is an alias of autonomy\.level/);
+  assert.match(r.out, /^autonomy\.level /m);
+  const m = await wiz(dir, 'edit', ['readiness.min_level'], []);
+  assert.equal(m.code, 1, m.out);
+  assert.match(m.out, /readiness block is not enabled/);
+  assert.match(m.out, /config edit readiness/);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).readiness, undefined);
+});
+
+test('init --from-draft on a FIFO does not hang', { skip: process.platform === 'win32' }, () => {
+  const dir = tmpDir('cfg-fifo-');
+  const fifo = path.join(dir, 'd.json');
+  assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
+  const code = `const { runConfigCommand } = await import(${JSON.stringify(path.join(SCRIPTS, 'lib', 'configcmd.mjs'))});
+const io = { out: () => {}, err: (t) => console.error(t), ask: async () => 'q' };
+process.exitCode = await runConfigCommand({ sub: 'init', args: [], opt: { 'from-draft': ${JSON.stringify(fifo)} }, root: ${JSON.stringify(dir)}, home: ${JSON.stringify(dir)}, io, tty: true });`;
+  const r = spawnSync('node', ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(r.signal, null, 'timed out on the FIFO');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /not a regular file/);
+});
+
+test('a config file over 64 KiB is refused with a clear message', () => {
+  const { dir, file } = project({ implementer_notes: 'x', pad: 'y'.repeat(70 * 1024) });
+  const before = fs.readFileSync(file);
+  const r = cli(dir, 'set', 'base', 'develop');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /over 64 KiB/);
+  assert.deepEqual(fs.readFileSync(file), before);
+});
+
+test('pinning: every argv entry is sensitive', () => {
+  const argv = SCHEMA.filter((x) => x.type === 'argv');
+  assert.ok(argv.length >= 6);
+  for (const e of argv) assert.equal(e.sensitive, true, e.path);
 });
