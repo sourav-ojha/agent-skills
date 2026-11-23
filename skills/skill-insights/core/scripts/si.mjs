@@ -94,7 +94,7 @@ function runRows(sessions) {
   for (const s of sessions) {
     for (const w of windows(s)) {
       if (w.skill === '(none)' && opt.skill !== '(none)') continue;
-      if (!match(w.skill)) continue;
+      if (!match(w.skill) || w.surveyOnly) continue;
       rows.push({ skill: w.skill, project: s.project, session: s.sessionId, date: s.date, tokens: w.tokens, wallMin: Number(min(w.wallMs)), toolCalls: w.toolCalls, toolErrors: w.toolErrors, filesRead: new Set(w.reads).size, repeatedReads: w.repeatedReads, fileReads: w.fileReads, repeatedFileReads: w.repeatedFileReads, largestResultBytes: w.largestResults[0] || 0 });
     }
   }
@@ -199,6 +199,7 @@ if (cmd === 'inventory') {
     console.log(`${sessions.length} session(s)\nskill | invocations | sessions | projects | last used`);
     for (const u of inv.used) console.log(`${u.skill} | ${u.invocations} | ${u.sessions} | ${u.projects} | ${u.lastUsed}`);
     console.log(`\ninstalled but never used in range: ${inv.unused.join(', ') || '(none)'}`);
+    if (inv.surveyOnly.length) console.log(`opened but not worked in (read only, no turns): ${inv.surveyOnly.map((x) => `${x.skill} x${x.reads}`).join(', ')}`);
   }
 } else if (cmd === 'runs') {
   const rows = runRows(sessions);
@@ -211,7 +212,9 @@ if (cmd === 'inventory') {
   for (const r of rows) { const a = by.get(r.skill) || []; a.push(r); by.set(r.skill, a); }
   const lines = [`# Skill insights (${sessions.length} sessions)`, '', '> Attribution is approximate: a skill owns activity from its invocation until the next skill invocation. Idle gaps over 10 min are excluded.', '', '## Usage', '', '| Skill | Invocations | Sessions | Projects | Last used |', '|---|---|---|---|---|'];
   for (const u of inv.used) lines.push(`| ${u.skill} | ${u.invocations} | ${u.sessions} | ${u.projects} | ${u.lastUsed} |`);
-  lines.push('', `Installed but never used in range: ${inv.unused.join(', ') || '(none)'}`, '', '## Cost and friction per skill', '', '| Skill | Runs | Avg in | Avg out | Avg cache-read | Total min | Tool errors | Repeated skill-file reads | Repeated file reads | Largest result |', '|---|---|---|---|---|---|---|---|---|---|');
+  lines.push('', `Installed but never used in range: ${inv.unused.join(', ') || '(none)'}`);
+  if (inv.surveyOnly.length) lines.push('', `Opened but not worked in (SKILL.md read, no turns of its own; left out of the tables, e.g. an agent browsing skills to pick one): ${inv.surveyOnly.map((x) => `${x.skill} x${x.reads}`).join(', ')}`);
+  lines.push('', '## Cost and friction per skill', '', '| Skill | Runs | Avg in | Avg out | Avg cache-read | Total min | Longest run min | Tool errors | Repeated skill-file reads | Repeated file reads (worst run) | Largest result |', '|---|---|---|---|---|---|---|---|---|---|---|');
   const flags = [];
   const total = (rs) => rs.reduce((t, r) => t + r.wallMin, 0);
   let ranked = [...by.entries()].sort((a, b) => total(b[1]) - total(a[1]));
@@ -221,9 +224,12 @@ if (cmd === 'inventory') {
     const n = rs.length; const avg = (f) => Math.round(rs.reduce((t, r) => t + f(r), 0) / n);
     const errs = rs.reduce((t, r) => t + r.toolErrors, 0); const rep = rs.reduce((t, r) => t + r.repeatedReads, 0); const repF = rs.reduce((t, r) => t + r.repeatedFileReads, 0);
     const big = Math.max(...rs.map((r) => r.largestResultBytes));
-    lines.push(`| ${skill} | ${n} | ${k(avg((r) => r.tokens.in))} | ${k(avg((r) => r.tokens.out))} | ${k(avg((r) => r.tokens.cacheRead))} | ${rs.reduce((t, r) => t + r.wallMin, 0).toFixed(1)} | ${errs} | ${rep} | ${repF} | ${k(big)}B |`);
+    lines.push(`| ${skill} | ${n} | ${k(avg((r) => r.tokens.in))} | ${k(avg((r) => r.tokens.out))} | ${k(avg((r) => r.tokens.cacheRead))} | ${rs.reduce((t, r) => t + r.wallMin, 0).toFixed(1)} | ${Math.max(...rs.map((r) => r.wallMin)).toFixed(1)} | ${errs} | ${rep} | ${repF} (${Math.max(...rs.map((r) => r.repeatedFileReads))}) | ${k(big)}B |`);
+    const tot = total(rs); const longest = Math.max(...rs.map((r) => r.wallMin));
+    if (n >= 2 && tot >= 10 && longest / tot >= 0.8) flags.push(`${skill}: one run holds ${Math.round((longest / tot) * 100)}% of its ${tot.toFixed(0)} min (that run is a long session after the skill loaded, not necessarily the skill's own cost): read it with \`si runs --skill ${skill}\` before changing the skill`);
     if (errs / n >= 2) flags.push(`${skill}: ${(errs / n).toFixed(1)} tool errors per run`);
-    if (repF / n >= 3) flags.push(`${skill}: ${repF} file(s) re-read without an edit in between (${(repF / n).toFixed(1)} per run)`);
+    const worstF = Math.max(...rs.map((r) => r.repeatedFileReads));
+    if (repF / n >= 3) flags.push(`${skill}: ${repF} file(s) re-read without an edit in between (${(repF / n).toFixed(1)} per run${n > 1 && worstF >= repF * 0.8 ? `; ${worstF} of them in one run` : ''})`);
     if (rep > 0) flags.push(`${skill}: ${rep} repeated read(s) of the same skill file`);
     if (big > 100_000) flags.push(`${skill}: a single tool result of ${k(big)}B (large outputs inflate every later turn)`);
   }

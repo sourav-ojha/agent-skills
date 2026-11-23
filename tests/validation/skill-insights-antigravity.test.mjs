@@ -99,3 +99,53 @@ test('si --host antigravity reads conversation SQLite files end to end, skips su
   const bad = spawnSync(process.execPath, [SI, 'report', '--host', 'nope'], { encoding: 'utf8' });
   assert.notEqual(bad.status, 0);
 });
+
+test('a shell command that writes files clears the repeated-read memory; plain shell commands do not', () => {
+  const run = (cmd) => windows(parseAgySteps(asRows([
+    modelStep(0, { in: 1, out: 1, cr: 0 }),
+    toolStep(1, 'read_file', { Path: '/p/a.js' }),
+    toolStep(2, 'run_command', { CommandLine: cmd }),
+    toolStep(3, 'read_file', { Path: '/p/a.js' }),
+  ])))[0].repeatedFileReads;
+  assert.equal(run('ls -la'), 1);
+  assert.equal(run('node t.js 2>&1 | tee out.log'), 0);
+  assert.equal(run('sed -i "" s/a/b/ a.js'), 0);
+  assert.equal(run('cat > a.js <<EOF\nx\nEOF'), 0);
+  assert.equal(run('npm test 2>/dev/null'), 1); // redirect to /dev/null writes nothing
+  assert.equal(run('git checkout -- a.js'), 0);
+});
+
+test('skills read but never worked in are surveyOnly: kept out of inventory.used and the report tables, listed apart', () => {
+  const steps = [
+    modelStep(0, { in: 5, out: 5, cr: 0 }),
+    toolStep(1, 'read_file', { Path: SKILL('survey1') }), toolStep(1, 'read_file', { Path: SKILL('survey2') }),
+    toolStep(2, 'read_file', { Path: SKILL('real') }),
+    modelStep(3, { in: 50, out: 20, cr: 500 }),
+    toolStep(4, 'run_command', { CommandLine: 'ls' }),
+  ];
+  const s = { project: 'p', sessionId: 's', date: '2026-11-23', ...parseAgySteps(asRows(steps)) };
+  assert.deepEqual(windows(s).filter((w) => w.surveyOnly).map((w) => w.skill), ['survey1', 'survey2']);
+  const inv = inventory([s], []);
+  assert.deepEqual(inv.used.map((u) => u.skill), ['real']);
+  assert.deepEqual(inv.surveyOnly.map((x) => x.skill).sort(), ['survey1', 'survey2']);
+});
+
+test('report flags a skill whose minutes sit in one run, and shows the longest run', () => {
+  const root = tmpDir();
+  const convs = path.join(root, 'antigravity-cli', 'conversations');
+  fs.mkdirSync(convs, { recursive: true });
+  const write = (id, steps) => {
+    const db = new DatabaseSync(path.join(convs, `${id}.db`));
+    db.exec('create table steps (idx integer primary key, step_type integer, status integer, error_details blob, metadata blob, step_payload blob); create table gen_metadata (idx integer primary key, data blob)');
+    steps.forEach((s, i) => db.prepare('insert into steps values (?,?,?,?,?,?)').run(i, 0, s.status, s.error_details, s.metadata, s.step_payload));
+    db.close();
+  };
+  const long = [toolStep(0, 'read_file', { Path: SKILL('heavy') })];
+  for (let m = 1; m <= 14; m++) long.push(modelStep(m, { in: 10, out: 10, cr: 0 }), toolStep(m, 'run_command', { CommandLine: 'ls' }));
+  const short = [toolStep(0, 'read_file', { Path: SKILL('heavy') }), modelStep(1, { in: 1, out: 1, cr: 0 })];
+  write('aaaa', long); write('bbbb', short);
+  const r = spawnSync(process.execPath, ['--no-warnings', SI, 'report', '--host', 'antigravity', '--projects-dir', convs, '--skills-dir', path.join(root, 'none')], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /Longest run min/);
+  assert.match(r.stdout, /heavy: one run holds \d+% of its \d+ min/);
+});

@@ -24,5 +24,6 @@ Installed skills: `~/.gemini/antigravity/skills` and `~/.agents/skills` (add oth
 ## Limits
 
 - The format is undocumented and may change between agy versions: if numbers look wrong after an upgrade, check `agy.mjs` first.
-- A session that reads many `SKILL.md` files in a row to survey them (not to run them) counts each as an invocation.
+- A session that reads many `SKILL.md` files in a row to survey them is shown on its own "opened but not worked in" line, not as runs.
+- Shell edits are recognised by pattern (redirects, `sed -i`, `tee`, `git checkout` and similar); an unusual command that writes files can still make a re-read look repeated.
 - Whether agy's input token count includes cached tokens is not documented; compare input and cache-read per run rather than summing them.

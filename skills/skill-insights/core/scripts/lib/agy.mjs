@@ -10,6 +10,8 @@ const READERS = new Set(['read_file', 'view_file']);
 const WRITERS = new Set(['write_file', 'edit_file', 'replace_file_content', 'multi_replace_file_content', 'write_to_file']);
 const PATH_KEYS = ['Path', 'AbsolutePath', 'TargetFile'];
 const STEP_ERROR = 7; // other non-3 statuses (cancelled, interrupted) are not tool failures
+// A shell command that probably changes files. Which file is unknown, so it only clears the "read and not edited since" memory.
+const SHELL_WRITE = /(?:^|[^>&0-9])>>?\s*(?!&|\/dev\/null)\S|\bsed\s+(?:-[A-Za-z]*i|--in-place)|\bperl\s+-[A-Za-z]*i|\btee\b|\bpatch\b|\bgit\s+(?:apply|checkout|restore|reset|merge|rebase|pull|stash|cherry-pick|revert)\b|\b(?:mv|cp|rm)\s|--(?:write|fix)\b|\bgofmt\s+-w\b/;
 const fileKey = (f) => crypto.createHash('sha1').update(f).digest('hex').slice(0, 12);
 const ms = (t) => { const s = int(t, 1); return s === undefined ? NaN : s * 1000 + Math.floor((int(t, 2) ?? 0) / 1e6); };
 
@@ -35,7 +37,10 @@ export function parseAgySteps(rows) {
       const tid = id ? { tid: id } : {};
       if (sk && sk[2] === 'SKILL.md' && sk[1] !== active) { active = sk[1]; entries.push({ ts, skill: sk[1], ...tid, ...(key ? { fileKey: key } : {}) }); }
       else if (sk) entries.push({ ts, read: { skill: sk[1], file }, ...tid, ...(key ? { fileKey: key } : {}) });
-      else entries.push({ ts, tool: name, ...tid, ...(key ? { fileKey: key, ...(isRead ? {} : { wrote: true }) } : {}) });
+      else {
+        const shellWrite = name === 'run_command' && typeof args.CommandLine === 'string' && SHELL_WRITE.test(args.CommandLine);
+        entries.push({ ts, tool: name, ...tid, ...(key ? { fileKey: key, ...(isRead ? {} : { wrote: true }) } : {}), ...(shellWrite ? { wroteAny: true } : {}) });
+      }
       const end = Number.isNaN(done) ? ts : done;
       const payload = r.payload ? decode(r.payload) : null;
       const own = payload ? first(payload, 5) : null;
