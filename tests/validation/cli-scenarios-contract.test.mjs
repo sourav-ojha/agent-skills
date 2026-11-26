@@ -48,11 +48,42 @@ test('extractCriteria: malformed CLI contract sections are errors naming the CLI
   }
 });
 
-test('extractCriteria: a hostile CLI contract cannot hang the parser', () => {
-  const t0 = Date.now();
-  const c = cr.extractCriteria(spec(`## CLI contract\n\n- \`${'a '.repeat(20000)}\`\n${'- `seo x`\n'.repeat(5000)}\n`));
+test('extractCriteria: the pattern cap is enforced', () => {
+  const c = cr.extractCriteria(spec(`## CLI contract\n\n${'- `seo x`\n'.repeat(600)}\n`));
   assert.equal(c.ok, false);
-  assert.ok(Date.now() - t0 < 5000);
+  assert.ok(c.errors.some((e) => e.includes('more than 500 patterns')), c.errors.join(' | '));
+  assert.ok(c.cliContract.length <= 500);
+});
+
+test('extractCriteria: an over-long CLI contract line is refused', () => {
+  const c = cr.extractCriteria(spec(`## CLI contract\n\n- \`${'a '.repeat(20000)}\`\n`));
+  assert.equal(c.ok, false);
+  assert.ok(c.errors.some((e) => e.includes('longer than')), c.errors.join(' | '));
+});
+
+test('extractCriteria: prose with backticks adds no pattern; a bullet without a command is an error', () => {
+  const c = cr.extractCriteria(spec('## CLI contract\n\nUse `<name>` and `...` as placeholders.\n\n- `seo about`\n- `seo show` with `<name>` text\n\n'));
+  assert.deepEqual(c.errors, []);
+  assert.deepEqual(c.cliContract, [{ words: ['about'] }, { words: ['show'] }]);
+  const bad = cr.extractCriteria(spec('## CLI contract\n\n- `seo about`\n- no command here\n\n'));
+  assert.ok(bad.errors.some((e) => e.includes('CLI contract')));
+});
+
+test('extractCriteria: "..." is only allowed as the final word', () => {
+  const c = cr.extractCriteria(spec('## CLI contract\n\n- `seo run ... x`\n\n'));
+  assert.equal(c.ok, false);
+  assert.ok(c.errors.some((e) => e.includes('CLI contract') && e.includes('...')), c.errors.join(' | '));
+  assert.deepEqual(cr.extractCriteria(spec('## CLI contract\n\n- `seo run ...`\n\n')).cliContract, [{ words: ['run', '...'] }]);
+});
+
+test('the shipped template, with its CLI block uncommented, extracts exactly the example and passes check', () => {
+  const tpl = fs.readFileSync(path.join(REPO, 'skills', 'feature-intake', 'templates', 'feature-specification.md'), 'utf8');
+  assert.deepEqual(cr.extractCriteria(tpl).cliContract, []);
+  const un = tpl.replace('<!--\n## CLI contract', '## CLI contract').replace('--json`\n-->', '--json`');
+  assert.notEqual(un, tpl);
+  const c = cr.extractCriteria(un);
+  assert.deepEqual(c.cliContract, [{ words: ['about', '--json'] }]);
+  assert.equal(c.errors.filter((e) => e.includes('CLI')).length, 0, c.errors.join(' | '));
 });
 
 test('matchCliContract', () => {

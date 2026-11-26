@@ -374,16 +374,15 @@ export function extractCriteria(specText) {
   if (found.cli.length) {
     let capped = false;
     for (const line of vis('cli')) {
-      if (line.includes('{{')) { errors.push(`CLI contract line has a template placeholder: ${norm(line)}`); continue; }
-      let n = 0;
-      for (const m of line.matchAll(/`([^`]+)`/g)) {
-        const w = norm(m[1]).split(' ');
-        if (!w[0]) continue;
-        n++;
-        if (cliContract.length < MAX_CLI_PATTERNS) cliContract.push({ words: w.slice(1) });
-        else if (!capped) { capped = true; errors.push(`CLI contract has more than ${MAX_CLI_PATTERNS} patterns`); }
-      }
-      if (!n) errors.push(`CLI contract line does not parse as a backticked command: ${norm(line).slice(0, 200)}`);
+      if (!/^\s*[-*+]\s/.test(line)) continue; // prose and other non-bullet lines never add patterns
+      if (line.includes('{{')) { errors.push(`CLI contract line has a template placeholder: ${norm(line).slice(0, 200)}`); continue; }
+      const m = /`([^`]+)`/.exec(line); // only the first backticked span of a bullet is the pattern
+      const w = m ? norm(m[1]).split(' ') : [''];
+      if (!w[0]) { errors.push(`CLI contract line does not parse as a backticked command: ${norm(line).slice(0, 200)}`); continue; }
+      const words = w.slice(1);
+      if (words.slice(0, -1).includes('...')) { errors.push(`CLI contract pattern uses "..." before its last word (it is only allowed as the final word): ${norm(line).slice(0, 200)}`); continue; }
+      if (cliContract.length < MAX_CLI_PATTERNS) cliContract.push({ words });
+      else if (!capped) { capped = true; errors.push(`CLI contract has more than ${MAX_CLI_PATTERNS} patterns`); }
     }
     if (!cliContract.length && !capped) errors.push('CLI contract section has no backticked command patterns');
   }
