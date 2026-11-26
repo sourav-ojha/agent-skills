@@ -871,3 +871,28 @@ test('pinning: every argv entry is sensitive', () => {
   assert.ok(argv.length >= 6);
   for (const e of argv) assert.equal(e.sensitive, true, e.path);
 });
+
+test('wizard cli answers: only a one-line JSON object is accepted, and it round-trips through parseConfig', async () => {
+  const { parseConfig } = await import(path.join(SCRIPTS, 'lib', 'config.mjs'));
+  const e = entry('app.cli');
+  for (const bad of ['node ./cli.js', '["node"]', '{"command":', '[]', '5', 'null']) assert.equal(W.parseAnswer(e, bad, null).action, 'invalid', bad);
+  const r = W.parseAnswer(e, '{"command":["node","./src/cli.ts"],"timeout_s":60}', null);
+  assert.deepEqual(r, { action: 'set', value: { command: ['node', './src/cli.ts'], timeout_s: 60 } });
+  assert.deepEqual(parseConfig({ app: { cli: r.value } }).config.app.cli, r.value);
+  assert.ok(parseConfig({ app: { cli: {} } }).errors.some((m) => m.includes('app.cli')), '{} is not a valid app.cli');
+  assert.match(W.renderPrompt(e, undefined), /JSON object/);
+});
+
+test('app.cli: null parses to null, control characters are refused, loosens flags changes', async () => {
+  const { parseConfig } = await import(path.join(SCRIPTS, 'lib', 'config.mjs'));
+  const r = parseConfig({ app: { cli: null } });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.config.app.cli, null);
+  assert.ok(parseConfig({ app: { cli: { command: ['node', 'a\nb'] } } }).errors.some((m) => m.includes('app.cli')));
+  assert.ok(parseConfig({ app: { cli: { command: ['node', 'a\0b'] } } }).errors.some((m) => m.includes('app.cli')));
+  const L = (b, a) => E.loosens(entry('app.cli'), { app: { cli: b } }, { app: { cli: a } });
+  const c = (t) => ({ command: ['a'], timeout_s: t });
+  assert.ok(L(c(30), c(60)));
+  assert.ok(L(c(30), null));
+  assert.equal(L(c(30), c(30)), null);
+});
