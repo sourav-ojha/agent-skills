@@ -79,16 +79,18 @@ export const validCliAssertion = (a) => {
   }
   return false;
 };
-const validArgs = (args) => Array.isArray(args) && args.length <= CLI_LIMITS.maxArgs
+// One invocation (`run` or a `setup.runs` entry): shared with the runner (clicheck.mjs) so lint and run accept the same shapes.
+export const validArgs = (args) => Array.isArray(args) && args.length <= CLI_LIMITS.maxArgs
   && args.every((x) => typeof x === 'string' && x.length <= CLI_LIMITS.maxArgLen && !x.includes('\0'));
-const validStdin = (v) => v === undefined || (typeof v === 'string' && Buffer.byteLength(v) <= CLI_LIMITS.maxStdinBytes);
+export const validStdin = (v) => v === undefined || (typeof v === 'string' && Buffer.byteLength(v) <= CLI_LIMITS.maxStdinBytes);
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 const onlyKeys = (o, allowed) => Object.keys(o).every((k) => allowed.includes(k));
+export const validCliInvocation = (r) => Boolean(isObj(r) && onlyKeys(r, ['args', 'stdin']) && validArgs(r.args) && validStdin(r.stdin));
 function lintCli(s, label, criteria, problems) {
   const contract = criteria.cliContract;
   const bad = (m) => problems.push(`scenario ${label}: ${m}`);
   const runOk = (r, what) => {
-    if (!isObj(r) || !onlyKeys(r, ['args', 'stdin']) || !validArgs(r.args) || !validStdin(r.stdin)) { bad(`${what} needs args (max ${CLI_LIMITS.maxArgs} strings of ${CLI_LIMITS.maxArgLen} chars, no NUL) and optional stdin (max 64 KiB)`); return; }
+    if (!validCliInvocation(r)) { bad(`${what} needs args (max ${CLI_LIMITS.maxArgs} strings of ${CLI_LIMITS.maxArgLen} chars, no NUL) and optional stdin (max 64 KiB)`); return; }
     if (!Array.isArray(contract) || contract.length === 0) bad(`${what} cannot match: the spec has no CLI contract`);
     else if (!matchCliContract(contract, r.args)) bad(`${what} args are not a command in the CLI contract`);
   };

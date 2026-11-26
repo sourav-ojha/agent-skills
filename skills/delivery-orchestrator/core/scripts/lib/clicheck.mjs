@@ -16,7 +16,7 @@
 // timeout makes the scenario `blocked`).
 import fs from 'node:fs';
 import path from 'node:path';
-import { CLI_LIMITS, validCliAssertion, validRelPath } from './scenarios.mjs';
+import { CLI_LIMITS, validCliAssertion, validCliInvocation, validRelPath } from './scenarios.mjs';
 import { prepareTextCheck, textCheck } from './apicheck.mjs';
 
 export const MAX_FILE_BYTES = 1024 * 1024;
@@ -36,10 +36,6 @@ function normRel(p) {
 }
 const foldKey = (n) => n.normalize('NFC').toLowerCase();
 
-const validArgs = (args) => Array.isArray(args) && args.length <= CLI_LIMITS.maxArgs
-  && args.every((x) => typeof x === 'string' && x.length <= CLI_LIMITS.maxArgLen && !x.includes('\0'));
-const validStdin = (v) => v === undefined || (typeof v === 'string' && Buffer.byteLength(v) <= CLI_LIMITS.maxStdinBytes);
-const validInvocation = (r) => isObj(r) && Object.keys(r).every((k) => k === 'args' || k === 'stdin') && validArgs(r.args) && validStdin(r.stdin);
 
 // Assertion shapes are validated before anything runs: an unrecognised one is a programming error (the lint refuses it first).
 function prepareAssertions(list) {
@@ -84,7 +80,8 @@ function planSetupFiles(files) {
 }
 
 // Create each parent directory one component at a time (never through a symlink), then the file with O_EXCL|O_NOFOLLOW. Throws on any problem.
-function writeSetupFile(realCase, rel, text) {
+// Exported as a named test seam only.
+export function writeSetupFile(realCase, rel, text) {
   const segs = rel.split('/');
   let cur = realCase;
   for (const seg of segs.slice(0, -1)) {
@@ -110,7 +107,8 @@ function writeSetupFile(realCase, rel, text) {
 
 // ---- file assertions ---------------------------------------------------------------------------------------------------------
 // { state: 'missing' } | { state: 'bad' } | { state: 'file', real, st }. 'bad' always fails the assertion, whatever its op.
-function resolveInCase(realCase, p) {
+// Exported as a named test seam only; runCliScenario is the interface.
+export function resolveInCase(realCase, p) {
   const rel = normRel(p);
   if (!rel) return { state: 'bad' };
   const segs = rel.split('/');
@@ -159,6 +157,8 @@ export async function runCliScenario(scenario, ctx) {
   const asserts = prepareAssertions(scenario.assert);
   const realCase = checkCtx(ctx);
   const blocked = (failed) => ({ status: 'blocked', failed });
+  // Each run gets a fresh, empty case folder: anything already there (an earlier run, a planted link) could alter the result.
+  if (fs.readdirSync(realCase).length !== 0) return blocked('setup');
   const invoke = async (r) => {
     try { return await ctx.run([...ctx.command, ...r.args], { stdin: r.stdin ?? '', timeoutS: ctx.timeoutS }); } catch { return null; }
   };
@@ -169,8 +169,8 @@ export async function runCliScenario(scenario, ctx) {
   const files = planSetupFiles(setup?.files);
   if (!files) return blocked('setup');
   const runs = setup?.runs ?? [];
-  if (!Array.isArray(runs) || runs.length > CLI_LIMITS.maxSetupRuns || !runs.every(validInvocation)) return blocked('setup');
-  if (!validInvocation(scenario.run)) return blocked('run');
+  if (!Array.isArray(runs) || runs.length > CLI_LIMITS.maxSetupRuns || !runs.every(validCliInvocation)) return blocked('setup');
+  if (!validCliInvocation(scenario.run)) return blocked('run');
   for (const f of files) {
     try { writeSetupFile(realCase, f.rel, f.text); } catch { return blocked('setup'); }
   }

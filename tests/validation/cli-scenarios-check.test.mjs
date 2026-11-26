@@ -70,6 +70,13 @@ test('pass: stdin defaults to the empty string', async (t) => {
   assert.equal(calls[0].stdin, '');
 });
 
+// The command under test leaves files behind: `plant(caseDir, outside)` runs inside the fake run, in a fresh, empty case folder per call.
+const afterRun = async (t, plant, asserts, res = ok()) => {
+  const { caseDir, outside } = dirs(t);
+  return go(scen({ assert: [{ exit: 0 }, ...asserts] }), caseDir, fakeRun(() => { plant(caseDir, outside); return res; }).run);
+};
+const nothing = () => {};
+
 // ---- fail ----------------------------------------------------------------------------------------------------------------------
 test('fail: wrong exit, stdout mismatch, json_path on non-JSON stdout, exists:false on an existing file, stderr; first failing decides', async (t) => {
   const { caseDir } = dirs(t);
@@ -78,11 +85,10 @@ test('fail: wrong exit, stdout mismatch, json_path on non-JSON stdout, exists:fa
   assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { stdout: { equals: 'x' } }] }), caseDir, out({ stdout: 'y' })), { status: 'fail', failed: 'stdout' });
   assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { stdout: { json_path: '$.a', equals: 1 } }] }), caseDir, out({ stdout: 'not json' })), { status: 'fail', failed: 'stdout' });
   assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { stderr: { not_contains: 'warn' } }] }), caseDir, out({ stderr: 'a warn' })), { status: 'fail', failed: 'stderr' });
-  fs.writeFileSync(path.join(caseDir, 'there.txt'), 'x');
-  assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { file: 'there.txt', exists: false }] }), caseDir, out({})), { status: 'fail', failed: 'file' });
   assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { file: 'missing.txt', equals: '' }] }), caseDir, out({})), { status: 'fail', failed: 'file' });
   // the first failing assertion names the family
   assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { stderr: { equals: 'e' } }, { exit: 3 }] }), caseDir, out({})), { status: 'fail', failed: 'stderr' });
+  assert.deepEqual(await afterRun(t, (d) => fs.writeFileSync(path.join(d, 'there.txt'), 'x'), [{ file: 'there.txt', exists: false }]), { status: 'fail', failed: 'file' });
 });
 
 test('fail: a process killed by a signal has no exit code, so an exit assertion never passes', async (t) => {
@@ -103,6 +109,18 @@ test('blocked: timedOut, overflow, spawn failure or a throwing run of the comman
   assert.deepEqual(await go(scen(), caseDir, async () => null), { status: 'blocked', failed: 'run' });
 });
 
+test('blocked: a case folder that is not empty is refused before anything is written or run', async (t) => {
+  const { caseDir, outside } = dirs(t);
+  const { run, calls } = fakeRun();
+  fs.symlinkSync(outside, path.join(caseDir, 'planted'));
+  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'a.txt', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
+  assert.deepEqual(fs.readdirSync(caseDir), ['planted']);
+  fs.rmSync(path.join(caseDir, 'planted'));
+  fs.writeFileSync(path.join(caseDir, '.hidden'), '');
+  assert.deepEqual(await go(scen(), caseDir, run), { status: 'blocked', failed: 'setup' }, 'a dotfile counts');
+  assert.equal(calls.length, 0);
+});
+
 test('blocked: a setup run that exits non-zero, times out, overflows or fails to spawn is blocked setup; the command never runs', async (t) => {
   const { caseDir } = dirs(t);
   for (const bad of [ok({ code: 2 }), ok({ code: null, timedOut: true }), ok({ overflow: true }), ok({ code: null }), ok({ code: null, signal: 'SIGTERM' })]) {
@@ -113,31 +131,44 @@ test('blocked: a setup run that exits non-zero, times out, overflows or fails to
   }
 });
 
-test('blocked: a setup file write failure (existing directory, symlink at the path, symlinked parent, invalid path) is blocked setup', async (t) => {
-  const { caseDir, outside } = dirs(t);
+test('blocked: a setup file write failure (unwritable case folder) or an invalid setup path is blocked setup', async (t) => {
+  const { caseDir } = dirs(t);
   const { run, calls } = fakeRun();
-  fs.mkdirSync(path.join(caseDir, 'taken'));
-  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'taken', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
-  fs.symlinkSync(path.join(outside, 'planted.txt'), path.join(caseDir, 'link.txt'));
-  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'link.txt', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
-  assert.equal(fs.existsSync(path.join(outside, 'planted.txt')), false, 'never wrote through a symlink');
-  fs.symlinkSync(outside, path.join(caseDir, 'outdir'));
-  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'outdir/x.txt', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
-  assert.equal(fs.existsSync(path.join(outside, 'x.txt')), false, 'never wrote through a symlinked parent');
-  fs.mkdirSync(path.join(caseDir, 'realdir'));
-  fs.symlinkSync('realdir', path.join(caseDir, 'indir'));
-  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'indir/y.txt', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' }, 'a parent symlink is refused even when it stays inside');
-  assert.equal(fs.existsSync(path.join(caseDir, 'realdir', 'y.txt')), false);
+  fs.chmodSync(caseDir, 0o500);
+  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'sub/a.txt', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
+  assert.deepEqual(await go(scen({ setup: { files: [{ path: 'a.txt', text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
+  fs.chmodSync(caseDir, 0o700);
   for (const p of ['../escape.txt', '/abs.txt', 'a/../../x', '.', 'a//b', 'a\\b', 'x\0y', '', 'a'.repeat(257)]) {
     assert.deepEqual(await go(scen({ setup: { files: [{ path: p, text: 'x' }] } }), caseDir, run), { status: 'blocked', failed: 'setup' }, JSON.stringify(p));
   }
   assert.deepEqual(await go(scen({ setup: { files: [{ path: 'big.txt', text: 'x'.repeat(256 * 1024 + 1) }] } }), caseDir, run), { status: 'blocked', failed: 'setup' });
   assert.equal(calls.length, 0, 'nothing ran after a setup failure');
+  assert.deepEqual(fs.readdirSync(caseDir), []);
   assert.equal(fs.existsSync(path.join(path.dirname(caseDir), 'escape.txt')), false);
 });
 
+test('writeSetupFile seam: never writes through a symlink at the path or in a parent, never over an existing entry', (t) => {
+  const { caseDir, outside } = dirs(t);
+  fs.mkdirSync(path.join(caseDir, 'taken'));
+  assert.throws(() => C.writeSetupFile(caseDir, 'taken', 'x'));
+  fs.writeFileSync(path.join(caseDir, 'exists.txt'), 'old');
+  assert.throws(() => C.writeSetupFile(caseDir, 'exists.txt', 'new'));
+  assert.equal(fs.readFileSync(path.join(caseDir, 'exists.txt'), 'utf8'), 'old');
+  fs.symlinkSync(path.join(outside, 'planted.txt'), path.join(caseDir, 'link.txt'));
+  assert.throws(() => C.writeSetupFile(caseDir, 'link.txt', 'x'));
+  assert.equal(fs.existsSync(path.join(outside, 'planted.txt')), false, 'never wrote through a symlink');
+  fs.symlinkSync(outside, path.join(caseDir, 'outdir'));
+  assert.throws(() => C.writeSetupFile(caseDir, 'outdir/x.txt', 'x'));
+  assert.equal(fs.existsSync(path.join(outside, 'x.txt')), false, 'never wrote through a symlinked parent');
+  fs.mkdirSync(path.join(caseDir, 'realdir'));
+  fs.symlinkSync('realdir', path.join(caseDir, 'indir'));
+  assert.throws(() => C.writeSetupFile(caseDir, 'indir/y.txt', 'x'), 'a parent symlink is refused even when it stays inside');
+  assert.equal(fs.existsSync(path.join(caseDir, 'realdir', 'y.txt')), false);
+  C.writeSetupFile(caseDir, 'new/deep/ok.txt', 'fine');
+  assert.equal(fs.readFileSync(path.join(caseDir, 'new', 'deep', 'ok.txt'), 'utf8'), 'fine');
+});
+
 test('blocked: setup files that collide after normalisation or case-folding, or a file that is also a directory, are refused', async (t) => {
-  const { caseDir } = dirs(t);
   const { run, calls } = fakeRun();
   for (const files of [
     [{ path: 'a.txt', text: '1' }, { path: './a.txt', text: '2' }],
@@ -145,9 +176,9 @@ test('blocked: setup files that collide after normalisation or case-folding, or 
     [{ path: 'Config.yaml', text: '1' }, { path: 'config.YAML', text: '2' }],
     [{ path: 'Sites/x.yaml', text: '1' }, { path: 'sites', text: '2' }],
   ]) {
-    const d = fs.mkdtempSync(path.join(caseDir, 'c'));
-    assert.deepEqual(await go(scen({ setup: { files } }), d, run), { status: 'blocked', failed: 'setup' }, JSON.stringify(files));
-    assert.deepEqual(fs.readdirSync(d), [], 'collisions are refused before anything is written');
+    const { caseDir } = dirs(t);
+    assert.deepEqual(await go(scen({ setup: { files } }), caseDir, run), { status: 'blocked', failed: 'setup' }, JSON.stringify(files));
+    assert.deepEqual(fs.readdirSync(caseDir), [], 'collisions are refused before anything is written');
   }
   assert.equal(calls.length, 0);
 });
@@ -178,85 +209,86 @@ test('order: setup.files are written (mode 0600, parents created) before setup.r
 
 // ---- file safety -------------------------------------------------------------------------------------------------------------
 const leaks = (r) => JSON.stringify(r).includes('TOP-SECRET') || JSON.stringify(r).includes('outside');
+const plantLinks = (caseDir, outside) => {
+  fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(caseDir, 'leak.txt'));
+  fs.symlinkSync(outside, path.join(caseDir, 'outdir'));
+  fs.symlinkSync(path.join(outside, 'nope'), path.join(caseDir, 'dangling'));
+  fs.symlinkSync('../outside/secret.txt', path.join(caseDir, 'rel.txt'));
+};
 
 test('file safety: a symlink (final or parent) whose realpath leaves the case folder fails file and is never read', async (t) => {
-  const { caseDir, outside } = dirs(t);
-  const { run } = fakeRun(() => {
-    fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(caseDir, 'leak.txt'));
-    fs.symlinkSync(outside, path.join(caseDir, 'outdir'));
-    fs.symlinkSync(path.join(outside, 'nope'), path.join(caseDir, 'dangling'));
-    fs.symlinkSync('../outside/secret.txt', path.join(caseDir, 'rel.txt'));
-    return ok();
-  });
-  // Run once to plant the links; then evaluate many assertions against the same folder with a no-op run.
-  await go(scen(), caseDir, run);
-  const noop = fakeRun().run;
   for (const a of [
     { file: 'leak.txt', contains: 'TOP' }, { file: 'leak.txt', not_contains: 'TOP' }, { file: 'leak.txt', exists: true }, { file: 'leak.txt', exists: false },
     { file: 'outdir/secret.txt', equals: 'TOP-SECRET-OUTSIDE' }, { file: 'outdir/secret.txt', exists: true },
     { file: 'outdir/absent.txt', exists: false }, // must not probe a directory outside the case folder
     { file: 'dangling', exists: false }, { file: 'rel.txt', matches: 'SECRET' },
   ]) {
-    const r = await go(scen({ assert: [{ exit: 0 }, a] }), caseDir, noop);
+    const r = await afterRun(t, plantLinks, [a]);
     assert.deepEqual(r, { status: 'fail', failed: 'file' }, JSON.stringify(a));
     assert.equal(leaks(r), false);
   }
 });
 
 test('file safety: a hard link to a file outside the case folder fails file and is never read', async (t) => {
-  const { caseDir, outside } = dirs(t);
-  fs.linkSync(path.join(outside, 'secret.txt'), path.join(caseDir, 'hard.txt'));
+  const plant = (d, o) => fs.linkSync(path.join(o, 'secret.txt'), path.join(d, 'hard.txt'));
   for (const a of [{ file: 'hard.txt', contains: 'TOP' }, { file: 'hard.txt', exists: true }]) {
-    const r = await go(scen({ assert: [{ exit: 0 }, a] }), caseDir, fakeRun().run);
-    assert.deepEqual(r, { status: 'fail', failed: 'file' }, JSON.stringify(a));
+    assert.deepEqual(await afterRun(t, plant, [a]), { status: 'fail', failed: 'file' }, JSON.stringify(a));
   }
 });
 
 test('file safety: a symlink that stays inside the case folder is followed', async (t) => {
-  const { caseDir } = dirs(t);
-  fs.mkdirSync(path.join(caseDir, 'real'));
-  fs.writeFileSync(path.join(caseDir, 'real', 'f.txt'), 'inside');
-  fs.symlinkSync('real', path.join(caseDir, 'alias'));
-  fs.symlinkSync('real/f.txt', path.join(caseDir, 'f-link'));
-  const r = await go(scen({ assert: [{ exit: 0 }, { file: 'alias/f.txt', equals: 'inside' }, { file: 'f-link', exists: true }] }), caseDir, fakeRun().run);
+  const r = await afterRun(t, (d) => {
+    fs.mkdirSync(path.join(d, 'real'));
+    fs.writeFileSync(path.join(d, 'real', 'f.txt'), 'inside');
+    fs.symlinkSync('real', path.join(d, 'alias'));
+    fs.symlinkSync('real/f.txt', path.join(d, 'f-link'));
+  }, [{ file: 'alias/f.txt', equals: 'inside' }, { file: 'f-link', exists: true }]);
   assert.deepEqual(r, { status: 'pass' });
 });
 
-test('file safety: .., absolute, NUL and over-long assertion paths fail file (defence in depth behind the lint)', async (t) => {
+test('resolveInCase seam: .., absolute, NUL, empty segments and over-long paths are refused (defence in depth behind the lint)', (t) => {
   const { caseDir } = dirs(t);
-  for (const p of ['../outside/secret.txt', 'a/../../outside/secret.txt', '/etc/hosts', '.', 'x\0y', 'a'.repeat(257), 'a//b']) {
+  fs.mkdirSync(path.join(caseDir, 'a'));
+  for (const p of ['..', '../outside/secret.txt', 'a/../../outside/secret.txt', 'a/..', '/etc/hosts', '.', './.', 'x\0y', 'a'.repeat(257), 'a//b', 'a\\b', '', null, 3]) {
+    assert.deepEqual(C.resolveInCase(caseDir, p), { state: 'bad' }, JSON.stringify(p));
+  }
+  assert.deepEqual(C.resolveInCase(caseDir, 'a/missing.txt'), { state: 'missing' });
+});
+
+test('file safety: end to end, .., absolute, NUL and over-long assertion paths are thrown before any run; `.` fails file', async (t) => {
+  const { caseDir } = dirs(t);
+  const { run, calls } = fakeRun();
+  for (const p of ['../outside/secret.txt', 'a/../../outside/secret.txt', '/etc/hosts', 'x\0y', 'a'.repeat(257), 'a//b']) {
     for (const a of [{ file: p, exists: false }, { file: p, contains: 'x' }]) {
-      const r = await go(scen({ assert: [{ exit: 0 }, a] }), caseDir, fakeRun().run).catch((e) => ({ threw: e.message }));
-      // an unrecognised shape is a programming error (thrown before any run) or a file failure; never a pass
-      if (r.threw) assert.ok(!r.threw.includes('secret') && !r.threw.includes('etc'), r.threw);
-      else assert.deepEqual(r, { status: 'fail', failed: 'file' }, JSON.stringify(a));
+      await assert.rejects(go(scen({ assert: [{ exit: 0 }, a] }), caseDir, run), (e) => !e.message.includes('secret') && !e.message.includes('etc'), JSON.stringify(a));
     }
+  }
+  assert.equal(calls.length, 0);
+  for (const a of [{ file: '.', exists: false }, { file: '.', exists: true }, { file: './.', contains: 'x' }]) {
+    assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, a] }), caseDir, run), { status: 'fail', failed: 'file' }, JSON.stringify(a));
   }
 });
 
 test('file safety: a directory, a FIFO and a file over 1 MiB fail file; never blocks on the FIFO', async (t) => {
-  const { caseDir } = dirs(t);
-  fs.mkdirSync(path.join(caseDir, 'adir'));
-  const big = path.join(caseDir, 'big.txt');
-  fs.writeFileSync(big, Buffer.alloc(1024 * 1024 + 1, 0x61));
-  fs.writeFileSync(path.join(caseDir, 'edge.txt'), Buffer.alloc(1024 * 1024, 0x61));
-  const noop = fakeRun().run;
+  const plant = (d) => {
+    fs.mkdirSync(path.join(d, 'adir'));
+    fs.writeFileSync(path.join(d, 'big.txt'), Buffer.alloc(1024 * 1024 + 1, 0x61));
+    fs.writeFileSync(path.join(d, 'edge.txt'), Buffer.alloc(1024 * 1024, 0x61));
+  };
   for (const a of [{ file: 'adir', exists: true }, { file: 'adir', exists: false }, { file: 'adir', contains: 'x' }, { file: 'big.txt', contains: 'a' }, { file: 'big.txt', not_contains: 'zzz' }]) {
-    assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, a] }), caseDir, noop), { status: 'fail', failed: 'file' }, JSON.stringify(a));
+    assert.deepEqual(await afterRun(t, plant, [a]), { status: 'fail', failed: 'file' }, JSON.stringify(a));
   }
-  assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, { file: 'edge.txt', not_contains: 'b' }, { file: 'big.txt', exists: true }] }), caseDir, noop), { status: 'pass' }, 'exactly 1 MiB is readable');
-  const fifo = path.join(caseDir, 'pipe');
-  const mk = spawnSync('mkfifo', [fifo]);
-  if (mk.status !== 0) { t.diagnostic('mkfifo unavailable: FIFO case skipped'); return; }
+  assert.deepEqual(await afterRun(t, plant, [{ file: 'edge.txt', not_contains: 'b' }, { file: 'big.txt', exists: true }]), { status: 'pass' }, 'exactly 1 MiB is readable');
+  const probe = spawnSync('mkfifo', [path.join(tmp(t), 'probe')]);
+  if (probe.status !== 0) { t.diagnostic('mkfifo unavailable: FIFO case skipped'); return; }
+  const fifo = (d) => assert.equal(spawnSync('mkfifo', [path.join(d, 'pipe')]).status, 0);
   for (const a of [{ file: 'pipe', contains: 'x' }, { file: 'pipe', exists: true }]) {
-    assert.deepEqual(await go(scen({ assert: [{ exit: 0 }, a] }), caseDir, noop), { status: 'fail', failed: 'file' }, JSON.stringify(a));
+    assert.deepEqual(await afterRun(t, fifo, [a]), { status: 'fail', failed: 'file' }, JSON.stringify(a));
   }
 });
 
 test('file safety: invalid UTF-8 contents fail the text check', async (t) => {
-  const { caseDir } = dirs(t);
-  fs.writeFileSync(path.join(caseDir, 'bin.dat'), Buffer.from([0x61, 0xff, 0xfe, 0x62]));
-  const r = await go(scen({ assert: [{ exit: 0 }, { file: 'bin.dat', not_contains: 'zzz' }] }), caseDir, fakeRun().run);
+  const r = await afterRun(t, (d) => fs.writeFileSync(path.join(d, 'bin.dat'), Buffer.from([0x61, 0xff, 0xfe, 0x62])), [{ file: 'bin.dat', not_contains: 'zzz' }]);
   assert.deepEqual(r, { status: 'fail', failed: 'file' });
 });
 
