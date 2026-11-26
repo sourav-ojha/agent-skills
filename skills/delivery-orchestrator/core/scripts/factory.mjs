@@ -809,7 +809,7 @@ function builderRoot(ctx) {
   return real;
 }
 // One line of an error for the terminal, with every path replaced by <path> (as the top-level handler does).
-const redactLine = (e) => String(e?.message || e).split('\n')[0].replace(/(?:[A-Za-z]:)?(?:\/[^\s/:'"]+)+\/?/g, '<path>').replace(/[^\s'"]*\/[^\s'"]*/g, '<path>').slice(0, 200);
+const redactLine = (e) => clean(String(e?.message || e).split('\n')[0], 400).replace(/(?:[A-Za-z]:)?(?:\/[^\s/:'"]+)+\/?/g, '<path>').replace(/[^\s'"]*\/[^\s'"]*/g, '<path>').slice(0, 200);
 const LEFTOVER_FIX = 'a process still names the builder clone or its run dir in its arguments, environment (PWD, OLDPWD) or working directory: end it, and start factory from a shell that never changed into the clone';
 const SETTINGS_FIX = 'run factory with a HOME whose settings.json (in its .claude folder) holds only the allowed keys ($schema, model, env, permissions.deny, cleanupPeriodDays, includeCoAuthoredBy, and enabledPlugins and sandbox only when empty): a dedicated factory home, logged in to claude and gh (references/factory-driver.md, "Before the first run")';
 const survivors = (ctx, markers) => (ctx.deps.survivors || scanSurvivors)(markers);
