@@ -227,25 +227,34 @@ const READ_ROOTS_EXTRA = ['/Users'];
 //   allow reads of node/toolchains; allow read+write of writable dirs; deny writes to .git in them; deny credential reads (LAST of the
 //   file rules); /dev writes; deny signals and process-info outside this sandbox; mach allowlist; network.
 // Writable dirs must be under realpath(FACTORY_HOME)/work or /tmp unless `unsafeAllowOutsideFactoryHome` (TESTS ONLY).
+// `readOnly` dirs (the cli run phase's worktree) are readable and never writable: they get only a file-read* allow, so the initial
+// `(deny file-write*)` still covers them. Same placement rules as writable dirs, and none may lie inside a writable dir (whose write
+// allow would cover it).
 export function sandboxProfile({
-  writable = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false, nodePaths,
+  writable = [], readOnly = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false, nodePaths,
 } = {}) {
-  if (!Array.isArray(writable) || !Array.isArray(readDeny)) throw new Error('writable and readDeny must be arrays');
+  if (!Array.isArray(writable) || !Array.isArray(readOnly) || !Array.isArray(readDeny)) throw new Error('writable, readOnly and readDeny must be arrays');
   const homes = home === undefined ? homeDirs() : (Array.isArray(home) ? home : [home]).map(canonical);
   const fh = canonical(fhIn);
   const tmp = tmpDir ? realDir(tmpDir) : null;
   const wr = [...new Set([...writable.map(realDir), ...(tmp ? [tmp] : [])])];
+  const ro = [...new Set(readOnly.map(realDir))];
   // FACTORY_HOME is a deny ROOT (first deny), not a credential: re-denying it last would hide the worktree under FACTORY_HOME/work.
   const credentials = [...new Set([...defaultReadDeny(homes, fh).slice(1), ...readDeny].map(canonical))];
   const denyRoots = [...new Set([...homes, ...READ_ROOTS_EXTRA.map(canonical), ...userTempDirs(), fh])];
-  for (const w of wr) {
-    if (w === '/') throw new Error('writable path must not be /');
-    for (const d of [...credentials, ...homes, fh]) if (within(d, w)) throw new Error(`writable path ${w} contains protected path ${d}`);
+  const placed = (w, what) => {
+    if (w === '/') throw new Error(`${what} path must not be /`);
+    for (const d of [...credentials, ...homes, fh]) if (within(d, w)) throw new Error(`${what} path ${w} contains protected path ${d}`);
     if (!unsafeAllowOutsideFactoryHome) {
       const okRoots = [path.join(fh, 'work'), path.join(fh, 'tmp')];
-      if (!okRoots.some((r) => within(w, r) && w !== r)) throw new Error(`writable path ${w} must be inside ${okRoots.join(' or ')}`);
-      if (!okRoots.some((r) => [w, ...ancestorsOf(w)].some((a) => a !== w && sameFile(a, r)))) throw new Error(`writable path ${w} is not under FACTORY_HOME by inode`);
+      if (!okRoots.some((r) => within(w, r) && w !== r)) throw new Error(`${what} path ${w} must be inside ${okRoots.join(' or ')}`);
+      if (!okRoots.some((r) => [w, ...ancestorsOf(w)].some((a) => a !== w && sameFile(a, r)))) throw new Error(`${what} path ${w} is not under FACTORY_HOME by inode`);
     }
+  };
+  for (const w of wr) placed(w, 'writable');
+  for (const r of ro) {
+    placed(r, 'readOnly');
+    if (wr.some((w) => within(r, w))) throw new Error(`readOnly path ${r} is inside a writable path`);
   }
   const toolchains = (readAllow ?? homes.flatMap((h) => TOOLCHAIN_PATHS.map((r) => path.join(h, r))))
     .map((p) => { checkPath(p); return p; }).filter((p) => fs.existsSync(p)).map(canonical);
@@ -253,7 +262,7 @@ export function sandboxProfile({
   const node = nodeReadPaths({ nodePaths: nodePaths ?? defaultNodePaths(), homes, denyRoots });
   const readAllowAll = [...new Set([...node.subpaths, ...toolchains])];
   const ancestors = new Set();
-  for (const p of [...wr, ...readAllowAll, ...node.literals]) for (const a of ancestorsOf(p)) ancestors.add(a);
+  for (const p of [...wr, ...ro, ...readAllowAll, ...node.literals]) for (const a of ancestorsOf(p)) ancestors.add(a);
   const historyRegex = homes.map((h) => regexLit(`^${regexEscape(h)}/\\.[^/]*_history$`));
   // Credential-named files INSIDE an allowed toolchain dir (found by probe: ~/.nvm/.npmrc, a pnpm auth.json) stay denied too.
   const toolchainCreds = readAllowAll.map(credNameRule);
@@ -267,6 +276,7 @@ export function sandboxProfile({
   // Node's realpath lstats every ancestor of the cwd/script; stat only (no listing, no content) of the ancestors keeps that working.
   if (ancestors.size) lines.push(`(allow file-read-metadata ${[...ancestors].sort().map(literal).join(' ')})`);
   if (readAllowAll.length || node.literals.length) lines.push(`(allow file-read* ${[...readAllowAll.map(subpath), ...node.literals.map(literal)].join(' ')})`);
+  if (ro.length) lines.push(`(allow file-read* ${ro.map(subpath).join(' ')})`); // read only: no write allow follows for these
   if (wr.length) {
     lines.push(`(allow file-read* file-write* ${wr.map(subpath).join(' ')})`);
     // No `.git` (directory, gitfile or symlink; any case) can be created or written at ANY depth of a worktree: an embedded repo's
