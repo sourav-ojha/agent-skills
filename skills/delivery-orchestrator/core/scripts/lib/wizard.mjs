@@ -76,6 +76,10 @@ export function parseAnswer(e, text, current) {
       return LOCAL.test(t) ? set(t) : bad('give a port number, or http://localhost:<port> or http://127.0.0.1:<port>');
     }
     case 'ready': return num === 1 || num === 2 ? { action: 'choose', value: num === 1 ? 'url' : 'log_pattern' } : bad('choose 1 (url) or 2 (log_pattern)');
+    case 'cli': {
+      if (t.startsWith('{')) { try { const v = JSON.parse(t); return v && typeof v === 'object' && !Array.isArray(v) ? set(v) : bad('expected a JSON object'); } catch (x) { return bad(`not a JSON object: ${x.message}`); } }
+      return bad('give a JSON object on one line, such as {"command":["node","./src/cli.ts"],"timeout_s":30}');
+    }
     case 'object-null': return t === 'y' ? set({}) : t === 'n' ? { action: 'keep' } : bad('answer y or n');
     default: {
       let v = t;

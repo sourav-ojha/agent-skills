@@ -16,6 +16,19 @@ const relPath = (v) => typeof v === 'string' && v && !v.startsWith('/') && !v.sp
 export const isLocalUrl = (u) => typeof u === 'string' && /^http:\/\/(?:localhost|127\.0\.0\.1):\d{1,5}(?:\/[^\s@]*)?$/.test(u);
 const keys = (o, allowed, at, errs) => { for (const k of Object.keys(o)) if (!allowed.includes(k)) errs.push(`${at}: unknown key "${k}" (allowed: ${allowed.join(', ')})`); };
 
+// The command verification runs for a CLI: a program on PATH or a path inside the checkout. Never an absolute path,
+// never a ".." segment in any element (so "./x/../../y" cannot leave the folder either). Returns a reason, or null.
+export function cliCommandProblem(command) {
+  if (!Array.isArray(command) || !command.length) return 'an argument list such as ["node","./src/cli.ts"]';
+  for (const el of command) {
+    if (typeof el !== 'string' || !el) return 'every element must be a non-empty string';
+    if (/[\u0000-\u001f]/.test(el)) return 'no element may contain a NUL, newline or other control character';
+    if (el.startsWith('/') || /^[A-Za-z]:[\\/]/.test(el) || el.startsWith('\\')) return `"${el}" is an absolute path; use a program on PATH or a path starting with ./`;
+    if (el.split(/[\\/]/).includes('..')) return `"${el}" has a ".." segment; the command must stay inside the repository`;
+  }
+  return null;
+}
+
 export function defaults() {
   return {
     version: 1,
@@ -32,7 +45,7 @@ export function defaults() {
     hold_paths: [],
     limits: { max_fix_rounds: 2, max_failures: 2, ci_budget_s: 1800 },
     implementer_notes: '',
-    app: { setup: null, start: null, stop: null, base_url: null, ready: null, logs_dir: null, seed: null, env_example: null },
+    app: { setup: null, start: null, stop: null, base_url: null, ready: null, logs_dir: null, seed: null, env_example: null, cli: null },
     tests: { setup: null, all: null, timeout_s: 900 },
     readiness: null, // null = not opted in
     verification: { required: false, scenario_approval: 'auto', session_timeout_s: { builder: 1800, author: 900 }, max_turns: { builder: 200, author: 40 }, model: { builder: null, author: null }, test_globs: [] },
@@ -138,6 +151,23 @@ export function parseConfig(raw) {
     else {
       keys(raw.app, Object.keys(cfg.app), 'app', errs);
       for (const k of ['setup', 'start', 'stop', 'seed']) if (raw.app[k] !== undefined && raw.app[k] !== null) { const l = strList(raw.app[k], `app.${k}`, errs, 30); if (!l.length) errs.push(`app.${k}: an argument list such as ["npm","run","dev"]`); else cfg.app[k] = l; }
+      if (raw.app.cli !== undefined && raw.app.cli !== null) {
+        const c = raw.app.cli;
+        if (!isObj(c)) errs.push('app.cli: expected an object such as {"command":["node","./src/cli.ts"]}');
+        else {
+          keys(c, ['command', 'timeout_s'], 'app.cli', errs);
+          const t = c.timeout_s === undefined ? 30 : c.timeout_s;
+          if (!Number.isInteger(t) || t < 1 || t > 120) errs.push('app.cli.timeout_s: an integer 1-120');
+          if (c.command === undefined) errs.push('app.cli.command: required, an argument list such as ["node","./src/cli.ts"]');
+          else {
+            const before = errs.length;
+            const cmd = strList(c.command, 'app.cli.command', errs, 10);
+            const why = errs.length === before ? cliCommandProblem(cmd) : null;
+            if (why) errs.push(`app.cli.command: ${why}`);
+            if (errs.length === before && Number.isInteger(t) && t >= 1 && t <= 120) cfg.app.cli = { command: cmd, timeout_s: t };
+          }
+        }
+      }
       if (raw.app.base_url !== undefined && raw.app.base_url !== null) { if (isLocalUrl(raw.app.base_url)) cfg.app.base_url = raw.app.base_url; else errs.push('app.base_url: http://localhost:<port> or http://127.0.0.1:<port>'); }
       for (const k of ['logs_dir', 'env_example']) if (raw.app[k] !== undefined && raw.app[k] !== null) { if (relPath(raw.app[k])) cfg.app[k] = raw.app[k]; else errs.push(`app.${k}: a relative path inside the repository`); }
       if (raw.app.ready !== undefined && raw.app.ready !== null) {

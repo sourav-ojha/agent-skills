@@ -286,7 +286,7 @@ test('a sensitive key without an explicit rule fails closed; every sensitive key
     local_checks: [[], [{ name: 'a', command: ['x'], timeout_s: 9 }]], 'verification.test_globs': [['t/'], []],
     'verification.required': [true, false], 'verification.scenario_approval': ['human', 'auto'],
     'budgets.feature.tokens': [1000000, 2000000], 'budgets.feature.turns': [100, 200], 'budgets.day_tokens': [20000000, 30000000],
-    'app.setup': [['a'], ['b']], 'app.start': [['a'], ['b']], 'app.stop': [['a'], ['b']], 'app.seed': [['a'], ['b']], 'tests.setup': [['a'], ['b']], 'tests.all': [['a'], ['b']],
+    'app.cli': [{ command: ['a'] }, { command: ['b'] }], 'app.setup': [['a'], ['b']], 'app.start': [['a'], ['b']], 'app.stop': [['a'], ['b']], 'app.seed': [['a'], ['b']], 'tests.setup': [['a'], ['b']], 'tests.all': [['a'], ['b']],
   };
   for (const e of SCHEMA.filter((x) => x.sensitive)) {
     assert.ok(ex[e.path], `sensitive key ${e.path} needs a loosening example`);
