@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { runCmd, startApp, registerCleanup, allowEnv } from './proc.mjs';
+import { runCmd, runCapture, startApp, registerCleanup, allowEnv } from './proc.mjs';
 import { factoryHome } from './factoryhome.mjs';
 
 export const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
@@ -359,6 +359,12 @@ function withTmp(env, tmpDir, profile) {
 export async function runSandboxed(argv, { cwd, env, timeoutS, profile, tmpDir, sandbox } = {}) {
   const full = sandboxArgv(argv, profile, sandbox);
   return runCmd(full, { cwd, env: withTmp(env, tmpDir, profile), timeoutS });
+}
+
+// runSandboxed with the output captured (runCapture): stdin written then closed, stdout and stderr kept separately up to maxBytes each.
+export async function runSandboxedCapture(argv, { cwd, env, timeoutS, profile, tmpDir, stdin, sandbox, maxBytes } = {}) {
+  const full = sandboxArgv(argv, profile, sandbox);
+  return runCapture(full, { cwd, env: withTmp(env, tmpDir, profile), timeoutS, stdin, maxBytes });
 }
 
 export function startSandboxed(argv, { cwd, env, profile, tmpDir, sandbox } = {}) {

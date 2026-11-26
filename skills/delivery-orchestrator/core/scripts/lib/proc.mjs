@@ -94,6 +94,53 @@ export function runCmd(argv, { cwd, env, timeoutS = 900 } = {}) {
   });
 }
 
+// runCmd's process-group handling (detached, tracked, the group SIGKILLed on exit and on timeout, then untracked) with the output
+// CAPTURED instead of tailed: stdin is written then closed (EPIPE from a command that never reads it is ignored); stdout and stderr
+// are kept separately as UTF-8, each capped at maxBytes. A stream that passes the cap stops being appended, sets `overflow` and gets
+// the group killed, so a command that floods output cannot run on. `code` is null when the process died from `signal` or never
+// started (spawn failure: code and signal both null).
+export function runCapture(argv, { cwd, env, timeoutS = 900, stdin = '', maxBytes = 1024 * 1024 } = {}) {
+  return new Promise((resolve) => {
+    const bufs = { stdout: [], stderr: [] }; const sizes = { stdout: 0, stderr: 0 };
+    let timedOut = false, overflow = false, done = false, timer;
+    const text = (k) => Buffer.concat(bufs[k]).toString('utf8');
+    const finish = (code, signal) => {
+      if (done) return; done = true; clearTimeout(timer);
+      resolve({ code, signal: signal ?? null, timedOut, overflow, stdout: text('stdout'), stderr: text('stderr') });
+    };
+    let child;
+    try {
+      child = spawn(argv[0], argv.slice(1), { cwd, env: env ?? allowEnv(null), shell: false, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch { return finish(null, null); }
+    const take = (k) => (d) => {
+      if (overflow) return;
+      if (sizes[k] + d.length > maxBytes) {
+        overflow = true;
+        bufs[k].push(d.subarray(0, maxBytes - sizes[k])); sizes[k] = maxBytes;
+        killGroup(child.pid, 'SIGKILL');
+        return;
+      }
+      bufs[k].push(d); sizes[k] += d.length;
+    };
+    child.stdout.on('data', take('stdout'));
+    child.stderr.on('data', take('stderr'));
+    child.stdin.on('error', () => { /* EPIPE: the command closed stdin without reading it */ });
+    child.on('error', () => finish(null, null));
+    // Resolve on 'exit', not 'close': a background child holding the pipes must not keep us waiting for the timeout.
+    child.on('exit', (code, signal) => {
+      killGroup(child.pid, 'SIGKILL'); // sweep anything the command left behind in its process group
+      untrackIfDead(child.pid);
+      let settled = false;
+      const end = () => { if (settled) return; settled = true; child.stdout.destroy(); child.stderr.destroy(); child.stdin.destroy(); finish(code, signal); };
+      child.once('close', end); // pipes close quickly once the group is dead; keep what they still hold
+      setTimeout(end, 500).unref();
+    });
+    if (child.pid) track(child.pid);
+    timer = setTimeout(() => { timedOut = true; killGroup(child.pid, 'SIGKILL'); }, timeoutS * 1000);
+    child.stdin.end(String(stdin));
+  });
+}
+
 export function startApp(argv, { cwd, env } = {}) {
   let out = '';
   const child = spawn(argv[0], argv.slice(1), { cwd, env: env ?? allowEnv(null), shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });

@@ -11,9 +11,10 @@
 // `matches` pattern (max MAX_PATTERN chars, no flags) is first compiled in-process (compiling is linear), then run in a
 // short-lived worker thread that is terminated after regexTimeoutMs; a timeout makes the assertion `blocked`. Subjects longer
 // than MAX_SUBJECT chars are not truncated (a truncated subject can match where the full one would not); they fail.
+// The text and json_path evaluation is shared with cli scenarios (clicheck.mjs) through textCheck, with the same limits and worker.
 import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
-import { validAssertion } from './scenarios.mjs';
+import { validAssertion, validCliAssertion } from './scenarios.mjs';
 
 const MAX_PATH_EXPR = 256;
 const MAX_SEGMENTS = 32;
@@ -120,6 +121,56 @@ async function allMatch(pattern, subjects, ms) {
     });
     return Array.isArray(out) && out.length === subjects.length && out.every((x) => x === true);
   } finally { clearTimeout(t); w.terminate(); }
+}
+
+// One `json_path` op on an already parsed value. Shared by api assertions and cli text checks (textCheck). `ms` is a function
+// returning the regex budget at the moment the regex runs. Throws on an invalid pattern or a regex timeout.
+async function jsonPathOp(parsed, a, op, ms) {
+  const { values: m, resolved } = walk(parsed, a.json_path);
+  const v = a[op];
+  if ((op === 'not_contains' || op === 'count') && !resolved) return false; // a typo or an error body must not pass vacuously
+  if (op === 'equals') return m.length > 0 && m.every((x) => deepEqual(x, v));
+  if (op === 'contains') return m.some((x) => containsOne(x, v));
+  if (op === 'not_contains') return !m.some((x) => containsOne(x, v));
+  if (op === 'count') return (!a.json_path.includes('[*]') && m.length === 1 && Array.isArray(m[0]) ? m[0].length : m.length) === v;
+  return allMatch(v, m, ms());
+}
+
+// Throws unless `check` is a cli text check (scenarios.mjs validCliAssertion) this engine can run: a supported json_path, a
+// non-negative integer count, a pattern of at most MAX_PATTERN characters. Returns the op name.
+export function prepareTextCheck(check) {
+  const bad = () => new Error('invalid text check');
+  if (!validCliAssertion({ stdout: check })) throw bad();
+  if (!('json_path' in check)) {
+    const [op] = Object.keys(check);
+    if (op === 'matches' && check.matches.length > MAX_PATTERN) throw bad();
+    return op;
+  }
+  parsePath(check.json_path);
+  const op = Object.keys(check).find((k) => k !== 'json_path');
+  if (op === 'count' && !(Number.isInteger(check.count) && check.count >= 0)) throw bad();
+  if (op === 'matches' && (typeof check.matches !== 'string' || check.matches.length > MAX_PATTERN)) throw bad();
+  return op;
+}
+
+// A cli text check on a whole text (stdout, stderr or a file's UTF-8 contents): `equals`, `contains`, `not_contains` or `matches`
+// on the text, or `json_path` + one op on the text parsed as JSON. Text that does not parse fails (false). Resolves a boolean;
+// rejects on an invalid check, an invalid pattern or a regex timeout (the caller makes that `blocked`). `matches` runs in the same
+// time-limited worker as api assertions; a subject over MAX_SUBJECT characters fails (never truncated).
+export async function textCheck(text, check, { regexTimeoutMs = 500 } = {}) {
+  const op = prepareTextCheck(check);
+  if (typeof text !== 'string') return false;
+  const ms = () => regexTimeoutMs;
+  if ('json_path' in check) {
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { return false; }
+    return jsonPathOp(parsed, check, op, ms);
+  }
+  const v = check[op];
+  if (op === 'equals') return text === v;
+  if (op === 'contains') return text.includes(v);
+  if (op === 'not_contains') return !text.includes(v);
+  return allMatch(v, [text], ms());
 }
 
 function checkBaseUrl(baseUrl) {
@@ -256,16 +307,7 @@ export async function runApiScenario(scenario, baseUrl, { fetchImpl = globalThis
         else if ('equals' in a) ok = v === a.equals;
         else ok = await allMatch(a.matches, [v], regexMs());
       } else if (!json()) ok = false;
-      else {
-        const { values: m, resolved } = walk(parsed, a.json_path);
-        const v = a[op];
-        if ((op === 'not_contains' || op === 'count') && !resolved) ok = false; // a typo or an error body must not pass vacuously
-        else if (op === 'equals') ok = m.length > 0 && m.every((x) => deepEqual(x, v));
-        else if (op === 'contains') ok = m.some((x) => containsOne(x, v));
-        else if (op === 'not_contains') ok = !m.some((x) => containsOne(x, v));
-        else if (op === 'count') ok = (!a.json_path.includes('[*]') && m.length === 1 && Array.isArray(m[0]) ? m[0].length : m.length) === v;
-        else ok = await allMatch(v, m, regexMs());
-      }
+      else ok = await jsonPathOp(parsed, a, op, regexMs);
     } catch { return blocked(kind); }
     if (ok !== true) return { status: 'fail', failed: kind };
   }
