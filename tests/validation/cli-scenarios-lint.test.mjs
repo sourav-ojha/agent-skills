@@ -109,10 +109,33 @@ test('validRelPath and CLI_LIMITS', () => {
   assert.equal(sc.CLI_LIMITS.maxArgs, 64);
 });
 
-test('symptom-brief filter collects cli run, setup and assert strings', () => {
-  const s = cli({ run: { args: ['about', 'secret-arg-value'] }, setup: { files: [{ path: 'p.txt', text: 'secret-file-text' }] }, assert: [{ exit: 0 }, { stdout: { equals: 'secret-expected' } }] });
-  for (const secret of ['secret-arg-value', 'secret-file-text', 'secret-expected']) {
-    const brief = vf.symptomBrief([{ covers: ['AC-1'], status: 'fail' }], [s], CANARY);
-    assert.ok(brief.every((l) => !l.includes(secret)));
+test('api scenario with the canary only in assert is still refused (canary extension is cli-only)', () => {
+  const api = { id: 'S-1', covers: ['AC-1'], kind: 'api', request: { method: 'GET', path: '/api/p' }, assert: [{ status: 200 }, { json_path: '$.a', equals: CANARY }] };
+  const r = lint([api], crit(undefined, [{ method: 'GET', path: '/api/p' }]));
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => p.includes('canary does not appear')));
+});
+
+test('unknown keys and wrong container types in run/setup are refused', () => {
+  refused(cli({ run: { args: ['about'], argz: [] } }));
+  refused(cli({ setup: { fils: [] } }));
+  refused(cli({ setup: { files: [{ path: 'a', text: '', mode: 1 }] } }));
+  refused(cli({ setup: { runs: [{ args: ['about'], env: {} }] } }));
+  for (const v of [null, [], 'x', 5]) {
+    refused(cli({ run: v }));
+    refused(cli({ setup: v }));
+    if (!Array.isArray(v)) { refused(cli({ setup: { files: v } })); refused(cli({ setup: { runs: v } })); }
   }
+});
+
+test('duplicate setup file paths and file/dir conflicts are refused', () => {
+  refused(cli({ setup: { files: [{ path: 'a', text: '' }, { path: 'a', text: '' }] } }));
+  refused(cli({ setup: { files: [{ path: 'a', text: '' }, { path: 'a/b', text: '' }] } }));
+  assert.equal(lint([cli({ setup: { files: [{ path: 'a/b', text: '' }, { path: 'a/c', text: '' }, { path: 'ab', text: '' }] } })]).ok, true);
+});
+
+test('symptom-brief filter collects cli run, setup and assert strings', () => {
+  const s = cli({ run: { args: ['about', 'secret-arg-value'] }, setup: { files: [{ path: 'p.txt', text: 'secret-file-text' }], runs: [{ args: ['secret-setup-arg'] }] }, assert: [{ exit: 0 }, { stdout: { equals: 'secret-expected' } }] });
+  const got = vf.scenarioStrings([s], CANARY);
+  for (const secret of [CANARY, 'secret-arg-value', 'secret-file-text', 'secret-setup-arg', 'secret-expected']) assert.ok(got.has(secret), secret);
 });

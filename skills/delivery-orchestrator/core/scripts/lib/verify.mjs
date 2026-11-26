@@ -388,7 +388,7 @@ const LINE_SHAPE = new RegExp(`^(?:${ID}(?:, ${ID})*: ${API_SYMPTOM}|${FALLBACK}
 
 // Every string value in a scenario's setup, request, assertions, steps and expectations, plus the object keys inside request
 // `body` / `headers` (data; elsewhere keys are schema words such as "status"). null when too large to check.
-function scenarioStrings(list, canary) {
+export function scenarioStrings(list, canary) {
   const out = new Set();
   if (typeof canary === 'string' && canary) out.add(canary);
   const stack = list.filter((x) => x && typeof x === 'object').flatMap((sc) => [sc.setup, sc.request, sc.assert, sc.steps, sc.expect, sc.run].map((v) => [v, false]));

@@ -83,11 +83,12 @@ const validArgs = (args) => Array.isArray(args) && args.length <= CLI_LIMITS.max
   && args.every((x) => typeof x === 'string' && x.length <= CLI_LIMITS.maxArgLen && !x.includes('\0'));
 const validStdin = (v) => v === undefined || (typeof v === 'string' && Buffer.byteLength(v) <= CLI_LIMITS.maxStdinBytes);
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+const onlyKeys = (o, allowed) => Object.keys(o).every((k) => allowed.includes(k));
 function lintCli(s, label, criteria, problems) {
   const contract = criteria.cliContract;
   const bad = (m) => problems.push(`scenario ${label}: ${m}`);
   const runOk = (r, what) => {
-    if (!isObj(r) || !validArgs(r.args) || !validStdin(r.stdin)) { bad(`${what} needs args (max ${CLI_LIMITS.maxArgs} strings of ${CLI_LIMITS.maxArgLen} chars, no NUL) and optional stdin (max 64 KiB)`); return; }
+    if (!isObj(r) || !onlyKeys(r, ['args', 'stdin']) || !validArgs(r.args) || !validStdin(r.stdin)) { bad(`${what} needs args (max ${CLI_LIMITS.maxArgs} strings of ${CLI_LIMITS.maxArgLen} chars, no NUL) and optional stdin (max 64 KiB)`); return; }
     if (!Array.isArray(contract) || contract.length === 0) bad(`${what} cannot match: the spec has no CLI contract`);
     else if (!matchCliContract(contract, r.args)) bad(`${what} args are not a command in the CLI contract`);
   };
@@ -101,13 +102,19 @@ function lintCli(s, label, criteria, problems) {
     if (!s.assert.some((a) => validCliAssertion(a) && 'exit' in a)) bad('cli scenario needs an exit assertion');
   }
   if (s.setup === undefined) return;
-  if (!isObj(s.setup)) { bad('cli setup must be an object with files and runs'); return; }
+  if (!isObj(s.setup) || !onlyKeys(s.setup, ['files', 'runs'])) { bad('cli setup must be an object with files and runs'); return; }
   const { files, runs } = s.setup;
   if (files !== undefined) {
     if (!Array.isArray(files)) bad('setup.files must be an array');
     else if (files.length > CLI_LIMITS.maxSetupFiles) bad(`setup has ${files.length} files (max ${CLI_LIMITS.maxSetupFiles})`);
-    else files.forEach((f, k) => {
-      if (!isObj(f) || !validRelPath(f.path) || typeof f.text !== 'string' || Buffer.byteLength(f.text) > CLI_LIMITS.maxFileTextBytes) bad(`setup file ${k + 1} needs a relative path and text (max 256 KiB)`);
+    else {
+      const paths = files.map((f) => (isObj(f) && typeof f.path === 'string' ? f.path : null)).filter((x) => x !== null);
+      const set = new Set(paths);
+      if (set.size !== paths.length) bad('setup.files has a duplicate path');
+      else if (paths.some((p) => [...set].some((q) => q.startsWith(`${p}/`)))) bad('setup.files has a file that is also a directory of another');
+    }
+    if (Array.isArray(files) && files.length <= CLI_LIMITS.maxSetupFiles) files.forEach((f, k) => {
+      if (!isObj(f) || !onlyKeys(f, ['path', 'text']) || !validRelPath(f.path) || typeof f.text !== 'string' || Buffer.byteLength(f.text) > CLI_LIMITS.maxFileTextBytes) bad(`setup file ${k + 1} needs a relative path and text (max 256 KiB)`);
     });
   }
   if (runs !== undefined) {
@@ -177,7 +184,8 @@ const refusedRequest = (r) => {
   if (!r.headers || typeof r.headers !== 'object' || Array.isArray(r.headers)) return true;
   return Object.keys(r.headers).some((n) => REFUSED_HEADERS.has(n.toLowerCase()) || /^(proxy-|sec-)/i.test(n));
 };
-const dataOf = (s) => canonical([s.setup, s.request, s.steps, s.expect, s.run, s.assert]);
+// api and ui scan exactly what they always did; only cli scans run and assert.
+const dataOf = (s) => canonical(s.kind === 'cli' ? [s.setup, s.run, s.assert] : [s.setup, s.request, s.steps, s.expect]);
 const strList = (a) => Array.isArray(a) && a.every((x) => typeof x === 'string' && x.trim() !== '' && x.length <= 500);
 
 export function lintScenarios(doc, criteria, currentHash) {
