@@ -54,6 +54,14 @@ Non-goals: {{what it deliberately does not change}}
 
 <!-- Optional: one bullet per endpoint, each a backticked METHOD /path. Delete this section when the feature has no HTTP API. -->
 
+<!-- Optional CLI contract. Uncomment and fill for a command-line feature, delete otherwise (an empty section is an error):
+
+## CLI contract
+
+- `seo about --json`
+
+One backticked command per bullet. The first word is the program's display name and is ignored when matching; `<name>` stands for one argument and a trailing `...` allows more. -->
+
 ## 9. Technical considerations
 
 {{API, database, authentication and authorization, dependencies.}}

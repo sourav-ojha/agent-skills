@@ -117,6 +117,7 @@ export function validateSpec(text, ctx = {}) {
   errors.push(...layout.map((p) => `layout: ${p}`));
   const cr = extractCriteria(text);
   for (const e of cr.errors) if (!layout.includes(e)) errors.push(`criteria: ${e}`);
+  if (cr.contract.length && cr.cliContract.length) warnings.push('the spec has both an HTTP contract and a CLI contract; the factory verifies one kind per feature in this phase, so split the feature or keep one contract');
   if (has('superseded_by')) {
     for (const d of parseDeps(fm.superseded_by)) {
       if (!FEATURE_ID.test(d)) errors.push(`superseded_by has invalid id "${d}"`);

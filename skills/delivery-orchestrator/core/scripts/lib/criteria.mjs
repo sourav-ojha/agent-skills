@@ -26,7 +26,9 @@ const TITLES = {
   'error and failure scenarios': 'er',
   'failure scenarios': 'er',
   'http contract': 'contract',
+  'cli contract': 'cli',
 };
+const MAX_CLI_PATTERNS = 500;
 const METHODS = 'GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS';
 
 const norm = (s) => String(s).replace(/\s+/g, ' ').trim();
@@ -258,7 +260,7 @@ const UNDERLINE = /^ {0,3}(=+|-+)\s*$/;
 
 function splitSections(text, errors) {
   const lines = String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
-  const found = { ac: [], ec: [], er: [], contract: [] };
+  const found = { ac: [], ec: [], er: [], contract: [], cli: [] };
   const order = [];
   let fence = null; let inComment = false; let cur = null; let longLine = false;
   for (let i = 0; i < lines.length; i++) {
@@ -366,11 +368,44 @@ export function extractCriteria(specText) {
     if (!n) errors.push(`HTTP contract line does not parse as \`METHOD /path\`: ${norm(line)}`);
   }
 
+  // CLI contract: one backticked command per bullet; the first word is a display name and is dropped. Bounded so a hostile spec
+  // cannot grow the result without limit (MAX_LINE already bounds each line).
+  const cliContract = [];
+  if (found.cli.length) {
+    let capped = false;
+    for (const line of vis('cli')) {
+      if (line.includes('{{')) { errors.push(`CLI contract line has a template placeholder: ${norm(line)}`); continue; }
+      let n = 0;
+      for (const m of line.matchAll(/`([^`]+)`/g)) {
+        const w = norm(m[1]).split(' ');
+        if (!w[0]) continue;
+        n++;
+        if (cliContract.length < MAX_CLI_PATTERNS) cliContract.push({ words: w.slice(1) });
+        else if (!capped) { capped = true; errors.push(`CLI contract has more than ${MAX_CLI_PATTERNS} patterns`); }
+      }
+      if (!n) errors.push(`CLI contract line does not parse as a backticked command: ${norm(line).slice(0, 200)}`);
+    }
+    if (!cliContract.length && !capped) errors.push('CLI contract section has no backticked command patterns');
+  }
+
   if (!found.ac.length) errors.push('missing "Acceptance criteria" section');
   else if (!ac.length) errors.push('Acceptance criteria section has no parseable AC-<n> rows');
 
   const sections = canonicalSpec(specText);
-  return { ac, ec, er, contract, sections, errors, ok: errors.length === 0 };
+  return { ac, ec, er, contract, cliContract, sections, errors, ok: errors.length === 0 };
+}
+
+// Does `args` match one CLI contract pattern, word for word? `<name>` matches exactly one non-empty argument; a final `...`
+// allows any further arguments (zero or more).
+const PLACEHOLDER = /^<[^<>\s]+>$/;
+export function matchCliContract(cliContract, args) {
+  if (!Array.isArray(cliContract) || !Array.isArray(args)) return false;
+  return cliContract.some(({ words }) => {
+    const open = words.at(-1) === '...';
+    const fixed = open ? words.slice(0, -1) : words;
+    if (open ? args.length < fixed.length : args.length !== fixed.length) return false;
+    return fixed.every((w, i) => (PLACEHOLDER.test(w) ? typeof args[i] === 'string' && args[i] !== '' : args[i] === w));
+  });
 }
 
 export const criteriaHash = (sections) => `sha256:${createHash('sha256').update(String(sections)).digest('hex')}`;
