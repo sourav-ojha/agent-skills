@@ -391,7 +391,7 @@ const LINE_SHAPE = new RegExp(`^(?:${ID}(?:, ${ID})*: ${API_SYMPTOM}|${FALLBACK}
 function scenarioStrings(list, canary) {
   const out = new Set();
   if (typeof canary === 'string' && canary) out.add(canary);
-  const stack = list.filter((x) => x && typeof x === 'object').flatMap((sc) => [sc.setup, sc.request, sc.assert, sc.steps, sc.expect].map((v) => [v, false]));
+  const stack = list.filter((x) => x && typeof x === 'object').flatMap((sc) => [sc.setup, sc.request, sc.assert, sc.steps, sc.expect, sc.run].map((v) => [v, false]));
   let n = 0;
   while (stack.length) {
     const [v, data] = stack.pop();

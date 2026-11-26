@@ -6,11 +6,12 @@ import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { factoryHome, writeJsonAtomic, readJson } from './factoryhome.mjs';
 import { FEATURE_ID } from './queue.mjs';
+import { matchCliContract } from './criteria.mjs';
 
 export const CRIT_ID = /^(AC|EC|ER)-[1-9]\d{0,3}$/;
 export const SCEN_ID = /^S-\d{1,4}$/;
 const CANARY = /^fx-[0-9a-f]{6}$/;
-const KINDS = ['api', 'ui'];
+const KINDS = ['api', 'ui', 'cli'];
 
 export const newCanary = () => `fx-${randomBytes(3).toString('hex')}`;
 
@@ -40,6 +41,81 @@ export const validAssertion = (a) => {
   }
   return false;
 };
+// ---- cli scenarios ----------------------------------------------------------------------------------------------------------------
+// Limits from the cli design ("Scenario shape"). Tasks 4 and 5 (runner, verifier) import them so lint and run agree.
+export const CLI_LIMITS = Object.freeze({ maxArgs: 64, maxArgLen: 4096, maxStdinBytes: 64 * 1024, maxSetupFiles: 50, maxFileTextBytes: 256 * 1024, maxSetupRuns: 10, maxAssertions: 100, maxPathLen: 256, maxRegexLen: 256 });
+// Relative, forward slashes, no `..` segment, no leading `/`, no NUL, at most 256 characters.
+export const validRelPath = (p) => typeof p === 'string' && p !== '' && p.length <= CLI_LIMITS.maxPathLen
+  && !p.startsWith('/') && !p.includes('\\') && !p.includes('\0') && !p.split('/').some((x) => x === '..' || x === '');
+const TEXT_OPS = ['equals', 'contains', 'not_contains', 'matches'];
+const regexOk = (re) => typeof re === 'string' && re !== '' && re.length <= CLI_LIMITS.maxRegexLen && (() => { try { new RegExp(re); return true; } catch { return false; } })();
+// A text check: exactly one text op on the whole text, or `json_path` plus exactly one JSON_PATH_OPS entry.
+const validTextCheck = (t) => {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return false;
+  const keys = Object.keys(t);
+  if ('json_path' in t) return validAssertion(t) && (!('matches' in t) || regexOk(t.matches));
+  if (keys.length !== 1 || !TEXT_OPS.includes(keys[0])) return false;
+  const [op] = keys;
+  if (typeof t[op] !== 'string') return false;
+  if (op === 'contains') return t.contains !== '';
+  if (op === 'matches') return regexOk(t.matches);
+  return true;
+};
+// Accepted cli assertion shapes (Task 5's engine must execute exactly this list):
+//   { exit: <integer 0-255> }
+//   { stdout | stderr: <text check> }
+//   { file: <relative path>, exists: <boolean> }
+//   { file: <relative path>, <text check> }
+export const validCliAssertion = (a) => {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
+  const keys = Object.keys(a);
+  if ('exit' in a) return keys.length === 1 && Number.isInteger(a.exit) && a.exit >= 0 && a.exit <= 255;
+  if ('stdout' in a || 'stderr' in a) return keys.length === 1 && validTextCheck(a.stdout ?? a.stderr);
+  if ('file' in a) {
+    if (!validRelPath(a.file)) return false;
+    const { file: _f, ...rest } = a;
+    if ('exists' in rest) return Object.keys(rest).length === 1 && typeof rest.exists === 'boolean';
+    return validTextCheck(rest);
+  }
+  return false;
+};
+const validArgs = (args) => Array.isArray(args) && args.length <= CLI_LIMITS.maxArgs
+  && args.every((x) => typeof x === 'string' && x.length <= CLI_LIMITS.maxArgLen && !x.includes('\0'));
+const validStdin = (v) => v === undefined || (typeof v === 'string' && Buffer.byteLength(v) <= CLI_LIMITS.maxStdinBytes);
+const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+function lintCli(s, label, criteria, problems) {
+  const contract = criteria.cliContract;
+  const bad = (m) => problems.push(`scenario ${label}: ${m}`);
+  const runOk = (r, what) => {
+    if (!isObj(r) || !validArgs(r.args) || !validStdin(r.stdin)) { bad(`${what} needs args (max ${CLI_LIMITS.maxArgs} strings of ${CLI_LIMITS.maxArgLen} chars, no NUL) and optional stdin (max 64 KiB)`); return; }
+    if (!Array.isArray(contract) || contract.length === 0) bad(`${what} cannot match: the spec has no CLI contract`);
+    else if (!matchCliContract(contract, r.args)) bad(`${what} args are not a command in the CLI contract`);
+  };
+  if (s.run === undefined) bad('cli scenario needs run');
+  else runOk(s.run, 'run');
+  if (!nonEmptyArr(s.assert)) bad('cli scenario needs a non-empty assert');
+  else if (s.assert.length > CLI_LIMITS.maxAssertions) bad(`cli scenario has ${s.assert.length} assertions (max ${CLI_LIMITS.maxAssertions})`);
+  else {
+    const n = s.assert.filter((a) => !validCliAssertion(a)).length;
+    if (n) bad(`${n} assertion(s) are not a recognised shape`);
+    if (!s.assert.some((a) => validCliAssertion(a) && 'exit' in a)) bad('cli scenario needs an exit assertion');
+  }
+  if (s.setup === undefined) return;
+  if (!isObj(s.setup)) { bad('cli setup must be an object with files and runs'); return; }
+  const { files, runs } = s.setup;
+  if (files !== undefined) {
+    if (!Array.isArray(files)) bad('setup.files must be an array');
+    else if (files.length > CLI_LIMITS.maxSetupFiles) bad(`setup has ${files.length} files (max ${CLI_LIMITS.maxSetupFiles})`);
+    else files.forEach((f, k) => {
+      if (!isObj(f) || !validRelPath(f.path) || typeof f.text !== 'string' || Buffer.byteLength(f.text) > CLI_LIMITS.maxFileTextBytes) bad(`setup file ${k + 1} needs a relative path and text (max 256 KiB)`);
+    });
+  }
+  if (runs !== undefined) {
+    if (!Array.isArray(runs)) bad('setup.runs must be an array');
+    else if (runs.length > CLI_LIMITS.maxSetupRuns) bad(`setup has ${runs.length} runs (max ${CLI_LIMITS.maxSetupRuns})`);
+    else runs.forEach((r, k) => runOk(r, `setup run ${k + 1}`));
+  }
+}
 const tooDeep = (v, d = 0) => {
   if (d > MAX_DEPTH) return true;
   if (v && typeof v === 'object') return Object.values(v).some((x) => tooDeep(x, d + 1));
@@ -101,7 +177,7 @@ const refusedRequest = (r) => {
   if (!r.headers || typeof r.headers !== 'object' || Array.isArray(r.headers)) return true;
   return Object.keys(r.headers).some((n) => REFUSED_HEADERS.has(n.toLowerCase()) || /^(proxy-|sec-)/i.test(n));
 };
-const dataOf = (s) => canonical([s.setup, s.request, s.steps, s.expect]);
+const dataOf = (s) => canonical([s.setup, s.request, s.steps, s.expect, s.run, s.assert]);
 const strList = (a) => Array.isArray(a) && a.every((x) => typeof x === 'string' && x.trim() !== '' && x.length <= 500);
 
 export function lintScenarios(doc, criteria, currentHash) {
@@ -157,7 +233,8 @@ export function lintScenarios(doc, criteria, currentHash) {
       if (!nonEmptyArr(s.steps) || !nonEmptyArr(s.expect)) problems.push(`scenario ${label}: ui scenario needs steps and expect`);
       else if (!strList(s.steps) || !strList(s.expect)) problems.push(`scenario ${label}: steps and expect entries must be non-empty strings (max 500 chars)`);
       if (s.setup !== undefined && !strList(s.setup)) problems.push(`scenario ${label}: setup entries must be non-empty strings (max 500 chars)`);
-    } else problems.push(`scenario ${label}: kind must be api or ui`);
+    } else if (s.kind === 'cli') lintCli(s, label, criteria, problems);
+    else problems.push(`scenario ${label}: kind must be api, ui or cli`);
 
     if (typeof doc.canary === 'string' && CANARY.test(doc.canary) && dataOf(s).includes(doc.canary)) canaryHit = true;
   });
