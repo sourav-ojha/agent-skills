@@ -591,6 +591,7 @@ export async function cmdScenarios(ctx) {
     const r = await authorOne(ctx, spec, bc);
     if (r.status === 'error') {
       ctx.out(`${spec.id} author session: ${r.kind}`);
+      if (r.kind === 'settings_unsafe') ctx.out(`fix: ${SETTINGS_FIX}`); // the category only, never the refused key names
       // Interrupted author sessions are restarted from scratch (no partial context) after the same wait; a stop ends the command.
       if (r.kind === 'usage_limit' || r.kind === 'budget') {
         if (await authorInterrupt(ctx, spec, r) === 'retry') { i--; continue; }
@@ -807,6 +808,10 @@ function builderRoot(ctx) {
   if (bad(real)) refuse('the builder directory resolves into FACTORY_HOME', 'point FACTORY_BUILDER_HOME at a real directory outside FACTORY_HOME');
   return real;
 }
+// One line of an error for the terminal, with every path replaced by <path> (as the top-level handler does).
+const redactLine = (e) => String(e?.message || e).split('\n')[0].replace(/(?:[A-Za-z]:)?(?:\/[^\s/:'"]+)+\/?/g, '<path>').replace(/[^\s'"]*\/[^\s'"]*/g, '<path>').slice(0, 200);
+const LEFTOVER_FIX = 'a process still names the builder clone or its run dir in its arguments, environment (PWD, OLDPWD) or working directory: end it, and start factory from a shell that never changed into the clone';
+const SETTINGS_FIX = 'run factory with a HOME whose settings.json (in its .claude folder) holds only the allowed keys ($schema, model, env, permissions.deny, cleanupPeriodDays, includeCoAuthoredBy, and enabledPlugins and sandbox only when empty): a dedicated factory home, logged in to claude and gh (references/factory-driver.md, "Before the first run")';
 const survivors = (ctx, markers) => (ctx.deps.survivors || scanSurvivors)(markers);
 // Every time, whether or not this process has touched the builder clone yet (a restart resuming at pr_open/ci_passed included).
 const builderRun = (ctx) => path.join(ctx.bRoot, 'run', ctx.key);
@@ -937,6 +942,8 @@ const specRel = (ctx, f) => {
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || path.posix.basename(rel) !== `${f.id}.md` || /[\0\n]/.test(rel)) throw new Error('the feature spec path is not inside the driver clone');
   return rel;
 };
+// `deliver built` refuses a spec whose frontmatter does not say `delivery: complete`, so the brief names the implementer's Close step.
+const DELIVERY_TEXT = 'When every acceptance criterion is delivered and the tests pass, record it in the specification before the last commit (the implementer Close step: `delivery: complete` in the frontmatter and a row in its Delivery log); if not, report blocked with the reason.';
 const RESULT_TEXT = (id) => `At the end write .implementation/${id}/result.json: {"status":"done","summary":"..."} or {"status":"blocked","question":"..."}. Commit your work on the checked-out branch (never push, never open a pull request).`;
 // Briefs (spec "Builder result"): build = id + spec path; CI fix = check names + bounded tail; symptom fix = the symptom brief only.
 // An interrupted step (act.continue) gets the continue brief appended: feature id, step, continue from the branch and the ledger.
@@ -950,7 +957,7 @@ function baseBrief(ctx, f, act) {
   const rel = specRel(ctx, f);
   const head = `${f.id}: specification ${rel}.`;
   switch (act.brief) {
-    case 'build': return { prompt: `Build ${head} Use the implementer skill, unattended. Put a short pull request description in .delivery/pr-${f.id}.md. ${RESULT_TEXT(f.id)}` };
+    case 'build': return { prompt: `Build ${head} Use the implementer skill, unattended. Put a short pull request description in .delivery/pr-${f.id}.md. ${DELIVERY_TEXT} ${RESULT_TEXT(f.id)}` };
     case 'local_fix': {
       const lines = (Array.isArray(f.local_failing) ? f.local_failing : []).slice(0, 10).map((x) => `- local check ${clean(x.name, 80)} failed: ${clean(x.tail, 400)}`);
       return { prompt: `Fix the local checks of ${head} Read the fix brief .implementation/${f.id}/fix-brief.md (implementer --fix-brief). ${RESULT_TEXT(f.id)}`, file: ['Local checks failed:', ...lines].join('\n') };
@@ -1442,6 +1449,8 @@ async function loop(ctx) {
         try { addAttention(ctx.fh, ctx.key, { id: f.id, kind, severity: 'high', what: 'the WIP commit of the interrupted session failed: the work is uncommitted in the builder clone', run: 'factory run --continue' }); } catch { /* the jsonl row and the terminal line remain */ }
       }
       ctx.out(`stopped: ${kind}`);
+      if (kind === 'leftovers') ctx.out(`fix: ${LEFTOVER_FIX}`);
+      else if (kind === 'error') ctx.out(`error: ${redactLine(e)}`);
       ctx.stopReason = kind;
       return finish(ctx, 2);
     }

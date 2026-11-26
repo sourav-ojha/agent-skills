@@ -1003,6 +1003,17 @@ test('run record: verification fields and session usage are IDs and counts only;
 
 // ---- factory run --------------------------------------------------------------------------------------------------------------------
 
+test('factory scenarios: a HOME whose .claude/settings.json has hooks refuses the author session with a fix line naming the dedicated home, never the key names', (t) => {
+  const w = world(t);
+  fs.writeFileSync(path.join(w.home, '.claude', 'settings.json'), JSON.stringify({ hooks: { Stop: [] }, env: { SECRET_TOKEN_NAME: 'x' } }));
+  const r = w.factory(['scenarios']);
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.out, /^FEATURE-001 author session: settings_unsafe$/m);
+  assert.match(r.out, /^fix: run factory with a HOME whose settings\.json \(in its \.claude folder\) holds only the allowed keys .*Before the first run/m);
+  assert.ok(!/hooks|SECRET_TOKEN_NAME/.test(r.out), 'no refused key names in the output');
+  assert.equal(w.sessions().length, 0, 'no session started');
+});
+
 test('factory run: two API features delivered end to end; factory/verified posted on the merged head before the merge', (t) => {
   const w = ready(t, { fake: { plan: { 'FEATURE-001': [good('FEATURE-001')], 'FEATURE-002': [good('FEATURE-002')] } } });
   const r = w.factory(['run']);
@@ -1019,6 +1030,7 @@ test('factory run: two API features delivered end to end; factory/verified poste
     assert.equal(gh.prs[f.pr.number - 1].state, 'MERGED');
     assert.match(gh.prs[f.pr.number - 1].body, /^Verified: 2\/2 scenarios at [0-9a-f]{7}$/m);
     assert.equal(builderRuns(w, f.id).length, 1);
+    assert.match(promptOf(builderRuns(w, f.id)[0]), /record it in the specification .*`delivery: complete`/, 'the build brief names the spec writeback deliver built checks');
   }
   // The builder ran in the builder clone (outside FACTORY_HOME), never in the driver clone.
   for (const s of w.sessions().filter((x) => !x.argv.includes('--tools'))) { assert.equal(s.cwd, w.builder); assert.ok(!s.cwd.startsWith(w.fhome + path.sep)); }
@@ -1215,6 +1227,7 @@ test('factory run: a process escaping the builder session (own session, cwd in t
   const r = w.factory(['run']);
   assert.equal(r.code, 2, r.out + r.err);
   assert.match(r.out, /attention: FEATURE-001 building \(leftovers\)/); assert.match(r.out, /stopped: leftovers/);
+  assert.match(r.out, /^fix: a process still names the builder clone or its run dir .*\(PWD, OLDPWD\)/m, 'the stop says what counts as a live process');
   assert.equal(w.queue().features[0].state, 'building', 'state left as it is');
 });
 

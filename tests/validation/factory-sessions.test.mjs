@@ -105,9 +105,22 @@ test('checkSettings: a Read deny without a sandbox denyRead twin, and unknown ke
   assert.ok(S.checkSettings(b, { allowPlaceholders: true }).some((m) => /has no sandbox denyRead entry/.test(m)));
   for (const mut of [(s) => { s.env = {}; }, (s) => { s.statusLine = {}; }, (s) => { s.apiKeyHelper = 'x'; }, (s) => { s.enabledPlugins = {}; },
     (s) => { s.permissions.additionalDirectories = []; }, (s) => { s.sandbox.enableWeakerNestedSandbox = true; }, (s) => { s.sandbox.filesystem.allowWrite = []; },
-    (s) => { s.sandbox.network.allowUnixSockets = []; }, (s) => { s.sandbox.network = []; }]) {
+    (s) => { s.sandbox.network.allowAllUnixSockets = true; }, (s) => { s.sandbox.network = []; }]) {
     const s = base(); mut(s); assert.ok(S.checkSettings(s, { allowPlaceholders: true }).some((m) => /unknown key|must be an object/.test(m)), String(mut));
   }
+});
+
+test('builder settings: unix sockets only in the sandbox temp dir (tsx and similar runners open an IPC socket there)', () => {
+  const tpl = readTemplate('builder');
+  assert.deepEqual(tpl.sandbox.network.allowUnixSockets, ['{{SANDBOX_TMP}}']);
+  assert.deepEqual(S.checkSettings(tpl, { allowPlaceholders: true }), []);
+  const uid = process.getuid();
+  assert.deepEqual(S.sandboxTmpDirs(), [`/tmp/claude-${uid}`, `/private/tmp/claude-${uid}`]);
+  for (const bad of [['/'], ['/tmp'], ['/var/run'], [`/tmp/claude-${uid}/x`], [`/tmp/claude-${uid + 1}`], [1], 'x']) {
+    const s = JSON.parse(JSON.stringify(tpl)); s.sandbox.network.allowUnixSockets = bad;
+    assert.ok(S.checkSettings(s, { allowPlaceholders: true }).some((m) => /unix sockets outside/.test(m)), JSON.stringify(bad));
+  }
+  assert.ok(S.checkSettings(tpl).some((m) => /unix sockets outside/.test(m)), 'an unsubstituted placeholder is not a socket dir');
 });
 
 test('author settings: no tools, no network, hooks off', () => {
@@ -174,6 +187,7 @@ test('materialiseSettings: substitutes FACTORY_HOME, HOME and REPO as absolute p
   assert.ok(s.sandbox.filesystem.denyRead.includes(`${home}/.ssh`) && s.permissions.deny.includes(`Read(/${home}/.ssh/**)`));
   assert.ok(s.sandbox.filesystem.denyWrite.includes(`${repo}/.git/hooks`));
   assert.ok(s.permissions.deny.includes('Bash(gh *)'));
+  assert.deepEqual(s.sandbox.network.allowUnixSockets, S.sandboxTmpDirs(), 'unix sockets: the sandbox temp dir, both spellings');
   assert.deepEqual(S.checkSettings(s), []);
   const a = S.materialiseSettings('author', { factoryHome: fh, home });
   assert.notEqual(a, file);

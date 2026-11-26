@@ -44,6 +44,15 @@ All read from `.product/delivery.json` on `origin/<base>`; each prints a fix lin
 
 Also refused: a `FACTORY_HOME` that is a symlink, owned by another user or group/world writable; a lock held by a live run; an untrusted driver clone (below). Merging still needs `merge.mode: "squash"` in the base config: the driver never passes `--merge`. Every start prints a warning that `factory/verified` is a plain commit status (see [verification.md](verification.md#factoryverified)).
 
+## Before the first run
+
+Measured on a real repository (Claude Code 2.1, git 2.52, macOS). Each item stops a run on its own:
+
+1. **A dedicated factory home.** Sessions refuse (`settings_unsafe`) a user `settings.json` (in the home's `.claude` folder) with anything beyond `$schema`, `model`, `env` (allowlisted names), `permissions.deny`, `cleanupPeriodDays`, `includeCoAuthoredBy`, and an empty `enabledPlugins` or `sandbox`. Hooks, a status line or plugins, as most personal setups have, refuse every session. Make a separate home whose `.claude` folder holds a `settings.json` of `{}`, log in there once yourself (`HOME=<home> claude`, then `/login`), and start `factory` with `HOME=<home>`. On macOS the login lives in that home's own keychain, so the home cannot be moved afterwards.
+2. **`gh` logged in for that home** (`HOME=<home> gh auth login`), as the configured `github.account`: your usual login is in your real keychain and is not visible there. Give the home a `~/.ssh` (a link to yours works) if `origin` uses SSH.
+3. **Dependencies installed in the builder clone.** The builder has no network. After the first run creates `<FACTORY_HOME>-builder/<owner>__<repo>`, install there once (for example `pnpm install --frozen-lockfile`) and again whenever the lockfile changes. Without it the builder reports blocked.
+4. **Start `factory` from a shell that never changed into a clone.** The leftover scan counts any process naming the builder clone or its run dir in its arguments, environment or working directory, `PWD` and `OLDPWD` included: a script that did `cd <builder clone>` and then left counts, and the run stops as `leftovers`. Use `git -C <dir>` in scripts.
+
 ## Layout
 
 `FACTORY_HOME` comes from the driver's environment (default `~/.factory`), is resolved to an absolute real path, and is created 0700; `deliver` subprocesses get that resolved path.
@@ -215,7 +224,7 @@ Session isolation:
 9. **`CLAUDE_CONFIG_DIR` and auth** (step 6): unverified, so `configDir` is not used and the author runs with `--no-session-persistence`.
 10. **API-key or token auth** is not passed through.
 11. **Orphans if the driver is SIGKILLed.** Recorded groups are killed on the next start (tested). A process that leaves its group (`setsid`) is not reached by the kill; the survivor scan (by path, argv, environment and cwd) catches it and stops the run. A process that clears its environment, rewrites its argv and leaves the path is not found.
-12. **No network for the builder**: dependencies must already be installed in the clone.
+12. **No network for the builder**: dependencies must already be installed in the clone ([Before the first run](#before-the-first-run)).
 13. **`blockReadsOutsideWorkingDirectories` is not set** (the builder reads the implementer skill outside the repo); `FACTORY_HOME` and transcripts are denied by name.
 14. **The max-turns result shape** is from docs, not a capture.
 15. **`disableAllHooks` is unproven** against hooks and a status line in user settings, and against plugin hooks (step 5). Until both are proven the allowlist refuses them, and the factory refuses on a machine with either (by design).
@@ -245,3 +254,5 @@ Phase 2 (run control, [run-control.md](run-control.md)) additions:
 35. **Crash-resume of an interrupted feature** is capped separately (`interrupted_resumes`, 3, then `resume_loop`); a session that always times out is blocked after three timeouts.
 36. **A dying driver leaves its session running.** The session is in its own process group, so it outlives a driver that is SIGKILLed or crashes (exit criterion E3) and runs until the next start kills the recorded group, up to `session_timeout_s` and its max turns. Its usage is never recorded, so the feature and day caps undercount. A crash during a session that was not interrupted rebuilds that step from the base (crash rules): the session's work is lost.
 37. **HEAD off the feature branch.** A builder that switched the clone to another branch gets no WIP commit when it is interrupted (one line, a `wip_skipped` row); continuing the step checks the feature branch out again and its uncommitted edits are lost.
+38. **An empty `objects/info/commit-graphs` directory is allowed.** A builder session's clone ends up with one; it holds no graph, so it cannot change a parent. A file in it, or a symlink in its place, is still refused. Which process creates it was not pinned down.
+39. **Unix sockets in the sandbox temp dir.** The builder may open unix sockets only in Claude Code's sandbox temp dir (`/tmp/claude-<uid>`, both spellings on macOS): test runners such as tsx open an IPC socket there, and without it every test that launches the CLI fails with `EPERM`. Any sandboxed process can then talk to another sandboxed process's socket in that dir. On Linux the sandbox cannot allow a socket by path, so the setting has no effect there. Changing `builder.json` changes its sha: save a new isolation probe result.

@@ -212,7 +212,11 @@ export function checkRepoMetadata(cwd, { global = [], timeout = DEFAULT_TIMEOUT_
   if (dirs.status !== 0) throw new Error('git worktree not safe: git dir unreadable');
   const [gitDir, commonDir] = dirs.stdout.split('\n');
   if (!gitDir || !commonDir) throw new Error('git worktree not safe: git dir unreadable');
-  const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
+  // An EMPTY objects/info/commit-graphs directory holds no graph, so it cannot change a parent: a builder session's clone ends up
+  // with one (seen with git 2.52 and Claude Code 2.1), and refusing it stopped every built feature. A file inside it, or a
+  // symlink in its place, is still refused.
+  const emptyDir = (p) => { try { return fs.lstatSync(p).isDirectory() && fs.readdirSync(p).length === 0; } catch { return false; } };
+  const exists = (p) => { try { fs.lstatSync(p); } catch { return false; } return !(path.basename(p) === 'commit-graphs' && emptyDir(p)); };
   for (const rel of PLANTED) for (const d of new Set([commonDir, gitDir])) if (exists(path.join(d, ...rel))) throw new Error(`git worktree not safe: ${rel.join('/')} present`);
 }
 // Throws when <git dir>/hooks or <common dir>/hooks holds anything but git's own *.sample files (core.hooksPath itself is refused by
