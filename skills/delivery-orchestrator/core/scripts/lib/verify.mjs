@@ -305,6 +305,16 @@ function removeWorktree(git, dir, trashRoot) {
 const PRUNE_FAILED = 'git worktree prune failed in the factory clone: a stale verification worktree registration remains';
 const prune = (git) => { try { return git('worktree', 'prune')?.code === 0; } catch { return false; } };
 
+// { <scenario id>: <family word> } for the non-passing cli scenarios: ids are SCEN_ID (checked by scenarioPlan) and words are only
+// CLI_FAMILIES entries, so nothing else (no output, path or argument) can reach the driver's brief through it. Not in the verdict.
+function familyMap(results, families) {
+  const out = {};
+  results.forEach((r, i) => {
+    if ((r.status !== 'pass' || r.flaky) && SCEN_ID.test(r.id) && CLI_FAMILIES.includes(families[i])) out[r.id] = families[i];
+  });
+  return out;
+}
+
 const combine = (runs) => {
   const flaky = runs.some((r) => r !== runs[0]);
   return { status: flaky ? 'fail' : runs[0], flaky };
@@ -330,7 +340,7 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   const scHash = scenariosHash(scenarios);
 
   const prior = readVerdict(repoKey, id, sha);
-  if (prior && verdictMatches(prior, { sha, scenariosHash: scHash, criteriaHash })) return { verdict: 'pass', doc: prior, brief: [], reused: true };
+  if (prior && verdictMatches(prior, { sha, scenariosHash: scHash, criteriaHash })) return { verdict: 'pass', doc: prior, brief: [], reused: true, ...(isCli ? { families: {} } : {}) };
 
   const deadline = s.now() + budgetS * 1000;
   const leftS = () => Math.ceil((deadline - s.now()) / 1000);
@@ -400,29 +410,33 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
       return status;
     };
 
-    // cli run phase, per run of a scenario: a fresh empty case folder under the run temp is the cwd and the only writable dir besides
-    // the run temp; the worktree is mounted READ-ONLY; no network; no port checks, app start, seed or stop. Every invocation (the
+    // cli run phase, per run of a scenario: a fresh per-run temp <tmp>/run-<random> (its own TMPDIR, and HOME = <run>/home made by
+    // withTmp) holding a fresh empty case folder <run>/case, the cwd. Only that per-run temp is writable or readable among the run
+    // dirs: earlier runs' dirs are siblings, outside it (FACTORY_HOME stays read-denied), so no state carries between runs or
+    // scenarios. The worktree is mounted READ-ONLY; no network; no port checks, app start, seed or stop. Every invocation (the
     // scenario's setup runs included) goes through `run`, which runs the survivor scan right after it, before returning, so the next
     // invocation can never start before the previous one was scanned. The runner turns a throw from `run` into `blocked`, so a scan
     // failure or escape is kept in `cliFault`, every later invocation is refused, and it is rethrown once the runner returns.
     let cliFault = null;
-    const freshCase = () => {
-      const d = path.join(tmp, `case-${crypto.randomBytes(8).toString('hex')}`);
-      fs.mkdirSync(d, { mode: 0o700 }); // never through a planted link: mkdir fails on an existing name
+    // A new empty directory, never through a planted link (mkdir fails on an existing name); the parent was made by this process.
+    const freshDir = (d) => {
+      fs.mkdirSync(d, { mode: 0o700 });
       const st = fs.lstatSync(d);
-      if (st.isSymbolicLink() || !st.isDirectory() || fs.readdirSync(d).length !== 0) throw new Error('could not make a fresh case folder');
+      if (st.isSymbolicLink() || !st.isDirectory() || fs.readdirSync(d).length !== 0) throw new Error('could not make a fresh run folder');
       return d;
     };
     const cliRun = async (sc, command) => {
       checkBudget();
-      const caseDir = freshCase();
-      const profile = s.sandboxProfile({ writable: [caseDir], readOnly: [wt], tmpDir: tmp, network: 'none' });
-      const runEnv = { ...env, CI: '1', NO_COLOR: '1', HOME: path.join(tmp, 'home'), TMPDIR: tmp }; // withTmp sets the same HOME/TMPDIR
+      const runTmp = freshDir(path.join(tmp, `run-${crypto.randomBytes(8).toString('hex')}`));
+      const caseDir = freshDir(path.join(runTmp, 'case'));
+      const profile = s.sandboxProfile({ writable: [caseDir], readOnly: [wt], tmpDir: runTmp, network: 'none' });
+      // withTmp sets the same HOME/TMPDIR from the profile's run temp; the survivor markers ([wt, tmp]) cover every per-run temp.
+      const runEnv = { ...env, CI: '1', NO_COLOR: '1', HOME: path.join(runTmp, 'home'), TMPDIR: runTmp };
       const run = async (argv, { stdin, timeoutS } = {}) => {
         if (cliFault) throw cliFault;
         if (leftS() <= 0) { cliFault = new Error('verification exceeded its time budget'); throw cliFault; }
         try {
-          return await s.runSandboxedCapture(argv, { cwd: caseDir, env: runEnv, timeoutS: Math.max(1, Math.min(timeoutS ?? plan.timeoutS, leftS())), profile, tmpDir: tmp, stdin });
+          return await s.runSandboxedCapture(argv, { cwd: caseDir, env: runEnv, timeoutS: Math.max(1, Math.min(timeoutS ?? plan.timeoutS, leftS())), profile, tmpDir: runTmp, stdin });
         } finally {
           try { await afterPhase('app.cli'); } catch (e) { cliFault ??= e; }
         }
@@ -447,7 +461,12 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
     for (const sc of list) {
       const runs = []; const fams = [];
       for (let i = 0; i < RUNS; i++) {
-        if (!setupOk) { runs.push('blocked'); fams.push('setup'); } else if (isCli) { const r = await cliRun(sc, command); runs.push(r.status); fams.push(r.failed); } else runs.push(await oneRun(sc));
+        if (!setupOk) {
+          runs.push('blocked'); fams.push('setup');
+        } else if (isCli) {
+          const r = await cliRun(sc, command);
+          runs.push(r.status); fams.push(r.failed);
+        } else runs.push(await oneRun(sc));
       }
       results.push({ id: sc.id, covers: [...sc.covers], ...combine(runs) });
       families.push(isCli ? fams[runs.findIndex((x) => x !== 'pass')] : undefined);
@@ -458,7 +477,8 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
     const doc = { feature: id, sha, scenarios_hash: scHash, criteria_hash: criteriaHash, results, verdict, at: new Date().toISOString() };
     writeVerdict(repoKey, doc);
     const brief = verdict === 'pass' ? [] : symptomBrief(results.map((r, i) => ({ ...r, failed: families[i] })).filter((r) => r.status !== 'pass' || r.flaky), scenarios, scenarios.canary);
-    outcome = { verdict, doc, brief, reused: false };
+    // cli only (the api result shape is unchanged): fixed family words per failing scenario id, for the driver's brief.
+    outcome = { verdict, doc, brief, reused: false, ...(isCli ? { families: familyMap(results, families) } : {}) };
   } catch (e) {
     failure = e;
     if (running) { try { await stopRunning(); } catch { /* still alive: the worktree stays (below) */ } }

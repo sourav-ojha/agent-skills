@@ -44,6 +44,12 @@ else if (cmd === 'write-case') { fs.writeFileSync('out.txt', 'ok'); console.log(
 else if (cmd === 'write-wt') { try { fs.writeFileSync(new URL('../written.txt', import.meta.url), 'x'); console.log('wrote'); } catch (e) { console.log('denied:' + e.code); } }
 else if (cmd === 'write-wt-strict') fs.writeFileSync(new URL('../written.txt', import.meta.url), 'x');
 else if (cmd === 'env') console.log(JSON.stringify({ home: process.env.HOME, tmp: process.env.TMPDIR, ci: process.env.CI, nc: process.env.NO_COLOR, cwd: process.cwd(), port: process.env.PORT ?? null }));
+else if (cmd === 'remember') {
+  const marks = [process.env.HOME + '/.mem', process.env.TMPDIR + '/.mem'];
+  const seen = marks.filter((m) => fs.existsSync(m));
+  for (const m of marks) fs.writeFileSync(m, 'x');
+  console.log(seen.length ? 'carried' : 'fresh');
+}
 else process.exit(2);
 `;
 
@@ -112,6 +118,7 @@ test('a cli set with only app.cli verifies: no port check, no app start/stop, tw
   assert.equal(r.verdict, 'pass', JSON.stringify(r.doc?.results));
   assert.deepEqual(r.doc.results, [{ id: 'S-1', covers: ['AC-1'], status: 'pass', flaky: false }, { id: 'S-2', covers: ['AC-2', 'EC-1'], status: 'pass', flaky: false }]);
   assert.deepEqual(r.brief, []);
+  assert.deepEqual(r.families, {});
   assert.deepEqual(Object.keys(r.doc).sort(), VERDICT_KEYS);
   assert.deepEqual(V.readVerdict('o__r', 'FEATURE-001', w.sha), r.doc);
   assert.equal(r.doc.scenarios_hash, SC.scenariosHash(cscenarios()));
@@ -146,6 +153,13 @@ test('run phase: worktree read-only, case folder writable, network none, cwd the
     assert.ok(p.tmpDir.startsWith(w.tmpRoot + path.sep));
   }
   assert.deepEqual(new Set(runProfiles.map((p) => p.writable[0])), new Set(mainCaps(w.log).map((e) => e[2].cwd)), 'the writable dir is the run\'s case folder');
+  assert.equal(new Set(runProfiles.map((p) => p.tmpDir)).size, 4, 'a fresh run temp per run');
+  for (const p of runProfiles) {
+    assert.equal(p.writable[0], path.join(p.tmpDir, 'case'), 'the case folder lives in its own run temp');
+    for (const q of runProfiles) if (q !== p) {
+      for (const root of [...p.writable, p.tmpDir]) assert.ok(!q.tmpDir.startsWith(root + path.sep) && q.tmpDir !== root && !root.startsWith(q.tmpDir + path.sep), 'no other run\'s folder is reachable');
+    }
+  }
   const setup = of(w.log, 'setup');
   assert.equal(setup.length, 1, 'app.setup runs once'); assert.deepEqual(setup[0][1], ['npm', 'ci']); assert.equal(setup[0][2].cwd, w.wt);
   for (const [, argv, o, listing] of of(w.log, 'cap')) {
@@ -215,6 +229,28 @@ test('a throw from the cli runner ends in the fail-closed path: no pass, no verd
   assert.deepEqual(w2.log, [], 'refused before the worktree or any phase');
 });
 
+test('no state carries between runs or scenarios: each run has its own HOME and TMPDIR; carried state never makes a pass', async (t) => {
+  const doc = cscenarios({ scenarios: [
+    { id: 'S-1', covers: ['AC-1'], kind: 'cli', run: { args: ['remember'] }, assert: [{ exit: 0 }, { stdout: { equals: 'fresh' } }] },
+    { id: 'S-2', covers: ['AC-2'], kind: 'cli', run: { args: ['remember'] }, assert: [{ exit: 0 }, { stdout: { equals: 'fresh' } }] },
+    { id: 'S-3', covers: ['AC-3'], kind: 'cli', run: { args: ['remember'] }, assert: [{ exit: 0 }, { stdout: { equals: 'carried' } }] },
+  ] });
+  const w = cworld(t, { scenarios: doc });
+  // a fake CLI that remembers: it writes under $HOME and $TMPDIR and reports whether an earlier invocation's files were there
+  const respond = (_a, o) => {
+    const marks = [path.join(o.env.HOME, '.tool', 'config'), path.join(o.env.TMPDIR, 'cache.txt')];
+    const seen = marks.some((m) => fs.existsSync(m));
+    for (const m of marks) { fs.mkdirSync(path.dirname(m), { recursive: true }); fs.writeFileSync(m, 'x'); }
+    return ok({ stdout: seen ? 'carried' : 'fresh' });
+  };
+  const r = await VF.verifyFeature(w.args(), cseams(w.log, { respond }));
+  assert.deepEqual(r.doc.results.map((x) => [x.id, x.status, x.flaky]), [['S-1', 'pass', false], ['S-2', 'pass', false], ['S-3', 'fail', false]]);
+  assert.equal(r.verdict, 'fail', 'a scenario that passes only on carried state does not pass');
+  assert.deepEqual(r.families, { 'S-3': 'stdout' });
+  const homes = of(w.log, 'cap').map((e) => e[2].env.HOME);
+  assert.equal(new Set(homes).size, 6, 'a fresh HOME per run');
+});
+
 // ---- results -------------------------------------------------------------------------------------------------------------------
 test('two disagreeing runs are fail + flaky; a hung command or an overflow is blocked, never pass', async (t) => {
   const one = cscenarios({ scenarios: [cscenarios().scenarios[0]] });
@@ -222,15 +258,26 @@ test('two disagreeing runs are fail + flaky; a hung command or an overflow is bl
   const r = await VF.verifyFeature(w.args(), cseams(w.log, { respond: (_a, _o, n) => ok({ stdout: n === 0 ? 'hello\n' : 'bye\n' }) }));
   assert.equal(r.verdict, 'fail');
   assert.deepEqual(r.doc.results, [{ id: 'S-1', covers: ['AC-1'], status: 'fail', flaky: true }]);
+  assert.deepEqual(r.families, { 'S-1': 'stdout' });
   for (const [name, res] of [['timeout', ok({ code: null, signal: 'SIGKILL', timedOut: true })], ['overflow', ok({ overflow: true })]]) {
     const w2 = cworld(t, { scenarios: one });
     const r2 = await VF.verifyFeature(w2.args(), cseams(w2.log, { respond: () => res }));
     assert.equal(r2.verdict, 'fail', name);
     assert.deepEqual(r2.doc.results, [{ id: 'S-1', covers: ['AC-1'], status: 'blocked', flaky: false }], name);
+    assert.deepEqual(r2.families, { 'S-1': 'run' }, name);
   }
   const w3 = cworld(t, { scenarios: one, app: { setup: ['npm', 'ci'] } });
   const r3 = await VF.verifyFeature(w3.args(), cseams(w3.log, { runSandboxed: async () => ({ code: 1, timedOut: false }) }));
   assert.deepEqual(r3.doc.results, [{ id: 'S-1', covers: ['AC-1'], status: 'blocked', flaky: false }], 'a failed app.setup blocks');
+  assert.deepEqual(r3.families, { 'S-1': 'setup' });
+  // a family word outside the fixed set never reaches the result; a reused verdict has no families
+  const w4 = cworld(t, { scenarios: one });
+  const r4 = await VF.verifyFeature(w4.args(), cseams(w4.log, { runCliScenario: async () => ({ status: 'fail', failed: 'PROGRAM-OUTPUT-fx' }) }));
+  assert.deepEqual(r4.families, {}); assert.ok(!JSON.stringify(r4).includes('PROGRAM-OUTPUT-fx'));
+  const w5 = cworld(t, { scenarios: one });
+  await VF.verifyFeature(w5.args(), cseams(w5.log));
+  const again = await VF.verifyFeature(w5.args(), cseams(w5.log, { runSandboxedCapture: mustNot('runSandboxedCapture') }));
+  assert.equal(again.reused, true); assert.deepEqual(again.families, {});
   assert.equal(of(w3.log, 'cap').length, 0);
 });
 
@@ -241,6 +288,7 @@ test('the symptom brief of a failing cli scenario: criterion IDs and the failed 
   const r = await VF.verifyFeature(w.args(), cseams(w.log, { respond: () => ok({ stdout: 'PROGRAM-OUTPUT-fx', stderr: 'PROGRAM-ERR-fx' }) }));
   assert.equal(r.verdict, 'fail');
   assert.deepEqual(r.brief, [`AC-1, EC-2: ${VF.CLI_SYMPTOM} (stdout)`]);
+  assert.deepEqual(r.families, { 'S-1': 'stdout' }, 'the family word for the driver, keyed by scenario id');
   const text = JSON.stringify(r);
   for (const s of ['SECRET-ARG-fx', 'EXPECTED-VALUE-fx', 'PROGRAM-OUTPUT-fx', 'PROGRAM-ERR-fx', 'SETUP-TEXT-fx', 'STDIN-fx', 'seed-fx', CANARY, 'S-1']) {
     assert.ok(!JSON.stringify(r.brief).includes(s), `brief leaks ${s}`);
@@ -358,6 +406,7 @@ test('the api path is unchanged: an api set with app.start verifies as before (p
   assert.deepEqual(profiles.map((p) => p.network), ['registries', { localhostPort: 4123 }]);
   for (const p of profiles) { assert.deepEqual(p.writable, [w.wt]); assert.equal(p.readOnly, undefined); }
   assert.equal(of(w.log, 'start')[0][2].env.PORT, '4123');
+  assert.equal('families' in r, false, 'the api result shape is unchanged');
 });
 
 // ---- the sandbox profile -------------------------------------------------------------------------------------------------------
@@ -385,17 +434,20 @@ test('sandboxProfile readOnly: read allowed, never written; must be under FACTOR
 const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 test('real sandbox: output and file checks pass; writing into the worktree is denied (and fails a scenario that needs it); env as pinned', { skip: SBX_SKIP }, async (t) => {
   const w = cworld(t, { scenarios: { feature: 'FEATURE-001', criteria_hash: VCH, canary: CANARY, scenarios: [] } });
-  const tmpRe = `^${reEsc(w.tmpRoot)}/[0-9a-f]+`;
+  const tmpRe = `^${reEsc(w.tmpRoot)}/[0-9a-f]+/run-[0-9a-f]+`;
   const doc = cscenarios({ scenarios: [
     { id: 'S-1', covers: ['AC-1'], kind: 'cli', run: { args: ['about'] }, assert: [{ exit: 0 }, { stdout: { equals: 'hello from cli\n' } }, { stderr: { equals: '' } }] },
     { id: 'S-2', covers: ['AC-2'], kind: 'cli', run: { args: ['write-case'] }, assert: [{ exit: 0 }, { file: 'out.txt', equals: 'ok' }] },
     { id: 'S-3', covers: ['AC-3'], kind: 'cli', run: { args: ['write-wt'] }, assert: [{ exit: 0 }, { stdout: { contains: 'denied:EPERM' } }] },
     { id: 'S-4', covers: ['AC-4'], kind: 'cli', run: { args: ['write-wt-strict'] }, assert: [{ exit: 0 }] },
     { id: 'S-5', covers: ['AC-5'], kind: 'cli', run: { args: ['env'] }, assert: [{ exit: 0 }, { stdout: { json_path: '$.ci', equals: '1' } }, { stdout: { json_path: '$.nc', equals: '1' } },
-      { stdout: { json_path: '$.home', matches: `${tmpRe}/home$` } }, { stdout: { json_path: '$.tmp', matches: `${tmpRe}$` } }, { stdout: { json_path: '$.cwd', matches: `${tmpRe}/case-[0-9a-f]+$` } }] },
+      { stdout: { json_path: '$.home', matches: `${tmpRe}/home$` } }, { stdout: { json_path: '$.tmp', matches: `${tmpRe}$` } }, { stdout: { json_path: '$.cwd', matches: `${tmpRe}/case$` } }] },
+    { id: 'S-6', covers: ['AC-6'], kind: 'cli', setup: { runs: [{ args: ['remember'] }] }, run: { args: ['remember'] }, assert: [{ exit: 0 }, { stdout: { equals: 'carried\n' } }] },
+    { id: 'S-7', covers: ['AC-7'], kind: 'cli', run: { args: ['remember'] }, assert: [{ exit: 0 }, { stdout: { equals: 'fresh\n' } }] },
   ] });
   const r = await VF.verifyFeature(w.args({ scenarios: doc }));
-  assert.deepEqual(r.doc.results.map((x) => [x.id, x.status, x.flaky]), [['S-1', 'pass', false], ['S-2', 'pass', false], ['S-3', 'pass', false], ['S-4', 'fail', false], ['S-5', 'pass', false]]);
+  assert.deepEqual(r.doc.results.map((x) => [x.id, x.status, x.flaky]), [['S-1', 'pass', false], ['S-2', 'pass', false], ['S-3', 'pass', false], ['S-4', 'fail', false], ['S-5', 'pass', false], ['S-6', 'pass', false], ['S-7', 'pass', false]]);
   assert.deepEqual(r.brief, [`AC-4: ${VF.CLI_SYMPTOM} (exit)`]);
+  assert.deepEqual(r.families, { 'S-4': 'exit' });
   assert.ok(!fs.existsSync(w.wt), 'worktree removed');
 });

@@ -229,7 +229,8 @@ const READ_ROOTS_EXTRA = ['/Users'];
 // Writable dirs must be under realpath(FACTORY_HOME)/work or /tmp unless `unsafeAllowOutsideFactoryHome` (TESTS ONLY).
 // `readOnly` dirs (the cli run phase's worktree) are readable and never writable: they get only a file-read* allow, so the initial
 // `(deny file-write*)` still covers them. Same placement rules as writable dirs, and none may lie inside a writable dir (whose write
-// allow would cover it).
+// allow would cover it). Read-only is enforced BY PATH (SBPL subpath rules), not by inode: a hard link to a read-only file created
+// inside a writable dir would be writable through that link (the inode check above is only the placement check).
 export function sandboxProfile({
   writable = [], readOnly = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false, nodePaths,
 } = {}) {
