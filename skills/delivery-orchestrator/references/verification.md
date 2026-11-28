@@ -1,8 +1,8 @@
 # Verification gate (factory Phase 1a)
 
-A feature merges only when hidden scenarios the builder never saw pass against its running app, on the exact commit being merged. Phase 1a covers API scenarios; UI scenarios need the Phase 1b evaluator and are refused (below). The driver that runs all of this: [factory-driver.md](factory-driver.md). Spec: `docs/factory/specs/phase-1-verification-gate.md` in this repository.
+A feature merges only when hidden scenarios the builder never saw pass against its running app, on the exact commit being merged. Phase 1a covers API scenarios and CLI scenarios ([below](#cli-scenarios)); UI scenarios need the Phase 1b evaluator and are refused (below). The driver that runs all of this: [factory-driver.md](factory-driver.md). Spec: `docs/factory/specs/phase-1-verification-gate.md` in this repository.
 
-Code: `core/scripts/lib/scenarios.mjs` (format, lint, approval), `core/scripts/lib/criteria.mjs` (criteria hash), `core/scripts/lib/verify.mjs` (verification run, symptom brief, `factory/verified`), `core/scripts/lib/apicheck.mjs` (API checks), `core/scripts/lib/verdict.mjs`, `core/scripts/lib/antigaming.mjs` (G1-G5), `core/scripts/lib/sandbox.mjs` (untrusted-code sandbox).
+Code: `core/scripts/lib/scenarios.mjs` (format, lint, approval), `core/scripts/lib/criteria.mjs` (criteria hash), `core/scripts/lib/verify.mjs` (verification run, symptom brief, `factory/verified`), `core/scripts/lib/apicheck.mjs` (API checks), `core/scripts/lib/clicheck.mjs` (CLI checks), `core/scripts/lib/verdict.mjs`, `core/scripts/lib/antigaming.mjs` (G1-G5), `core/scripts/lib/sandbox.mjs` (untrusted-code sandbox).
 
 ## Trust model
 
@@ -74,6 +74,59 @@ These follow from the lint and the checker (`apicheck.mjs`); the author prompt s
 - Requests, **blocked at run time** (the scenario is `blocked`, so the verdict fails; the lint does not catch these): a method that is not exactly upper-case `GET POST PUT PATCH DELETE HEAD OPTIONS`; a path that is not relative printable ASCII or has `//`, `\` or `#`; header names that are not tokens or values with control characters; more than 32 headers, 20 setup requests or 100 assertions; a body over 256 KiB; **a setup request answered with a status outside 2xx**. Redirects are not followed (the 3xx is the response).
 - **The app must listen on 127.0.0.1.** Requests go to `http://127.0.0.1:<port>` even when `app.base_url` says `localhost` (so a process on `::1` cannot answer), and the `Host` header is therefore `127.0.0.1:<port>`. The app gets `HOST=127.0.0.1` and `PORT=<port>`.
 - Each scenario has a 10 s budget for all its requests, body reads and regexes; bodies over 1 MiB are abandoned.
+
+## CLI scenarios
+
+A `cli` scenario runs the project's command-line program with arguments the author chose and checks its exit code, output and the files it wrote. It runs inside the same verifier as `api` scenarios: the same worktree, sandbox, two runs, survivor and escape checks, verdict file, `factory/verified` status and merge gate.
+
+### Config and contract
+
+- **`app.cli`** in `.product/delivery.json` on the base branch fixes the program: `{ "command": ["node", "./src/cli.ts"], "timeout_s": 30 }`. `command` is 1 to 10 elements, no shell string, no absolute path, no `..` segment. An element starting with `./` is resolved inside the verification worktree (the PR's code runs, the base config picks the entry point); a symlink that leaves the worktree is refused. `timeout_s` is 1 to 120 (default 30) per invocation. A CLI set needs only `app.cli` (and optionally `app.setup`, `app.env_example`): no `app.start`, `base_url` or `ready`, and a configured `app.seed` is ignored.
+- **`## CLI contract`** in the spec lists one backticked command pattern per bullet, like the HTTP contract (`` `seo about` ``, `` `seo about --json` ``, `` `seo init <dir>` ``). The first word is a display name and is ignored when matching. `<name>` stands for exactly one non-empty argument; a trailing `...` allows more arguments. Every scenario's `run.args` and every `setup.runs[].args` must match one pattern word for word. The section is part of the criteria hash, so editing it invalidates stored scenarios.
+
+### Scenario shape
+
+```json
+{ "id": "S-1", "covers": ["AC-1"], "kind": "cli",
+  "setup": { "files": [{ "path": "sites/x.yaml", "text": "..." }], "runs": [{ "args": ["init"] }] },
+  "run": { "args": ["about", "--json"], "stdin": "" },
+  "assert": [ { "exit": 0 }, { "stdout": { "json_path": "$.name", "equals": "seo-workflow-orchestrator" } },
+              { "file": "seo.config.yaml", "exists": true } ] }
+```
+
+Limits (`CLI_LIMITS`): `run.args` up to 64 strings of 4096 characters, no NUL; `stdin` up to 64 KiB; up to 50 setup files of up to 256 KiB each; up to 10 setup runs; up to 100 assertions. At least one `{ "exit": 0..255 }` assertion is required (like `status` for `api`). Other assertions: `{ "stdout" | "stderr": <text check> }`, `{ "file": <path>, "exists": true | false }`, `{ "file": <path>, <text check> }`. A text check is `equals`, `contains`, `not_contains` or `matches` on the whole text, or `json_path` with `equals`, `contains`, `not_contains`, `count` or `matches` (the text must parse as JSON). `json_path` and regex rules are the `api` ones; an empty `contains` or `matches` is refused. File paths are relative, forward slashes, no `..`, no leading `/`, at most 256 characters; after the run each is resolved with `realpath` and must stay inside the case folder (a symlink pointing out fails the assertion and is never read). Streams and files over 1 MiB fail or block the scenario.
+
+### How a run differs from an API run
+
+- **Fresh per-run temp.** Every run of every scenario gets its own run temp with an empty **case folder** (the command's working directory), a `HOME` and a `TMPDIR` inside it. Nothing carries between runs or scenarios, and an earlier run's folders are not reachable.
+- **Read-only worktree.** The worktree is mounted read-only for the run phase (unlike `api`, where it stays writable); the case folder and run temp are the only writable places. A command that writes into its own source tree fails, which is the honest result.
+- **Hard-link refusal.** A file in the case folder that is a hard link (link count above 1) is not read, so a command cannot point an assertion at a file outside the folder.
+- **No network, no port.** Network is `none`; there is no app start, seed, stop or port check. Environment is `allowEnv` from `app.env_example` plus `CI=1` and `NO_COLOR=1`. The survivor scan runs after every invocation, setup runs included.
+- **Setup.** `setup.files` are written first, then `setup.runs` in order; a non-zero exit of a setup run makes the scenario `blocked`. A timeout, a spawn failure or an over-size stream is `blocked` too.
+- Both runs must pass; disagreement is `fail` with `flaky: true`. The verdict file is unchanged (7 keys); the kind is part of `scenarios_hash`.
+
+### Unverifiable sets and refusals
+
+`factory scenarios` reports a stored set the verifier cannot run as `unverifiable (<why>)` (counted in its summary line; the set stays stored). The reasons:
+
+| Reason | Meaning | Fix |
+|---|---|---|
+| `ui scenarios` | any `ui` scenario (Phase 1b) | re-author as `api` or `cli` |
+| `mixed kinds` | `api` and `cli` in one set | one kind per feature |
+| `mixed contracts` | the spec has both an HTTP and a CLI contract | give the spec one contract |
+| `needs app.cli` | a `cli` set and no usable `app.cli` on the base | set `app.cli` |
+| `needs app.start` | an `api` set and no startable app on the base | set `app.start`, `base_url`, `ready` |
+| `no scenarios` | no runnable scenarios | re-run `factory scenarios` |
+
+`factory run` refuses at start (exit 1, with a `fix:` line) when a picked feature is unverifiable, instead of building it and holding it at verification. The check applies to a **new run**; resuming (`--continue`) does not repeat it. Use `--only` to run the other features.
+
+### Fix brief
+
+A failing `cli` scenario uses the same symptom brief plus one fixed word, the failed family (`exit`, `stdout`, `stderr`, `file`, `run`, `setup`). Program output, arguments and expected values are never included. `verifyFeature` returns the words as `families`; they are kept **in the driver's memory only** (not in the verdict), for that sha, and are **lost when the driver restarts**, after which the brief has the generic line.
+
+### Worked example
+
+Spec excerpt: `## CLI contract` with `` - `seo about --json` `` and AC-1 "prints the package name". Config: `"app": { "cli": { "command": ["node", "./node_modules/tsx/dist/cli.mjs", "./src/cli.ts"] } }`. The author stores S-1 as the JSON above (without setup), `factory scenarios` approves it, `factory run` builds the feature, and at `ci_passed` the verifier runs `node .../cli.mjs .../src/cli.ts about --json` twice in two fresh case folders, checks exit 0 and the `$.name` value, and posts `factory/verified` on a pass.
 
 ## Verification run (`verifyFeature`)
 

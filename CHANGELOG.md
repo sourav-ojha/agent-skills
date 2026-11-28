@@ -4,6 +4,12 @@ All notable changes are documented here. Format: [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added (delivery-orchestrator: cli scenarios)
+- A `cli` scenario kind for the hidden-scenario verifier: the fixed program from the new `app.cli` config key (`{ command, timeout_s }`) runs with the scenario's arguments and stdin in a fresh empty case folder, no network, a read-only worktree and a per-run `HOME`/`TMPDIR`; scenarios check exit code, stdout/stderr (text or `json_path`) and files written. Arguments must match the spec's new optional `## CLI contract`. Reuses the verifier's two runs, survivor checks, verdict and `factory/verified`. Only `app.cli` is needed (no `app.start`, `base_url` or `ready`).
+- `factory scenarios` reports `unverifiable (<why>)` for a stored set the verifier cannot run (ui scenarios, mixed kinds, mixed contracts, needs `app.cli`, needs `app.start`, no scenarios), and a new `factory run` refuses such a feature at start with a `fix:` line (resuming does not re-check). The fix brief adds a fixed failed-family word (`exit`, `stdout`, `stderr`, `file`, `run`, `setup`), held in memory only.
+- Readiness check C9 (level 4): `app.setup`, then `app.cli.command` with no arguments in an empty folder exits within `app.cli.timeout_s` with any code and leaves no process. `computeLevel(results, { cliOnly })`: with `app.cli` set and `app.start` not, C6 to C8 may be `skip` when C9 passes; with both set, C6 to C9 must pass. `factory run`'s start check accepts `app.cli` in place of a startable app, and the config wizard's factory profile walks `app.cli`.
+- Docs: a CLI scenarios section in `references/verification.md`, C9 in `references/readiness.md`, known gaps 40-44 in `references/factory-driver.md`, the guide, regenerated `references/config.md` tables.
+
 ### Changed (skill-insights 0.3.1)
 - Reports no longer count skills that were only opened: a window with no model turn of its own and nothing but its opening read is `surveyOnly`. It is left out of `inventory`/`report`/`runs` and listed on its own line (an agent browsing `SKILL.md` files to choose one used to show up as invocations).
 - agy: a `run_command` that writes files (redirect to a file, `tee`, `sed -i`, `git checkout`/`apply`/`reset`, `mv`/`cp`/`rm` and similar) clears the "read and not edited since" memory, so re-reads after a shell edit are no longer counted as repeated.

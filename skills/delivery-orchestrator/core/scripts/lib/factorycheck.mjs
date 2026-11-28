@@ -6,7 +6,7 @@ const VERIFIED = 'factory/verified';
 const port = (u) => { try { return portOf(u); } catch { return null; } };
 
 // The keys `config edit --profile factory` walks, in order (readiness is the opt-in switch for readiness.min_level).
-export const FACTORY_KEYS = ['verification.required', 'readiness.min_level', 'local_checks', 'checks.required', 'app.setup', 'app.start', 'app.stop', 'app.seed', 'app.base_url', 'app.ready', 'app.logs_dir', 'app.env_example', 'tests.setup', 'tests.all', 'tests.timeout_s', 'autonomy.level'];
+export const FACTORY_KEYS = ['verification.required', 'readiness.min_level', 'local_checks', 'checks.required', 'app.setup', 'app.start', 'app.cli', 'app.stop', 'app.seed', 'app.base_url', 'app.ready', 'app.logs_dir', 'app.env_example', 'tests.setup', 'tests.all', 'tests.timeout_s', 'autonomy.level'];
 
 // policy = the parsed config (parseConfig(doc).config) -> [{ id, why, fix }]
 export function fileProblems(policy) {
@@ -17,7 +17,9 @@ export function fileProblems(policy) {
   need(p.local_checks.length > 0, 'local_checks', 'local_checks are configured, and deliver built runs them outside the untrusted-code sandbox', 'run those checks in CI (checks.required) for factory runs, and set local_checks to []');
   need(p.checks.required.some((n) => n.toLowerCase() === VERIFIED), 'required_verified', `checks.required names ${VERIFIED}, which is posted only after CI passed`, `remove "${VERIFIED}" from checks.required (branch protection requires it at merge)`);
   const a = p.app || {};
-  need(!a.start, 'app_start', 'app.start is not set', 'set app.start to the command that starts the app, as an argument list such as ["npm","run","dev"]');
+  // A CLI-only project (app.cli set, app.start not) has no app to start: it needs no start command, base_url or ready.
+  if (a.cli && !a.start) return out;
+  need(!a.start, 'app_start', 'app.start is not set', 'set app.start (or app.cli for a command-line tool) to the command that starts the app, as an argument list such as ["npm","run","dev"]');
   const bp = a.base_url ? port(a.base_url) : null;
   need(!a.base_url || !bp, 'app_base_url', 'app.base_url is not set or has no port', 'set app.base_url to http://127.0.0.1:<port>, the address the app listens on');
   const rp = a.ready && a.ready.url ? port(a.ready.url) : null;

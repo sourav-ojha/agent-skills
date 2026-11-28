@@ -33,7 +33,9 @@ export const AUTHOR_OK = JSON.stringify({ scenarios: [
   { id: 'S-1', covers: ['AC-1'], kind: 'api', setup: [{ method: 'POST', path: '/api/items', body: { name: `${HIDDEN} {{CANARY}}` } }], request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }, { json_path: '$.items[*].name', contains: `${HIDDEN} {{CANARY}}` }] },
   { id: 'S-2', covers: ['EC-1'], kind: 'api', request: { method: 'GET', path: '/api/items' }, assert: [{ status: 200 }] },
 ] });
-export const BASE_CONFIG = { protected_branches: [], merge: { mode: 'squash' }, checks: { required: ['ci'] }, readiness: { min_level: 4 }, verification: { required: true } };
+export const BASE_CONFIG = { protected_branches: [], merge: { mode: 'squash' }, checks: { required: ['ci'] }, readiness: { min_level: 4 }, verification: { required: true },
+  // The api scenarios of the default world are runnable by the verifier (factory run refuses a set it cannot run).
+  app: { start: ['node', 'app.mjs'], base_url: 'http://127.0.0.1:3000', ready: { url: 'http://127.0.0.1:3000/' } } };
 
 // A bare origin with two ready API features, a fake gh (protection requiring factory/verified), the fake claude as `claude`.
 // probe: the saved isolation-probe result (FACTORY_HOME/probes/last.json). Default ('denied'): a result that proves the whole
