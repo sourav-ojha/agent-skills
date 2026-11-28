@@ -139,3 +139,31 @@ test('symptom-brief filter collects cli run, setup and assert strings', () => {
   const got = vf.scenarioStrings([s], CANARY);
   for (const secret of [CANARY, 'secret-arg-value', 'secret-file-text', 'secret-setup-arg', 'secret-expected']) assert.ok(got.has(secret), secret);
 });
+
+test('lint refuses exactly what the runner refuses: json_path shapes the engine cannot parse, count not a non-negative integer', () => {
+  const bad = [
+    { stdout: { json_path: '$..name', equals: 'x' } }, { stdout: { json_path: '$["a"]', equals: 'x' } }, { stdout: { json_path: 'name', equals: 'x' } },
+    { stdout: { json_path: '$.a', count: '3' } }, { stdout: { json_path: '$.a', count: -1 } }, { stdout: { json_path: '$.a', count: 1.5 } },
+    { file: 'a.json', json_path: '$..x', equals: 'x' }, { file: 'a.json', json_path: '$.a', count: '3' },
+  ];
+  for (const a of bad) {
+    assert.equal(sc.validCliAssertion(a), false, JSON.stringify(a));
+    refused(cli({ assert: [{ exit: 0 }, a, { stdout: { contains: CANARY } }] }));
+    assert.throws(() => vf.scenarioPlan({ criteria_hash: HASH, scenarios: [{ id: 'S-1', covers: ['AC-1'], kind: 'cli', run: { args: ['about'] }, assert: [{ exit: 0 }, a] }] }, HASH), /invalid cli assertions/, JSON.stringify(a));
+  }
+  for (const a of [{ stdout: { json_path: '$.a.b[0]', count: 0 } }, { stdout: { json_path: '$.a', equals: 'x' } }]) assert.equal(sc.validCliAssertion(a), true, JSON.stringify(a));
+});
+
+test('setup file paths are compared after normalisation and case-folding, like the runner', () => {
+  refused(cli({ setup: { files: [{ path: './a', text: '' }, { path: 'a', text: '' }] } }));
+  refused(cli({ setup: { files: [{ path: 'A', text: '' }, { path: 'a', text: '' }] } }));
+  refused(cli({ setup: { files: [{ path: 'd//x', text: '' }, { path: 'D/x', text: '' }] } }));
+  refused(cli({ setup: { files: [{ path: './a', text: '' }, { path: 'A/b', text: '' }] } }));
+});
+
+test('a file exists:true assertion on a setup-created path is refused (a do-nothing program would pass)', () => {
+  const files = [{ path: 'in/a.txt', text: 'x' }];
+  refused(cli({ setup: { files }, assert: [{ exit: 0 }, { file: 'in/a.txt', exists: true }, { stdout: { contains: CANARY } }] }));
+  refused(cli({ setup: { files }, assert: [{ exit: 0 }, { file: './IN/a.txt', exists: true }, { stdout: { contains: CANARY } }] }));
+  assert.equal(lint([cli({ setup: { files }, assert: [{ exit: 0 }, { file: 'in/a.txt', exists: false }, { file: 'out.txt', exists: true }, { stdout: { contains: CANARY } }] })]).ok, true);
+});

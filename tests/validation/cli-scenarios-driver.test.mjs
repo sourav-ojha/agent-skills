@@ -122,3 +122,13 @@ test('a failing cli verification puts only the family word in the fix brief', (t
   }
   assert.ok(!fs.readdirSync(path.join(w.fhome, 'verdicts', 'o__r')).some((f) => /famil/.test(fs.readFileSync(path.join(w.fhome, 'verdicts', 'o__r', f), 'utf8'))), 'families never stored');
 });
+
+test('factory scenarios: a stored set awaiting approval still carries the unverifiable tag on later runs', (t) => {
+  const w = world(t, { config: { ...BASE_CONFIG, verification: { required: true, scenario_approval: 'human' } }, specs: { 'FEATURE-001': 'One' }, fake: { author: { 'FEATURE-001': CANARY_FIX(cliReply) } } });
+  put(w, { 'FEATURE-001': cliSpec('FEATURE-001', 'One') }); readiness(w);
+  const first = w.factory(['scenarios']);
+  assert.match(first.out, /awaiting approval \(factory scenarios --approve FEATURE-001 --by <name>\), unverifiable \(needs app\.cli\)/, first.out);
+  const again = w.factory(['scenarios']);
+  assert.match(again.out, /FEATURE-001 scenarios: current, awaiting approval \(factory scenarios --approve FEATURE-001 --by <name>\), unverifiable \(needs app\.cli\)/, again.out);
+  assert.match(again.out, /unverifiable 1$/m);
+});

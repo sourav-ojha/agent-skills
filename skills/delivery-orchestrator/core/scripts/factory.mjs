@@ -595,7 +595,12 @@ export async function cmdScenarios(ctx) {
       if (why) counts.unverifiable++;
       counts.current++; ctx.out(`${spec.id} scenarios: current and approved${why ? `, unverifiable (${why})` : ''}`); continue;
     }
-    if (now.why === 'unapproved') { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
+    if (now.why === 'unapproved') {
+      counts.awaiting_approval++; approvalRow(ctx, spec.id);
+      const why = unverifiableWhy(ctx, now.doc, bc);
+      if (why) counts.unverifiable++;
+      ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)${why ? `, unverifiable (${why})` : ''}`); continue;
+    }
     const r = await authorOne(ctx, spec, bc);
     if (r.status === 'error') {
       ctx.out(`${spec.id} author session: ${r.kind}`);

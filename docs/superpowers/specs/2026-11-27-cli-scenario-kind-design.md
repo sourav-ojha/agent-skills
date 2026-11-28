@@ -148,7 +148,7 @@ Both runs must pass, and disagreement is `fail` with `flaky: true`, as today. Th
 
 ### Readiness C9
 
-A new check at level 4: "CLI runs". It runs the same way C6 to C8 run today: in a temp worktree of the base tip, through the readiness command runner, with the allowlisted environment and not sandboxed, because readiness runs only reviewed base code. It runs `app.setup`, then `app.cli.command` with no arguments, in an empty case folder with no network. It passes when the process exits within `timeout_s`, with any exit code, and leaves no survivor. The aim is to prove the program starts under the sandbox, not that it behaves.
+A new check at level 4: "CLI runs". It runs the same way C6 to C8 run today: in a temp worktree of the base tip, through the readiness command runner, with the allowlisted environment and not sandboxed, because readiness runs only reviewed base code. It runs `app.setup`, then `app.cli.command` with no arguments, in an empty folder with its own `HOME` and `TMPDIR`, with no stdin and with the network unrestricted (C9 is not sandboxed). It passes when the process exits within `timeout_s`, with any exit code, and leaves no survivor. The aim is to prove the program starts and stops on its own, not that it behaves; the sandbox applies only to verification runs.
 
 - **When `app.cli` is set and `app.start` is not:** C6 to C8 are skipped and C9 decides level 4.
 - **When both are set:** all of C6 to C9 must pass.

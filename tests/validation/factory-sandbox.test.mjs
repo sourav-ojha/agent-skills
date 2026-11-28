@@ -1025,3 +1025,18 @@ test('T7 gitSafe: objects/info/alternates or config.worktree planted in the repo
   assert.throws(() => G.gitSafe(b, 'status'), /^Error: git worktree not safe: config\.worktree present$/);
   assert.equal(G.gitSafe(b, 'rev-parse', 'HEAD').code, 0, 'non-worktree commands still work');
 });
+
+test('sandbox ipc: the profile denies POSIX shm, POSIX semaphores and SysV IPC', (t) => {
+  const w = world(t);
+  const prof = profileOf(w);
+  for (const c of ['ipc-posix-shm', 'ipc-posix-sem', 'ipc-sysv']) assert.match(prof, new RegExp(`\\(deny ${c}\\*\\)`), c);
+});
+
+test('sandbox ipc: a sandboxed process cannot create POSIX shared memory (nothing is left for an outside process)', { skip: SKIP }, async (t) => {
+  const w = world(t);
+  const py = 'from multiprocessing import shared_memory as m\nimport sys\ntry:\n s=m.SharedMemory(name=sys.argv[1],create=True,size=16); s.unlink(); print("CREATED")\nexcept Exception: print("DENIED")';
+  const probe = (name) => spawnSync('/usr/bin/python3', ['-c', py, name], { encoding: 'utf8' });
+  if (probe(`fxsanity${rnd()}`).stdout.trim() !== 'CREATED') return; // python3 shm unavailable on this machine: nothing to prove
+  const r = await sb(w, `out({ shm: t(()=>String(cp.spawnSync('/usr/bin/python3',['-c',A[0],A[1]],{encoding:'utf8'}).stdout).trim()) })`, { args: [py, `fxsbx${rnd()}`] });
+  assert.equal(r.shm, 'DENIED');
+});

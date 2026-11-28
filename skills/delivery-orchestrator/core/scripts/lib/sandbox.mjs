@@ -229,8 +229,9 @@ const READ_ROOTS_EXTRA = ['/Users'];
 // Writable dirs must be under realpath(FACTORY_HOME)/work or /tmp unless `unsafeAllowOutsideFactoryHome` (TESTS ONLY).
 // `readOnly` dirs (the cli run phase's worktree) are readable and never writable: they get only a file-read* allow, so the initial
 // `(deny file-write*)` still covers them. Same placement rules as writable dirs, and none may lie inside a writable dir (whose write
-// allow would cover it). Read-only is enforced BY PATH (SBPL subpath rules), not by inode: a hard link to a read-only file created
-// inside a writable dir would be writable through that link (the inode check above is only the placement check).
+// allow would cover it). Read-only is enforced BY PATH (SBPL subpath rules), not by inode. Probed: from the sandbox,
+// link() of a read-only file into a writable dir fails EPERM (so does creating a symlink there and renaming a file out of the worktree),
+// so no second name for a read-only file can be made. The by-inode check in the placement code below only confirms the path sits under FACTORY_HOME/work or /tmp.
 export function sandboxProfile({
   writable = [], readOnly = [], network, readDeny = [], readAllow, tmpDir, home, factoryHome: fhIn = factoryHome(), unsafeAllowOutsideFactoryHome = false, nodePaths,
 } = {}) {
@@ -300,6 +301,11 @@ export function sandboxProfile({
   // unsandboxed app, cfprefsd (`defaults write`) writes ~/Library/Preferences, securityd (`security dump-keychain`) reads the keychain,
   // and the pasteboard leaks. So mach-lookup is deny-by-default with a short allowlist that node, npm, git, curl and python need.
   lines.push('(deny mach-lookup)', `(allow mach-lookup ${MACH_ALLOW.map((n) => `(global-name ${sbplString(n)})`).join(' ')})`);
+  // Shared memory and semaphores are a same-user channel that bypasses every file rule: a sandboxed program could leave data in POSIX shm
+  // (confirmed with python3 multiprocessing.shared_memory) for an outside process to read. Denied for all three IPC classes.
+  // Residual: notification_center (darwin notifications) stays allowed through MACH_ALLOW and could still carry a few bits; see
+  // references/factory-driver.md known gaps.
+  lines.push('(deny ipc-posix-shm*)', '(deny ipc-posix-sem*)', '(deny ipc-sysv*)');
   lines.push(...networkRules(network));
   return `${lines.join('\n')}\n`;
 }

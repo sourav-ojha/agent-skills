@@ -58,6 +58,9 @@ function parsePath(expr) {
   return segs;
 }
 
+// True when the json_path expression parses (scenarios.mjs lint and the runner must agree on this).
+export function jsonPathParses(expr) { try { parsePath(expr); return true; } catch { return false; } }
+
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // Own properties only: `.key` on plain objects, `[n]` on arrays, `[*]` over own values of either.

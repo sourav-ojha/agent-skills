@@ -7,6 +7,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { factoryHome, writeJsonAtomic, readJson } from './factoryhome.mjs';
 import { FEATURE_ID } from './queue.mjs';
 import { matchCliContract } from './criteria.mjs';
+import { jsonPathParses } from './apicheck.mjs';
 
 export const CRIT_ID = /^(AC|EC|ER)-[1-9]\d{0,3}$/;
 export const SCEN_ID = /^S-\d{1,4}$/;
@@ -47,13 +48,19 @@ export const CLI_LIMITS = Object.freeze({ maxArgs: 64, maxArgLen: 4096, maxStdin
 // Relative, forward slashes, no `..` segment, no leading `/`, no NUL, at most 256 characters.
 export const validRelPath = (p) => typeof p === 'string' && p !== '' && p.length <= CLI_LIMITS.maxPathLen
   && !p.startsWith('/') && !p.includes('\\') && !p.includes('\0') && !p.split('/').some((x) => x === '..' || x === '');
+const foldPath = (p) => path.posix.normalize(p).normalize('NFC').toLowerCase();
 const TEXT_OPS = ['equals', 'contains', 'not_contains', 'matches'];
 const regexOk = (re) => typeof re === 'string' && re !== '' && re.length <= CLI_LIMITS.maxRegexLen && (() => { try { new RegExp(re); return true; } catch { return false; } })();
 // A text check: exactly one text op on the whole text, or `json_path` plus exactly one JSON_PATH_OPS entry.
 const validTextCheck = (t) => {
   if (!t || typeof t !== 'object' || Array.isArray(t)) return false;
   const keys = Object.keys(t);
-  if ('json_path' in t) return validAssertion(t) && (!('matches' in t) || regexOk(t.matches));
+  // Refuses exactly what the runner's prepareTextCheck refuses: a path its engine cannot parse ($.. , $["a"], no leading $) and a count
+  // that is not a non-negative integer, so a stored set cannot break late (verifyFeature throwing) on a shape that linted clean.
+  if ('json_path' in t) {
+    return validAssertion(t) && jsonPathParses(t.json_path) && (!('matches' in t) || regexOk(t.matches))
+      && (!('count' in t) || (Number.isInteger(t.count) && t.count >= 0));
+  }
   if (keys.length !== 1 || !TEXT_OPS.includes(keys[0])) return false;
   const [op] = keys;
   if (typeof t[op] !== 'string') return false;
@@ -110,10 +117,14 @@ function lintCli(s, label, criteria, problems) {
     if (!Array.isArray(files)) bad('setup.files must be an array');
     else if (files.length > CLI_LIMITS.maxSetupFiles) bad(`setup has ${files.length} files (max ${CLI_LIMITS.maxSetupFiles})`);
     else {
-      const paths = files.map((f) => (isObj(f) && typeof f.path === 'string' ? f.path : null)).filter((x) => x !== null);
+      // Compared the way the runner compares them: normalised, NFC and case-folded (macOS is case-insensitive).
+      const paths = files.map((f) => (isObj(f) && validRelPath(f.path) ? foldPath(f.path) : null)).filter((x) => x !== null);
       const set = new Set(paths);
       if (set.size !== paths.length) bad('setup.files has a duplicate path');
       else if (paths.some((p) => [...set].some((q) => q.startsWith(`${p}/`)))) bad('setup.files has a file that is also a directory of another');
+      else if (Array.isArray(s.assert) && s.assert.some((a) => isObj(a) && a.exists === true && validRelPath(a.file) && set.has(foldPath(a.file)))) {
+        bad('an assertion checks that a setup file exists (the program did not create it); assert on a file the program writes');
+      }
     }
     if (Array.isArray(files) && files.length <= CLI_LIMITS.maxSetupFiles) files.forEach((f, k) => {
       if (!isObj(f) || !onlyKeys(f, ['path', 'text']) || !validRelPath(f.path) || typeof f.text !== 'string' || Buffer.byteLength(f.text) > CLI_LIMITS.maxFileTextBytes) bad(`setup file ${k + 1} needs a relative path and text (max 256 KiB)`);
