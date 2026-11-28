@@ -129,7 +129,7 @@ export function loosens(e, before, after, raw) {
     }
     case 'verification.test_globs': { const gone = added(a, b); return gone.length ? `removes test globs (${gone.join(', ')}), so fewer files count as tests` : null; }
     default:
-      if (e.type === 'argv') return JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a command that runs as you' : null;
+      if (e.type === 'argv' || e.type === 'cli') return JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a command that runs as you' : null;
       // Fail closed for a sensitive key without an explicit rule: any change to its effective value needs a person.
       return e.sensitive && JSON.stringify(b ?? null) !== JSON.stringify(a ?? null) ? 'changes a sensitive setting' : null;
   }

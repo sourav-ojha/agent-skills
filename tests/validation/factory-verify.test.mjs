@@ -1908,7 +1908,7 @@ test('T10 r2: a refs/replace-forged base config (required:false) is ignored by t
   rm(a);
 });
 
-test('T10 r2: commit-graphs are never read or written by gitSafe, and a planted one is refused', () => {
+test('T10 r2: commit-graphs are never read or written by gitSafe, and a planted one is refused (an empty commit-graphs dir is not)', () => {
   for (const kv of ['core.commitGraph=false', 'gc.writeCommitGraph=false', 'fetch.writeCommitGraph=false']) assert.ok(GS.GIT_SAFE_FLAGS.includes(kv), kv);
   const r = vship();
   for (const kv of ['core.commitGraph=false', 'gc.writeCommitGraph=false', 'fetch.writeCommitGraph=false']) assert.equal(GS.gitSafeOpts(r.work, ['-c', kv, 'rev-parse', 'HEAD'], { verified: true }).code, 0, `caller may pass ${kv}`);
@@ -1922,8 +1922,14 @@ test('T10 r2: commit-graphs are never read or written by gitSafe, and a planted 
   const m = merge(r);
   assert.equal(J(m)?.state, 'awaiting_human', m.out + m.err); assert.match(J(m).reason, /not a trusted clone/); assert.equal(mergeCalled(r), false);
   fs.rmSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graph'));
-  fs.mkdirSync(path.join(gitDirOf(r), 'objects', 'info', 'commit-graphs'));
-  assert.throws(() => GS.checkRepoMetadata(r.work), /commit-graphs present/);
+  const cgs = path.join(gitDirOf(r), 'objects', 'info', 'commit-graphs');
+  fs.mkdirSync(cgs);
+  assert.doesNotThrow(() => GS.checkRepoMetadata(r.work), 'an empty commit-graphs directory holds no graph');
+  fs.writeFileSync(path.join(cgs, 'commit-graph-chain'), 'x\n');
+  assert.throws(() => GS.checkRepoMetadata(r.work), /commit-graphs present/, 'a chain file inside it is refused');
+  fs.rmSync(cgs, { recursive: true });
+  fs.symlinkSync(os.tmpdir(), cgs);
+  assert.throws(() => GS.checkRepoMetadata(r.work), /commit-graphs present/, 'a symlink in its place is refused');
   rm(r);
 });
 

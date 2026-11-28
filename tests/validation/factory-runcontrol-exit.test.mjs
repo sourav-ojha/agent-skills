@@ -233,7 +233,7 @@ test('E3 driver killed during a session and during a wait: next start kills the 
 // ---- E4 -----------------------------------------------------------------------------------------------------------------------------
 test('E4 stop --now halts within 60 s, ports free, --continue resumes correctly', async (t) => {
   const port = await freePort();
-  const config = { ...BASE_CONFIG, app: { start: ['node', 'server.js'], ready: { url: `http://127.0.0.1:${port}/health`, timeout_s: 5 } } };
+  const config = { ...BASE_CONFIG, app: { start: ['node', 'server.js'], base_url: `http://127.0.0.1:${port}`, ready: { url: `http://127.0.0.1:${port}/health`, timeout_s: 5 } } };
   const w = ready(t, { config, specs: ONE, fake: { plan: { 'FEATURE-001': [{ files: { 'src/FEATURE-001.wip': 'half\n' }, escape_ms: 120000, escape_port: port, linger_ms: 120000 }, { ...good('FEATURE-001'), require_files: ['src/FEATURE-001.wip'] }] } } });
   const run = bg(w, ['run']);
   await until(async () => builderRuns(w, 'FEATURE-001').length === 1 && await P.portInUse(port, '127.0.0.1'), 'the session and its escaped app');

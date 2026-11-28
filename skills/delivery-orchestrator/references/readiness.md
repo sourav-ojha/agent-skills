@@ -9,11 +9,11 @@ deliver readiness [--repeat N] [--json]
 ```
 Run from the repository root with `gh` logged in. It fetches, checks `origin/<base>`, prints a summary and saves the result (see "Where it lives"). `--repeat N` (1 to 5) reruns all checks N times (not only the command checks); a check whose status differs between runs becomes `unstable`. `--json` prints the stored document plus `file` and `min_level`. Exit codes: `0` level meets `readiness.min_level` (default 1 when the config has no `readiness` key), `2` it does not, `1` error.
 
-Command checks (C3, C6, C7, C8) run in a temporary worktree of the base tip, removed afterwards, never in your working tree. Their commands (`tests.*`, `app.*`) and the account come only from the reviewed `.product/delivery.json` on `origin/<base>`; an uncommitted or unmerged edit to the config never runs (C1 fails instead). If the base has no valid config, the command checks are skipped. The base itself is `--base`, else the `base` in the config committed on the default branch, else the default branch; the working-copy `base` is ignored, so an unreviewed edit cannot point readiness at another branch. Commands are argument lists, run without a shell, in their own process group (killed on exit, timeout or signal), with an allowlisted environment: `PATH`, `HOME`, `LANG`, `TMPDIR`, `NODE_ENV=test`, `CI=1` and the `KEY=VALUE` lines of `app.env_example`. There are no credential environment variables (`HOME` is passed, so files under it remain readable). `app.env_example` cannot override the pinned keys (`PATH`, `HOME`, `LANG`, `TMPDIR`, `NODE_ENV`, `CI`). A command that times out is a failure. A failing command check is retried once: fail then pass is `unstable`, fail twice is `fail`. Port-in-use and leaked-listener failures (C6) are final and are not retried. The fixed timeouts are 900 s for `app.setup` and 600 s for `app.seed`; the port checked comes from `app.ready.url`, or `app.base_url` when `ready` has no url, on `localhost` (both 127.0.0.1 and ::1), 127.0.0.1 as written. Output in reasons is the last 40 lines, redacted (paths, URLs, emails, secrets, long tokens).
+Command checks (C3, C6 to C9) run in a temporary worktree of the base tip, removed afterwards, never in your working tree. Their commands (`tests.*`, `app.*`) and the account come only from the reviewed `.product/delivery.json` on `origin/<base>`; an uncommitted or unmerged edit to the config never runs (C1 fails instead). If the base has no valid config, the command checks are skipped. The base itself is `--base`, else the `base` in the config committed on the default branch, else the default branch; the working-copy `base` is ignored, so an unreviewed edit cannot point readiness at another branch. Commands are argument lists, run without a shell, in their own process group (killed on exit, timeout or signal), with an allowlisted environment: `PATH`, `HOME`, `LANG`, `TMPDIR`, `NODE_ENV=test`, `CI=1` and the `KEY=VALUE` lines of `app.env_example`. There are no credential environment variables (`HOME` is passed, so files under it remain readable). `app.env_example` cannot override the pinned keys (`PATH`, `HOME`, `LANG`, `TMPDIR`, `NODE_ENV`, `CI`). The one exception to the pinned values is C9, which also sets `NO_COLOR=1` and overrides `HOME` and `TMPDIR` with a private temp folder removed afterwards (so files under your real home are not what the command sees). A command that times out is a failure. A failing command check is retried once: fail then pass is `unstable`, fail twice is `fail`. Port-in-use and leaked-listener failures (C6) are final and are not retried. The fixed timeouts are 900 s for `app.setup` and 600 s for `app.seed`; the port checked comes from `app.ready.url`, or `app.base_url` when `ready` has no url, on `localhost` (both 127.0.0.1 and ::1), 127.0.0.1 as written. Output in reasons is the last 40 lines, redacted (paths, URLs, emails, secrets, long tokens).
 
 ## Checks
 
-Status is `pass`, `fail`, `skip` (the config key is absent) or `unstable`. Every non-`pass` level check (C1 to C8) adds a fix item; the advisory A1 gets none. C2 reports a missing `gh` login for `github.account` as a `fail` with the reason; it does not stop the run.
+Status is `pass`, `fail`, `skip` (the config key is absent) or `unstable`. Every non-`pass` level check (C1 to C9) adds a fix item; the advisory A1 gets none. C2 reports a missing `gh` login for `github.account` as a `fail` with the reason; it does not stop the run.
 
 | ID | Level | Check | Passes when |
 |---|---|---|---|
@@ -25,11 +25,17 @@ Status is `pass`, `fail`, `skip` (the config key is absent) or `unstable`. Every
 | C6 | 4 | App starts and stops | the port in `app.ready.url` (or `app.base_url`) is free first; `app.setup`, then `app.start` becomes ready within `app.ready.timeout_s`; after stop nothing listens on the port |
 | C7 | 4 | Logs on disk | a file under `app.logs_dir` is created or grows while the app runs |
 | C8 | 4 | Seed | `app.seed` exits 0, or no seed is declared and the app reaches ready with `app.env_example` alone |
+| C9 | 4 | CLI runs | `app.cli` is set: `app.setup`, then `app.cli.command` with no arguments in an empty folder (own `HOME` and `TMPDIR`, no stdin) exits with any exit code within `app.cli.timeout_s`, and no process it started is left running. `skip` when `app.cli` is not set |
 | A1 | advisory | Branch protection | protection or a ruleset on the base lists required checks (`pass`, `fail` or `unknown` when the plan or token cannot read it). Never part of the level |
 
 ## Levels
 
-The level is the highest L such that every check at levels 1..L is `pass` (`skip`, `fail` and `unstable` do not pass).
+The level is the highest L such that every check at levels 1..L is `pass` (`skip`, `fail` and `unstable` do not pass), with these exceptions at level 4:
+- **C9 `skip`** (no `app.cli`) does not block level 4.
+- **A CLI-only project** (`app.cli` set, `app.start` not set): C6, C7 and C8 may be `skip` when C9 passes, so a command-line tool can reach level 4 with no startable app. `deliver readiness` and the merge gate apply this from the reviewed config.
+- **Both set**: C6 to C9 must all pass.
+
+C9 runs unsandboxed, like C6 to C8: it runs reviewed base code, but with your user's permissions. It proves the command starts and ends under a clean environment, not that it behaves; a verification run adds the sandbox and no network.
 
 | Level | Meaning | Allows |
 |---|---|---|
@@ -37,7 +43,7 @@ The level is the highest L such that every check at levels 1..L is `pass` (`skip
 | 1 | Configured | supervised runs |
 | 2 | Tests run | supervised runs |
 | 3 | CI gate trustworthy | merge on green |
-| 4 | App drivable with a seed-only environment | the later evaluator phase |
+| 4 | App starts, logs and seeds from a clean checkout; or, for a command-line tool with `app.cli`, the command runs from a clean checkout (C9) | the later evaluator phase |
 
 ## Config keys (`.product/delivery.json`, all optional)
 
@@ -57,7 +63,7 @@ The level is the highest L such that every check at levels 1..L is `pass` (`skip
 
 ## Where it lives
 
-The result is written atomically to `$FACTORY_HOME/readiness/<owner>__<repo>.json` (`FACTORY_HOME` defaults to `~/.factory`), outside the repository so a builder agent in the checkout does not edit it. It holds the helper version, base branch name, base sha, config hash (sha256 of the config file on `origin/<base>`), each check's status, reason and duration, the level, the fix list and a timestamp. The helper refuses to write through a symlink. Whether the directory can be made unwritable for the builder is the sandbox question: [docs/factory/spikes/sandbox-deny.md](../../../docs/factory/spikes/sandbox-deny.md). Until that is settled, the stored level for command checks (C3, C6 to C8) is advisory.
+The result is written atomically to `$FACTORY_HOME/readiness/<owner>__<repo>.json` (`FACTORY_HOME` defaults to `~/.factory`), outside the repository so a builder agent in the checkout does not edit it. It holds the helper version, base branch name, base sha, config hash (sha256 of the config file on `origin/<base>`), each check's status, reason and duration, the level, the fix list and a timestamp. The helper refuses to write through a symlink. Whether the directory can be made unwritable for the builder is the sandbox question: [docs/factory/spikes/sandbox-deny.md](../../../docs/factory/spikes/sandbox-deny.md). Until that is settled, the stored level for command checks (C3, C6 to C9) is advisory.
 
 ## The gate in `deliver init`
 
@@ -75,7 +81,7 @@ On success the level is stored in the queue as `readiness_level`.
 
 ## Fix items
 
-One per non-pass check: the check ID, what failed, the config key or file to change, and fixed help text. Nothing is guessed. Typical changes: C1 commit the config to the base branch; C3 make tests pass from a clean checkout with only `env_example`; C4 untrack secrets and ignore `logs_dir`; C5 commit a CI workflow and set `checks.required`; C6 to C8 make the app start, log and seed from a clean checkout.
+One per non-pass check: the check ID, what failed, the config key or file to change, and fixed help text. Nothing is guessed. Typical changes: C1 commit the config to the base branch; C3 make tests pass from a clean checkout with only `env_example`; C4 untrack secrets and ignore `logs_dir`; C5 commit a CI workflow and set `checks.required`; C6 to C8 make the app start, log and seed from a clean checkout; C9 make `app.setup` and `app.cli.command` run from a clean checkout and exit within `app.cli.timeout_s`.
 
 ## Run records
 

@@ -185,7 +185,10 @@
     },
     "network": {
       "allowedDomains": [],
-      "allowLocalBinding": true
+      "allowLocalBinding": true,
+      "allowUnixSockets": [
+        "{{SANDBOX_TMP}}"
+      ]
     }
   }
 }

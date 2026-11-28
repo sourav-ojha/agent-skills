@@ -51,7 +51,10 @@ export function settingsTemplate(role) {
 
 // CLAUDE_DIR is the home Claude Code config dir (transcripts, credentials), derived from home. GITDIR and GIT_COMMON are the
 // repo's git dir and common dir (the same dir for a plain clone; resolved through the `.git` file for a linked worktree).
-const PLACEHOLDERS = ['FACTORY_HOME', 'HOME', 'REPO', 'CLAUDE_DIR', 'GITDIR', 'GIT_COMMON'];
+const PLACEHOLDERS = ['FACTORY_HOME', 'HOME', 'REPO', 'CLAUDE_DIR', 'GITDIR', 'GIT_COMMON', 'SANDBOX_TMP'];
+// SANDBOX_TMP is the temp dir Claude Code's sandbox gives Bash commands (/tmp/claude-<uid>; /private/tmp on macOS). Test runners
+// such as tsx open an IPC socket there, which the macOS sandbox refuses unless allowUnixSockets names the dir. Only that dir.
+export const sandboxTmpDirs = (uid = process.getuid?.() ?? 0) => [`/tmp/claude-${uid}`, `/private/tmp/claude-${uid}`];
 const PH = /\{\{([A-Za-z0-9_]*)\}\}/g;
 function safeAbs(name, v) {
   if (typeof v !== 'string' || !path.isAbsolute(v)) throw new TypeError(`${name} must be an absolute path`);
@@ -171,7 +174,7 @@ export function materialiseSettings(role, { factoryHome, repoDir, home = default
   if (repoDir) safeAbs('repoDir', repoDir);
   safeAbs('home', home);
   if (runDir) safeAbs('runDir', runDir);
-  const vars = { FACTORY_HOME: variantsOf(factoryHome), HOME: variantsOf(home), CLAUDE_DIR: variantsOf(path.join(home, '.claude')) };
+  const vars = { FACTORY_HOME: variantsOf(factoryHome), HOME: variantsOf(home), CLAUDE_DIR: variantsOf(path.join(home, '.claude')), SANDBOX_TMP: sandboxTmpDirs() };
   let git = null;
   if (repoDir) {
     git = gitDirsOf(repoDir);
@@ -218,7 +221,7 @@ const KEYS = {
   permissions: ['allow', 'deny', 'ask', 'defaultMode', 'disableBypassPermissionsMode', 'blockWritesOutsideWorkingDirectories'],
   sandbox: ['enabled', 'failIfUnavailable', 'allowUnsandboxedCommands', 'autoAllowBashIfSandboxed', 'excludedCommands', 'filesystem', 'network'],
   'sandbox.filesystem': ['denyRead', 'denyWrite'],
-  'sandbox.network': ['allowedDomains', 'allowLocalBinding'],
+  'sandbox.network': ['allowedDomains', 'allowLocalBinding', 'allowUnixSockets'],
 };
 const keyName = (k) => (/^[A-Za-z0-9_$]{1,64}$/.test(k) ? k : '<key>');
 function unknownKeys(s) {
@@ -257,6 +260,10 @@ export function checkSettings(s, { allowPlaceholders = false } = {}) {
     if (sb.excludedCommands !== undefined && !(Array.isArray(sb.excludedCommands) && sb.excludedCommands.length === 0)) p.push('sandbox.excludedCommands not empty');
     const dom = sb.network?.allowedDomains;
     if (dom !== undefined && !(Array.isArray(dom) && dom.length === 0)) p.push('sandbox network allows domains');
+    // Unix sockets only in the sandbox's own temp dir (never allowAllUnixSockets, which is not an allowed key).
+    const socks = sb.network?.allowUnixSockets;
+    const okSock = (x) => typeof x === 'string' && (sandboxTmpDirs().includes(x) || (allowPlaceholders && x === '{{SANDBOX_TMP}}'));
+    if (socks !== undefined && !(Array.isArray(socks) && socks.every(okSock))) p.push('sandbox network allows unix sockets outside the sandbox temp dir');
   }
   // Every Read(...) path deny needs a sandbox denyRead twin: the Read rule covers the Read tool, the sandbox covers Bash children.
   const denyRead = new Set((Array.isArray(sb?.filesystem?.denyRead) ? sb.filesystem.denyRead : []).map((x) => String(x).replace(/\/\*\*$/, '')));

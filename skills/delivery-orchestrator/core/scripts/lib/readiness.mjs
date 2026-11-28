@@ -1,11 +1,12 @@
-// Readiness checks C1-C8 (+ advisory A1), level computation and fix items. See docs/factory/specs/phase-0-foundations.md (P0.1).
+// Readiness checks C1-C9 (+ advisory A1), level computation and fix items. See docs/factory/specs/phase-0-foundations.md (P0.1).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { parseConfig, CONFIG_PATH } from './config.mjs';
 import { CI_PATHS } from './queue.mjs';
-import { allowEnv, runCmd, startApp, stopApp, portOf, hostOf, portInUse, waitReady, registerCleanup } from './proc.mjs';
+import { survivorPids } from './verify.mjs';
+import { allowEnv, runCmd, runCapture, startApp, stopApp, portOf, hostOf, portInUse, waitReady, registerCleanup } from './proc.mjs';
 
 export const CHECKS = [
   { id: 'C1', level: 1, runsCommands: false },
@@ -16,18 +17,27 @@ export const CHECKS = [
   { id: 'C6', level: 4, runsCommands: true },
   { id: 'C7', level: 4, runsCommands: true },
   { id: 'C8', level: 4, runsCommands: true },
+  { id: 'C9', level: 4, runsCommands: true },
   { id: 'A1', level: 0, runsCommands: false }, // advisory: never part of the level
 ];
 
 export const SECRET_PATTERNS = [/^\.env$/, /^\.env\..+$/, /\.pem$/, /\.key$/, /^id_rsa/, /^id_ed25519/, /\.p12$/];
 
-// Highest L such that every check at levels 1..L passed. Missing, skip, fail and unstable all count as not passing.
-export function computeLevel(results) {
+// Highest L such that every check at levels 1..L passed. Missing, skip, fail and unstable all count as not passing, with two
+// exceptions at level 4: C9 may be skip or missing (the project has no app.cli), and with { cliOnly: true } (app.cli set, app.start
+// not) C6, C7 and C8 may be skip when C9 passed (there is no app to start).
+export function computeLevel(results, { cliOnly = false } = {}) {
   const status = new Map(results.map((r) => [r.id, r.status]));
+  const c9 = status.get('C9');
+  const ok = (id) => {
+    const s = status.get(id);
+    if (s === 'pass') return true;
+    if (id === 'C9') return s === 'skip' || s === undefined;
+    return cliOnly && s === 'skip' && c9 === 'pass' && ['C6', 'C7', 'C8'].includes(id);
+  };
   let level = 0;
   for (let l = 1; l <= 4; l++) {
-    const need = CHECKS.filter((c) => c.level === l);
-    if (need.every((c) => status.get(c.id) === 'pass')) level = l; else break;
+    if (CHECKS.filter((c) => c.level === l).every((c) => ok(c.id))) level = l; else break;
   }
   return level;
 }
@@ -41,6 +51,7 @@ const HELP = {
   C6: { change: 'app.setup / app.start / app.stop / app.ready', help: 'Make the app start from a clean checkout with env_example only, become ready within app.ready.timeout_s, and leave nothing listening on its port after stop.' },
   C7: { change: 'app.logs_dir', help: 'Make the running app write log files under app.logs_dir.' },
   C8: { change: 'app.seed / app.env_example', help: 'Make app.seed exit 0 from a clean checkout, or declare no seed and let the app start with env_example alone.' },
+  C9: { change: 'app.cli / app.setup', help: 'Make app.setup succeed from a clean checkout and app.cli.command start, run in an empty folder with no arguments and exit (any exit code) within app.cli.timeout_s, leaving no process behind.' },
   A1: { change: 'GitHub branch protection or rulesets for the base branch', help: 'Advisory: enable branch protection or a ruleset on the base branch that lists required status checks. Not available on every plan.' },
 };
 export function fixItem(id, result) {
@@ -257,6 +268,46 @@ async function appAttempt(ctx, sha) {
   }
 }
 
+// C9: app.setup, then app.cli.command with no arguments in an empty case folder, in a worktree of the base tip. Unsandboxed like
+// C6-C8 (the base tip is the reviewed code); the process gets the allowlisted environment, HOME and TMPDIR in a private temp, no stdin.
+// Any exit code passes: it proves the command starts and ends, not that it is right. A timeout, a spawn failure or a survivor fails.
+// True when a process still mentions a marker after a short poll (a slow-dying member of the command's process group may need a
+// moment to disappear: the final state decides). Whatever is still there after the poll and is safe to signal (it carries the
+// run's TMPDIR/HOME) is killed, so a failing check leaves little behind. Fails closed when ps or lsof fails.
+async function survivors(markers, sandbox, { polls = 5, waitMs = 200 } = {}) {
+  let r;
+  for (let i = 0; i < polls; i++) {
+    r = survivorPids(markers, { sandbox: [sandbox] });
+    if (r.ok && !r.pids.size) return false;
+    await new Promise((ok) => setTimeout(ok, waitMs));
+  }
+  r = survivorPids(markers, { sandbox: [sandbox] });
+  if (r.ok && !r.pids.size) return false;
+  for (const pid of r.killable) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* gone */ } }
+  return true;
+}
+
+export const c9Survivors = survivors;
+async function c9Attempt(ctx, sha) {
+  const { cli, setup } = ctx.config.app;
+  const wt = await ctx.worktree(sha);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'factory-c9-'));
+  try {
+    const env = envFor(wt.dir, ctx.config);
+    if (setup) { const r = await runCmd(setup, { cwd: wt.dir, env, timeoutS: 900 }); if (r.code !== 0 || r.timedOut) return res('fail', cmdFail('app.setup', r)); }
+    const caseDir = path.join(tmp, 'case'), home = path.join(tmp, 'home');
+    fs.mkdirSync(caseDir); fs.mkdirSync(home);
+    const argv = cli.command.map((el) => (el.startsWith('./') ? path.join(wt.dir, el.slice(2)) : el));
+    const r = await runCapture(argv, { cwd: caseDir, env: { ...env, CI: '1', NO_COLOR: '1', HOME: home, TMPDIR: tmp }, timeoutS: cli.timeout_s, stdin: '' });
+    if (r.overflow) return res('fail', 'app.cli.command printed more than 1 MiB with no arguments and was killed');
+    if (r.timedOut) return res('fail', `app.cli.command did not exit within ${cli.timeout_s}s`);
+    if (r.code === null && r.signal === null) return res('fail', 'app.cli.command could not be started (is the program installed and on PATH?)');
+    const left = await survivors([tmp, wt.dir], tmp);
+    if (left) return res('fail', 'a process started by app.cli.command was still running after it exited (killable ones were killed)');
+    return res('pass', `app.cli.command exited ${r.code ?? r.signal}`);
+  } finally { wt.remove(); fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+
 // Fail then pass is unstable; fail twice is fail. `final` failures are not retried.
 function merge(first, second) {
   if (first.status !== 'fail' || first.final) return first;
@@ -271,7 +322,7 @@ export async function runChecks(ctx, { only } = {}) {
   const timed = async (id, fn) => { const t0 = Date.now(); let r; try { r = await fn(); } catch (e) { r = res('fail', `check crashed: ${e.message}`); } const { final, ...rest } = r; results.push({ id, ...rest, ms: Date.now() - t0 }); };
   const sync = { C1: c1, C2: c2, C4: c4, C5: c5, A1: a1 };
   for (const id of ['C1', 'C2']) if (want(id)) await timed(id, () => sync[id](ctx));
-  const sha = ['C3', 'C6', 'C7', 'C8'].some(want) ? baseSha(ctx) : null;
+  const sha = ['C3', 'C6', 'C7', 'C8', 'C9'].some(want) ? baseSha(ctx) : null;
   const noBase = () => res('fail', `cannot resolve ${baseRef(ctx)}`);
   if (want('C3')) {
     await timed('C3', async () => {
@@ -304,6 +355,14 @@ export async function runChecks(ctx, { only } = {}) {
     if (!r.C8) r.C8 = res('skip', 'no seed declared and no app to start');
     const ms = Date.now() - t0;
     for (const id of ['C6', 'C7', 'C8']) if (want(id)) { const { final, ...rest } = r[id]; results.push({ id, ...rest, ms }); }
+  }
+  if (want('C9')) {
+    await timed('C9', async () => {
+      if (!ctx.config?.app?.cli) return res('skip', 'app.cli is not configured');
+      if (!sha) return noBase();
+      const first = await c9Attempt(ctx, sha);
+      return first.status === 'fail' ? merge(first, await c9Attempt(ctx, sha)) : first;
+    });
   }
   if (want('A1')) await timed('A1', () => a1(ctx));
   return results;

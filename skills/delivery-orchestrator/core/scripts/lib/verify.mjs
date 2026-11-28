@@ -14,7 +14,13 @@
 //   FACTORY_HOME/trash/<random> (if that fails it stays in place), then prunes, then deletes the quarantined tree.
 // - Bounded: at most MAX_SCENARIOS scenarios, and an overall wall-clock budget (budgetS) checked before every phase.
 // - Each scenario runs twice from a fresh seed and app start; it passes only if both runs pass. Disagreement is `fail` + flaky.
-// - The symptom brief carries criterion IDs and one fixed sentence only.
+// - The symptom brief carries criterion IDs and one fixed sentence only (a cli line adds only a fixed family word).
+// - A scenario set is all `api` or all `cli` (scenarioPlan); `ui` and mixed sets are refused. A cli set needs only app.cli (plus
+//   optional app.setup and app.env_example). Its run phase, per run: a fresh empty case folder under the run temp (cwd, writable),
+//   the worktree READ-ONLY (sandboxProfile readOnly), network none, env = allowEnv + CI=1 + NO_COLOR=1 with HOME/TMPDIR in the run
+//   temp; no port checks, no app start, seed or stop. The survivor scan runs after EVERY cli invocation (setup runs included).
+//   A `./` command element is resolved into the worktree; one that leaves it (symlink, dangling link, `..`) is refused, checked
+//   after `worktree add` (before app.setup) and again after app.setup.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,9 +29,10 @@ import { spawnSync } from 'node:child_process';
 import * as sbx from './sandbox.mjs';
 import * as proc from './proc.mjs';
 import { runApiScenario } from './apicheck.mjs';
+import { runCliScenario } from './clicheck.mjs';
 import { readVerdict, writeVerdict, verdictMatches, validVerdict, verdictPath } from './verdict.mjs';
-import { checkRepoKey, scenariosHash, CRIT_ID, SCEN_ID } from './scenarios.mjs';
-import { isLocalUrl } from './config.mjs';
+import { checkRepoKey, scenariosHash, CRIT_ID, SCEN_ID, CLI_LIMITS, validCliAssertion } from './scenarios.mjs';
+import { isLocalUrl, cliCommandProblem } from './config.mjs';
 import { FEATURE_ID } from './queue.mjs';
 import { factoryHome, repoKey as repoKeyOf } from './factoryhome.mjs';
 
@@ -126,11 +133,13 @@ const DEFAULT_SEAMS = {
   removeRunTemp: sbx.removeRunTemp,
   keepRunTemp: sbx.keepRunTemp,
   runSandboxed: sbx.runSandboxed,
+  runSandboxedCapture: sbx.runSandboxedCapture,
   startSandboxed: sbx.startSandboxed,
   stopApp: proc.stopApp,
   waitReady: proc.waitReady,
   portInUse: proc.portInUse,
   runApiScenario,
+  runCliScenario,
   alive: groupAlive,
   survivors: (markers) => sweepSurvivors(markers),
   rmVerdict: (file) => fs.rmSync(file, { force: true }),
@@ -157,32 +166,103 @@ function appPlan(config) {
     if (proc.portOf(r.url) !== port) throw new Error('app.ready.url must use the same port as app.base_url (the sandbox opens that port only)');
     ready = { ...r, url: pin127(r.url) }; // the driver's own readiness probe must not reach an impostor on ::1
   }
-  return { setup: a.setup ?? null, seed: a.seed ?? null, stop: a.stop ?? null, start: a.start, baseUrl: a.base_url, port, ready, envExample: a.env_example ?? null };
+  return { kind: 'api', setup: a.setup ?? null, seed: a.seed ?? null, stop: a.stop ?? null, start: a.start, baseUrl: a.base_url, port, ready, envExample: a.env_example ?? null };
 }
 
-// API scenarios of a doc bound to the current criteria. 1a cannot verify UI scenarios: refuse rather than pass or fail them.
-function apiScenarios(doc, criteriaHash) {
+// The cli plan from the BASE config: only app.cli (+ optional app.setup and app.env_example) is needed; app.start, base_url, ready,
+// seed and stop are not used for a cli set (a configured app.seed is ignored: there is no app to seed). Throws when unusable.
+// The command is re-checked here (cliCommandProblem, as parseConfig did) in case a caller hands in an unparsed config.
+const CLI_MAX_ARGV = 10;
+const CLI_MAX_TIMEOUT_S = 120;
+function cliPlan(config) {
+  const a = config?.app;
+  if (!a || typeof a !== 'object') throw new Error('config.app is required for verification');
+  const c = a.cli;
+  if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error('app.cli is required to verify cli scenarios');
+  if (cliCommandProblem(c.command) || c.command.length > CLI_MAX_ARGV) throw new Error(`app.cli.command must be an argument list of 1-${CLI_MAX_ARGV} elements with no absolute path, ".." segment or control character`);
+  if (!Number.isInteger(c.timeout_s) || c.timeout_s < 1 || c.timeout_s > CLI_MAX_TIMEOUT_S) throw new Error(`app.cli.timeout_s must be an integer 1-${CLI_MAX_TIMEOUT_S}`);
+  if (a.setup != null && !isArgv(a.setup)) throw new Error('app.setup must be an argument list');
+  return { kind: 'cli', setup: a.setup ?? null, command: [...c.command], timeoutS: c.timeout_s, envExample: a.env_example ?? null, port: null };
+}
+
+// Non-throwing: why a stored set cannot be verified with this config yet (Task 6: `factory scenarios`, `factory run`), or ok.
+// The kind rules are scenarioPlan's and the config rules are appPlan's / cliPlan's (called, not copied).
+export function verifiable(doc, config) {
+  const k = kindOf(doc);
+  if (k.why) return { ok: false, why: k.why };
+  try { (k.kind === 'cli' ? cliPlan : appPlan)(config); } catch { return { ok: false, why: k.kind === 'cli' ? 'needs app.cli' : 'needs app.start' }; }
+  return { ok: true };
+}
+
+// { kind } or { why }: the kind of a scenario set. `ui` first (Phase 1b), then a mix of api and cli, then anything else unrunnable.
+function kindOf(doc) {
+  const list = doc && typeof doc === 'object' && Array.isArray(doc.scenarios) ? doc.scenarios : [];
+  const kinds = new Set(list.map((s) => s?.kind));
+  if (kinds.has('ui')) return { why: 'ui scenarios', message: 'UI scenarios need the Phase 1b evaluator: refusing to verify this feature in 1a' };
+  if (kinds.has('api') && kinds.has('cli')) return { why: 'mixed kinds', message: 'scenario doc mixes api and cli scenarios: one kind per feature in this phase; refusing to verify' };
+  if (!list.length || kinds.size !== 1 || !(kinds.has('api') || kinds.has('cli'))) return { why: 'no scenarios', message: 'scenario doc has no runnable scenarios (no api scenarios and no cli scenarios, or entries of unknown kind)' };
+  return { kind: [...kinds][0] };
+}
+
+// scenarioPlan(doc, criteriaHash) -> { kind: 'api'|'cli', list }: the scenarios of a doc bound to the current criteria, all of one
+// runnable kind. 1a cannot verify UI scenarios: refuse rather than pass or fail them. A cli scenario's assertion list is checked
+// here (shape, count, an exit check), so the runner's own shape throw cannot be the first place it is caught.
+export function scenarioPlan(doc, criteriaHash) {
   if (!doc || typeof doc !== 'object' || !Array.isArray(doc.scenarios)) throw new Error('scenario doc has no scenarios array');
   if (doc.scenarios.length > MAX_SCENARIOS) throw new Error(`scenario doc has more than ${MAX_SCENARIOS} scenarios`);
   if (doc.criteria_hash !== criteriaHash) throw new Error('scenario doc criteria_hash is not current');
-  if (doc.scenarios.some((s) => s?.kind === 'ui')) throw new Error('UI scenarios need the Phase 1b evaluator: refusing to verify this feature in 1a');
-  const list = doc.scenarios.filter((s) => s?.kind === 'api');
-  if (!list.length || list.length !== doc.scenarios.length) throw new Error('scenario doc has no api scenarios (or entries of unknown kind)');
+  const k = kindOf(doc);
+  if (k.why) throw new Error(k.message);
+  const list = doc.scenarios;
   for (const [i, s] of list.entries()) {
     if (typeof s.id !== 'string' || !SCEN_ID.test(s.id)) throw new Error(`scenario #${i + 1}: invalid id`);
     if (!Array.isArray(s.covers) || !s.covers.length || s.covers.length > 50 || !s.covers.every((x) => typeof x === 'string' && CRIT_ID.test(x))) throw new Error(`scenario #${i + 1}: invalid covers`);
+    if (k.kind === 'cli' && !(Array.isArray(s.assert) && s.assert.length > 0 && s.assert.length <= CLI_LIMITS.maxAssertions
+      && s.assert.every(validCliAssertion) && s.assert.some((a) => 'exit' in a))) throw new Error(`scenario #${i + 1}: invalid cli assertions`);
   }
-  return list;
+  return { kind: k.kind, list: [...list] };
 }
 
-// allowEnv over the env example read from the BASE ref (never the feature branch), then the pinned listen address.
+// allowEnv over the env example read from the BASE ref (never the feature branch), then (api) the pinned listen address.
 function appEnv(git, baseRef, plan) {
   let text = null;
   if (plan.envExample) {
     const r = git('cat-file', '-p', `${baseRef}:${plan.envExample}`);
     if (r.code === 0 && typeof r.out === 'string' && r.out.length <= ENV_EXAMPLE_MAX) text = r.out;
   }
-  return { ...proc.allowEnv(text), HOST: '127.0.0.1', PORT: String(plan.port) };
+  const env = proc.allowEnv(text);
+  return plan.kind === 'cli' ? env : { ...env, HOST: '127.0.0.1', PORT: String(plan.port) };
+}
+
+// app.cli.command with each `./` element resolved against the verification worktree (the PR's code runs; the BASE config picks the
+// entry point). Every existing component is lstat'ed: a symlink is followed only when its realpath stays inside the real worktree,
+// and the element becomes that real path (no later swap can redirect it: the worktree is read-only in the run phase). A symlink that
+// leaves the worktree, a dangling symlink or a `..` segment is REFUSED (throws), never followed. A missing component keeps the
+// rest lexical (inside the worktree; the command then fails on its own). Other elements are used as written.
+const OUTSIDE_WT = 'app.cli.command: a ./ element resolves outside the verification worktree (symlink or ..): refusing to verify';
+function resolveCommand(command, wt) {
+  const root = fs.realpathSync.native(wt);
+  return command.map((el) => {
+    if (!el.startsWith('./')) return el;
+    const segs = el.slice(2).split('/').filter((x) => x !== '' && x !== '.');
+    if (segs.includes('..')) throw new Error(OUTSIDE_WT);
+    let cur = root;
+    for (let i = 0; i < segs.length; i++) {
+      const next = path.join(cur, segs[i]);
+      let st;
+      try { st = fs.lstatSync(next); } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return path.join(next, ...segs.slice(i + 1));
+        throw new Error(OUTSIDE_WT);
+      }
+      if (st.isSymbolicLink()) {
+        let real;
+        try { real = fs.realpathSync.native(next); } catch { throw new Error(OUTSIDE_WT); }
+        if (!within(real, root)) throw new Error(OUTSIDE_WT);
+        cur = real;
+      } else cur = next;
+    }
+    return cur;
+  });
 }
 
 const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
@@ -225,6 +305,16 @@ function removeWorktree(git, dir, trashRoot) {
 const PRUNE_FAILED = 'git worktree prune failed in the factory clone: a stale verification worktree registration remains';
 const prune = (git) => { try { return git('worktree', 'prune')?.code === 0; } catch { return false; } };
 
+// { <scenario id>: <family word> } for the non-passing cli scenarios: ids are SCEN_ID (checked by scenarioPlan) and words are only
+// CLI_FAMILIES entries, so nothing else (no output, path or argument) can reach the driver's brief through it. Not in the verdict.
+function familyMap(results, families) {
+  const out = {};
+  results.forEach((r, i) => {
+    if ((r.status !== 'pass' || r.flaky) && SCEN_ID.test(r.id) && CLI_FAMILIES.includes(families[i])) out[r.id] = families[i];
+  });
+  return out;
+}
+
 const combine = (runs) => {
   const flaky = runs.some((r) => r !== runs[0]);
   return { status: flaky ? 'fail' : runs[0], flaky };
@@ -244,17 +334,19 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   if (typeof git !== 'function') throw new Error('invalid git runner (expected a function bound to the factory clone)');
   if (typeof criteriaHash !== 'string' || !HASH.test(criteriaHash)) throw new Error('invalid criteria hash');
   if (!Number.isInteger(budgetS) || budgetS < 1 || budgetS > MAX_BUDGET_S) throw new Error(`invalid budget (expected 1-${MAX_BUDGET_S} seconds)`);
-  const list = apiScenarios(scenarios, criteriaHash);
-  const plan = appPlan(config);
+  const { kind, list } = scenarioPlan(scenarios, criteriaHash);
+  const isCli = kind === 'cli';
+  const plan = isCli ? cliPlan(config) : appPlan(config);
   const scHash = scenariosHash(scenarios);
 
   const prior = readVerdict(repoKey, id, sha);
-  if (prior && verdictMatches(prior, { sha, scenariosHash: scHash, criteriaHash })) return { verdict: 'pass', doc: prior, brief: [], reused: true };
+  if (prior && verdictMatches(prior, { sha, scenariosHash: scHash, criteriaHash })) return { verdict: 'pass', doc: prior, brief: [], reused: true, ...(isCli ? { families: {} } : {}) };
 
   const deadline = s.now() + budgetS * 1000;
   const leftS = () => Math.ceil((deadline - s.now()) / 1000);
   const checkBudget = () => { if (leftS() <= 0) throw new Error('verification exceeded its time budget'); };
-  const listening = async () => (await s.portInUse(plan.port, '127.0.0.1')) || (await s.portInUse(plan.port, '::1'));
+  // A cli set has no port: its after-phase checks are the survivor scan alone.
+  const listening = async () => !isCli && ((await s.portInUse(plan.port, '127.0.0.1')) || (await s.portInUse(plan.port, '::1')));
 
   const avail = s.sandboxAvailable();
   if (!avail?.ok) throw new Error(`untrusted-code sandbox unavailable (${avail?.reason ?? 'unknown'}); refusing to verify: there is no unsandboxed fallback`);
@@ -277,7 +369,7 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
   const afterPhase = async (phase) => {
     if (await listening() || (await s.survivors([wt, tmp].filter(Boolean))) > 0) {
       escaped = true;
-      throw new Error(`a process from ${phase} is still running or listening on port ${plan.port} after it finished`);
+      throw new Error(isCli ? `a process from ${phase} is still running after it finished` : `a process from ${phase} is still running or listening on port ${plan.port} after it finished`);
     }
   };
   const stopRunning = async (profile) => {
@@ -293,7 +385,9 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
     if (add.code !== 0) throw new Error('git worktree add failed for the verification worktree');
     tmp = s.makeRunTemp();
     const setupProfile = s.sandboxProfile({ writable: [wt], tmpDir: tmp, network: 'registries' });
-    const runProfile = s.sandboxProfile({ writable: [wt], tmpDir: tmp, network: { localhostPort: plan.port } });
+    const runProfile = isCli ? null : s.sandboxProfile({ writable: [wt], tmpDir: tmp, network: { localhostPort: plan.port } });
+    // A ./ element that a committed symlink points out of the worktree is refused before any phase runs.
+    if (isCli) resolveCommand(plan.command, wt);
 
     const oneRun = async (sc) => {
       checkBudget();
@@ -316,6 +410,43 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
       return status;
     };
 
+    // cli run phase, per run of a scenario: a fresh per-run temp <tmp>/run-<random> (its own TMPDIR, and HOME = <run>/home made by
+    // withTmp) holding a fresh empty case folder <run>/case, the cwd. Only that per-run temp is writable or readable among the run
+    // dirs: earlier runs' dirs are siblings, outside it (FACTORY_HOME stays read-denied), so no state carries between runs or
+    // scenarios. The worktree is mounted READ-ONLY; no network; no port checks, app start, seed or stop. Every invocation (the
+    // scenario's setup runs included) goes through `run`, which runs the survivor scan right after it, before returning, so the next
+    // invocation can never start before the previous one was scanned. The runner turns a throw from `run` into `blocked`, so a scan
+    // failure or escape is kept in `cliFault`, every later invocation is refused, and it is rethrown once the runner returns.
+    let cliFault = null;
+    // A new empty directory, never through a planted link (mkdir fails on an existing name); the parent was made by this process.
+    const freshDir = (d) => {
+      fs.mkdirSync(d, { mode: 0o700 });
+      const st = fs.lstatSync(d);
+      if (st.isSymbolicLink() || !st.isDirectory() || fs.readdirSync(d).length !== 0) throw new Error('could not make a fresh run folder');
+      return d;
+    };
+    const cliRun = async (sc, command) => {
+      checkBudget();
+      const runTmp = freshDir(path.join(tmp, `run-${crypto.randomBytes(8).toString('hex')}`));
+      const caseDir = freshDir(path.join(runTmp, 'case'));
+      const profile = s.sandboxProfile({ writable: [caseDir], readOnly: [wt], tmpDir: runTmp, network: 'none' });
+      // withTmp sets the same HOME/TMPDIR from the profile's run temp; the survivor markers ([wt, tmp]) cover every per-run temp.
+      const runEnv = { ...env, CI: '1', NO_COLOR: '1', HOME: path.join(runTmp, 'home'), TMPDIR: runTmp };
+      const run = async (argv, { stdin, timeoutS } = {}) => {
+        if (cliFault) throw cliFault;
+        if (leftS() <= 0) { cliFault = new Error('verification exceeded its time budget'); throw cliFault; }
+        try {
+          return await s.runSandboxedCapture(argv, { cwd: caseDir, env: runEnv, timeoutS: Math.max(1, Math.min(timeoutS ?? plan.timeoutS, leftS())), profile, tmpDir: runTmp, stdin });
+        } finally {
+          try { await afterPhase('app.cli'); } catch (e) { cliFault ??= e; }
+        }
+      };
+      const r = await s.runCliScenario(sc, { command, timeoutS: plan.timeoutS, caseDir, run });
+      if (cliFault) throw cliFault;
+      const status = STATUSES.has(r?.status) ? r.status : 'blocked';
+      return { status, failed: status === 'pass' ? undefined : r?.failed };
+    };
+
     checkBudget();
     let setupOk = true;
     if (plan.setup) {
@@ -323,19 +454,31 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
       try { r = await s.runSandboxed(plan.setup, { cwd: wt, env, timeoutS: Math.min(SETUP_TIMEOUT_S, leftS()), profile: setupProfile, tmpDir: tmp }); } finally { await afterPhase('app.setup'); }
       setupOk = r?.code === 0 && !r?.timedOut;
     }
+    // Again after app.setup (which may have created or replaced the ./ targets, e.g. node_modules); the worktree is read-only from here.
+    const command = isCli && setupOk ? resolveCommand(plan.command, wt) : null;
     const results = [];
+    const families = []; // cli only: the failed family word of a non-passing scenario (for the brief; never stored in the verdict)
     for (const sc of list) {
-      const runs = [];
-      for (let i = 0; i < RUNS; i++) runs.push(setupOk ? await oneRun(sc) : 'blocked');
+      const runs = []; const fams = [];
+      for (let i = 0; i < RUNS; i++) {
+        if (!setupOk) {
+          runs.push('blocked'); fams.push('setup');
+        } else if (isCli) {
+          const r = await cliRun(sc, command);
+          runs.push(r.status); fams.push(r.failed);
+        } else runs.push(await oneRun(sc));
+      }
       results.push({ id: sc.id, covers: [...sc.covers], ...combine(runs) });
+      families.push(isCli ? fams[runs.findIndex((x) => x !== 'pass')] : undefined);
     }
     checkBudget();
     await afterPhase('the run'); // before the verdict is written: an escape must never leave a stored (reusable) verdict
     const verdict = results.length > 0 && results.every((r) => r.status === 'pass' && !r.flaky) ? 'pass' : 'fail';
     const doc = { feature: id, sha, scenarios_hash: scHash, criteria_hash: criteriaHash, results, verdict, at: new Date().toISOString() };
     writeVerdict(repoKey, doc);
-    const brief = verdict === 'pass' ? [] : symptomBrief(results.filter((r) => r.status !== 'pass' || r.flaky), scenarios, scenarios.canary);
-    outcome = { verdict, doc, brief, reused: false };
+    const brief = verdict === 'pass' ? [] : symptomBrief(results.map((r, i) => ({ ...r, failed: families[i] })).filter((r) => r.status !== 'pass' || r.flaky), scenarios, scenarios.canary);
+    // cli only (the api result shape is unchanged): fixed family words per failing scenario id, for the driver's brief.
+    outcome = { verdict, doc, brief, reused: false, ...(isCli ? { families: familyMap(results, families) } : {}) };
   } catch (e) {
     failure = e;
     if (running) { try { await stopRunning(); } catch { /* still alive: the worktree stays (below) */ } }
@@ -377,6 +520,9 @@ export async function verifyFeature({ repoKey, id, sha, baseRef, config, scenari
 
 // ---- symptom brief ---------------------------------------------------------------------------------------------------------------
 export const API_SYMPTOM = 'an endpoint returned an unexpected status or body';
+export const CLI_SYMPTOM = 'a command exited, printed or wrote something unexpected';
+// The only words a cli brief line may add: clicheck's `failed` family. Anything else (never expected) is dropped, not printed.
+export const CLI_FAMILIES = Object.freeze(['exit', 'stdout', 'stderr', 'file', 'run', 'setup']);
 const FALLBACK = 'behaviour does not satisfy';
 const MAX_LINES = 50;
 const MAX_IDS = 20;
@@ -384,14 +530,15 @@ const MAX_LINE = 300;
 const MIN_LEAF = 4; // shorter scenario strings ("GET", "1") would match the fixed text by accident; the output is IDs + fixed text anyway
 const MAX_NODES = 100000;
 const ID = String.raw`(?:AC|EC|ER)-[1-9]\d{0,3}`;
-const LINE_SHAPE = new RegExp(`^(?:${ID}(?:, ${ID})*: ${API_SYMPTOM}|${FALLBACK} ${ID}(?:, ${ID})*)$`);
+const IDS = `${ID}(?:, ${ID})*`;
+const LINE_SHAPE = new RegExp(`^(?:${IDS}: ${API_SYMPTOM}|${IDS}: ${CLI_SYMPTOM}(?: \\((?:${CLI_FAMILIES.join('|')})\\))?|${FALLBACK} ${IDS})$`);
 
 // Every string value in a scenario's setup, request, assertions, steps and expectations, plus the object keys inside request
 // `body` / `headers` (data; elsewhere keys are schema words such as "status"). null when too large to check.
-function scenarioStrings(list, canary) {
+export function scenarioStrings(list, canary) {
   const out = new Set();
   if (typeof canary === 'string' && canary) out.add(canary);
-  const stack = list.filter((x) => x && typeof x === 'object').flatMap((sc) => [sc.setup, sc.request, sc.assert, sc.steps, sc.expect].map((v) => [v, false]));
+  const stack = list.filter((x) => x && typeof x === 'object').flatMap((sc) => [sc.setup, sc.request, sc.assert, sc.steps, sc.expect, sc.run].map((v) => [v, false]));
   let n = 0;
   while (stack.length) {
     const [v, data] = stack.pop();
@@ -406,8 +553,11 @@ function scenarioStrings(list, canary) {
   return out;
 }
 
-// symptomBrief(failures, scenarios, canary) -> string[]: per failure `<covers IDs>: an endpoint returned an unexpected status or body`.
-// Only covers entries that are exactly criterion IDs survive; scenario ids, paths, data, the canary, quotes and URLs never appear.
+// symptomBrief(failures, scenarios, canary) -> string[]: per failure `<covers IDs>: an endpoint returned an unexpected status or body`,
+// or for a cli set `<covers IDs>: a command exited, printed or wrote something unexpected (<family>)`, where <family> is the failure's
+// `failed` word only when it is one of CLI_FAMILIES (stored verdict results carry none: the line then has no family). Program output,
+// args and expected values never appear. Only covers entries that are exactly criterion IDs survive; scenario ids, paths, data, the
+// canary, quotes and URLs never appear.
 // A line that would contain any scenario string falls back to `behaviour does not satisfy <IDs>`, else it is dropped. Deduped, then
 // sorted by the covers string (the order of scenarios or results is not a signal), then capped.
 export function symptomBrief(failures, scenarios, canary) {
@@ -416,6 +566,7 @@ export function symptomBrief(failures, scenarios, canary) {
   const forbidden = scenarioStrings(list, canary);
   if (!forbidden) return [];
   const safeId = (x) => typeof x === 'string' && x.length <= 7 && CRIT_ID.test(x);
+  const cli = list.length > 0 && list.every((x) => x?.kind === 'cli');
   const clean = (line) => line.length <= MAX_LINE && LINE_SHAPE.test(line) && ![...forbidden].some((f) => line.includes(f));
   const lines = new Map(); // covers head -> line
   for (const f of failures.slice(0, MAX_SCENARIOS)) {
@@ -423,7 +574,9 @@ export function symptomBrief(failures, scenarios, canary) {
     const ids = [...new Set((Array.isArray(f.covers) ? f.covers : []).filter(safeId))].slice(0, MAX_IDS);
     if (!ids.length) continue;
     const head = ids.join(', ');
-    const line = [`${head}: ${API_SYMPTOM}`, `${FALLBACK} ${head}`].find(clean);
+    const fam = cli && CLI_FAMILIES.includes(f.failed) ? f.failed : null;
+    const candidates = cli ? [...(fam ? [`${head}: ${CLI_SYMPTOM} (${fam})`] : []), `${head}: ${CLI_SYMPTOM}`] : [`${head}: ${API_SYMPTOM}`];
+    const line = [...candidates, `${FALLBACK} ${head}`].find(clean);
     if (line && !lines.has(head)) lines.set(head, line);
   }
   return [...lines.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, MAX_LINES).map((k) => lines.get(k));

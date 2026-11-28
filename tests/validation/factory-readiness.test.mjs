@@ -17,7 +17,7 @@ test('config: app/tests/readiness parse with defaults', () => {
 });
 test('config: defaults for app/tests/readiness', () => {
   const d = c.defaults();
-  assert.deepEqual(d.app, { setup: null, start: null, stop: null, base_url: null, ready: null, logs_dir: null, seed: null, env_example: null });
+  assert.deepEqual(d.app, { setup: null, start: null, stop: null, base_url: null, ready: null, logs_dir: null, seed: null, env_example: null, cli: null });
   assert.deepEqual(d.tests, { setup: null, all: null, timeout_s: 900 });
   assert.equal(d.readiness, null);
 });
@@ -62,6 +62,7 @@ const sh = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8
 const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); });
 const res = (id, status) => ({ id, status });
 const ALL = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8'];
+const CHECK_IDS = [...ALL, 'C9'];
 
 // A work clone with a bare origin; `files` are committed on main and pushed. Returns a ctx over the real git, a fake gh, and a tracked worktree list.
 function mkRepo({ files = {}, config, gh = {} } = {}) {
@@ -87,8 +88,8 @@ function mkRepo({ files = {}, config, gh = {} } = {}) {
 const only = async (r, ...ids) => Object.fromEntries((await rd.runChecks(r.ctx, { only: ids })).map((x) => [x.id, x]));
 
 test('readiness: CHECKS table and computeLevel', () => {
-  assert.deepEqual(rd.CHECKS.map((x) => x.id), [...ALL, 'A1']);
-  assert.deepEqual(rd.CHECKS.filter((x) => x.runsCommands).map((x) => x.id), ['C3', 'C6', 'C7', 'C8']);
+  assert.deepEqual(rd.CHECKS.map((x) => x.id), [...CHECK_IDS, 'A1']);
+  assert.deepEqual(rd.CHECKS.filter((x) => x.runsCommands).map((x) => x.id), ['C3', 'C6', 'C7', 'C8', 'C9']);
   assert.equal(rd.CHECKS.find((x) => x.id === 'A1').level, 0);
   const allPass = ALL.map((id) => res(id, 'pass'));
   const with_ = (id, status) => allPass.map((r) => (r.id === id ? res(id, status) : r));
@@ -101,7 +102,7 @@ test('readiness: CHECKS table and computeLevel', () => {
 });
 
 test('readiness: fixItem is static help without inferred values', () => {
-  for (const id of [...ALL, 'A1']) { const f = rd.fixItem(id, { reason: 'why' }); assert.equal(f.id, id); assert.equal(f.what, 'why'); assert.ok(f.change && f.help); }
+  for (const id of [...CHECK_IDS, 'A1']) { const f = rd.fixItem(id, { reason: 'why' }); assert.equal(f.id, id); assert.equal(f.what, 'why'); assert.ok(f.change && f.help); }
 });
 
 test('C1: fails when the config file is missing, passes when it equals origin', async () => {
@@ -619,5 +620,19 @@ test('init gate: a refusal writes no queue file and no info/exclude entries, als
     assert.equal(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null, before);
     assert.doesNotMatch(before ?? '', /\.delivery\/|\.implementation\//);
   }
+  done(r);
+});
+
+test('deliver readiness and the init gate pass cliOnly: a cli-only config reaches level 4 with C6-C8 skipped', async () => {
+  const r = await gateRepo({ app: { cli: { command: ['node', '-e', 'process.exit(1)'], timeout_s: 10 }, env_example: '.env.example' } });
+  const x = r.d('readiness', '--json');
+  assert.equal(x.code, 0, x.out + x.err);
+  const doc = JSON.parse(x.out);
+  const st = Object.fromEntries(doc.results.map((q) => [q.id, q.status]));
+  assert.equal(st.C9, 'pass'); assert.deepEqual([st.C6, st.C7, st.C8], ['skip', 'skip', 'skip']);
+  assert.equal(doc.level, 4);
+  const g = r.d(...initArgs); // readinessGate recomputes the level with the same option
+  assert.equal(g.code, 0, g.out + g.err);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(r.work, '.delivery', 'queue.json'), 'utf8')).readiness_level, 4);
   done(r);
 });

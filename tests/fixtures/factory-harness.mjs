@@ -42,7 +42,9 @@ async function verifyStub({ repoKey, id, sha, scenarios, criteriaHash, git }) {
   const doc = { feature: id, sha, scenarios_hash: scenariosHash(scenarios), criteria_hash: criteriaHash, results, verdict: status, at: new Date().toISOString() };
   V.writeVerdict(repoKey, doc);
   fs.appendFileSync(path.join(process.env.FACTORY_HOME, 'verify-calls.log'), `${id} ${sha} ${status}\n`);
-  return { verdict: status, doc, brief: status === 'pass' ? [] : VF.symptomBrief(results, scenarios, scenarios.canary), reused: false };
+  // verify.family: a cli set's failing scenarios report that failed-family word (the real verifier returns it as `families`, never stored).
+  const families = cfg.verify?.family && status !== 'pass' ? Object.fromEntries(results.map((r) => [r.id, cfg.verify.family])) : null;
+  return { verdict: status, doc, brief: status === 'pass' ? [] : VF.symptomBrief(results.map((r) => ({ ...r, failed: families?.[r.id] })), scenarios, scenarios.canary), reused: false, ...(families ? { families } : {}) };
 }
 
 let fakeNow = Number.isFinite(cfg.now) ? cfg.now : null;
