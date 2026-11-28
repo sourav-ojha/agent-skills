@@ -109,7 +109,7 @@ An optional section, parsed like `## HTTP contract`. Each bullet is one backtick
 
 The steps of `verifyFeature` stay the same: stored verdict reuse, refusals, worktree, setup phase, two runs per scenario, survivor checks, verdict, final sweep. The run phase for a `cli` scenario changes:
 
-1. **Case folder.** Make a fresh, empty case folder under the run temp for this run of this scenario. It is the command's working directory and the only writable place besides the run temp. The worktree is read-only during the run phase. This is a change from `api`, where the worktree stays writable. A command that writes into its own source tree fails, which is the honest result.
+1. **Case folder.** Make a fresh run temp for this run of this scenario, with its own empty case folder, `HOME` and `TMPDIR` inside it. An earlier run's folders are not reachable from a later run. It is the command's working directory and the only writable place besides the run temp. The worktree is read-only during the run phase. This is a change from `api`, where the worktree stays writable. A command that writes into its own source tree fails, which is the honest result.
 2. **Setup.** Write `setup.files` into the case folder, then run `setup.runs` in order.
 3. **The command.** Run `app.cli.command` + `run.args` through `runSandboxed`:
    - working directory: the case folder;
@@ -155,7 +155,7 @@ A new check at level 4: "CLI runs". It runs the same way C6 to C8 run today: in 
 
 ### Symptom briefs
 
-A failing `cli` scenario uses the existing `symptomBrief`. That brief gives the criterion IDs and one fixed sentence per failure, and it drops any line that contains a scenario string. The brief adds only the assertion family that failed (`exit`, `stdout`, `stderr` or `file`). It never includes program output, args or expected values, because output often repeats the expected values.
+A failing `cli` scenario uses the existing `symptomBrief`. That brief gives the criterion IDs and one fixed sentence per failure, and it drops any line that contains a scenario string. The brief adds only the failed family, one of the fixed words `exit`, `stdout`, `stderr`, `file`, `run` or `setup`. `verifyFeature` returns the words as `families` (not stored in the verdict, which keeps its 7 keys) and the driver puts them in the fix brief. It never includes program output, args or expected values, because output often repeats the expected values.
 
 ## Constraints
 
