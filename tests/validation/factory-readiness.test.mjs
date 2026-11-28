@@ -622,3 +622,17 @@ test('init gate: a refusal writes no queue file and no info/exclude entries, als
   }
   done(r);
 });
+
+test('deliver readiness and the init gate pass cliOnly: a cli-only config reaches level 4 with C6-C8 skipped', async () => {
+  const r = await gateRepo({ app: { cli: { command: ['node', '-e', 'process.exit(1)'], timeout_s: 10 }, env_example: '.env.example' } });
+  const x = r.d('readiness', '--json');
+  assert.equal(x.code, 0, x.out + x.err);
+  const doc = JSON.parse(x.out);
+  const st = Object.fromEntries(doc.results.map((q) => [q.id, q.status]));
+  assert.equal(st.C9, 'pass'); assert.deepEqual([st.C6, st.C7, st.C8], ['skip', 'skip', 'skip']);
+  assert.equal(doc.level, 4);
+  const g = r.d(...initArgs); // readinessGate recomputes the level with the same option
+  assert.equal(g.code, 0, g.out + g.err);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(r.work, '.delivery', 'queue.json'), 'utf8')).readiness_level, 4);
+  done(r);
+});

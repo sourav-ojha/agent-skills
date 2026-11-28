@@ -123,3 +123,20 @@ test('factorycheck: app.cli with no app.start meets the factory run requirements
   // a startable app still needs its own base_url and ready
   assert.ok(ids(policy({ ...cli, start: ['npm', 'run', 'dev'] })).includes('app_base_url'));
 });
+
+test('C9: output over 1 MiB fails with a clear message', async () => {
+  const x = await c9({ app: { cli: { command: ['node', '-e', 'process.stdout.write("x".repeat(3*1024*1024))'], timeout_s: 20 } } });
+  assert.equal(x.status, 'fail'); assert.match(x.reason, /more than 1 MiB/);
+});
+
+test('C9 survivors(): a pid that is gone by a later poll does not fail; one still there after the polls does', async () => {
+  const { spawn } = await import('node:child_process');
+  const dir = tmpDir('c9s-');
+  const mk = (ms) => spawn(process.execPath, ['-e', `setTimeout(()=>{},${ms})`], { cwd: dir, env: { ...process.env, TMPDIR: dir, HOME: dir }, detached: true, stdio: 'ignore' });
+  const slow = mk(700); slow.unref();
+  assert.equal(await rd.c9Survivors([dir], dir, { polls: 20, waitMs: 150 }), false);
+  const stuck = mk(60000); stuck.unref();
+  assert.equal(await rd.c9Survivors([dir], dir, { polls: 2, waitMs: 50 }), true);
+  await new Promise((ok) => setTimeout(ok, 300));
+  assert.throws(() => process.kill(stuck.pid, 0)); // the killable survivor was killed
+});

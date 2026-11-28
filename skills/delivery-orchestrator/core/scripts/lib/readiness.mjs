@@ -271,19 +271,23 @@ async function appAttempt(ctx, sha) {
 // C9: app.setup, then app.cli.command with no arguments in an empty case folder, in a worktree of the base tip. Unsandboxed like
 // C6-C8 (the base tip is the reviewed code); the process gets the allowlisted environment, HOME and TMPDIR in a private temp, no stdin.
 // Any exit code passes: it proves the command starts and ends, not that it is right. A timeout, a spawn failure or a survivor fails.
-// True when a process mentions a marker (a poll lets the process-group kill show); those that are safe to signal are killed so a failing check leaves nothing running. Fails closed when ps or lsof fails.
-async function survivors(markers, sandbox) {
-  let found = false;
-  for (let i = 0; i < 5; i++) {
-    const r = survivorPids(markers, { sandbox: [sandbox] });
-    if (r.ok && !r.pids.size) return found;
-    found = true;
-    for (const pid of r.killable) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* gone */ } }
-    await new Promise((ok) => setTimeout(ok, 200));
+// True when a process still mentions a marker after a short poll (a slow-dying member of the command's process group may need a
+// moment to disappear: the final state decides). Whatever is still there after the poll and is safe to signal (it carries the
+// run's TMPDIR/HOME) is killed, so a failing check leaves little behind. Fails closed when ps or lsof fails.
+async function survivors(markers, sandbox, { polls = 5, waitMs = 200 } = {}) {
+  let r;
+  for (let i = 0; i < polls; i++) {
+    r = survivorPids(markers, { sandbox: [sandbox] });
+    if (r.ok && !r.pids.size) return false;
+    await new Promise((ok) => setTimeout(ok, waitMs));
   }
-  return found;
+  r = survivorPids(markers, { sandbox: [sandbox] });
+  if (r.ok && !r.pids.size) return false;
+  for (const pid of r.killable) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* gone */ } }
+  return true;
 }
 
+export const c9Survivors = survivors;
 async function c9Attempt(ctx, sha) {
   const { cli, setup } = ctx.config.app;
   const wt = await ctx.worktree(sha);
@@ -295,10 +299,11 @@ async function c9Attempt(ctx, sha) {
     fs.mkdirSync(caseDir); fs.mkdirSync(home);
     const argv = cli.command.map((el) => (el.startsWith('./') ? path.join(wt.dir, el.slice(2)) : el));
     const r = await runCapture(argv, { cwd: caseDir, env: { ...env, CI: '1', NO_COLOR: '1', HOME: home, TMPDIR: tmp }, timeoutS: cli.timeout_s, stdin: '' });
+    if (r.overflow) return res('fail', 'app.cli.command printed more than 1 MiB with no arguments and was killed');
     if (r.timedOut) return res('fail', `app.cli.command did not exit within ${cli.timeout_s}s`);
     if (r.code === null && r.signal === null) return res('fail', 'app.cli.command could not be started (is the program installed and on PATH?)');
     const left = await survivors([tmp, wt.dir], tmp);
-    if (left) return res('fail', 'a process started by app.cli.command was still running after it exited (it has been killed)');
+    if (left) return res('fail', 'a process started by app.cli.command was still running after it exited (killable ones were killed)');
     return res('pass', `app.cli.command exited ${r.code ?? r.signal}`);
   } finally { wt.remove(); fs.rmSync(tmp, { recursive: true, force: true }); }
 }
