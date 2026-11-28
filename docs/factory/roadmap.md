@@ -110,6 +110,13 @@ Multi-repo, parallel worktrees, milestone re-planning, canary and contract tests
 2. Write an implementation plan per phase, then build phases 0–2.
 3. Re-specify phases 3–8 using Phase 1's benchmark numbers, in the same spec → review → iterate loop.
 
+## Bench log
+
+Real-repo runs of the factory against a scratch fork of a command-line project (a TypeScript CLI run through `tsx`):
+
+- **2026-11-28, `cli` scenario kind (first end-to-end pass).** Spec with a `## CLI contract` and `app.cli`; the factory authored five hidden `cli` scenarios, built the feature, opened the PR, held it at G1 (new tests; released by hand), passed CI, ran the hidden scenarios twice each (5/5 pass), posted `factory/verified` and stopped at `merge held for a person` (autonomy L1), with the PR mergeable and clean. First attempt failed all five scenarios: `tsx` opens a unix-socket IPC server in `TMPDIR` and the `network: none` profile denied it. Fixed by allowing unix sockets inside the run's own temp only (known gap 46).
+- Gaps seen: the author sometimes returns a set the lint rejects (re-run stores a valid one); the Claude login in the factory home writes a `theme` key that the settings check refuses (reset `settings.json` to `{}` after logging in); a stale local branch in the driver clone stops `deliver next` after a PR is closed.
+
 ## Research basis
 
 Summarised from research in Nov 2026: Factory.ai Missions and Software Factory, StrongDM's software factory (external scenarios, digital twins), Anthropic's long-running-agent and harness-design posts (generator/evaluator split, progress files), OpenAI's harness-engineering report, METR and DORA on AI productivity, studies on LLM-written tests and reward hacking, memory and token-compression tools, anti-slop design tools, and safety practices for unreviewed merges. Most outcome evidence in this space is vendor-reported; the thresholds above are starting points to tune from our own run records.
