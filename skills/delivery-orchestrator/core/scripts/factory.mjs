@@ -27,7 +27,7 @@ import { loadScenarios, saveScenarios, lintScenarios, isCurrentApproved, approve
 import { runSession, materialiseSettings, renderPrompt, defaultHome, readBuilderResult } from './lib/sessions.mjs';
 import { sessionResult, nextAction, resumeAction, canHold, MAX_RESUMES } from './lib/driver.mjs';
 import { acquire, inspect, LockError } from './lib/lock.mjs';
-import { verifyFeature, scanSurvivors, survivorPids, symptomBrief, postVerified } from './lib/verify.mjs';
+import { verifyFeature, scanSurvivors, survivorPids, symptomBrief, postVerified, verifiable } from './lib/verify.mjs';
 import { portOf, portInUse } from './lib/proc.mjs';
 import { makeRunTemp } from './lib/sandbox.mjs';
 import { readVerdict, verdictMatches } from './lib/verdict.mjs';
@@ -333,7 +333,11 @@ export function specSections(criteria) {
   if (criteria.ec.length) parts.push('', '### Edge cases', ...criteria.ec.map(ITEM));
   if (criteria.er.length) parts.push('', '### Error and failure scenarios', ...criteria.er.map(ITEM));
   if (criteria.contract.length) parts.push('', '### HTTP contract', ...criteria.contract.map((c) => `- \`${c.method} ${c.path}\``));
-  else parts.push('', '### HTTP contract', '(none: use UI scenarios only)');
+  else parts.push('', '### HTTP contract', '(none)');
+  const cli = criteria.cliContract || [];
+  // The arguments after the program name (the display name in the spec is dropped; the program is fixed by the project).
+  if (cli.length) parts.push('', '### CLI contract (arguments after the program name)', ...cli.map((c) => (c.words.length ? `- \`${c.words.join(' ')}\`` : '- (no arguments)')));
+  else parts.push('', '### CLI contract', '(none)');
   return parts.join('\n');
 }
 
@@ -579,14 +583,18 @@ export async function cmdScenarios(ctx) {
   for (const id of only) if (!specs.some((s) => s.id === id)) refuse(`--only names ${id}, which has no spec on origin/${ctx.base}`);
   const pick = specs.filter((s) => (only.length ? only.includes(s.id) : s.status === 'ready' && s.delivery !== 'complete'));
   const mode = ctx.policy.verification.scenario_approval;
-  const counts = { stored: 0, current: 0, awaiting_approval: 0, invalid: 0, criteria_errors: 0, failed: 0 };
+  const counts = { stored: 0, current: 0, awaiting_approval: 0, invalid: 0, criteria_errors: 0, failed: 0, unverifiable: 0 };
   let code = 0;
   for (let i = 0; i < pick.length; i++) {
     const spec = pick[i];
     const bc = baseCriteria(ctx.git, ctx.base, spec.rel);
     if (!bc || !bc.criteria.ok) { counts.criteria_errors++; ctx.out(`${spec.id} criteria: ${bc ? bc.criteria.errors.length : 1} error(s) in the base spec; fix the spec first`); code = 1; continue; }
     const now = scenarioState(ctx.key, spec.id, bc, mode);
-    if (now.ok) { counts.current++; ctx.out(`${spec.id} scenarios: current and approved`); continue; }
+    if (now.ok) {
+      const why = unverifiableWhy(ctx, now.doc, bc);
+      if (why) counts.unverifiable++;
+      counts.current++; ctx.out(`${spec.id} scenarios: current and approved${why ? `, unverifiable (${why})` : ''}`); continue;
+    }
     if (now.why === 'unapproved') { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: current, awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); continue; }
     const r = await authorOne(ctx, spec, bc);
     if (r.status === 'error') {
@@ -605,9 +613,12 @@ export async function cmdScenarios(ctx) {
     if (r.status === 'invalid') { counts.invalid++; ctx.out(`${spec.id} scenarios rejected: ${r.problems.length} problem(s)`); for (const p of r.problems.slice(0, 50)) ctx.out(`  ${p}`); code = 1; continue; }
     const doc = mode === 'auto' ? approve(r.doc, 'auto') : r.doc;
     saveScenarios(ctx.key, spec.id, doc);
-    if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto`); } else { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)`); }
+    const why = unverifiableWhy(ctx, doc, bc);
+    if (why) counts.unverifiable++;
+    const tail = why ? `, unverifiable (${why})` : '';
+    if (mode === 'auto') { counts.stored++; ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), approved: auto${tail}`); } else { counts.awaiting_approval++; approvalRow(ctx, spec.id); ctx.out(`${spec.id} scenarios: stored (${doc.scenarios.length}), awaiting approval (factory scenarios --approve ${spec.id} --by <name>)${tail}`); }
   }
-  ctx.out(`scenarios: ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+  ctx.out(`scenarios: ${Object.entries(counts).filter(([k, v]) => k !== 'unverifiable' || v > 0).map(([k, v]) => `${k} ${v}`).join(', ')}`);
   endRun('finished');
   return code;
 }
@@ -654,6 +665,39 @@ function approveCmd(ctx, id, by) {
   try { resolveAttention(ctx.fh, ctx.key, { id, kind: 'scenario_approval' }); } catch { /* advisory */ }
   ctx.out(`${id} scenarios: approved`);
   return 0;
+}
+
+// Why a stored scenario set cannot be run by the verifier now (fixed strings only), or null. `mixed contracts` comes from the base
+// spec (both an HTTP and a CLI contract; verifiable has no spec access) and has precedence over verifiable's own reason.
+export function unverifiableWhy(ctx, doc, bc) {
+  if (bc?.criteria?.contract?.length && bc.criteria.cliContract?.length) return 'mixed contracts';
+  const v = verifiable(doc, ctx.policy);
+  return v.ok ? null : v.why;
+}
+const UNVERIFIABLE_FIX = {
+  'ui scenarios': 'UI scenarios need Phase 1b; re-author the feature\'s scenarios as api or cli (reopen the spec if it has no HTTP or CLI contract)',
+  'mixed kinds': 'a feature\'s scenarios must be all api or all cli; give the spec one contract and re-author',
+  'mixed contracts': 'a feature\'s scenarios must be all api or all cli; give the spec one contract and re-author',
+  'needs app.cli': 'set app.cli in .product/delivery.json on the base branch',
+  'needs app.start': 'set app.start, app.base_url and app.ready on the base branch',
+  'no scenarios': 're-run factory scenarios',
+};
+// The first picked feature whose current scenarios the verifier cannot run: { id, why } or null (refused at run start).
+function firstUnverifiable(ctx, ids) {
+  const specs = new Map(baseSpecs(ctx.git, ctx.base, ctx.policy.features_dir).map((s) => [s.id, s]));
+  for (const id of ids) {
+    const s = specs.get(id);
+    const bc = s ? baseCriteria(ctx.git, ctx.base, s.rel) : null;
+    const st = s ? scenarioState(ctx.key, id, bc, ctx.policy.verification.scenario_approval) : { ok: false };
+    if (!st.ok) continue; // missingScenarios reports these
+    const why = unverifiableWhy(ctx, st.doc, bc);
+    if (why) return { id, why };
+  }
+  return null;
+}
+function refuseUnverifiable(ctx, ids) {
+  const u = firstUnverifiable(ctx, ids);
+  if (u) refuse(`${u.id} has scenarios the verifier cannot run (${u.why})`, UNVERIFIABLE_FIX[u.why]);
 }
 
 // ---- run: start checks ----------------------------------------------------------------------------------------------------------------
@@ -986,7 +1030,10 @@ function symptomLines(ctx, f) {
   try {
     const doc = SHA.test(String(f.verdict_sha)) ? readVerdict(ctx.key, f.id, f.verdict_sha) : null;
     const sc = loadScenarios(ctx.key, f.id);
-    if (doc && sc) lines = symptomBrief(doc.results.filter((r) => r.status !== 'pass' || r.flaky), sc, sc.canary);
+    // The cli failed-family words ({ 'S-n': word }) are not in the verdict file: they come from the in-memory result of the
+    // verification this process ran for this exact sha. After a driver restart they are absent and the brief has the generic line.
+    const fam = ctx.famMem?.[f.id]?.sha === f.verdict_sha ? ctx.famMem[f.id].families : null;
+    if (doc && sc) lines = symptomBrief(doc.results.filter((r) => r.status !== 'pass' || r.flaky).map((r) => (fam && typeof fam[r.id] === 'string' ? { ...r, failed: fam[r.id] } : r)), sc, sc.canary);
   } catch { lines = []; }
   return lines.length ? lines : ['behaviour does not satisfy the acceptance criteria'];
 }
@@ -1182,6 +1229,7 @@ async function stepVerify(ctx, f) {
     r = await (ctx.deps.verifyFeature || verifyFeature)({ repoKey: ctx.key, id: f.id, sha: f.ci_sha, baseRef: OR(ctx.base), config: ctx.policy, scenarios: st.doc, criteriaHash: bc.hash, git: (...a) => gitSafeOpts(ctx.D, a) }, verifySeamsFor(ctx));
   } catch { threw = true; }
   const ok = !threw && (r?.verdict === 'pass' || r?.verdict === 'fail');
+  if (ok && r.families && typeof r.families === 'object') (ctx.famMem ||= {})[f.id] = { sha: f.ci_sha, families: r.families };
   const failedIds = ok && r.verdict === 'fail' ? (r.doc?.results || []).filter((x) => x.status !== 'pass' || x.flaky).flatMap((x) => x.covers) : [];
   update(ctx, f.id, (x) => {
     x.verify_runs = (x.verify_runs ?? 0) + 1; x.verify_ms = (x.verify_ms ?? 0) + (Date.now() - t0);
@@ -1340,6 +1388,7 @@ export async function cmdRun(ctx) {
     try { picked = buildQueue(discover(path.join(ctx.D, ctx.policy.features_dir)), { only, limit: opt.limit ? Number(opt.limit) : 0 }); } catch (e) { refuse(`the feature queue cannot be built: ${e.message.slice(0, 120)}`); }
     const bad = missingScenarios(ctx, picked.map((f) => f.id));
     if (bad.length) refuse(`features without current approved scenarios: ${bad.join(', ')}`, 'run "factory scenarios" (and approve them when scenario_approval is human)');
+    refuseUnverifiable(ctx, picked.map((f) => f.id));
     const d = deliver(ctx, 'init', ...(only.length ? ['--only', only.join(',')] : []), ...(opt.limit ? ['--limit', String(opt.limit)] : []));
     if (d.code !== 0) refuse('deliver init refused (readiness gate, config or repository checks)', `run "DELIVER_QUEUE=${ctx.queueFile} node deliver.mjs init --dir ${ctx.D} --dry-run" to see why`);
     if (!fs.existsSync(ctx.queueFile)) { ctx.out('no feature is ready'); return 0; }
