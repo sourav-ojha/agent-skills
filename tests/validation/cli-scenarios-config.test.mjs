@@ -49,5 +49,5 @@ test('app.cli is a sensitive project key', () => {
   const e = SCHEMA.find((x) => x.path === 'app.cli');
   assert.ok(e);
   assert.equal(e.sensitive, true);
-  assert.deepEqual(e.readBy, ['factory run']);
+  assert.deepEqual(e.readBy, ['deliver readiness', 'factory run']);
 });

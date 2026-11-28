@@ -272,6 +272,8 @@ C.config = async () => {
   if (errors.length) process.exitCode = 1;
 };
 
+const cliOnlyOf = (cfg) => ({ cliOnly: !!cfg?.app?.cli && !cfg?.app?.start });
+
 // Merging runs in an opted-in project need a fresh readiness result for the config now on origin/<base>.
 // The cheap checks (C1, C2, C4, C5) are re-run and merged over the stored results before the level is recomputed.
 async function readinessGate(config, nameWithOwner, base) {
@@ -289,7 +291,7 @@ async function readinessGate(config, nameWithOwner, base) {
   const fresh = await runChecks(ctx, { only: ['C1', 'C2', 'C4', 'C5'] });
   const freshIds = new Set(fresh.map((r) => r.id));
   const merged = [...doc.results.filter((r) => !freshIds.has(r.id)), ...fresh];
-  const level = Math.min(computeLevel(merged), doc.level); // the re-run can only lower the stored level, never raise it
+  const level = Math.min(computeLevel(merged, cliOnlyOf(config)), doc.level); // the re-run can only lower the stored level, never raise it
   if (level < min) {
     const st = new Map(merged.map((r) => [r.id, r]));
     const fixes = CHECKS.filter((c) => c.level > 0 && st.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, st.get(c.id)));
@@ -446,7 +448,7 @@ C.readiness = async () => {
     const again = new Map((await runChecks(ctx)).map((r) => [r.id, r]));
     results = results.map((r) => (again.get(r.id)?.status === r.status ? r : { ...r, status: 'unstable', reason: `status differed between repeated runs (${r.status} then ${again.get(r.id)?.status}): ${r.reason}` }));
   }
-  const level = computeLevel(results);
+  const level = computeLevel(results, cliOnlyOf(runConfig));
   const status = new Map(results.map((r) => [r.id, r]));
   const fixes = CHECKS.filter((c) => c.level > 0 && status.get(c.id)?.status !== 'pass').map((c) => fixItem(c.id, status.get(c.id)));
   const doc = { helper_version: HELPER_VERSION, base, base_sha: sha.out, config_hash: configHash, level, results, fixes, at: new Date().toISOString() };
