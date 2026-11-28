@@ -171,7 +171,7 @@ test('graceful stop during a session aborts it, WIP-commits its edits, ends stat
 
 test('after stop no process with the factory clone or work directory as cwd survives, and the app port from app.ready.url is free', async (t) => {
   const port = await freePort();
-  const config = { ...BASE_CONFIG, app: { start: ['node', 'server.js'], ready: { url: `http://127.0.0.1:${port}/health`, timeout_s: 5 } } };
+  const config = { ...BASE_CONFIG, app: { start: ['node', 'server.js'], base_url: `http://127.0.0.1:${port}`, ready: { url: `http://127.0.0.1:${port}/health`, timeout_s: 5 } } };
   const w = ready(t, { config, specs: ONE, fake: { plan: { 'FEATURE-001': [{ files: { 'src/x.wip': 'x\n' }, escape_ms: 120000, escape_port: port, linger_ms: 60000 }] } } });
   const run = bg(w, ['run']);
   await until(() => builderRuns(w, 'FEATURE-001').length === 1 && fs.existsSync(path.join(w.builder, 'src', 'x.wip')), 'the builder session');
