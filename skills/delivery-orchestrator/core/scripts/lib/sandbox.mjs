@@ -174,8 +174,15 @@ const regexEscape = (s) => {
 };
 const sameFile = (a, b) => { try { const x = fs.statSync(a), y = fs.statSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
 
-function networkRules(network) {
-  if (network === 'none') return ['(deny network*)'];
+// `tmp` is the profile's run temp (realpath) or null.
+function networkRules(network, tmp) {
+  if (network === 'none') {
+    // Unix-domain sockets whose path is inside this run's own temp only (tsx's IPC server `$TMPDIR/tsx-<uid>/<pid>.pipe`): bind covers
+    // bind+listen, and accept needs no inbound rule; outbound covers connect. Measured: a socket in another run temp, the worktree or
+    // /private/var/run/mDNSResponder stays EPERM, as does a symlink or `..` path in the temp that resolves outside it; TCP stays denied.
+    if (!tmp) return ['(deny network*)'];
+    return ['(deny network*)', `(allow network-bind (local unix-socket ${subpath(tmp)}))`, `(allow network-outbound (remote unix-socket ${subpath(tmp)}))`];
+  }
   if (network === 'registries') {
     // Outbound TCP 443/80 to any PUBLIC host, plus the mDNSResponder socket so name resolution works (found empirically: without it every
     // lookup is ENOTFOUND; UDP 53 is not needed on macOS). Loopback is denied last. SBPL hosts can only be `*` or `localhost`, so LAN,
@@ -306,7 +313,7 @@ export function sandboxProfile({
   // Residual: notification_center (darwin notifications) stays allowed through MACH_ALLOW and could still carry a few bits; see
   // references/factory-driver.md known gaps.
   lines.push('(deny ipc-posix-shm*)', '(deny ipc-posix-sem*)', '(deny ipc-sysv*)');
-  lines.push(...networkRules(network));
+  lines.push(...networkRules(network, tmp));
   return `${lines.join('\n')}\n`;
 }
 

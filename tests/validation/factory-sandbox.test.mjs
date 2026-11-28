@@ -241,6 +241,21 @@ test('sandboxProfile: network rules per mode', (t) => {
   assert.ok(!lp.includes('mDNSResponder') && !lp.includes('*:443') && !lp.includes('(deny network-outbound (remote ip "localhost:*"))'));
 });
 
+test('sandboxProfile: none + tmpDir allows unix sockets in the run temp only; registries and localhostPort are unchanged by a tmpDir', (t) => {
+  const root = tmp(t); const tmpDir = path.join(root, 'rt'); fs.mkdirSync(tmpDir);
+  const base = { writable: [path.join(root)], factoryHome: '/nonexistent/fh', unsafeAllowOutsideFactoryHome: true };
+  const net = (p) => p.slice(p.indexOf('(deny network*)')).trim().split('\n');
+  const T = JSON.stringify(tmpDir);
+  assert.deepEqual(net(S.sandboxProfile({ ...base, tmpDir, network: 'none' })), ['(deny network*)',
+    `(allow network-bind (local unix-socket (subpath ${T})))`, `(allow network-outbound (remote unix-socket (subpath ${T})))`]);
+  assert.deepEqual(net(S.sandboxProfile({ ...base, network: 'none' })), ['(deny network*)'], 'no tmpDir: no unix-socket allow');
+  assert.deepEqual(net(S.sandboxProfile({ ...base, tmpDir, network: 'registries' })), ['(deny network*)',
+    '(allow network-outbound (remote tcp "*:443") (remote tcp "*:80") (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
+    '(deny network-outbound (remote ip "localhost:*"))']);
+  assert.deepEqual(net(S.sandboxProfile({ ...base, tmpDir, network: { localhostPort: 4321 } })), ['(deny network*)',
+    '(allow network-outbound (remote ip "localhost:4321"))', '(allow network-bind network-inbound (local ip "localhost:4321"))']);
+});
+
 test('makeRunTemp: FACTORY_HOME/tmp/<random>, mode 0700, realpath; removeRunTemp deletes it', (t) => {
   const raw = fs.mkdtempSync(path.join(os.tmpdir(), 'factory-fh-')); gone(t, raw);
   const a = S.makeRunTemp(raw); const b = S.makeRunTemp(raw);
@@ -387,6 +402,46 @@ test('sandbox net: registries allows only tcp 80/443 to non-loopback hosts (loop
   const none = await sb(w, code, { network: 'none', args: [String(eph), p443 ? '1' : ''] });
   assert.equal(none.eph, 'EPERM'); assert.equal(none.unix, 'EPERM'); assert.ok(['EPERM', 'skip'].includes(none.p443));
   assert.ok(['EPERM', 'none', 'ENOENT'].includes(none.agent) && reg.agent !== 'OK', 'ssh-agent socket reachable');
+});
+
+// Unix sockets in 'none' mode: allowed (bind/listen/accept/connect) only for paths inside the profile's own run temp. The world lives
+// under a short /private/tmp root: a run temp under os.tmpdir() (/var/folders/...) leaves no room in sun_path (104 bytes) for a socket name.
+function shortWorld(t) {
+  const root = fs.realpathSync(fs.mkdtempSync('/private/tmp/fsk-')); gone(t, root);
+  const fh = path.join(root, 'fh'); const work = path.join(fh, 'work', 'wt');
+  fs.mkdirSync(work, { recursive: true });
+  const tmpDir = S.makeRunTemp(fh); t.after(() => S.removeRunTemp(tmpDir));
+  const other = S.makeRunTemp(fh); t.after(() => S.removeRunTemp(other)); // another run's temp under the same FACTORY_HOME/tmp
+  return { root, fh, work, tmpDir, other, unsafe: false };
+}
+const UNIX = `const uListen=(p)=>new Promise(r=>{const s=net.createServer(c=>c.end('hi'));s.on('error',e=>r(e.code));s.listen(p,()=>{const c=net.connect(p);c.setTimeout(1500,()=>{c.destroy();s.close();r('TIMEOUT')});c.on('data',d=>{c.destroy();s.close();r(String(d))});c.on('error',e=>{s.close();r('conn:'+e.code)})})});
+const uConn=(p)=>new Promise(r=>{const c=net.connect(p);c.setTimeout(1500,()=>{c.destroy();r('TIMEOUT')});c.on('connect',()=>{c.destroy();r('OK')});c.on('error',e=>r(e.code))});\n`;
+const unixServe = (t, p) => new Promise((res, rej) => { const s = net.createServer((c) => { c.on('error', () => {}); c.end('x'); }); s.on('error', rej); s.listen(p, () => { t.after(() => new Promise((r) => s.close(r))); res(p); }); });
+
+test('sandbox net none: a unix socket inside the run temp works (listen, accept, connect), nested dirs and the tsx layout too', { skip: SKIP }, async (t) => {
+  const w = shortWorld(t);
+  const r = await sb(w, UNIX + `fs.mkdirSync(path.join(A[0],'tsx-501'));(async()=>out({ top: await uListen(path.join(A[0],'a.pipe')), nested: await uListen(path.join(A[0],'tsx-501','1234.pipe')),
+    viaTmpdir: await uListen(path.join(process.env.TMPDIR,'b.pipe')) }))()`, { args: [w.tmpDir] });
+  assert.deepEqual(r, { top: 'hi', nested: 'hi', viaTmpdir: 'hi' });
+});
+
+test('sandbox net none: unix sockets outside the run temp are denied (listen in another run temp, the worktree; connect to outside sockets, via symlink too)', { skip: SKIP }, async (t) => {
+  const w = shortWorld(t);
+  const outSock = await unixServe(t, path.join(w.other, 'srv.sock')); // a live socket another run (or the driver) owns
+  fs.symlinkSync(outSock, path.join(w.tmpDir, 'link.sock'));
+  fs.symlinkSync(w.other, path.join(w.tmpDir, 'otherdir'));
+  const r = await sb(w, UNIX + `(async()=>out({ listenOther: await uListen(path.join(A[1],'c.pipe')), listenWork: await uListen(path.join(A[2],'d.pipe')),
+    connOther: await uConn(A[3]), connLink: await uConn(path.join(A[0],'link.sock')), connDotDot: await uConn(path.join(A[0],'..',path.basename(A[1]),'srv.sock')),
+    connViaDir: await uConn(path.join(A[0],'otherdir','srv.sock')), mdns: await uConn('/private/var/run/mDNSResponder') }))()`, { args: [w.tmpDir, w.other, w.work, outSock] });
+  assert.deepEqual(r, { listenOther: 'EPERM', listenWork: 'EPERM', connOther: 'EPERM', connLink: 'EPERM', connDotDot: 'EPERM', connViaDir: 'EPERM', mdns: 'EPERM' });
+  assert.ok(!fs.existsSync(path.join(w.other, 'c.pipe')));
+});
+
+test('sandbox net none: TCP on 127.0.0.1 stays denied (bind/listen and connect) with the unix-socket allow present', { skip: SKIP }, async (t) => {
+  const w = shortWorld(t);
+  const port = await serve(t, 0);
+  const r = await sb(w, `(async()=>out({ listen: await listen('127.0.0.1',0), conn: await conn('127.0.0.1',+A[0]), v6: await conn('::1',+A[0]), ext: await conn('93.184.216.34',80) }))()`, { args: [String(port)] });
+  assert.deepEqual(r, { listen: 'EPERM', conn: 'EPERM', v6: 'EPERM', ext: 'EPERM' });
 });
 
 test('startSandboxed: the app listens on its port inside the sandbox, cannot write outside, and stopApp kills it', { skip: SKIP }, async (t) => {
